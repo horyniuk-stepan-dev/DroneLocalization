@@ -1,15 +1,9 @@
-﻿"""
-Interactive map widget using Leaflet.js through QWebEngineView
-"""
-
-from PyQt6.QtWebEngineWidgets import QWebEngineView
+﻿from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QUrl
-
+import os
 
 class MapBridge(QObject):
-    """Bridge between Python and JavaScript"""
-    
     updateMarkerSignal = pyqtSignal(float, float)
     addTrajectoryPointSignal = pyqtSignal(float, float)
     clearTrajectorySignal = pyqtSignal()
@@ -17,10 +11,7 @@ class MapBridge(QObject):
     def __init__(self):
         super().__init__()
 
-
 class MapWidget(QWebEngineView):
-    """Interactive map widget"""
-    
     marker_clicked = pyqtSignal(float, float)
     
     def __init__(self, parent=None):
@@ -30,30 +21,25 @@ class MapWidget(QWebEngineView):
         self.load_map()
     
     def setup_web_channel(self):
-        """Setup QWebChannel for Python-JS communication"""
-        # TODO: Create QWebChannel
-        # TODO: Register bridge object
-        # TODO: Set channel to page
-        pass
+        self.channel = QWebChannel()
+        self.channel.registerObject("mapBridge", self.bridge)
+        self.page().setWebChannel(self.channel)
     
     def load_map(self):
-        """Load Leaflet.js map"""
-        # TODO: Load HTML with Leaflet.js
-        # TODO: Setup JavaScript listeners
-        # TODO: Connect to QWebChannel
-        pass
+        map_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../resources/maps/map_template.html"))
+        if os.path.exists(map_path):
+            self.setUrl(QUrl.fromLocalFile(map_path))
+        else:
+            self.setHtml("<html><body><h1>Карта не знайдена</h1></body></html>")
     
     @pyqtSlot(float, float)
     def update_marker(self, lat, lon):
-        """Update marker position"""
         self.bridge.updateMarkerSignal.emit(lat, lon)
     
     @pyqtSlot(float, float)
     def add_trajectory_point(self, lat, lon):
-        """Add point to trajectory"""
         self.bridge.addTrajectoryPointSignal.emit(lat, lon)
     
     @pyqtSlot()
     def clear_trajectory(self):
-        """Clear trajectory"""
         self.bridge.clearTrajectorySignal.emit()

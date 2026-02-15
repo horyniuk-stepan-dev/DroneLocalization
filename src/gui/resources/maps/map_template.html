@@ -14,10 +14,39 @@
 <body>
     <div id="map"></div>
     <script>
-        // TODO: Initialize Leaflet map
-        // TODO: Setup QWebChannel
-        // TODO: Connect to Python bridge
-        // TODO: Add marker update handlers
+        var map = L.map('map').setView([50.4501, 30.5234], 13);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        var droneMarker = null;
+        var trajectoryLine = L.polyline([], {color: 'red'}).addTo(map);
+
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            window.mapBridge = channel.objects.mapBridge;
+
+            mapBridge.updateMarkerSignal.connect(function(lat, lon) {
+                if (droneMarker === null) {
+                    droneMarker = L.marker([lat, lon]).addTo(map);
+                    map.setView([lat, lon], 16);
+                } else {
+                    droneMarker.setLatLng([lat, lon]);
+                }
+            });
+
+            mapBridge.addTrajectoryPointSignal.connect(function(lat, lon) {
+                trajectoryLine.addLatLng([lat, lon]);
+            });
+
+            mapBridge.clearTrajectorySignal.connect(function() {
+                trajectoryLine.setLatLngs([]);
+                if (droneMarker !== null) {
+                    map.removeLayer(droneMarker);
+                    droneMarker = null;
+                }
+            });
+        });
     </script>
 </body>
 </html>
