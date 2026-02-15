@@ -1,0 +1,78 @@
+﻿# Configuration for Drone Localization System
+
+application:
+  name: "Drone Topometric Localization"
+  version: "1.0.0"
+  window_title: "Drone Localization System"
+  
+hardware:
+  device: "cuda"
+  gpu_id: 0
+  num_workers: 4
+  
+paths:
+  data_root: "data"
+  databases_dir: "data/databases"
+  models_dir: "data/models"
+  calibration_dir: "data/calibration"
+  results_dir: "data/results"
+  logs_dir: "logs"
+  
+models:
+  yolo:
+    model: "yolov8x-seg.pt"
+    conf_threshold: 0.25
+    device: "cuda"
+  
+  superpoint:
+    max_keypoints: 2048
+    keypoint_threshold: 0.005
+    nms_radius: 4
+  
+  netvlad:
+    descriptor_dim: 32768
+    
+  lightglue:
+    features: "superpoint"
+    depth_confidence: 0.95
+    width_confidence: 0.99
+  
+  depth_anything:
+    model: "vit_large"
+    
+database:
+  storage_format: "hdf5"
+  compression: "gzip"
+  compression_level: 4
+  chunk_size: 1000
+  
+localization:
+  retrieval_top_k: 10
+  matching_top_k: 5
+  ransac_threshold: 3.0
+  ransac_max_iters: 5000
+  ransac_confidence: 0.999
+  min_matches: 10
+  min_inliers: 20
+  
+calibration:
+  min_points: 3
+  ransac_threshold_meters: 10.0
+  
+tracking:
+  kalman_process_noise: 0.1
+  kalman_measurement_noise: 10.0
+  outlier_threshold_std: 3.0
+  trajectory_window_size: 10
+  
+gui:
+  theme: "dark"
+  map_update_interval_ms: 100
+  video_fps: 30
+  progress_update_interval_ms: 500
+  
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  rotation: "10 MB"
+  retention: "7 days"

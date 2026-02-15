@@ -1,0 +1,80 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project Data
+data/databases/*.h5
+data/databases/*.hdf5
+data/videos/reference/*.mp4
+data/videos/reference/*.avi
+data/videos/query/*.mp4
+data/videos/query/*.avi
+data/models/*.pt
+data/models/*.pth
+data/calibration/temp/
+
+# Outputs
+outputs/
+logs/
+*.log
+
+# PyInstaller
+*.spec
+build/
+dist/
+
+# Qt
+*.ui.py
+*.qrc.py
+
+# Temp files
+*.tmp
+*.bak
+*.cache
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
