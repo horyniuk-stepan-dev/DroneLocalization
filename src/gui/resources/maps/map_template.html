@@ -1,51 +1,79 @@
 ﻿<!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <title>Drone Localization Map</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <title>Drone Tracker Map</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
     <style>
-        body { margin: 0; padding: 0; }
-        #map { width: 100%; height: 100vh; }
+        body { padding: 0; margin: 0; }
+        html, body, #map { height: 100%; width: 100%; }
     </style>
 </head>
 <body>
     <div id="map"></div>
     <script>
-        var map = L.map('map').setView([50.4501, 30.5234], 13);
+        // Ініціалізуємо карту з супутниковим шаром (поки що центр десь в Україні)
+        var map = L.map('map').setView([48.3794, 31.1656], 6);
 
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors'
+        var satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
         }).addTo(map);
 
         var droneMarker = null;
-        var trajectoryLine = L.polyline([], {color: 'red'}).addTo(map);
+        var trajectoryLine = L.polyline([], {color: 'red', weight: 3}).addTo(map);
 
-        new QWebChannel(qt.webChannelTransport, function(channel) {
-            window.mapBridge = channel.objects.mapBridge;
+        // Ця функція оновлює маркер і центрує карту
+        function updateMarker(lat, lon) {
+            var newLatLng = new L.LatLng(lat, lon);
 
-            mapBridge.updateMarkerSignal.connect(function(lat, lon) {
-                if (droneMarker === null) {
-                    droneMarker = L.marker([lat, lon]).addTo(map);
-                    map.setView([lat, lon], 16);
-                } else {
-                    droneMarker.setLatLng([lat, lon]);
-                }
-            });
+            if (droneMarker === null) {
+                droneMarker = L.marker(newLatLng).addTo(map);
+                map.setView(newLatLng, 18); // Наближаємо при першій точці
+            } else {
+                droneMarker.setLatLng(newLatLng);
+                map.panTo(newLatLng); // Плавно переміщуємо камеру за дроном
+            }
+        }
 
-            mapBridge.addTrajectoryPointSignal.connect(function(lat, lon) {
-                trajectoryLine.addLatLng([lat, lon]);
-            });
+        // Ця функція додає точку до червоної лінії траєкторії
+        function addTrajectoryPoint(lat, lon) {
+            trajectoryLine.addLatLng([lat, lon]);
+        }
 
-            mapBridge.clearTrajectorySignal.connect(function() {
-                trajectoryLine.setLatLngs([]);
-                if (droneMarker !== null) {
-                    map.removeLayer(droneMarker);
-                    droneMarker = null;
-                }
-            });
+        // Очищення траєкторії при старті нової місії
+        function clearTrajectory() {
+            trajectoryLine.setLatLngs([]);
+            if (droneMarker !== null) {
+                map.removeLayer(droneMarker);
+                droneMarker = null;
+            }
+        }
+
+        // Налаштування каналу зв'язку з Python
+        document.addEventListener("DOMContentLoaded", function () {
+            if (typeof qt !== 'undefined' && qt.webChannelTransport) {
+                new QWebChannel(qt.webChannelTransport, function (channel) {
+                    var bridge = channel.objects.mapBridge;
+
+                    // Підписуємося на сигнали з Python
+                    bridge.updateMarkerSignal.connect(function(lat, lon) {
+                        updateMarker(lat, lon);
+                    });
+
+                    bridge.addTrajectoryPointSignal.connect(function(lat, lon) {
+                        addTrajectoryPoint(lat, lon);
+                    });
+
+                    bridge.clearTrajectorySignal.connect(function() {
+                        clearTrajectory();
+                    });
+                });
+            } else {
+                console.log("QWebChannel не знайдено. Карта працює в автономному режимі.");
+            }
         });
     </script>
 </body>

@@ -3,6 +3,9 @@ from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QUrl
 import os
 
+from utils.logging_utils import get_logger
+
+
 class MapBridge(QObject):
     updateMarkerSignal = pyqtSignal(float, float)
     addTrajectoryPointSignal = pyqtSignal(float, float)
@@ -10,6 +13,7 @@ class MapBridge(QObject):
     
     def __init__(self):
         super().__init__()
+        self.logger = get_logger('MapBridge')
 
 class MapWidget(QWebEngineView):
     marker_clicked = pyqtSignal(float, float)
