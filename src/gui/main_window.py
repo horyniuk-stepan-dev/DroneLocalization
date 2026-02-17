@@ -74,7 +74,97 @@ class MainWindow(QMainWindow):
         self.control_panel.start_tracking_clicked.connect(self.on_start_tracking)
         self.control_panel.stop_tracking_clicked.connect(self.on_stop_tracking)
         self.control_panel.calibrate_clicked.connect(self.on_calibrate)
+        self.control_panel.load_calibration_clicked.connect(self.on_load_calibration)  # ДОДАНО
+        self.control_panel.generate_panorama_clicked.connect(self.on_generate_panorama)
+        self.control_panel.show_panorama_clicked.connect(self.on_show_panorama)
         self.control_panel.localize_image_clicked.connect(self.on_localize_image)
+
+    @pyqtSlot()
+    def on_generate_panorama(self):
+        video_path, _ = QFileDialog.getOpenFileName(
+            self, "Виберіть відео для панорами", "", "Video Files (*.mp4 *.avi *.mkv)"
+        )
+        if not video_path: return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Зберегти панораму", "panorama.jpg", "Images (*.jpg *.png)"
+        )
+        if not save_path: return
+
+        from src.workers.panorama_worker import PanoramaWorker
+        self.pano_worker = PanoramaWorker(video_path, save_path, frame_step=20)
+
+        self.control_panel.btn_gen_pano.setEnabled(False)
+        self.pano_worker.progress.connect(self.on_db_progress)
+
+        def on_complete(path):
+            self.control_panel.btn_gen_pano.setEnabled(True)
+            self.status_bar.showMessage(f"Панораму збережено у: {path}")
+            QMessageBox.information(self, "Успіх", "Панораму успішно створено!")
+
+        def on_error(err):
+            self.control_panel.btn_gen_pano.setEnabled(True)
+            QMessageBox.critical(self, "Помилка", err)
+
+        self.pano_worker.completed.connect(on_complete)
+        self.pano_worker.error.connect(on_error)
+        self.pano_worker.start()
+
+    @pyqtSlot()
+    def on_show_panorama(self):
+        if not self.calibration.is_calibrated:
+            QMessageBox.warning(self, "Увага",
+                                "Спочатку виконайте калібрування GPS, щоб система знала, куди покласти панораму!")
+            return
+
+        image_path, _ = QFileDialog.getOpenFileName(
+            self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
+        )
+        if not image_path: return
+
+        import cv2
+        import base64
+
+        img = cv2.imread(image_path)
+        if img is None:
+            QMessageBox.critical(self, "Помилка", "Не вдалося прочитати зображення.")
+            return
+
+        height, width = img.shape[:2]
+        self.logger.info(f"Завантажено панораму для відображення: {width}x{height} пікселів")
+
+        try:
+            # Важливо: Якщо ти відкалібрував GPS на відео 1920x1080, а панорама має розмір 500x300,
+            # координати нижче будуть розраховані НЕПРАВИЛЬНО. Калібрувати треба саме файл панорами!
+            lat_tl, lon_tl = self.calibration.transform_to_gps(0, 0)
+            lat_tr, lon_tr = self.calibration.transform_to_gps(width, 0)
+            lat_br, lon_br = self.calibration.transform_to_gps(width, height)
+            lat_bl, lon_bl = self.calibration.transform_to_gps(0, height)
+
+            self.logger.info(f"GPS кути панорами: TL({lat_tl:.4f}, {lon_tl:.4f}), BR({lat_br:.4f}, {lon_br:.4f})")
+
+            max_dim = 2048
+            if width > max_dim or height > max_dim:
+                scale = max_dim / max(width, height)
+                img = cv2.resize(img, (int(width * scale), int(height * scale)))
+
+            _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            b64_string = base64.b64encode(buffer).decode('utf-8')
+            data_url = f"data:image/jpeg;base64,{b64_string}"
+
+            self.map_widget.set_panorama_overlay(
+                data_url,
+                lat_tl, lon_tl,
+                lat_tr, lon_tr,
+                lat_br, lon_br,
+                lat_bl, lon_bl
+            )
+            self.status_bar.showMessage("Панорама успішно накладена на карту")
+
+        except Exception as e:
+            self.logger.error(f"Failed to overlay panorama: {e}")
+            QMessageBox.critical(self, "Помилка", f"Не вдалося накласти панораму:\n{e}")
+
     @pyqtSlot()
     def on_new_mission(self):
         dialog = NewMissionDialog(self)
@@ -186,7 +276,7 @@ class MainWindow(QMainWindow):
         self.tracking_worker.frame_ready.connect(self.on_frame_ready)
         self.tracking_worker.location_found.connect(self.on_location_found)
         self.tracking_worker.status_update.connect(self.control_panel.update_status)
-
+        self.tracking_worker.fov_found.connect(self.map_widget.update_fov)  # <--- ДОДАНО ПІДКЛЮЧЕННЯ
         self.map_widget.clear_trajectory()
         self.tracking_worker.start()
         self.status_bar.showMessage("Відстеження розпочато")
@@ -258,6 +348,8 @@ class MainWindow(QMainWindow):
                 inliers = result.get("inliers", 0)
 
                 self.map_widget.update_marker(lat, lon)
+                if "fov_polygon" in result:
+                    self.map_widget.update_fov(result["fov_polygon"])
                 self.status_bar.showMessage(
                     f"Локалізація: {lat:.6f}, {lon:.6f} | Впевненість: {conf:.2f} | Точок: {inliers}")
                 self.control_panel.update_status("Фото успішно локалізовано")
@@ -287,7 +379,20 @@ class MainWindow(QMainWindow):
         dialog.calibration_complete.connect(self.on_calibration_complete)
         dialog.exec()
 
-    @pyqtSlot(object)
+    @pyqtSlot()
+    def on_load_calibration(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "Виберіть файл калібрування", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if file_name:
+            try:
+                self.calibration.load(file_name)
+                self.status_bar.showMessage(f"Завантажено калібрування: {file_name}")
+                self.control_panel.update_status("Калібрування завантажено")
+                QMessageBox.information(self, "Успіх",
+                                        "Файл калібрування успішно завантажено! Можна починати відстеження.")
+            except Exception as e:
+                QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити калібрування:\n{str(e)}")@pyqtSlot(object)
     def on_calibration_complete(self, calibration_data):
         try:
             result = self.calibration.calibrate(
@@ -295,11 +400,20 @@ class MainWindow(QMainWindow):
                 calibration_data['points_gps']
             )
             self.status_bar.showMessage(f"Калібрування успішне! Похибка: {result['rmse_meters']:.2f} м.")
-            QMessageBox.information(self, "Успіх",
-                                    f"Калібрування збережено.\nСередня похибка: {result['rmse_meters']:.2f} метрів.")
+
+            # Пропонуємо зберегти результат
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, "Зберегти файл калібрування", "", "JSON Files (*.json)"
+            )
+
+            if save_path:
+                self.calibration.save(save_path)
+                QMessageBox.information(self, "Успіх", f"Калібрування збережено у {save_path}.\nСередня похибка: {result['rmse_meters']:.2f} метрів.")
+            else:
+                QMessageBox.information(self, "Успіх", f"Калібрування застосовано (без збереження).\nСередня похибка: {result['rmse_meters']:.2f} метрів.")
+
         except Exception as e:
             QMessageBox.critical(self, "Помилка калібрування", str(e))
-
     @pyqtSlot(QPixmap)
     def on_frame_ready(self, pixmap):
         if hasattr(self.video_widget, 'display_frame'):

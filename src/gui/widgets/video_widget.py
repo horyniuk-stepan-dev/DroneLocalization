@@ -2,7 +2,7 @@
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPen, QColor, QBrush, QPainter
 
-from utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger  # ВИПРАВЛЕНО: було 'from utils...'
 
 
 class VideoWidget(QGraphicsView):
@@ -36,23 +36,19 @@ class VideoWidget(QGraphicsView):
         pen = QPen(color)
         pen.setWidth(2)
         brush = QBrush(color)
-        radius = 8  # Збільшений радіус для кращої видимості
+        radius = 8
 
-        # Малюємо саму точку
         ellipse_item = self.scene.addEllipse(x - radius, y - radius, radius * 2, radius * 2, pen, brush)
         self.overlay_items.append(ellipse_item)
 
-        # Додаємо текст з номером
         text_item = self.scene.addText(text)
-        text_item.setDefaultTextColor(QColor(255, 255, 255))  # Білий текст
+        text_item.setDefaultTextColor(QColor(255, 255, 255))
 
-        # Налаштовуємо шрифт
         font = text_item.font()
         font.setBold(True)
-        font.setPointSize(16)  # Великий шрифт
+        font.setPointSize(16)
         text_item.setFont(font)
 
-        # Розміщуємо текст трохи правіше і вище від точки
         text_item.setPos(x + radius + 2, y - radius - 20)
         self.overlay_items.append(text_item)
 
@@ -71,8 +67,6 @@ class VideoWidget(QGraphicsView):
         y = int(scene_pos.y())
 
         if 0 <= x <= self.video_item.pixmap().width() and 0 <= y <= self.video_item.pixmap().height():
-            # Ми більше не малюємо точку автоматично тут,
-            # лише відправляємо сигнал діалогу
             self.frame_clicked.emit(x, y)
 
         super().mousePressEvent(event)

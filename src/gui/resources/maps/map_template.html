@@ -4,75 +4,146 @@
     <title>Drone Tracker Map</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
     <style>
-        body { padding: 0; margin: 0; }
-        html, body, #map { height: 100%; width: 100%; }
+        body, html { padding: 0; margin: 0; height: 100%; overflow: hidden; background-color: #f0f0f0; }
+        #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; width: 100%; height: 100%; }
+        #error-log { position: absolute; top: 10px; left: 50px; z-index: 9999; color: red; background: white; padding: 10px; display: none; font-weight: bold; border: 2px solid red;}
     </style>
 </head>
 <body>
+    <div id="error-log"></div>
     <div id="map"></div>
     <script>
-        // Ініціалізуємо карту з супутниковим шаром (поки що центр десь в Україні)
+        // === ВБУДОВАНИЙ ПЛАГІН РОЗТАШУВАННЯ (ЩОБ УНИКНУТИ БЛОКУВАННЯ БРАУЗЕРОМ) ===
+        L.ImageOverlay.Rotated = L.ImageOverlay.extend({
+            initialize: function (image, topleft, topright, bottomleft, options) {
+                this._url = image;
+                this._topLeft = L.latLng(topleft);
+                this._topRight = L.latLng(topright);
+                this._bottomLeft = L.latLng(bottomleft);
+                L.setOptions(this, options);
+            },
+            onAdd: function (map) {
+                if (!this._image) {
+                    this._initImage();
+                    if (this.options.opacity < 1) L.DomUtil.setOpacity(this._image, this.options.opacity);
+                }
+                map.getPanes().overlayPane.appendChild(this._image);
+                map.on('viewreset', this._reset, this);
+                if (map.options.zoomAnimation && L.Browser.any3d) map.on('zoomanim', this._animateZoom, this);
+                this._reset();
+            },
+            onRemove: function (map) {
+                map.getPanes().overlayPane.removeChild(this._image);
+                map.off('viewreset', this._reset, this);
+                if (map.options.zoomAnimation) map.off('zoomanim', this._animateZoom, this);
+            },
+            _initImage: function () {
+                var img = this._image = L.DomUtil.create('img', 'leaflet-image-layer');
+                img.style.position = 'absolute';
+                img.style.transformOrigin = '0 0';
+                // Фікс проблеми 0-розміру (коли панорама надто мала або не встигла завантажитись)
+                img.onload = () => this._reset();
+                img.src = this._url;
+            },
+            _reset: function () {
+                if (!this._image || this._image.width === 0) return;
+                var p = this._map.latLngToLayerPoint(this._topLeft),
+                    q = this._map.latLngToLayerPoint(this._topRight),
+                    r = this._map.latLngToLayerPoint(this._bottomLeft);
+                var vX = [q.x - p.x, q.y - p.y], vY = [r.x - p.x, r.y - p.y];
+                this._image.style.transform = 'matrix(' + (vX[0]/this._image.width) + ',' + (vX[1]/this._image.width) + ',' + (vY[0]/this._image.height) + ',' + (vY[1]/this._image.height) + ',' + p.x + ',' + p.y + ')';
+            },
+            _animateZoom: function (e) {
+                if (!this._image || this._image.width === 0) return;
+                var p = this._map._latLngToNewLayerPoint(this._topLeft, e.zoom, e.center),
+                    q = this._map._latLngToNewLayerPoint(this._topRight, e.zoom, e.center),
+                    r = this._map._latLngToNewLayerPoint(this._bottomLeft, e.zoom, e.center);
+                var vX = [q.x - p.x, q.y - p.y], vY = [r.x - p.x, r.y - p.y];
+                this._image.style.transform = 'matrix(' + (vX[0]/this._image.width) + ',' + (vX[1]/this._image.width) + ',' + (vY[0]/this._image.height) + ',' + (vY[1]/this._image.height) + ',' + p.x + ',' + p.y + ')';
+            }
+        });
+        L.imageOverlay.rotated = function (imgSrc, topleft, topright, bottomleft, options) {
+            return new L.ImageOverlay.Rotated(imgSrc, topleft, topright, bottomleft, options);
+        };
+        // =====================================================================
+
         var map = L.map('map').setView([48.3794, 31.1656], 6);
 
         var satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+            attribution: 'Tiles &copy; Esri',
+            maxZoom: 20
         }).addTo(map);
 
         var droneMarker = null;
         var trajectoryLine = L.polyline([], {color: 'red', weight: 3}).addTo(map);
+        var fovPolygon = L.polygon([], {color: '#00ff00', weight: 2, fillOpacity: 0.15}).addTo(map);
+        var panoramaOverlay = null;
 
-        // Ця функція оновлює маркер і центрує карту
         function updateMarker(lat, lon) {
             var newLatLng = new L.LatLng(lat, lon);
-
             if (droneMarker === null) {
                 droneMarker = L.marker(newLatLng).addTo(map);
-                map.setView(newLatLng, 18); // Наближаємо при першій точці
+                map.setView(newLatLng, 18);
             } else {
                 droneMarker.setLatLng(newLatLng);
-                map.panTo(newLatLng); // Плавно переміщуємо камеру за дроном
+                map.panTo(newLatLng);
             }
         }
 
-        // Ця функція додає точку до червоної лінії траєкторії
-        function addTrajectoryPoint(lat, lon) {
-            trajectoryLine.addLatLng([lat, lon]);
+        function addTrajectoryPoint(lat, lon) { trajectoryLine.addLatLng([lat, lon]); }
+
+        function updateFOV(lat1, lon1, lat2, lon2, lat3, lon3, lat4, lon4) {
+            fovPolygon.setLatLngs([ [lat1, lon1], [lat2, lon2], [lat3, lon3], [lat4, lon4] ]);
         }
 
-        // Очищення траєкторії при старті нової місії
         function clearTrajectory() {
             trajectoryLine.setLatLngs([]);
-            if (droneMarker !== null) {
-                map.removeLayer(droneMarker);
-                droneMarker = null;
+            fovPolygon.setLatLngs([]);
+            if (droneMarker !== null) { map.removeLayer(droneMarker); droneMarker = null; }
+        }
+
+        function setPanoramaOverlay(dataUrl, lat_tl, lon_tl, lat_tr, lon_tr, lat_br, lon_br, lat_bl, lon_bl) {
+            try {
+                if (panoramaOverlay !== null) { map.removeLayer(panoramaOverlay); }
+
+                var topleft    = L.latLng(lat_tl, lon_tl);
+                var topright   = L.latLng(lat_tr, lon_tr);
+                var bottomleft = L.latLng(lat_bl, lon_bl);
+
+                panoramaOverlay = L.imageOverlay.rotated(dataUrl, topleft, topright, bottomleft, {
+                    opacity: 0.75,
+                    interactive: false
+                }).addTo(map);
+
+                var bounds = L.latLngBounds([
+                    [lat_tl, lon_tl], [lat_tr, lon_tr], [lat_br, lon_br], [lat_bl, lon_bl]
+                ]);
+                map.fitBounds(bounds);
+
+                document.getElementById('error-log').style.display = 'none'; // Приховуємо помилки, якщо успіх
+            } catch (error) {
+                var errDiv = document.getElementById('error-log');
+                errDiv.innerHTML = "Помилка відображення панорами: " + error.message;
+                errDiv.style.display = 'block';
             }
         }
 
-        // Налаштування каналу зв'язку з Python
         document.addEventListener("DOMContentLoaded", function () {
             if (typeof qt !== 'undefined' && qt.webChannelTransport) {
                 new QWebChannel(qt.webChannelTransport, function (channel) {
                     var bridge = channel.objects.mapBridge;
-
-                    // Підписуємося на сигнали з Python
-                    bridge.updateMarkerSignal.connect(function(lat, lon) {
-                        updateMarker(lat, lon);
-                    });
-
-                    bridge.addTrajectoryPointSignal.connect(function(lat, lon) {
-                        addTrajectoryPoint(lat, lon);
-                    });
-
-                    bridge.clearTrajectorySignal.connect(function() {
-                        clearTrajectory();
-                    });
+                    bridge.updateMarkerSignal.connect(updateMarker);
+                    bridge.addTrajectoryPointSignal.connect(addTrajectoryPoint);
+                    bridge.clearTrajectorySignal.connect(clearTrajectory);
+                    bridge.setPanoramaSignal.connect(setPanoramaOverlay);
+                    bridge.updateFOVSignal.connect(updateFOV);
                 });
-            } else {
-                console.log("QWebChannel не знайдено. Карта працює в автономному режимі.");
             }
         });
     </script>

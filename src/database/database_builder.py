@@ -35,11 +35,15 @@ class DatabaseBuilder:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
+
         if num_frames <= 0:
             cap.release()
             logger.error(f"Invalid frame count ({num_frames}). Video might be corrupted or uses unsupported codec.")
             raise ValueError(
-                "OpenCV не зміг розпізнати відео. Файл пошкоджений або використовує непідтримуваний кодек. Спробуйте переконвертувати відео у стандартний MP4 (H.264).")
+                "OpenCV не зміг розпізнати відео. Файл пошкоджений або використовує непідтримуваний кодек. "
+                "Спробуйте переконвертувати відео у стандартний MP4 (H.264)."
+            )
+
         logger.info(f"Video properties: {width}x{height}, {num_frames} frames, {fps:.2f} FPS")
 
         # Initialize neural network wrappers
@@ -88,8 +92,10 @@ class DatabaseBuilder:
                 # Step 4: Save data to HDF5
                 self.save_frame_data(i, features, current_pose)
 
+                # ВИПРАВЛЕНО: progress_percent тепер завжди визначена в цьому блоці
+                progress_percent = int((i + 1) / num_frames * 100)
+
                 if progress_callback:
-                    progress_percent = int((i + 1) / num_frames * 100)
                     progress_callback(progress_percent)
 
                 if (i + 1) % 100 == 0:
@@ -139,13 +145,10 @@ class DatabaseBuilder:
         """Save extracted data for a single frame"""
         logger.debug(f"Saving frame {frame_id} data to database")
 
-        # Write to pre-allocated global arrays
         self.db_file['global_descriptors']['descriptors'][frame_id] = features['global_desc']
         self.db_file['global_descriptors']['frame_poses'][frame_id] = pose_2d
 
-        # Dynamic dataset creation for local points (variable count)
         frame_group = self.db_file['local_features'].create_group(f'frame_{frame_id}')
-
         frame_group.create_dataset('keypoints', data=features['keypoints'],
                                    dtype='float32', compression='gzip')
         frame_group.create_dataset('descriptors', data=features['descriptors'],

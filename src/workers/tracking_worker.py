@@ -17,6 +17,7 @@ class RealtimeTrackingWorker(QThread):
     fps_updated = pyqtSignal(float)
     error = pyqtSignal(str)
     status_update = pyqtSignal(str)
+    fov_found = pyqtSignal(list)
 
     def __init__(self, video_source: str, localizer, config=None):
         super().__init__()
@@ -69,22 +70,35 @@ class RealtimeTrackingWorker(QThread):
 
                 if result.get("success"):
                     logger.debug(
-                        f"Frame {frame_count}: Localization successful - ({result['lat']:.6f}, {result['lon']:.6f})")
+                        f"Frame {frame_count}: Localization successful - "
+                        f"({result['lat']:.6f}, {result['lon']:.6f})"
+                    )
                     self.location_found.emit(
                         result["lat"],
                         result["lon"],
                         result["confidence"],
                         result.get("inliers", 0)
                     )
+                    if "fov_polygon" in result and len(result["fov_polygon"]) == 4:
+                        self.fov_found.emit(result["fov_polygon"])
                 else:
-                    logger.debug(f"Frame {frame_count}: Localization failed - {result.get('error', 'Unknown error')}")
+                    logger.debug(
+                        f"Frame {frame_count}: Localization failed - "
+                        f"{result.get('error', 'Unknown error')}"
+                    )
 
-                # Send frame to GUI
+                # ВИПРАВЛЕНО: frame_rgb має бути неперервним у пам'яті,
+                # а QImage.copy() гарантує що QPixmap не залежить від
+                # буфера numpy, який може бути перезаписаний на наступній
+                # ітерації циклу → UB / артефакти зображення
                 h, w, ch = frame_rgb.shape
                 bytes_per_line = ch * w
-                q_img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                pixmap = QPixmap.fromImage(q_img)
-
+                frame_contiguous = np.ascontiguousarray(frame_rgb)
+                q_img = QImage(
+                    frame_contiguous.data, w, h,
+                    bytes_per_line, QImage.Format.Format_RGB888
+                )
+                pixmap = QPixmap.fromImage(q_img.copy())
                 self.frame_ready.emit(pixmap)
 
             except Exception as e:

@@ -2,7 +2,7 @@
                              QProgressBar, QGroupBox)
 from PyQt6.QtCore import pyqtSignal, Qt
 
-from utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger  # ВИПРАВЛЕНО: було 'from utils...'
 
 
 class ControlPanel(QWidget):
@@ -14,6 +14,9 @@ class ControlPanel(QWidget):
     stop_tracking_clicked = pyqtSignal()
     calibrate_clicked = pyqtSignal()
     localize_image_clicked = pyqtSignal()
+    load_calibration_clicked = pyqtSignal()
+    generate_panorama_clicked = pyqtSignal()
+    show_panorama_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -33,8 +36,16 @@ class ControlPanel(QWidget):
         self.btn_load_db = QPushButton("Завантажити існуючу базу (HDF5)")
         self.btn_load_db.clicked.connect(self.load_database_clicked.emit)
 
+        self.btn_gen_pano = QPushButton("Згенерувати панораму з відео")
+        self.btn_gen_pano.clicked.connect(self.generate_panorama_clicked.emit)
+
+        self.btn_show_pano = QPushButton("Накласти панораму на карту")
+        self.btn_show_pano.clicked.connect(self.show_panorama_clicked.emit)
+
         mission_layout.addWidget(self.btn_new_mission)
         mission_layout.addWidget(self.btn_load_db)
+        mission_layout.addWidget(self.btn_gen_pano)
+        mission_layout.addWidget(self.btn_show_pano)
         mission_group.setLayout(mission_layout)
         layout.addWidget(mission_group)
 
@@ -43,8 +54,11 @@ class ControlPanel(QWidget):
 
         self.btn_calibrate = QPushButton("Виконати калібрування (Video -> Map)")
         self.btn_calibrate.clicked.connect(self.calibrate_clicked.emit)
+        self.btn_load_calibrate = QPushButton("Завантажити калібрування (JSON)")
+        self.btn_load_calibrate.clicked.connect(self.load_calibration_clicked.emit)
 
         calib_layout.addWidget(self.btn_calibrate)
+        calib_layout.addWidget(self.btn_load_calibrate)
         calib_group.setLayout(calib_layout)
         layout.addWidget(calib_group)
 
@@ -64,15 +78,11 @@ class ControlPanel(QWidget):
         self.btn_localize_image = QPushButton("Локалізувати одне фото")
         self.btn_localize_image.clicked.connect(self.localize_image_clicked.emit)
 
-        # 2. ДОДАЄМО всі три кнопки у макет
         track_layout.addWidget(self.btn_start_tracking)
         track_layout.addWidget(self.btn_stop_tracking)
-        track_layout.addWidget(self.btn_localize_image)  # <--- Цього рядка не вистачало!
-
-        # 3. Застосовуємо макет до групи
+        track_layout.addWidget(self.btn_localize_image)
         track_group.setLayout(track_layout)
         layout.addWidget(track_group)
-
 
         status_group = QGroupBox("Статус системи")
         status_layout = QVBoxLayout()

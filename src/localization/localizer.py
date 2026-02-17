@@ -66,7 +66,6 @@ class Localizer:
         candidates = self.retrieval.find_similar_frames(query_features['global_desc'], top_k=top_k)
         logger.debug(f"Found candidates: {[f'frame_{c[0]}' for c in candidates]}")
 
-        best_match = None
         best_inliers = 0
         best_homography = None
         best_candidate_id = -1
@@ -96,7 +95,6 @@ class Localizer:
                     best_inliers = inliers_count
                     best_homography = H
                     best_candidate_id = candidate_id
-                    best_match = (mkpts_query, mkpts_ref, mask)
                     logger.debug(f"New best match: frame {candidate_id} with {inliers_count} inliers")
 
         if best_homography is None:
@@ -105,33 +103,56 @@ class Localizer:
 
         logger.info(f"Best match: frame {best_candidate_id} with {best_inliers} inliers")
 
-        # Transform center point
-        ref_coords_2d = self.database.db_file['local_features'][f'frame_{best_candidate_id}']['coords_2d'][:]
+        # Трансформуємо центральну точку кадру у систему координат бази даних
         pt_2d = GeometryTransforms.apply_homography(center_pt, best_homography)[0]
         logger.debug(f"Center point transformed to 2D: ({pt_2d[0]:.2f}, {pt_2d[1]:.2f})")
 
-        # Convert to metric coordinates
+        # Перевірка викиду у метричних координатах перед фільтрацією
         metric_pt = GeometryTransforms.apply_affine(
             np.array([pt_2d], dtype=np.float32),
             self.calibration.affine_matrix
         )[0]
-        logger.debug(f"Metric coordinates: ({metric_pt[0]:.2f}, {metric_pt[1]:.2f})")
+        logger.debug(f"Metric coordinates (raw): ({metric_pt[0]:.2f}, {metric_pt[1]:.2f})")
 
-        # Check for outliers
+        # ВИПРАВЛЕНО: перевіряємо викид до фільтрації
         if self.outlier_detector.is_outlier(metric_pt):
             logger.warning("Outlier detected - rejecting measurement")
             return {"success": False, "error": "Виявлено аномальний стрибок координат"}
 
-        # Apply Kalman filter
-        filtered_pt = self.kalman_filter.update(metric_pt)
-        self.outlier_detector.add_position(filtered_pt)
-        logger.debug(f"Filtered coordinates: ({filtered_pt[0]:.2f}, {filtered_pt[1]:.2f})")
+        # ВИПРАВЛЕНО: застосовуємо Kalman filter і використовуємо його результат
+        filtered_metric_pt = self.kalman_filter.update(metric_pt)
+        self.outlier_detector.add_position(filtered_metric_pt)
+        logger.debug(f"Filtered metric coordinates: ({filtered_metric_pt[0]:.2f}, {filtered_metric_pt[1]:.2f})")
 
-        # Convert to GPS
-        lat, lon = self.calibration.transform_to_gps(pt_2d[0], pt_2d[1])
+        # ВИПРАВЛЕНО: конвертуємо у GPS з відфільтрованих метричних координат,
+        # а не з сирого pt_2d як було раніше
+        from src.geometry.coordinates import CoordinateConverter
+        lat, lon = CoordinateConverter.metric_to_gps(filtered_metric_pt[0], filtered_metric_pt[1])
+        logger.debug(f"GPS from filtered metric: ({lat:.6f}, {lon:.6f})")
+
+        # Розрахунок поля зору (FOV) — трансформуємо 4 кути кадру
+        corners = np.array([
+            [0,     0],
+            [width, 0],
+            [width, height],
+            [0,     height]
+        ], dtype=np.float32)
+
+        ref_corners_2d = GeometryTransforms.apply_homography(corners, best_homography)
+
+        gps_corners = []
+        for cx, cy in ref_corners_2d:
+            try:
+                corner_metric = GeometryTransforms.apply_affine(
+                    np.array([[cx, cy]], dtype=np.float32),
+                    self.calibration.affine_matrix
+                )[0]
+                c_lat, c_lon = CoordinateConverter.metric_to_gps(corner_metric[0], corner_metric[1])
+                gps_corners.append((c_lat, c_lon))
+            except Exception as e:
+                logger.warning(f"Не вдалося трансформувати кут у GPS: {e}")
 
         confidence = min(1.0, best_inliers / 50.0)
-
         logger.success(f"Localization successful: ({lat:.6f}, {lon:.6f}), confidence: {confidence:.2f}")
 
         return {
@@ -140,5 +161,6 @@ class Localizer:
             "lon": lon,
             "confidence": confidence,
             "matched_frame": best_candidate_id,
-            "inliers": best_inliers
+            "inliers": best_inliers,
+            "fov_polygon": gps_corners
         }

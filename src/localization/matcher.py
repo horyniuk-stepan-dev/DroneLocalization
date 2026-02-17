@@ -50,40 +50,52 @@ class FeatureMatcher:
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         logger.debug("Starting feature matching with LightGlue...")
 
+        # --- ЗАХИСТ ВІД БАГУ З ФОРМОЮ МАТРИЦЬ ---
+        # Якщо в базі HDF5 або з FeatureExtractor прийшла матриця (256, N) замість (N, 256)
+        if query_features['descriptors'].ndim == 2 and query_features['descriptors'].shape[0] == 256 and \
+                query_features['descriptors'].shape[1] != 256:
+            query_features['descriptors'] = query_features['descriptors'].T
+
+        if ref_features['descriptors'].ndim == 2 and ref_features['descriptors'].shape[0] == 256 and \
+                ref_features['descriptors'].shape[1] != 256:
+            ref_features['descriptors'] = ref_features['descriptors'].T
+        # ----------------------------------------
+
         # Prepare query features
         kpts_q = torch.from_numpy(query_features['keypoints']).float().unsqueeze(0).to(self.device)
         desc_q = torch.from_numpy(query_features['descriptors']).float().to(self.device)
 
-        # Ensure descriptors are in correct shape (B, D, N) for LightGlue
+        # ВАЖЛИВО: LightGlue очікує форму (B, N, D), тому ми просто додаємо batch_size = 1
         if desc_q.ndim == 2:
-            desc_q = desc_q.T.unsqueeze(0)  # (N, D) -> (D, N) -> (1, D, N)
-        elif desc_q.ndim == 3 and desc_q.shape[1] > desc_q.shape[2]:
-            desc_q = desc_q.transpose(1, 2)  # (B, N, D) -> (B, D, N)
+            desc_q = desc_q.unsqueeze(0)  # (N, D) -> (1, N, D)
 
         # Prepare reference features
         kpts_r = torch.from_numpy(ref_features['keypoints']).float().unsqueeze(0).to(self.device)
         desc_r = torch.from_numpy(ref_features['descriptors']).float().to(self.device)
 
         if desc_r.ndim == 2:
-            desc_r = desc_r.T.unsqueeze(0)
-        elif desc_r.ndim == 3 and desc_r.shape[1] > desc_r.shape[2]:
-            desc_r = desc_r.transpose(1, 2)
+            desc_r = desc_r.unsqueeze(0)  # (N, D) -> (1, N, D)
 
         logger.debug(f"Query: {kpts_q.shape[1]} keypoints, desc shape: {desc_q.shape}")
         logger.debug(f"Ref: {kpts_r.shape[1]} keypoints, desc shape: {desc_r.shape}")
 
-        # Prepare input for LightGlue
-        # LightGlue expects dict with 'keypoints' (B, N, 2) and 'descriptors' (B, D, N)
+        # Динамічний розрахунок розміру зображення
+        def get_img_size(kpts):
+            if kpts.shape[1] == 0:
+                return torch.tensor([[1920, 1080]]).to(self.device)
+            max_vals, _ = torch.max(kpts[0], dim=0)
+            return torch.tensor([[max_vals[0].item() + 10, max_vals[1].item() + 10]]).to(self.device)
+
         data0 = {
             'keypoints': kpts_q,
             'descriptors': desc_q,
-            'image_size': torch.tensor([[640, 480]]).to(self.device)  # Dummy size
+            'image_size': get_img_size(kpts_q)
         }
 
         data1 = {
             'keypoints': kpts_r,
             'descriptors': desc_r,
-            'image_size': torch.tensor([[640, 480]]).to(self.device)
+            'image_size': get_img_size(kpts_r)
         }
 
         try:
@@ -91,10 +103,9 @@ class FeatureMatcher:
             result = self.lightglue({'image0': data0, 'image1': data1})
 
             # Extract matches
-            # LightGlue returns dict with 'matches0' (N,) containing indices or -1 for no match
             matches0 = result['matches0'][0].cpu().numpy()  # (N_query,)
 
-            # Get valid matches (where matches0 >= 0)
+            # Get valid matches
             valid_mask = matches0 >= 0
             query_indices = np.where(valid_mask)[0]
             ref_indices = matches0[valid_mask]
@@ -113,9 +124,12 @@ class FeatureMatcher:
 
         except Exception as e:
             logger.error(f"Error during LightGlue matching: {e}", exc_info=True)
-            # Fallback to simple descriptor matching
             logger.warning("Falling back to simple L2 distance matching")
             return self._fallback_match(query_features, ref_features)
+
+
+
+
 
     def _fallback_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.8) -> tuple:
         """Fallback matching using descriptor L2 distance and Lowe's ratio test"""

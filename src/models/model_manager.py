@@ -189,7 +189,7 @@ class ModelManager:
 
                 except ImportError:
                     # Fallback to v1
-                    from transformers import pipeline
+                    from transformers import pipeline#                                                    &&&&&????????
 
                     model = pipeline(
                         task="depth-estimation",

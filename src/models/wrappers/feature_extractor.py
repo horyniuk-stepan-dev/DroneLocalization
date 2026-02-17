@@ -51,7 +51,7 @@ class FeatureExtractor:
         descriptors = sp_out['descriptors'][0].cpu().numpy()  # (D, N)
 
         # Transpose descriptors to (N, D) format
-        if descriptors.ndim == 2 and descriptors.shape[0] < descriptors.shape[1]:
+        if descriptors.ndim == 2 and descriptors.shape[0] == 256:
             descriptors = descriptors.T
 
         logger.debug(f"SuperPoint detected {len(keypoints)} keypoints")
