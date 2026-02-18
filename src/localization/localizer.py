@@ -222,9 +222,6 @@ class Localizer:
         if not self.calibration.is_calibrated:
             return {"success": False, "error": "Система не відкалібрована"}
 
-        if not self.database.is_propagated:
-            logger.warning("GPS propagation not done — accuracy reduced")
-
         height, width = frame_rgb.shape[:2]
         center_pt = np.array([[width / 2.0, height / 2.0]], dtype=np.float32)
 
@@ -238,7 +235,6 @@ class Localizer:
         best_inliers = 0
         best_H_query_to_ref = None
         best_candidate_id = -1
-        best_ref_features = None
 
         for candidate_id, score in candidates:
             ref_features = self.database.get_local_features(candidate_id)
@@ -256,69 +252,48 @@ class Localizer:
                     best_inliers = inliers_count
                     best_H_query_to_ref = H
                     best_candidate_id = candidate_id
-                    best_ref_features = ref_features
 
         if best_H_query_to_ref is None:
             return {"success": False, "error": "Недостатньо точок для розрахунку гомографії"}
 
-        logger.info(f"Best match: frame {best_candidate_id}, {best_inliers} inliers")
+        # 1. Отримуємо матрицю знайденого кадру з бази
+        affine_ref = self.database.get_frame_affine(best_candidate_id)
+        if affine_ref is None:
+            return {"success": False, "error": "Немає даних GPS для цього кадру. Запустіть пропагацію!"}
 
-        # Отримуємо H(ref → anchor) і відповідний якір
-        H_ref_to_anchor, anchor = self._get_anchor_for_ref(
-            best_candidate_id, best_ref_features
-        )
-
-        if anchor is None:
-            return {"success": False, "error": "Не знайдено якір для локалізації"}
-
-        # Трансформуємо центр у простір якоря
-        pts_in_anchor = self._transform_pts(
-            center_pt, best_H_query_to_ref, H_ref_to_anchor
-        )
-        if pts_in_anchor is None:
+        # 2. Трансформуємо центр у систему знайденого кадру
+        pt_in_ref = GeometryTransforms.apply_homography(center_pt, best_H_query_to_ref)
+        if pt_in_ref is None or len(pt_in_ref) == 0:
             return {"success": False, "error": "Помилка трансформації координат"}
 
-        px, py = float(pts_in_anchor[0][0]), float(pts_in_anchor[0][1])
-        logger.debug(f"Center in anchor_{anchor.frame_id} space: ({px:.2f}, {py:.2f})")
+        # 3. Переводимо в метрику і перевіряємо на аномалії
+        metric_pt = GeometryTransforms.apply_affine(pt_in_ref, affine_ref)[0]
 
-        # Піксель якоря → метрика → GPS
-        try:
-            mx, my = anchor.pixel_to_metric(px, py)
-        except Exception as e:
-            return {"success": False, "error": f"Affine помилка: {e}"}
-
-        metric_np = np.array([mx, my], dtype=np.float32)
-
-        if self.outlier_detector.is_outlier(metric_np):
+        if self.outlier_detector.is_outlier(metric_pt):
             return {"success": False, "error": "Виявлено аномальний стрибок координат"}
 
-        filtered = self.kalman_filter.update(metric_np)
-        self.outlier_detector.add_position(filtered)
+        filtered_pt = self.kalman_filter.update(metric_pt)
+        self.outlier_detector.add_position(filtered_pt)
 
-        lat, lon = CoordinateConverter.metric_to_gps(filtered[0], filtered[1])
+        lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
 
-        # FOV — 4 кути кадру тим самим ланцюжком
-        corners = np.array(
-            [[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32
-        )
+        # 4. Розрахунок поля зору (FOV)
+        corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+        ref_corners = GeometryTransforms.apply_homography(corners, best_H_query_to_ref)
+
         gps_corners = []
-        corners_in_anchor = self._transform_pts(
-            corners, best_H_query_to_ref, H_ref_to_anchor
-        )
-        if corners_in_anchor is not None:
-            for cx, cy in corners_in_anchor:
-                try:
-                    cmx, cmy = anchor.pixel_to_metric(float(cx), float(cy))
-                    clat, clon = CoordinateConverter.metric_to_gps(cmx, cmy)
-                    gps_corners.append((clat, clon))
-                except Exception:
-                    pass
+        if ref_corners is not None:
+            metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
+            if metric_corners is not None:
+                for cx, cy in metric_corners:
+                    try:
+                        clat, clon = CoordinateConverter.metric_to_gps(cx, cy)
+                        gps_corners.append((clat, clon))
+                    except Exception:
+                        pass
 
         confidence = min(1.0, best_inliers / 50.0)
-        logger.success(
-            f"Localization: ({lat:.6f}, {lon:.6f}), "
-            f"anchor={anchor.frame_id}, confidence={confidence:.2f}"
-        )
+        logger.success(f"Localization: ({lat:.6f}, {lon:.6f}), matched frame={best_candidate_id}")
 
         return {
             "success": True,
@@ -326,12 +301,10 @@ class Localizer:
             "lon": lon,
             "confidence": confidence,
             "matched_frame": best_candidate_id,
-            "anchor_frame": anchor.frame_id,
             "inliers": best_inliers,
             "fov_polygon": gps_corners
         }
 
     def reset_cache(self):
-        self._runtime_h_cache.clear()
-        self._anchor_features_cache.clear()
         logger.info("Localizer runtime cache cleared")
+

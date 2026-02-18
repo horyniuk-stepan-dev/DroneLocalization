@@ -572,53 +572,124 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def on_show_panorama(self):
-        if not self.calibration.is_calibrated:
-            QMessageBox.warning(
-                self, "Увага",
-                "Спочатку виконайте GPS калібрування!"
-            )
+        if not self.calibration.is_calibrated or not getattr(self.calibration, 'anchors', None):
+            QMessageBox.warning(self, "Увага", "Спочатку виконайте калібрування бази!")
             return
 
         image_path, _ = QFileDialog.getOpenFileName(
             self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
         )
-        if not image_path:
-            return
+        if not image_path: return
 
         import cv2
         import base64
+        import numpy as np
+        from src.geometry.coordinates import CoordinateConverter
+        from src.geometry.transformations import GeometryTransforms
 
         img = cv2.imread(image_path)
         if img is None:
             QMessageBox.critical(self, "Помилка", "Не вдалося прочитати зображення.")
             return
 
-        height, width = img.shape[:2]
-        self.logger.info(f"Панорама: {width}x{height} пікселів")
+        H_pano, W_pano = img.shape[:2]
+        self.logger.info(f"Панорама завантажена: {W_pano}x{H_pano} пікселів")
+        self.status_bar.showMessage("Автоматичний аналіз панорами (це може зайняти кілька секунд)...")
+        self.repaint()
 
         try:
-            # ВИПРАВЛЕНО: використовуємо перший якір для трансформації кутів панорами.
-            # Панорама має бути відкалібрована на тому самому кадрі що й перший якір.
-            first_anchor = self.calibration.anchors[0]
+            # 1. Готуємо 3 шматки панорами для розпізнавання (зліва, центр, справа)
+            crop_size = min(H_pano, W_pano)
+            crops = []
 
-            lat_tl, lon_tl = first_anchor.transform_to_gps(0, 0)
-            lat_tr, lon_tr = first_anchor.transform_to_gps(width, 0)
-            lat_br, lon_br = first_anchor.transform_to_gps(width, height)
-            lat_bl, lon_bl = first_anchor.transform_to_gps(0, height)
+            if W_pano > H_pano:  # Горизонтальна панорама
+                crops.append((img[0:crop_size, 0:crop_size], 0, 0))
+                cx = W_pano // 2 - crop_size // 2
+                crops.append((img[0:crop_size, cx:cx + crop_size], cx, 0))
+                crops.append((img[0:crop_size, W_pano - crop_size:W_pano], W_pano - crop_size, 0))
+            else:  # Вертикальна панорама
+                crops.append((img[0:crop_size, 0:crop_size], 0, 0))
+                cy = H_pano // 2 - crop_size // 2
+                crops.append((img[cy:cy + crop_size, 0:crop_size], 0, cy))
+                crops.append((img[H_pano - crop_size:H_pano, 0:crop_size], 0, H_pano - crop_size))
 
-            self.logger.info(
-                f"GPS кути: TL({lat_tl:.4f},{lon_tl:.4f}) "
-                f"BR({lat_br:.4f},{lon_br:.4f})"
-            )
+            # --- СТВОРЮЄМО ЛОКАЛІЗАТОР ---
+            from src.models.wrappers.feature_extractor import FeatureExtractor
+            from src.localization.matcher import FeatureMatcher
+            from src.localization.localizer import Localizer
 
+            sp_model = self.model_manager.load_superpoint()
+            nv_model = self.model_manager.load_netvlad()
+            lg_model = self.model_manager.load_lightglue()
+
+            fe = FeatureExtractor(sp_model, nv_model, self.model_manager.device)
+            matcher = FeatureMatcher(lg_model, self.model_manager.device)
+            localizer = Localizer(self.database, fe, matcher, self.calibration, self.config)
+
+            pts_pano = []
+            pts_metric = []
+
+            localizer.reset_cache()
+
+            # 2. Відправляємо шматки в локалізатор
+            for crop_img, offset_x, offset_y in crops:
+                crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
+
+                res = localizer.localize_frame(crop_rgb)
+
+                if res.get('success') and 'fov_polygon' in res:
+                    crop_pts = [(0, 0), (crop_size, 0), (crop_size, crop_size), (0, crop_size)]
+
+                    for (cx, cy), (lat, lon) in zip(crop_pts, res['fov_polygon']):
+                        pano_x = cx + offset_x
+                        pano_y = cy + offset_y
+                        mx, my = CoordinateConverter.gps_to_metric(lat, lon)
+
+                        pts_pano.append((pano_x, pano_y))
+                        pts_metric.append((mx, my))
+
+            localizer.reset_cache()
+
+            # 3. Перевіряємо, чи локалізатор знайшов панораму
+            if len(pts_pano) < 3:
+                QMessageBox.warning(self, "Помилка",
+                                    "Не вдалося автоматично прив'язати панораму. Зображення занадто спотворене або не збігається з базою.")
+                self.status_bar.clearMessage()
+                return
+
+            # 4. Будуємо ідеальну афінну матрицю для цілої панорами
+            pts_pano_np = np.array(pts_pano, dtype=np.float32)
+            pts_metric_np = np.array(pts_metric, dtype=np.float32)
+
+            M, _ = cv2.estimateAffine2D(pts_pano_np, pts_metric_np)
+
+            if M is None:
+                QMessageBox.warning(self, "Помилка", "Математична помилка при розрахунку матриці панорами.")
+                return
+
+            # 5. Знаходимо 4 реальні кути всієї панорами
+            corners_pano = np.array([
+                [0, 0], [W_pano, 0], [W_pano, H_pano], [0, H_pano]
+            ], dtype=np.float32)
+
+            corners_metric = GeometryTransforms.apply_affine(corners_pano, M)
+
+            lat_tl, lon_tl = CoordinateConverter.metric_to_gps(*corners_metric[0])
+            lat_tr, lon_tr = CoordinateConverter.metric_to_gps(*corners_metric[1])
+            lat_br, lon_br = CoordinateConverter.metric_to_gps(*corners_metric[2])
+            lat_bl, lon_bl = CoordinateConverter.metric_to_gps(*corners_metric[3])
+
+            self.logger.info(f"Авто-GPS кути панорами: TL({lat_tl:.4f}, {lon_tl:.4f}), BR({lat_br:.4f}, {lon_br:.4f})")
+
+            # 6. Стискаємо і відправляємо на карту
             max_dim = 2048
-            if width > max_dim or height > max_dim:
-                scale = max_dim / max(width, height)
-                img = cv2.resize(img, (int(width * scale), int(height * scale)))
+            if W_pano > max_dim or H_pano > max_dim:
+                scale = max_dim / max(W_pano, H_pano)
+                img = cv2.resize(img, (int(W_pano * scale), int(H_pano * scale)))
 
             _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            b64 = base64.b64encode(buffer).decode('utf-8')
-            data_url = f"data:image/jpeg;base64,{b64}"
+            b64_string = base64.b64encode(buffer).decode('utf-8')
+            data_url = f"data:image/jpeg;base64,{b64_string}"
 
             self.map_widget.set_panorama_overlay(
                 data_url,
@@ -627,12 +698,11 @@ class MainWindow(QMainWindow):
                 lat_br, lon_br,
                 lat_bl, lon_bl
             )
-            self.status_bar.showMessage("Панорама накладена на карту")
+            self.status_bar.showMessage("Панорама успішно розпізнана і накладена на карту!")
 
         except Exception as e:
-            self.logger.error(f"Panorama overlay failed: {e}", exc_info=True)
+            self.logger.error(f"Panorama auto-overlay failed: {e}", exc_info=True)
             QMessageBox.critical(self, "Помилка", f"Не вдалося накласти панораму:\n{e}")
-
     # ──────────────────────────────────────────────────────────────────
     # Слоти відео/локалізації
     # ──────────────────────────────────────────────────────────────────

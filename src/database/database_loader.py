@@ -1,5 +1,4 @@
-﻿import json
-import h5py
+﻿import h5py
 import numpy as np
 
 from src.utils.logging_utils import get_logger
@@ -17,30 +16,37 @@ class DatabaseLoader:
         self.frame_poses = None
         self.metadata = {}
 
-        # Multi-anchor propagation data
-        self.h_to_anchor = None           # (N, 3, 3) H(frame_i → nearest anchor)
-        self.nearest_anchor_fid = None    # (N,) frame_id якоря для кожного кадру
-        self.frame_gps = None             # (N, 2) (lat, lon) для кожного кадру
-        self.frame_valid = None           # (N,) bool
+        # Дані пропагації калібрування (заповнюються після калібрування)
+        self.h_to_calib = None      # (N, 3, 3) — H(frame_i → calib_frame)
+        self.frame_gps = None       # (N, 2)    — (lat, lon) центру кожного кадру
+        self.frame_valid = None     # (N,)      — True якщо кадр має GPS
+        self.calib_frame_id = None  # int
 
-        logger.info(f"Initializing DatabaseLoader: {db_path}")
+        logger.info(f"Initializing DatabaseLoader with path: {db_path}")
         self._load_hot_data()
 
     def _load_hot_data(self):
+        """Load global descriptors, poses and propagation data into RAM"""
         logger.info("Loading hot data into RAM...")
+
         try:
             self.db_file = h5py.File(self.db_path, 'r')
+
             self.global_descriptors = self.db_file['global_descriptors']['descriptors'][:]
             self.frame_poses = self.db_file['global_descriptors']['frame_poses'][:]
 
+            logger.info(f"Loaded global descriptors: shape {self.global_descriptors.shape}")
+            logger.info(f"Loaded frame poses: shape {self.frame_poses.shape}")
+
             for key, value in self.db_file['metadata'].attrs.items():
                 self.metadata[key] = value
+                logger.debug(f"Metadata - {key}: {value}")
 
-            logger.info(f"Descriptors: {self.global_descriptors.shape}, "
-                        f"Poses: {self.frame_poses.shape}")
-
+            # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
-            logger.success("Hot data loaded")
+
+            logger.success("Hot data loaded successfully into RAM")
+
         except Exception as e:
             logger.error(f"Failed to load database: {e}")
             raise
@@ -48,55 +54,38 @@ class DatabaseLoader:
     def _load_propagation_data(self):
         if 'calibration' not in self.db_file:
             logger.info("No propagation data in database (not calibrated yet)")
+            self.frame_affine = None
+            self.frame_valid = None
             return
         try:
             grp = self.db_file['calibration']
-            self.h_to_anchor = grp['h_to_anchor'][:]
-            self.nearest_anchor_fid = grp['nearest_anchor_frame_id'][:]
-            self.frame_gps = grp['frame_gps'][:]
-            self.frame_valid = grp['frame_valid'][:].astype(bool)
-
-            valid_count = int(np.sum(self.frame_valid))
-            num_anchors = int(grp.attrs.get('num_anchors', 1))
-            logger.success(
-                f"Propagation data loaded: {valid_count}/{len(self.frame_valid)} frames, "
-                f"{num_anchors} anchors"
-            )
+            if 'frame_affine' in grp:
+                self.frame_affine = grp['frame_affine'][:]
+                self.frame_valid = grp['frame_valid'][:].astype(bool)
+                valid_count = int(np.sum(self.frame_valid))
+                logger.success(f"Propagation data loaded: {valid_count} frames valid")
+            else:
+                logger.warning("Found old calibration format. Please run propagation again.")
+                self.frame_affine = None
+                self.frame_valid = None
         except Exception as e:
             logger.warning(f"Failed to load propagation data: {e}")
-            self.h_to_anchor = None
-            self.nearest_anchor_fid = None
-            self.frame_gps = None
+            self.frame_affine = None
             self.frame_valid = None
 
     @property
     def is_propagated(self) -> bool:
-        return (self.h_to_anchor is not None and
-                self.frame_gps is not None and
-                self.frame_valid is not None)
+        return getattr(self, 'frame_affine', None) is not None
 
-    def get_h_to_anchor(self, frame_id: int) -> tuple | None:
-        """
-        Повертає (H_to_anchor, anchor_frame_id) або None.
-        H_to_anchor — це H(frame_id → nearest_anchor).
-        """
+    def get_frame_affine(self, frame_id: int) -> np.ndarray | None:
+        """Повертає унікальну афінну матрицю для конкретного кадру"""
         if not self.is_propagated:
             return None
         if frame_id < 0 or frame_id >= len(self.frame_valid):
             return None
         if not self.frame_valid[frame_id]:
             return None
-        return self.h_to_anchor[frame_id], int(self.nearest_anchor_fid[frame_id])
-
-    def get_frame_gps(self, frame_id: int) -> tuple | None:
-        """Попередньо обчислені GPS координати центру кадру (lat, lon) або None"""
-        if not self.is_propagated:
-            return None
-        if frame_id < 0 or frame_id >= len(self.frame_valid):
-            return None
-        if not self.frame_valid[frame_id]:
-            return None
-        return float(self.frame_gps[frame_id][0]), float(self.frame_gps[frame_id][1])
+        return self.frame_affine[frame_id]
 
     def get_local_features(self, frame_id: int) -> dict:
         group_name = f'local_features/frame_{frame_id}'
@@ -117,3 +106,5 @@ class DatabaseLoader:
             self.db_file.close()
             self.db_file = None
             logger.info("Database file closed")
+
+
