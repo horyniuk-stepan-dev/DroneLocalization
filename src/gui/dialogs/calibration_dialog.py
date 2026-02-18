@@ -1,8 +1,8 @@
 ﻿import cv2
-import numpy as np  # ВИПРАВЛЕНО: перенесено з середини методу на верхній рівень
+import numpy as np
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QFileDialog, QLineEdit, QListWidget, QMessageBox,
-                             QSlider)
+                             QSlider, QSpinBox)
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QPixmap, QColor
 
@@ -23,13 +23,14 @@ class CalibrationDialog(QDialog):
         self.current_2d_point = None
         self.cap = None
         self.last_slider_value = 0
+        self._is_video = False
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.play_next_frame)
         self.is_playing = False
 
         self.setWindowTitle("GPS Калібрування місцевості")
-        self.resize(1100, 700)
+        self.resize(1100, 750)
         self.init_ui()
 
     def init_ui(self):
@@ -51,10 +52,8 @@ class CalibrationDialog(QDialog):
         self.btn_play.clicked.connect(self.toggle_playback)
         self.btn_step = QPushButton("⏭ Кадр вперед")
         self.btn_step.clicked.connect(self.step_forward)
-
         self.btn_play.setEnabled(False)
         self.btn_step.setEnabled(False)
-
         player_controls.addWidget(self.btn_play)
         player_controls.addWidget(self.btn_step)
 
@@ -84,6 +83,24 @@ class CalibrationDialog(QDialog):
 
         self.points_list = QListWidget()
 
+        # ВИПРАВЛЕНО: frame_id кадру калібрування.
+        # Для відео — синхронізується зі слайдером автоматично.
+        # Для статичного зображення — потрібно ввести вручну.
+        frame_id_layout = QHBoxLayout()
+        self.spinbox_frame_id = QSpinBox()
+        self.spinbox_frame_id.setRange(0, 999999)
+        self.spinbox_frame_id.setValue(0)
+        self.spinbox_frame_id.setToolTip(
+            "Номер кадру з відео бази даних, який зараз відображається.\n"
+            "При роботі з відео — заповнюється автоматично."
+        )
+        frame_id_layout.addWidget(QLabel("ID кадру в базі даних:"))
+        frame_id_layout.addWidget(self.spinbox_frame_id)
+
+        self.lbl_frame_id_warning = QLabel("")
+        self.lbl_frame_id_warning.setStyleSheet("color: #e65100; font-size: 11px;")
+        self.lbl_frame_id_warning.setWordWrap(True)
+
         self.btn_calculate = QPushButton("3. Розрахувати афінну матрицю")
         self.btn_calculate.setStyleSheet(
             "background-color: #2e7d32; color: white; font-weight: bold; padding: 10px;")
@@ -96,6 +113,8 @@ class CalibrationDialog(QDialog):
         right_layout.addWidget(self.btn_add_point)
         right_layout.addWidget(QLabel("Додані маркери (всі точки мають бути на одному кадрі):"))
         right_layout.addWidget(self.points_list)
+        right_layout.addLayout(frame_id_layout)
+        right_layout.addWidget(self.lbl_frame_id_warning)
         right_layout.addWidget(self.btn_calculate)
 
         main_layout.addLayout(left_layout, stretch=2)
@@ -103,43 +122,40 @@ class CalibrationDialog(QDialog):
 
     def load_frame(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Виберіть еталонне зображення або відео",
-            "",
+            self, "Виберіть еталонне зображення або відео", "",
             "Media Files (*.png *.jpg *.jpeg *.mp4 *.avi);;Images (*.png *.jpg *.jpeg);;Videos (*.mp4 *.avi)"
         )
-
         if not file_path:
             return
 
         self.clear_all_points()
 
         if file_path.lower().endswith(('.mp4', '.avi', '.mkv', '.mov')):
+            self._is_video = True
             if self.cap:
                 self.cap.release()
 
             self.cap = cv2.VideoCapture(file_path, cv2.CAP_FFMPEG)
             if not self.cap.isOpened():
                 self.cap = cv2.VideoCapture(file_path)
-
             if not self.cap.isOpened():
                 QMessageBox.critical(self, "Помилка", f"Не вдалося відкрити відео:\n{file_path}")
                 return
 
             total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
             self.slider.blockSignals(True)
             self.slider.setEnabled(True)
             self.slider.setRange(0, total_frames - 1)
             self.slider.setValue(0)
             self.slider.blockSignals(False)
-
             self.btn_play.setEnabled(True)
             self.btn_step.setEnabled(True)
-
+            self.spinbox_frame_id.setValue(0)
+            self.lbl_frame_id_warning.setText("")
             self.on_slider_changed(0)
 
         else:
+            self._is_video = False
             if self.cap:
                 self.cap.release()
                 self.cap = None
@@ -148,11 +164,12 @@ class CalibrationDialog(QDialog):
             self.btn_play.setEnabled(False)
             self.btn_step.setEnabled(False)
             self.lbl_frame_info.setText("Статичне зображення")
+            # Попередження: для статичного зображення frame_id треба вказати вручну
+            self.lbl_frame_id_warning.setText(
+                "⚠ Статичне зображення: вкажіть вручну номер кадру з відео "
+                "бази даних, якому відповідає це зображення."
+            )
 
-            # ВИПРАВЛЕНО: 'bytes' — вбудований тип Python, використання його
-            # як імені змінної приховує стандартну функцію bytes() у цьому scope.
-            # Перейменовано на 'raw_data'. Також прибрано 'import numpy as np'
-            # з середини методу — тепер імпорт на верхньому рівні файлу.
             with open(file_path, "rb") as stream:
                 raw_data = bytearray(stream.read())
                 numpyarray = np.asarray(raw_data, dtype=np.uint8)
@@ -167,7 +184,6 @@ class CalibrationDialog(QDialog):
     def toggle_playback(self):
         if not self.cap or not self.cap.isOpened():
             return
-
         if self.is_playing:
             self.timer.stop()
             self.btn_play.setText("▶ Відтворити")
@@ -185,11 +201,10 @@ class CalibrationDialog(QDialog):
             if ret:
                 current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
                 self.last_slider_value = current_frame
-
                 self.slider.blockSignals(True)
                 self.slider.setValue(current_frame)
                 self.slider.blockSignals(False)
-
+                self.spinbox_frame_id.setValue(current_frame)
                 pixmap = opencv_to_qpixmap(frame)
                 self.video_widget.display_frame(pixmap)
                 self.lbl_frame_info.setText(f"Кадр: {current_frame} / {self.slider.maximum()}")
@@ -231,6 +246,8 @@ class CalibrationDialog(QDialog):
                     ret, frame = self.cap.read()
 
             if ret and frame is not None:
+                # Синхронізуємо spinbox зі слайдером
+                self.spinbox_frame_id.setValue(value)
                 pixmap = opencv_to_qpixmap(frame)
                 self.video_widget.display_frame(pixmap)
                 self.lbl_frame_info.setText(f"Кадр: {value} / {self.slider.maximum()}")
@@ -245,17 +262,11 @@ class CalibrationDialog(QDialog):
 
     def redraw_points(self):
         self.video_widget.clear_overlays()
-
         for i, pt in enumerate(self.points_2d):
             self.video_widget.draw_numbered_point(pt[0], pt[1], str(i + 1), QColor(0, 200, 0))
-
         if self.current_2d_point:
             self.video_widget.draw_numbered_point(
-                self.current_2d_point[0],
-                self.current_2d_point[1],
-                "?",
-                QColor(255, 0, 0)
-            )
+                self.current_2d_point[0], self.current_2d_point[1], "?", QColor(255, 0, 0))
 
     def on_video_clicked(self, x, y):
         self.current_2d_point = (x, y)
@@ -266,7 +277,6 @@ class CalibrationDialog(QDialog):
         if not self.current_2d_point:
             QMessageBox.warning(self, "Помилка", "Спочатку клікніть мишкою на орієнтир на відео!")
             return
-
         try:
             lat = float(self.input_lat.text().strip())
             lon = float(self.input_lon.text().strip())
@@ -276,11 +286,10 @@ class CalibrationDialog(QDialog):
 
         self.points_2d.append(self.current_2d_point)
         self.points_gps.append((lat, lon))
-
         point_number = len(self.points_2d)
-        item_text = f"Точка {point_number}: Піксель {self.current_2d_point} ➔ GPS: {lat:.5f}, {lon:.5f}"
-        self.points_list.addItem(item_text)
-
+        self.points_list.addItem(
+            f"Точка {point_number}: Піксель {self.current_2d_point} ➔ GPS: {lat:.5f}, {lon:.5f}"
+        )
         self.current_2d_point = None
         self.lbl_selected_px.setText("Вибраний піксель (X, Y): Немає")
         self.input_lat.clear()
@@ -292,9 +301,16 @@ class CalibrationDialog(QDialog):
             QMessageBox.warning(self, "Увага", "Потрібно мінімум 3 точки для калібрування!")
             return
 
+        calib_frame_id = self.spinbox_frame_id.value()
+
+        # ВИПРАВЛЕНО: calib_frame_id передається разом з даними калібрування.
+        # Localizer використовує його щоб обчислити H(best_match → calib_frame)
+        # і правильно трансформувати координати у простір кадру калібрування
+        # перед застосуванням affine_matrix.
         calibration_data = {
             'points_2d': self.points_2d,
-            'points_gps': self.points_gps
+            'points_gps': self.points_gps,
+            'calib_frame_id': calib_frame_id
         }
         self.calibration_complete.emit(calibration_data)
         self.accept()
