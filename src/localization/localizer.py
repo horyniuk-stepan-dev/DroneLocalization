@@ -11,30 +11,27 @@ logger = get_logger(__name__)
 
 class Localizer:
     """
-    Main drone localization pipeline.
+    Drone localization pipeline з multi-anchor підтримкою.
 
-    Повний ланцюжок координат:
-        query → H(query→ref) → ref_space
-             → H(ref→calib)  → calib_space   (з БД після пропагації)
-             → affine_matrix → metric
-             → metric_to_gps → (lat, lon)
+    Ланцюжок координат (після пропагації):
+        query → H(query→ref)  → ref_space
+              → H(ref→anchor) → anchor_space  (з БД, pre-computed)
+              → affine_anchor → metric
+              → metric_to_gps → (lat, lon)
 
-    H(ref→calib) читається з бази даних (pre-computed CalibrationPropagationWorker).
-    Якщо пропагація ще не виконана — будує ланцюжок на льоту (fallback).
+    H(ref→anchor) читається з БД (pre-computed CalibrationPropagationWorker).
+    Якщо пропагація ще не виконана — fallback до runtime chain.
     """
 
     def __init__(self, database, feature_extractor, matcher, calibration, config=None):
         self.database = database
         self.feature_extractor = feature_extractor
         self.matcher = matcher
-        self.calibration = calibration
+        self.calibration = calibration   # MultiAnchorCalibration
         self.config = config or {}
 
         self.min_matches = self.config.get('localization', {}).get('min_matches', 15)
         self.ransac_thresh = self.config.get('localization', {}).get('ransac_threshold', 3.0)
-        self.chain_step = self.config.get('localization', {}).get('chain_step', 10)
-
-        logger.info("Initializing Localizer...")
 
         global_descs = self.database.global_descriptors
         self.retrieval = FastRetrieval(global_descs)
@@ -47,130 +44,138 @@ class Localizer:
             threshold_std=self.config.get('tracking', {}).get('outlier_threshold_std', 3.0)
         )
 
-        # Fallback кеш для випадку коли пропагація не виконана
+        # Runtime fallback кеш (якщо пропагація не виконана)
         self._runtime_h_cache: dict = {}
-        self._calib_features = None
-        self._load_calib_features()
+        self._anchor_features_cache: dict = {}
 
         if self.database.is_propagated:
-            logger.success("Propagation data found — using pre-computed H_to_calib (fast mode)")
+            logger.success(
+                f"Localizer init: propagation data found "
+                f"({int(np.sum(self.database.frame_valid))} frames pre-computed)"
+            )
         else:
             logger.warning(
-                "No propagation data found. "
-                "Run CalibrationPropagationWorker after calibration for best accuracy. "
-                "Falling back to runtime chain computation."
+                "Localizer init: no propagation data. "
+                "Run CalibrationPropagationWorker for accurate multi-anchor results."
             )
 
-        logger.success("Localizer initialization complete")
+        logger.success("Localizer ready")
 
-    # ------------------------------------------------------------------
-    # Ініціалізація
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # H(ref → anchor) — з БД або fallback
+    # ──────────────────────────────────────────────────────────────────
 
-    def _load_calib_features(self):
+    def _get_anchor_for_ref(self, candidate_id: int, ref_features: dict):
+        """
+        Повертає (H_ref_to_anchor, anchor) для candidate frame.
+        H_ref_to_anchor — матриця що переводить координати з простору
+        candidate frame у простір його найближчого якоря.
+
+        Якщо candidate_id == anchor.frame_id → H = None (identity).
+        """
         if not self.calibration.is_calibrated:
-            return
-        calib_id = self.calibration.calib_frame_id
-        try:
-            self._calib_features = self.database.get_local_features(calib_id)
-            logger.info(f"Loaded calib_frame {calib_id}: "
-                        f"{len(self._calib_features['keypoints'])} kpts")
-        except Exception as e:
-            logger.error(f"Failed to load calib_frame {calib_id}: {e}")
-            self._calib_features = None
+            return None, None
 
-    # ------------------------------------------------------------------
-    # Отримання H(ref → calib_frame)
-    # ------------------------------------------------------------------
+        # 1. Pre-computed з БД — O(1)
+        db_result = self.database.get_h_to_anchor(candidate_id)
+        if db_result is not None:
+            H_to_anchor, anchor_fid = db_result
+            anchor = next(
+                (a for a in self.calibration.anchors if a.frame_id == anchor_fid), None
+            )
+            if anchor is not None:
+                # identity означає що candidate_id сам є якорем
+                if anchor_fid == candidate_id:
+                    return None, anchor
+                return H_to_anchor, anchor
 
-    def _get_h_ref_to_calib(self, candidate_id: int, ref_features: dict) -> np.ndarray | None:
-        """
-        Пріоритет:
-        1. БД (pre-computed) — O(1), завжди точно.
-        2. Runtime кеш — якщо вже рахували в цій сесії.
-        3. Ланцюжок на льоту — тільки якщо пропагація не виконана.
-        """
-        calib_id = self.calibration.calib_frame_id
+        # 2. Runtime fallback — ланцюжок до найближчого якоря
+        anchor = self._find_nearest_anchor(candidate_id)
+        if anchor is None:
+            return None, None
 
-        if candidate_id == calib_id:
-            return None  # identity, крок не потрібен
+        if candidate_id == anchor.frame_id:
+            return None, anchor
 
-        # 1. Pre-computed з БД
-        H_db = self.database.get_h_to_calib(candidate_id)
-        if H_db is not None:
-            logger.debug(f"H(frame_{candidate_id}→calib): from DB (pre-computed)")
-            return H_db
+        cache_key = (candidate_id, anchor.frame_id)
+        if cache_key in self._runtime_h_cache:
+            return self._runtime_h_cache[cache_key], anchor
 
-        # 2. Runtime кеш
-        if candidate_id in self._runtime_h_cache:
-            logger.debug(f"H(frame_{candidate_id}→calib): from runtime cache")
-            return self._runtime_h_cache[candidate_id]
+        logger.info(f"Runtime: computing H(frame_{candidate_id} → anchor_{anchor.frame_id})")
+        anchor_feat = self._load_anchor_features(anchor.frame_id)
+        if anchor_feat is None:
+            return None, anchor
 
-        # 3. Fallback: будуємо ланцюжок на льоту
-        logger.info(f"H(frame_{candidate_id}→calib_{calib_id}): computing chain (fallback)...")
-        H = self._build_chain(candidate_id, calib_id, ref_features)
-        self._runtime_h_cache[candidate_id] = H
-        return H
+        H = self._build_chain(candidate_id, anchor.frame_id, ref_features, anchor_feat)
+        self._runtime_h_cache[cache_key] = H
+        return H, anchor
 
-    def _match_pair(self, features_a: dict, features_b: dict) -> np.ndarray | None:
-        """Зіставити два кадри → H(a→b) або None"""
-        mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
-        if len(mkpts_a) < self.min_matches:
+    def _find_nearest_anchor(self, frame_id: int):
+        """Знайти найближчий якір за номером кадру"""
+        if not self.calibration.anchors:
             return None
-        H, mask = GeometryTransforms.estimate_homography(
-            mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
+        return min(
+            self.calibration.anchors,
+            key=lambda a: abs(a.frame_id - frame_id)
         )
-        if H is None or int(np.sum(mask)) < self.min_matches:
+
+    def _load_anchor_features(self, anchor_fid: int) -> dict | None:
+        if anchor_fid in self._anchor_features_cache:
+            return self._anchor_features_cache[anchor_fid]
+        try:
+            feat = self.database.get_local_features(anchor_fid)
+            self._anchor_features_cache[anchor_fid] = feat
+            return feat
+        except Exception as e:
+            logger.error(f"Cannot load anchor {anchor_fid} features: {e}")
             return None
-        return H
+
+    def _match_pair(self, fa: dict, fb: dict) -> np.ndarray | None:
+        try:
+            mkpts_a, mkpts_b = self.matcher.match(fa, fb)
+            if len(mkpts_a) < self.min_matches:
+                return None
+            H, mask = GeometryTransforms.estimate_homography(
+                mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
+            )
+            if H is None or int(np.sum(mask)) < self.min_matches:
+                return None
+            return H
+        except Exception:
+            return None
 
     def _build_chain(
-        self, from_id: int, to_id: int, from_features: dict
+        self, from_id: int, to_id: int,
+        from_features: dict, to_features: dict,
+        step: int = 10
     ) -> np.ndarray | None:
-        """
-        Будує H(from_id → to_id) через проміжні кадри з кроком chain_step.
-        """
-        if self._calib_features is None:
-            return None
-
-        # Прямий матчинг
-        H = self._match_pair(from_features, self._calib_features)
+        """Ланцюжок H(from → to) через проміжні кадри"""
+        H = self._match_pair(from_features, to_features)
         if H is not None:
             return H
 
-        # Ланцюжок
-        step = self.chain_step if to_id > from_id else -self.chain_step
-        waypoints = list(range(from_id, to_id, step))
+        direction = 1 if to_id > from_id else -1
+        waypoints = list(range(from_id, to_id, direction * step))
         if not waypoints or waypoints[-1] != to_id:
             waypoints.append(to_id)
 
         H_chain = []
-        prev_features = from_features
+        prev_feat = from_features
 
         for i in range(1, len(waypoints)):
             wp_id = waypoints[i]
-            next_feat = (self._calib_features if wp_id == to_id
-                         else self._try_load(wp_id))
-            if next_feat is None:
+            try:
+                next_feat = (to_features if wp_id == to_id
+                             else self.database.get_local_features(wp_id))
+            except Exception:
                 return None
 
-            H_step = self._match_pair(prev_features, next_feat)
+            H_step = self._match_pair(prev_feat, next_feat)
             if H_step is None:
-                # Спробуємо midpoint
-                mid_id = (waypoints[i - 1] + wp_id) // 2
-                if mid_id not in (waypoints[i - 1], wp_id):
-                    mid_feat = self._try_load(mid_id)
-                    if mid_feat is not None:
-                        H1 = self._match_pair(prev_features, mid_feat)
-                        H2 = self._match_pair(mid_feat, next_feat)
-                        if H1 is not None and H2 is not None:
-                            H_step = (H2.astype(np.float64) @ H1.astype(np.float64)).astype(np.float32)
-                if H_step is None:
-                    logger.warning(f"Chain broken at step {waypoints[i-1]}→{wp_id}")
-                    return None
+                return None
 
             H_chain.append(H_step)
-            prev_features = next_feat
+            prev_feat = next_feat
 
         if not H_chain:
             return None
@@ -180,25 +185,19 @@ class Localizer:
             H_result = H.astype(np.float64) @ H_result
         return H_result.astype(np.float32)
 
-    def _try_load(self, frame_id: int) -> dict | None:
-        try:
-            return self.database.get_local_features(frame_id)
-        except Exception:
-            return None
-
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
     # Трансформація точок
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
 
-    def _to_calib_space(
+    def _transform_pts(
         self,
         pts: np.ndarray,
         H_query_to_ref: np.ndarray,
-        H_ref_to_calib: np.ndarray | None
+        H_ref_to_anchor: np.ndarray | None
     ) -> np.ndarray | None:
         """
-        pts (query space) → calib_frame space.
-        Якщо H_ref_to_calib is None — best_match і є calib_frame.
+        pts (query space) → anchor space.
+        H_ref_to_anchor=None означає ref і є якором.
         """
         pts_2d = pts.reshape(-1, 2)
 
@@ -206,45 +205,35 @@ class Localizer:
         if in_ref is None or len(in_ref) == 0:
             return None
 
-        if H_ref_to_calib is None:
+        if H_ref_to_anchor is None:
             return in_ref
 
-        in_calib = GeometryTransforms.apply_homography(in_ref, H_ref_to_calib)
-        if in_calib is None or len(in_calib) == 0:
+        in_anchor = GeometryTransforms.apply_homography(in_ref, H_ref_to_anchor)
+        if in_anchor is None or len(in_anchor) == 0:
             return None
 
-        return in_calib
+        return in_anchor
 
-    # ------------------------------------------------------------------
-    # Основний метод
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────
+    # Локалізація
+    # ──────────────────────────────────────────────────────────────────
 
     def localize_frame(self, frame_rgb: np.ndarray) -> dict:
-        """Process single frame and return GPS coordinates"""
         if not self.calibration.is_calibrated:
             return {"success": False, "error": "Система не відкалібрована"}
 
         if not self.database.is_propagated:
-            logger.warning(
-                "GPS propagation not done yet! "
-                "Run 'Calibration → Propagate GPS to all frames' for accurate results."
-            )
-
-        if self._calib_features is None:
-            self._load_calib_features()
-            if self._calib_features is None:
-                return {"success": False,
-                        "error": "Не вдалося завантажити кадр калібрування з бази"}
+            logger.warning("GPS propagation not done — accuracy reduced")
 
         height, width = frame_rgb.shape[:2]
         center_pt = np.array([[width / 2.0, height / 2.0]], dtype=np.float32)
 
-        # Витягуємо фічі
         query_features = self.feature_extractor.extract_features(frame_rgb)
 
-        # Знаходимо кандидатів
         top_k = self.config.get('localization', {}).get('retrieval_top_k', 5)
-        candidates = self.retrieval.find_similar_frames(query_features['global_desc'], top_k=top_k)
+        candidates = self.retrieval.find_similar_frames(
+            query_features['global_desc'], top_k=top_k
+        )
 
         best_inliers = 0
         best_H_query_to_ref = None
@@ -274,28 +263,31 @@ class Localizer:
 
         logger.info(f"Best match: frame {best_candidate_id}, {best_inliers} inliers")
 
-        # H(best_match → calib_frame) — з БД або fallback
-        H_ref_to_calib = self._get_h_ref_to_calib(best_candidate_id, best_ref_features)
+        # Отримуємо H(ref → anchor) і відповідний якір
+        H_ref_to_anchor, anchor = self._get_anchor_for_ref(
+            best_candidate_id, best_ref_features
+        )
 
-        if H_ref_to_calib is None and best_candidate_id != self.calibration.calib_frame_id:
-            logger.warning("Could not get H_ref_to_calib, using direct affine (reduced accuracy)")
-            pts_in_calib = GeometryTransforms.apply_homography(center_pt, best_H_query_to_ref)
-        else:
-            pts_in_calib = self._to_calib_space(center_pt, best_H_query_to_ref, H_ref_to_calib)
+        if anchor is None:
+            return {"success": False, "error": "Не знайдено якір для локалізації"}
 
-        if pts_in_calib is None or len(pts_in_calib) == 0:
+        # Трансформуємо центр у простір якоря
+        pts_in_anchor = self._transform_pts(
+            center_pt, best_H_query_to_ref, H_ref_to_anchor
+        )
+        if pts_in_anchor is None:
             return {"success": False, "error": "Помилка трансформації координат"}
 
-        pt_in_calib = pts_in_calib[0]
-        logger.debug(f"Center in calib_frame: ({pt_in_calib[0]:.2f}, {pt_in_calib[1]:.2f})")
+        px, py = float(pts_in_anchor[0][0]), float(pts_in_anchor[0][1])
+        logger.debug(f"Center in anchor_{anchor.frame_id} space: ({px:.2f}, {py:.2f})")
 
-        # calib pixel → metric → GPS
+        # Піксель якоря → метрика → GPS
         try:
-            metric_x, metric_y = self.calibration.pixel_to_metric(pt_in_calib[0], pt_in_calib[1])
+            mx, my = anchor.pixel_to_metric(px, py)
         except Exception as e:
-            return {"success": False, "error": f"Помилка affine: {e}"}
+            return {"success": False, "error": f"Affine помилка: {e}"}
 
-        metric_np = np.array([metric_x, metric_y], dtype=np.float32)
+        metric_np = np.array([mx, my], dtype=np.float32)
 
         if self.outlier_detector.is_outlier(metric_np):
             return {"success": False, "error": "Виявлено аномальний стрибок координат"}
@@ -305,26 +297,28 @@ class Localizer:
 
         lat, lon = CoordinateConverter.metric_to_gps(filtered[0], filtered[1])
 
-        # FOV
-        corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+        # FOV — 4 кути кадру тим самим ланцюжком
+        corners = np.array(
+            [[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32
+        )
         gps_corners = []
-
-        if H_ref_to_calib is None and best_candidate_id != self.calibration.calib_frame_id:
-            corners_in_calib = GeometryTransforms.apply_homography(corners, best_H_query_to_ref)
-        else:
-            corners_in_calib = self._to_calib_space(corners, best_H_query_to_ref, H_ref_to_calib)
-
-        if corners_in_calib is not None:
-            for cx, cy in corners_in_calib:
+        corners_in_anchor = self._transform_pts(
+            corners, best_H_query_to_ref, H_ref_to_anchor
+        )
+        if corners_in_anchor is not None:
+            for cx, cy in corners_in_anchor:
                 try:
-                    mx, my = self.calibration.pixel_to_metric(cx, cy)
-                    c_lat, c_lon = CoordinateConverter.metric_to_gps(mx, my)
-                    gps_corners.append((c_lat, c_lon))
+                    cmx, cmy = anchor.pixel_to_metric(float(cx), float(cy))
+                    clat, clon = CoordinateConverter.metric_to_gps(cmx, cmy)
+                    gps_corners.append((clat, clon))
                 except Exception:
                     pass
 
         confidence = min(1.0, best_inliers / 50.0)
-        logger.success(f"Localization: ({lat:.6f}, {lon:.6f}), confidence={confidence:.2f}")
+        logger.success(
+            f"Localization: ({lat:.6f}, {lon:.6f}), "
+            f"anchor={anchor.frame_id}, confidence={confidence:.2f}"
+        )
 
         return {
             "success": True,
@@ -332,13 +326,12 @@ class Localizer:
             "lon": lon,
             "confidence": confidence,
             "matched_frame": best_candidate_id,
+            "anchor_frame": anchor.frame_id,
             "inliers": best_inliers,
             "fov_polygon": gps_corners
         }
 
     def reset_cache(self):
-        """Очистити runtime кеш (після перекалібрування)"""
         self._runtime_h_cache.clear()
-        self._calib_features = None
-        self._load_calib_features()
+        self._anchor_features_cache.clear()
         logger.info("Localizer runtime cache cleared")

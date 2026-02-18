@@ -1,4 +1,5 @@
-﻿from PyQt6.QtWidgets import QMainWindow, QDockWidget, QStatusBar, QFileDialog, QMessageBox
+﻿from PyQt6.QtWidgets import (QMainWindow, QDockWidget, QStatusBar,
+                             QFileDialog, QMessageBox, QProgressDialog)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QPixmap
 
@@ -11,14 +12,17 @@ from src.gui.dialogs.calibration_dialog import CalibrationDialog
 from src.models.model_manager import ModelManager
 from src.workers.database_worker import DatabaseGenerationWorker
 from src.workers.tracking_worker import RealtimeTrackingWorker
+from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
 
 from src.database.database_loader import DatabaseLoader
-from src.calibration.gps_calibration import GPSCalibration
+# ВИПРАВЛЕНО: використовуємо MultiAnchorCalibration замість GPSCalibration
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.localization.matcher import FeatureMatcher
 from src.localization.localizer import Localizer
-from utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger   # ВИПРАВЛЕНО: правильний шлях імпорту
 from config.config import APP_CONFIG
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -29,11 +33,14 @@ class MainWindow(QMainWindow):
 
         self.current_database_path = None
         self.database = None
-        self.calibration = GPSCalibration()
+        # ВИПРАВЛЕНО: MultiAnchorCalibration замість GPSCalibration
+        self.calibration = MultiAnchorCalibration()
         self.config = APP_CONFIG
-        self.model_manager = ModelManager(config = APP_CONFIG)
+        self.model_manager = ModelManager(config=APP_CONFIG)
         self.db_worker = None
         self.tracking_worker = None
+        self.propagation_worker = None
+        self._propagation_dialog = None   # QProgressDialog під час пропагації
 
         self.init_ui()
 
@@ -61,9 +68,17 @@ class MainWindow(QMainWindow):
 
     def create_menu_bar(self):
         menubar = self.menuBar()
+
         file_menu = menubar.addMenu('Файл')
         file_menu.addAction('Вихід', self.close)
-        mission_menu = menubar.addMenu('Місія')
+
+        calibration_menu = menubar.addMenu('Калібрування')
+        calibration_menu.addAction('Додати якір...', self.on_calibrate)
+        calibration_menu.addAction('Завантажити калібрування...', self.on_load_calibration)
+        calibration_menu.addAction('Зберегти калібрування...', self.on_save_calibration)
+        calibration_menu.addSeparator()
+        calibration_menu.addAction('Запустити пропагацію вручну', self.on_run_propagation)
+
         view_menu = menubar.addMenu('Вигляд')
         view_menu.addAction(self.control_dock.toggleViewAction())
         view_menu.addAction(self.map_dock.toggleViewAction())
@@ -74,96 +89,220 @@ class MainWindow(QMainWindow):
         self.control_panel.start_tracking_clicked.connect(self.on_start_tracking)
         self.control_panel.stop_tracking_clicked.connect(self.on_stop_tracking)
         self.control_panel.calibrate_clicked.connect(self.on_calibrate)
-        self.control_panel.load_calibration_clicked.connect(self.on_load_calibration)  # ДОДАНО
+        self.control_panel.load_calibration_clicked.connect(self.on_load_calibration)
         self.control_panel.generate_panorama_clicked.connect(self.on_generate_panorama)
         self.control_panel.show_panorama_clicked.connect(self.on_show_panorama)
         self.control_panel.localize_image_clicked.connect(self.on_localize_image)
 
-    @pyqtSlot()
-    def on_generate_panorama(self):
-        video_path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть відео для панорами", "", "Video Files (*.mp4 *.avi *.mkv)"
-        )
-        if not video_path: return
-
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти панораму", "panorama.jpg", "Images (*.jpg *.png)"
-        )
-        if not save_path: return
-
-        from src.workers.panorama_worker import PanoramaWorker
-        self.pano_worker = PanoramaWorker(video_path, save_path, frame_step=20)
-
-        self.control_panel.btn_gen_pano.setEnabled(False)
-        self.pano_worker.progress.connect(self.on_db_progress)
-
-        def on_complete(path):
-            self.control_panel.btn_gen_pano.setEnabled(True)
-            self.status_bar.showMessage(f"Панораму збережено у: {path}")
-            QMessageBox.information(self, "Успіх", "Панораму успішно створено!")
-
-        def on_error(err):
-            self.control_panel.btn_gen_pano.setEnabled(True)
-            QMessageBox.critical(self, "Помилка", err)
-
-        self.pano_worker.completed.connect(on_complete)
-        self.pano_worker.error.connect(on_error)
-        self.pano_worker.start()
+    # ──────────────────────────────────────────────────────────────────
+    # Калібрування
+    # ──────────────────────────────────────────────────────────────────
 
     @pyqtSlot()
-    def on_show_panorama(self):
-        if not self.calibration.is_calibrated:
-            QMessageBox.warning(self, "Увага",
-                                "Спочатку виконайте калібрування GPS, щоб система знала, куди покласти панораму!")
-            return
-
-        image_path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
-        )
-        if not image_path: return
-
-        import cv2
-        import base64
-
-        img = cv2.imread(image_path)
-        if img is None:
-            QMessageBox.critical(self, "Помилка", "Не вдалося прочитати зображення.")
-            return
-
-        height, width = img.shape[:2]
-        self.logger.info(f"Завантажено панораму для відображення: {width}x{height} пікселів")
-
-        try:
-            # Важливо: Якщо ти відкалібрував GPS на відео 1920x1080, а панорама має розмір 500x300,
-            # координати нижче будуть розраховані НЕПРАВИЛЬНО. Калібрувати треба саме файл панорами!
-            lat_tl, lon_tl = self.calibration.transform_to_gps(0, 0)
-            lat_tr, lon_tr = self.calibration.transform_to_gps(width, 0)
-            lat_br, lon_br = self.calibration.transform_to_gps(width, height)
-            lat_bl, lon_bl = self.calibration.transform_to_gps(0, height)
-
-            self.logger.info(f"GPS кути панорами: TL({lat_tl:.4f}, {lon_tl:.4f}), BR({lat_br:.4f}, {lon_br:.4f})")
-
-            max_dim = 2048
-            if width > max_dim or height > max_dim:
-                scale = max_dim / max(width, height)
-                img = cv2.resize(img, (int(width * scale), int(height * scale)))
-
-            _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            b64_string = base64.b64encode(buffer).decode('utf-8')
-            data_url = f"data:image/jpeg;base64,{b64_string}"
-
-            self.map_widget.set_panorama_overlay(
-                data_url,
-                lat_tl, lon_tl,
-                lat_tr, lon_tr,
-                lat_br, lon_br,
-                lat_bl, lon_bl
+    def on_calibrate(self):
+        if not self.current_database_path:
+            QMessageBox.warning(
+                self, "Увага",
+                "Спочатку завантажте базу даних HDF5 для калібрування!"
             )
-            self.status_bar.showMessage("Панорама успішно накладена на карту")
+            return
 
+        # Передаємо вже існуючі якорі щоб діалог показав їх
+        existing = list(self.calibration.anchor_frame_ids)
+
+        dialog = CalibrationDialog(
+            database_path=self.current_database_path,
+            existing_anchors=existing,
+            parent=self
+        )
+        # Кожен доданий якір одразу обробляється
+        dialog.anchor_added.connect(self.on_anchor_added)
+        # Завершення — запускаємо пропагацію
+        dialog.calibration_complete.connect(self.on_run_propagation)
+        dialog.exec()
+
+    @pyqtSlot(object)
+    def on_anchor_added(self, anchor_data: dict):
+        """
+        Обробляє кожен доданий якір одразу:
+          - обчислює affine матрицю
+          - додає до MultiAnchorCalibration
+          - показує RMSE у статус-барі
+        """
+        try:
+            result = self.calibration.add_anchor(
+                frame_id=anchor_data['calib_frame_id'],
+                points_2d=anchor_data['points_2d'],
+                points_gps=anchor_data['points_gps']
+            )
+            n = result['total_anchors']
+            rmse = result['rmse_meters']
+            fid = result['frame_id']
+
+            self.status_bar.showMessage(
+                f"⚓ Якір {n}: кадр {fid}, RMSE = {rmse:.2f} м  |  "
+                f"Всього якорів: {n}"
+            )
+            self.logger.info(
+                f"Anchor added: frame={fid}, rmse={rmse:.2f}m, total={n}"
+            )
         except Exception as e:
-            self.logger.error(f"Failed to overlay panorama: {e}")
-            QMessageBox.critical(self, "Помилка", f"Не вдалося накласти панораму:\n{e}")
+            self.logger.error(f"Failed to add anchor: {e}", exc_info=True)
+            QMessageBox.critical(self, "Помилка якоря", str(e))
+
+    @pyqtSlot()
+    def on_run_propagation(self):
+        """
+        Запускає CalibrationPropagationWorker — хвильова пропагація
+        GPS від усіх якорів на всі кадри бази.
+        """
+        if not self.calibration.is_calibrated:
+            QMessageBox.warning(
+                self, "Увага", "Додайте хоча б один якір калібрування!"
+            )
+            return
+
+        if not self.database:
+            QMessageBox.warning(
+                self, "Увага", "База даних не завантажена!"
+            )
+            return
+
+        # Завантажуємо matcher для пропагації
+        try:
+            lg_model = self.model_manager.load_lightglue()
+            matcher = FeatureMatcher(lg_model, self.model_manager.device)
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити LightGlue:\n{e}")
+            return
+
+        n_anchors = len(self.calibration.anchors)
+        anchor_ids = self.calibration.anchor_frame_ids
+        n_frames = self.database.get_num_frames()
+
+        self.logger.info(
+            f"Starting propagation: {n_anchors} anchors "
+            f"at frames {anchor_ids}, total {n_frames} frames"
+        )
+
+        # Прогрес-діалог
+        self._propagation_dialog = QProgressDialog(
+            f"Пропагація GPS від {n_anchors} якорів на {n_frames} кадрів...",
+            "Скасувати", 0, 100, self
+        )
+        self._propagation_dialog.setWindowTitle("Розповсюдження GPS координат")
+        self._propagation_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._propagation_dialog.setMinimumDuration(0)
+        self._propagation_dialog.setValue(0)
+
+        self.propagation_worker = CalibrationPropagationWorker(
+            database=self.database,
+            calibration=self.calibration,
+            matcher=matcher,
+            config=self.config
+        )
+        self.propagation_worker.progress.connect(self.on_propagation_progress)
+        self.propagation_worker.completed.connect(self.on_propagation_completed)
+        self.propagation_worker.error.connect(self.on_propagation_error)
+
+        self._propagation_dialog.canceled.connect(self.propagation_worker.stop)
+
+        self.propagation_worker.start()
+
+    @pyqtSlot(int, str)
+    def on_propagation_progress(self, percent: int, message: str):
+        if self._propagation_dialog:
+            self._propagation_dialog.setValue(percent)
+            self._propagation_dialog.setLabelText(message)
+        self.status_bar.showMessage(message)
+
+    @pyqtSlot()
+    def on_propagation_completed(self):
+        if self._propagation_dialog:
+            self._propagation_dialog.close()
+            self._propagation_dialog = None
+
+        n_valid = int(self.database.frame_valid.sum()) if self.database.frame_valid is not None else 0
+        n_total = self.database.get_num_frames()
+
+        self.status_bar.showMessage(
+            f"✅ Пропагація завершена: {n_valid}/{n_total} кадрів мають GPS координати"
+        )
+
+        # Пропонуємо зберегти калібрування
+        reply = QMessageBox.question(
+            self, "Пропагація завершена",
+            f"GPS успішно розповсюджено на {n_valid}/{n_total} кадрів!\n\n"
+            f"Зберегти файл калібрування (якорі)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.on_save_calibration()
+
+        # Скидаємо runtime-кеш localizer якщо він запущений
+        if self.tracking_worker and self.tracking_worker.isRunning():
+            if hasattr(self.tracking_worker, 'localizer'):
+                self.tracking_worker.localizer.reset_cache()
+
+    @pyqtSlot(str)
+    def on_propagation_error(self, error_msg: str):
+        if self._propagation_dialog:
+            self._propagation_dialog.close()
+            self._propagation_dialog = None
+        self.logger.error(f"Propagation error: {error_msg}")
+        QMessageBox.critical(self, "Помилка пропагації", error_msg)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Збереження / завантаження калібрування
+    # ──────────────────────────────────────────────────────────────────
+
+    @pyqtSlot()
+    def on_save_calibration(self):
+        if not self.calibration.is_calibrated:
+            QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
+            return
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Зберегти калібрування", "calibration.json", "JSON Files (*.json)"
+        )
+        if save_path:
+            try:
+                self.calibration.save(save_path)
+                n = len(self.calibration.anchors)
+                self.status_bar.showMessage(f"Калібрування збережено: {save_path} ({n} якорів)")
+                QMessageBox.information(
+                    self, "Збережено",
+                    f"Калібрування збережено!\nЯкорів: {n}\nФайл: {save_path}"
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Помилка", f"Не вдалося зберегти:\n{e}")
+
+    @pyqtSlot()
+    def on_load_calibration(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "Завантажити калібрування", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if not file_name:
+            return
+        try:
+            self.calibration.load(file_name)
+            n = len(self.calibration.anchors)
+            ids = self.calibration.anchor_frame_ids
+            self.status_bar.showMessage(
+                f"Калібрування завантажено: {n} якорів, кадри {ids}"
+            )
+            self.control_panel.update_status("Калібрування завантажено")
+            QMessageBox.information(
+                self, "Успіх",
+                f"Завантажено {n} якір(ів)!\n"
+                f"Кадри: {ids}\n\n"
+                f"{'✅ База вже містить дані пропагації.' if self.database and self.database.is_propagated else '⚠ Запустіть пропагацію для точних результатів.'}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Бази даних
+    # ──────────────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_new_mission(self):
@@ -171,15 +310,12 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             mission_data = dialog.get_mission_data()
             video_path = mission_data.get('video_path')
-
             if not video_path:
                 QMessageBox.warning(self, "Помилка", "Будь ласка, виберіть еталонне відео.")
                 return
-
             save_path, _ = QFileDialog.getSaveFileName(
-                self, "Зберегти базу даних HDF5", "", "HDF5 Files (*.h5 *.hdf5)"
+                self, "Зберегти базу HDF5", "", "HDF5 Files (*.h5 *.hdf5)"
             )
-
             if save_path:
                 self.start_database_generation(video_path, save_path, mission_data)
         else:
@@ -196,11 +332,9 @@ class MainWindow(QMainWindow):
             model_manager=self.model_manager,
             config=APP_CONFIG
         )
-
         self.db_worker.progress.connect(self.on_db_progress)
         self.db_worker.completed.connect(self.on_db_completed)
         self.db_worker.error.connect(self.on_db_error)
-
         self.db_worker.start()
 
     @pyqtSlot(int, str)
@@ -225,41 +359,66 @@ class MainWindow(QMainWindow):
         self.control_panel.btn_load_db.setEnabled(True)
         self.control_panel.update_progress(0)
         self.control_panel.update_status("Помилка генерації")
-        QMessageBox.critical(self, "Помилка", f"Сталася помилка під час створення бази:\n{error_msg}")
+        QMessageBox.critical(self, "Помилка", f"Помилка під час генерації:\n{error_msg}")
 
     @pyqtSlot()
     def on_load_database(self):
         file_name, _ = QFileDialog.getOpenFileName(
-            self,
-            "Виберіть базу даних HDF5",
-            "",
-            "HDF5 Files (*.h5 *.hdf5);;All Files (*)"
+            self, "Виберіть базу HDF5", "", "HDF5 Files (*.h5 *.hdf5);;All Files (*)"
         )
         if file_name:
             self.current_database_path = file_name
             try:
                 self.database = DatabaseLoader(file_name)
-                self.status_bar.showMessage(f"Вибрано базу даних: {file_name}")
+
+                # Повідомлення про стан пропагації
+                if self.database.is_propagated:
+                    n_valid = int(self.database.frame_valid.sum())
+                    n_total = self.database.get_num_frames()
+                    self.status_bar.showMessage(
+                        f"База завантажена: {file_name} "
+                        f"(GPS: {n_valid}/{n_total} кадрів)"
+                    )
+                else:
+                    self.status_bar.showMessage(
+                        f"База завантажена: {file_name} (без даних GPS пропагації)"
+                    )
+
                 self.control_panel.update_status("База завантажена")
             except Exception as e:
-                QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу: {str(e)}")
+                QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу:\n{e}")
         else:
-            self.status_bar.showMessage("Вибір бази даних скасовано")
+            self.status_bar.showMessage("Вибір бази скасовано")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Відстеження
+    # ──────────────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_start_tracking(self):
         if not self.database:
-            QMessageBox.warning(self, "Увага", "Спочатку завантажте базу даних HDF5 для початку відстеження!")
+            QMessageBox.warning(self, "Увага", "Спочатку завантажте базу даних HDF5!")
             return
-
         if not self.calibration.is_calibrated:
-            QMessageBox.warning(self, "Увага", "Система не відкалібрована. Будь ласка, виконайте калібрування GPS.")
+            QMessageBox.warning(
+                self, "Увага",
+                "Система не відкалібрована. Виконайте калібрування GPS."
+            )
             return
+        if not self.database.is_propagated:
+            reply = QMessageBox.question(
+                self, "Увага",
+                "Пропагація GPS ще не виконана.\n"
+                "Точність локалізації буде знижена.\n\n"
+                "Продовжити без пропагації?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
 
         video_path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть відео з дрона для відстеження", "", "Video Files (*.mp4 *.avi *.mkv)"
+            self, "Відео з дрона", "", "Video Files (*.mp4 *.avi *.mkv)"
         )
-
         if not video_path:
             return
 
@@ -269,14 +428,16 @@ class MainWindow(QMainWindow):
 
         feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device)
         matcher = FeatureMatcher(lg_model, self.model_manager.device)
-
-        localizer = Localizer(self.database, feature_extractor, matcher, self.calibration)
+        localizer = Localizer(
+            self.database, feature_extractor, matcher,
+            self.calibration, config=self.config
+        )
 
         self.tracking_worker = RealtimeTrackingWorker(video_path, localizer)
         self.tracking_worker.frame_ready.connect(self.on_frame_ready)
         self.tracking_worker.location_found.connect(self.on_location_found)
         self.tracking_worker.status_update.connect(self.control_panel.update_status)
-        self.tracking_worker.fov_found.connect(self.map_widget.update_fov)  # <--- ДОДАНО ПІДКЛЮЧЕННЯ
+        self.tracking_worker.fov_found.connect(self.map_widget.update_fov)
         self.map_widget.clear_trajectory()
         self.tracking_worker.start()
         self.status_bar.showMessage("Відстеження розпочато")
@@ -289,26 +450,27 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Відстеження зупинено")
             self.control_panel.update_status("Очікування")
 
+    # ──────────────────────────────────────────────────────────────────
+    # Локалізація одного фото
+    # ──────────────────────────────────────────────────────────────────
+
     @pyqtSlot()
     def on_localize_image(self):
         if not self.database:
             QMessageBox.warning(self, "Увага", "Спочатку завантажте базу даних HDF5!")
             return
-
         if not self.calibration.is_calibrated:
-            QMessageBox.warning(self, "Увага", "Система не відкалібрована. Виконайте калібрування GPS.")
+            QMessageBox.warning(self, "Увага", "Виконайте калібрування GPS.")
             return
 
         image_path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть зображення для локалізації", "", "Images (*.png *.jpg *.jpeg)"
+            self, "Виберіть зображення", "", "Images (*.png *.jpg *.jpeg)"
         )
-
         if not image_path:
             return
 
         import cv2
         from PyQt6.QtWidgets import QApplication
-        from config.config import APP_CONFIG
         from src.utils.image_utils import opencv_to_qpixmap
 
         frame = cv2.imread(image_path)
@@ -316,48 +478,51 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Помилка", "Не вдалося прочитати зображення.")
             return
 
-        self.status_bar.showMessage("Завантаження моделей та обробка зображення...")
+        self.status_bar.showMessage("Обробка зображення...")
         self.control_panel.update_status("Локалізація фото...")
-        QApplication.processEvents()  # Оновлюємо інтерфейс перед важкими обчисленнями
+        QApplication.processEvents()
 
         try:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Завантажуємо моделі
             sp_model = self.model_manager.load_superpoint()
             nv_model = self.model_manager.load_netvlad()
             lg_model = self.model_manager.load_lightglue()
 
             feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device)
             matcher = FeatureMatcher(lg_model, self.model_manager.device)
+            localizer = Localizer(
+                self.database, feature_extractor, matcher,
+                self.calibration, config=APP_CONFIG
+            )
 
-            localizer = Localizer(self.database, feature_extractor, matcher, self.calibration, config=APP_CONFIG)
-
-            # Шукаємо координати
             result = localizer.localize_frame(frame_rgb)
 
-            # Відображаємо фото на екрані
-            pixmap = opencv_to_qpixmap(frame)
             if hasattr(self.video_widget, 'display_frame'):
-                self.video_widget.display_frame(pixmap)
+                self.video_widget.display_frame(opencv_to_qpixmap(frame))
 
             if result.get("success"):
-                lat = result["lat"]
-                lon = result["lon"]
+                lat, lon = result["lat"], result["lon"]
                 conf = result["confidence"]
                 inliers = result.get("inliers", 0)
+                anchor = result.get("anchor_frame", "?")
 
                 self.map_widget.update_marker(lat, lon)
                 if "fov_polygon" in result:
                     self.map_widget.update_fov(result["fov_polygon"])
-                self.status_bar.showMessage(
-                    f"Локалізація: {lat:.6f}, {lon:.6f} | Впевненість: {conf:.2f} | Точок: {inliers}")
-                self.control_panel.update_status("Фото успішно локалізовано")
 
+                self.status_bar.showMessage(
+                    f"Локалізація: {lat:.6f}, {lon:.6f} | "
+                    f"Впевненість: {conf:.2f} | Точок: {inliers} | "
+                    f"Якір: кадр {anchor}"
+                )
+                self.control_panel.update_status("Фото локалізовано")
                 QMessageBox.information(
-                    self,
-                    "Успіх",
-                    f"Координати знайдено!\n\nШирота: {lat:.6f}\nДовгота: {lon:.6f}\nВпевненість: {conf:.2f}\nТочок збігу: {inliers}"
+                    self, "Успіх",
+                    f"Координати знайдено!\n\n"
+                    f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
+                    f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
+                    f"Використаний якір: кадр {anchor}"
                 )
             else:
                 err = result.get('error', 'Невідома помилка')
@@ -366,54 +531,112 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Помилка", f"Не вдалося знайти координати:\n{err}")
 
         except Exception as e:
-            self.logger.error(f"Помилка локалізації зображення: {e}", exc_info=True)
-            QMessageBox.critical(self, "Критична помилка", f"Сталася помилка:\n{str(e)}")
+            self.logger.error(f"Image localization error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Критична помилка", str(e))
             self.status_bar.showMessage("Помилка обробки")
 
-    @pyqtSlot()
-    def on_calibrate(self):
-        if not self.current_database_path:
-            QMessageBox.warning(self, "Увага", "Спочатку завантажте базу даних HDF5 для калібрування!")
-            return
-        dialog = CalibrationDialog(database_path=self.current_database_path, parent=self)
-        dialog.calibration_complete.connect(self.on_calibration_complete)
-        dialog.exec()
+    # ──────────────────────────────────────────────────────────────────
+    # Панорама
+    # ──────────────────────────────────────────────────────────────────
 
     @pyqtSlot()
-    def on_load_calibration(self):
-        file_name, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть файл калібрування", "", "JSON Files (*.json);;All Files (*)"
+    def on_generate_panorama(self):
+        video_path, _ = QFileDialog.getOpenFileName(
+            self, "Відео для панорами", "", "Video Files (*.mp4 *.avi *.mkv)"
         )
-        if file_name:
-            try:
-                self.calibration.load(file_name)
-                self.status_bar.showMessage(f"Завантажено калібрування: {file_name}")
-                self.control_panel.update_status("Калібрування завантажено")
-                QMessageBox.information(self, "Успіх",
-                                        "Файл калібрування успішно завантажено! Можна починати відстеження.")
-            except Exception as e:
-                QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити калібрування:\n{str(e)}")@pyqtSlot(object)
-    def on_calibration_complete(self, calibration_data):
+        if not video_path:
+            return
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Зберегти панораму", "panorama.jpg", "Images (*.jpg *.png)"
+        )
+        if not save_path:
+            return
+
+        from src.workers.panorama_worker import PanoramaWorker
+        self.pano_worker = PanoramaWorker(video_path, save_path, frame_step=20)
+        self.control_panel.btn_gen_pano.setEnabled(False)
+        self.pano_worker.progress.connect(self.on_db_progress)
+
+        def on_complete(path):
+            self.control_panel.btn_gen_pano.setEnabled(True)
+            self.status_bar.showMessage(f"Панораму збережено: {path}")
+            QMessageBox.information(self, "Успіх", "Панораму успішно створено!")
+
+        def on_error(err):
+            self.control_panel.btn_gen_pano.setEnabled(True)
+            QMessageBox.critical(self, "Помилка", err)
+
+        self.pano_worker.completed.connect(on_complete)
+        self.pano_worker.error.connect(on_error)
+        self.pano_worker.start()
+
+    @pyqtSlot()
+    def on_show_panorama(self):
+        if not self.calibration.is_calibrated:
+            QMessageBox.warning(
+                self, "Увага",
+                "Спочатку виконайте GPS калібрування!"
+            )
+            return
+
+        image_path, _ = QFileDialog.getOpenFileName(
+            self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
+        )
+        if not image_path:
+            return
+
+        import cv2
+        import base64
+
+        img = cv2.imread(image_path)
+        if img is None:
+            QMessageBox.critical(self, "Помилка", "Не вдалося прочитати зображення.")
+            return
+
+        height, width = img.shape[:2]
+        self.logger.info(f"Панорама: {width}x{height} пікселів")
+
         try:
-            result = self.calibration.calibrate(
-                calibration_data['points_2d'],
-                calibration_data['points_gps']
-            )
-            self.status_bar.showMessage(f"Калібрування успішне! Похибка: {result['rmse_meters']:.2f} м.")
+            # ВИПРАВЛЕНО: використовуємо перший якір для трансформації кутів панорами.
+            # Панорама має бути відкалібрована на тому самому кадрі що й перший якір.
+            first_anchor = self.calibration.anchors[0]
 
-            # Пропонуємо зберегти результат
-            save_path, _ = QFileDialog.getSaveFileName(
-                self, "Зберегти файл калібрування", "", "JSON Files (*.json)"
+            lat_tl, lon_tl = first_anchor.transform_to_gps(0, 0)
+            lat_tr, lon_tr = first_anchor.transform_to_gps(width, 0)
+            lat_br, lon_br = first_anchor.transform_to_gps(width, height)
+            lat_bl, lon_bl = first_anchor.transform_to_gps(0, height)
+
+            self.logger.info(
+                f"GPS кути: TL({lat_tl:.4f},{lon_tl:.4f}) "
+                f"BR({lat_br:.4f},{lon_br:.4f})"
             )
 
-            if save_path:
-                self.calibration.save(save_path)
-                QMessageBox.information(self, "Успіх", f"Калібрування збережено у {save_path}.\nСередня похибка: {result['rmse_meters']:.2f} метрів.")
-            else:
-                QMessageBox.information(self, "Успіх", f"Калібрування застосовано (без збереження).\nСередня похибка: {result['rmse_meters']:.2f} метрів.")
+            max_dim = 2048
+            if width > max_dim or height > max_dim:
+                scale = max_dim / max(width, height)
+                img = cv2.resize(img, (int(width * scale), int(height * scale)))
+
+            _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            b64 = base64.b64encode(buffer).decode('utf-8')
+            data_url = f"data:image/jpeg;base64,{b64}"
+
+            self.map_widget.set_panorama_overlay(
+                data_url,
+                lat_tl, lon_tl,
+                lat_tr, lon_tr,
+                lat_br, lon_br,
+                lat_bl, lon_bl
+            )
+            self.status_bar.showMessage("Панорама накладена на карту")
 
         except Exception as e:
-            QMessageBox.critical(self, "Помилка калібрування", str(e))
+            self.logger.error(f"Panorama overlay failed: {e}", exc_info=True)
+            QMessageBox.critical(self, "Помилка", f"Не вдалося накласти панораму:\n{e}")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Слоти відео/локалізації
+    # ──────────────────────────────────────────────────────────────────
+
     @pyqtSlot(QPixmap)
     def on_frame_ready(self, pixmap):
         if hasattr(self.video_widget, 'display_frame'):
@@ -424,4 +647,6 @@ class MainWindow(QMainWindow):
         self.map_widget.update_marker(lat, lon)
         self.map_widget.add_trajectory_point(lat, lon)
         self.status_bar.showMessage(
-            f"Локалізація: {lat:.6f}, {lon:.6f} | Впевненість: {confidence:.2f} | Точок: {inliers}")
+            f"Локалізація: {lat:.6f}, {lon:.6f} | "
+            f"Впевненість: {confidence:.2f} | Точок: {inliers}"
+        )
