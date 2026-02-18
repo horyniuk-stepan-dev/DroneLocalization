@@ -87,6 +87,20 @@ class DatabaseLoader:
             return None
         return self.frame_affine[frame_id]
 
+    def get_h_to_anchor(self, frame_id: int):
+        """
+        Повертає (H_to_anchor, anchor_frame_id) для вказаного frame_id,
+        або None якщо пропагація не виконана.
+
+        Поточна реалізація: CalibrationPropagationWorker зберігає вже готову
+        affine матрицю для кожного кадру напряму (через інтерполяцію між якорями),
+        тому окремий H(ref→anchor) не потрібен — localizer читає frame_affine напряму
+        через get_frame_affine(). Метод залишений для сумісності з API
+        localizer._get_anchor_for_ref() і завжди повертає None,
+        щоб localizer йшов основним шляхом через get_frame_affine().
+        """
+        return None
+
     def get_local_features(self, frame_id: int) -> dict:
         group_name = f'local_features/frame_{frame_id}'
         if group_name not in self.db_file:
@@ -106,5 +120,3 @@ class DatabaseLoader:
             self.db_file.close()
             self.db_file = None
             logger.info("Database file closed")
-
-

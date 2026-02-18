@@ -12,6 +12,7 @@ class TrajectoryFilter:
     def __init__(self, process_noise=0.1, measurement_noise=10.0, dt=1.0):
         # Filter state: [x, y, vx, vy]
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
+        self.process_noise = process_noise  # зберігаємо для _update_matrices_for_dt
 
         logger.info("Initializing Kalman filter for trajectory smoothing")
         logger.info(f"Parameters: process_noise={process_noise}, measurement_noise={measurement_noise}, dt={dt}")
@@ -47,17 +48,46 @@ class TrajectoryFilter:
         self.is_initialized = False
         logger.success("Kalman filter initialized successfully")
 
+    def _update_matrices_for_dt(self, dt: float):
+        """Оновлює матриці F та Q під реальний dt між кадрами"""
+        self.kf.F = np.array([
+            [1.0, 0.0,  dt, 0.0],
+            [0.0, 1.0, 0.0,  dt],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ])
+        pn = self.process_noise
+        self.kf.Q = np.array([
+            [dt**4/4,       0, dt**3/2,       0],
+            [      0, dt**4/4,       0, dt**3/2],
+            [dt**3/2,       0,   dt**2,       0],
+            [      0, dt**3/2,       0,   dt**2]
+        ]) * pn
+
     def update(self, measurement: tuple) -> tuple:
-        """Update filter state with new coordinates (x, y)"""
+        """Update filter state with new coordinates (x, y). Використовує dt=1.0."""
+        return self.update_with_dt(measurement, dt=1.0)
+
+    def update_with_dt(self, measurement: tuple, dt: float) -> tuple:
+        """
+        Update filter з реальним часовим кроком dt (секунди).
+        Перераховує матриці F та Q під кожен конкретний dt,
+        що усуває похибку при нерівномірній частоті кадрів.
+        """
         z = np.array([[measurement[0]], [measurement[1]]])
 
         if not self.is_initialized:
             self.kf.x = np.array([[measurement[0]], [measurement[1]], [0.0], [0.0]])
             self.is_initialized = True
-            logger.info(f"Kalman filter initialized with measurement: ({measurement[0]:.2f}, {measurement[1]:.2f})")
+            logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
             return measurement
 
-        logger.debug(f"Kalman predict-update cycle for measurement: ({measurement[0]:.2f}, {measurement[1]:.2f})")
+        # Клампуємо dt: захист від зависань і занадто малих значень
+        dt = max(0.01, min(dt, 5.0))
+
+        self._update_matrices_for_dt(dt)
+
+        logger.debug(f"Kalman update dt={dt:.3f}s: ({measurement[0]:.2f}, {measurement[1]:.2f})")
 
         self.kf.predict()
         self.kf.update(z)

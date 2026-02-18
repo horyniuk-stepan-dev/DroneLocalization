@@ -2,20 +2,30 @@
 """
 Main application entry point for Drone Topometric Localization System
 """
-
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
-
+import sys
+import traceback
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import setup_logging, get_logger
 # Initialize logging before any other imports
+
+sys.path.insert(0, str(Path(__file__).parent))
 setup_logging(log_level="INFO", log_file="logs/app.log")
 logger = get_logger(__name__)
 
+
+
+def exception_hook(exctype, value, tb):
+    """Перехоплює всі помилки і друкує їх у консоль замість тихого краху PyQt6"""
+    print("=" * 80)
+    print("CRITICAL ERROR CATCHED:")
+    traceback.print_exception(exctype, value, tb)
+    print("=" * 80)
+    sys.exit(1)
+
+sys.excepthook = exception_hook
 
 def main():
     logger.info("=" * 80)

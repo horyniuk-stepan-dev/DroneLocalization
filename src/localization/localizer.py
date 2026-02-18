@@ -218,14 +218,15 @@ class Localizer:
     # Локалізація
     # ──────────────────────────────────────────────────────────────────
 
-    def localize_frame(self, frame_rgb: np.ndarray) -> dict:
+    def localize_frame(self, frame_rgb: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0) -> dict:
         if not self.calibration.is_calibrated:
             return {"success": False, "error": "Система не відкалібрована"}
 
         height, width = frame_rgb.shape[:2]
         center_pt = np.array([[width / 2.0, height / 2.0]], dtype=np.float32)
 
-        query_features = self.feature_extractor.extract_features(frame_rgb)
+        # Передаємо маску в екстрактор, щоб ігнорувати рухомі об'єкти
+        query_features = self.feature_extractor.extract_features(frame_rgb, static_mask=static_mask)
 
         top_k = self.config.get('localization', {}).get('retrieval_top_k', 5)
         candidates = self.retrieval.find_similar_frames(
@@ -266,15 +267,21 @@ class Localizer:
         if pt_in_ref is None or len(pt_in_ref) == 0:
             return {"success": False, "error": "Помилка трансформації координат"}
 
-        # 3. Переводимо в метрику і перевіряємо на аномалії
+        # 3. Переводимо в метрику і перевіряємо на аномалії (враховуючи dt)
         metric_pt = GeometryTransforms.apply_affine(pt_in_ref, affine_ref)[0]
 
-        if self.outlier_detector.is_outlier(metric_pt):
+        if self.outlier_detector.is_outlier(metric_pt, dt=dt):
             return {"success": False, "error": "Виявлено аномальний стрибок координат"}
 
-        filtered_pt = self.kalman_filter.update(metric_pt)
+        # Оновлення Калмана з dt
+        if hasattr(self.kalman_filter, 'update_with_dt'):
+            filtered_pt = self.kalman_filter.update_with_dt(metric_pt, dt)
+        else:
+            filtered_pt = self.kalman_filter.update(metric_pt)
+
         self.outlier_detector.add_position(filtered_pt)
 
+        from src.geometry.coordinates import CoordinateConverter
         lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
 
         # 4. Розрахунок поля зору (FOV)

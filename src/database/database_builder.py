@@ -22,8 +22,17 @@ class DatabaseBuilder:
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
         logger.info(f"NetVLAD descriptor dimension: {self.descriptor_dim}")
 
-    def build_from_video(self, video_path: str, model_manager, progress_callback=None):
-        """Process video and build database"""
+    def build_from_video(self, video_path: str, model_manager, progress_callback=None,
+                         save_keypoint_video: bool = True):
+        """
+        Process video and build database.
+
+        Args:
+            save_keypoint_video: якщо True — поруч з HDF5 збережеться відео
+                                  *_keypoints.mp4 де на кожному кадрі намальовані
+                                  точки SuperPoint (зелені) і маска YOLO (червона зона).
+                                  Це допомагає визначити найкращі кадри для GPS калібрування.
+        """
         logger.info(f"Starting database build from video: {video_path}")
 
         cap = cv2.VideoCapture(video_path)
@@ -46,6 +55,20 @@ class DatabaseBuilder:
 
         logger.info(f"Video properties: {width}x{height}, {num_frames} frames, {fps:.2f} FPS")
 
+        # Ініціалізуємо запис відео з keypoints
+        kp_video_path = None
+        kp_writer = None
+        if save_keypoint_video:
+            from pathlib import Path
+            kp_video_path = str(Path(self.output_path).with_suffix('')) + '_keypoints.mp4'
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (width, height))
+            if kp_writer.isOpened():
+                logger.info(f"Keypoint video will be saved to: {kp_video_path}")
+            else:
+                logger.warning("Failed to initialize keypoint video writer, skipping")
+                kp_writer = None
+
         # Initialize neural network wrappers
         logger.info("Loading neural network models...")
         yolo_model = model_manager.load_yolo()
@@ -60,8 +83,9 @@ class DatabaseBuilder:
         logger.info("Creating HDF5 database structure...")
         self.create_hdf5_structure(num_frames, width, height)
 
-        # Initial homography (identity matrix 3x3) for first frame
+        # Накопичена поза: H(frame_i → frame_0), починаємо з identity для кадру 0
         current_pose = np.eye(3, dtype=np.float32)
+        prev_features = None  # фічі попереднього кадру для матчингу
 
         try:
             self.db_file = h5py.File(self.output_path, 'a')
@@ -89,7 +113,30 @@ class DatabaseBuilder:
                 # Step 3: Transform coordinates
                 features['coords_2d'] = features['keypoints']
 
-                # Step 4: Save data to HDF5
+                # Step 4: Малюємо keypoints на кадрі і записуємо у відео
+                if kp_writer is not None:
+                    kp_frame = self._draw_keypoints_frame(
+                        frame, features['keypoints'], static_mask, i, num_frames
+                    )
+                    kp_writer.write(kp_frame)
+
+                # Step 5: Оновлюємо накопичену позу H(frame_i → frame_0)
+                # Матчимо поточний кадр з попереднім і множимо гомографії
+                if i == 0 or prev_features is None:
+                    current_pose = np.eye(3, dtype=np.float32)
+                else:
+                    H_step = self._compute_inter_frame_H(prev_features, features)
+                    if H_step is not None:
+                        # current_pose = H(prev→frame_0) @ H(curr→prev) = H(curr→frame_0)
+                        current_pose = (current_pose.astype(np.float64)
+                                        @ H_step.astype(np.float64)).astype(np.float32)
+                    else:
+                        # Якщо матч не вдався — залишаємо попередню позу як апроксимацію
+                        logger.warning(f"Frame {i}: inter-frame match failed, reusing previous pose")
+
+                prev_features = features
+
+                # Step 5: Save data to HDF5
                 self.save_frame_data(i, features, current_pose)
 
                 # ВИПРАВЛЕНО: progress_percent тепер завжди визначена в цьому блоці
@@ -105,6 +152,10 @@ class DatabaseBuilder:
             logger.error(f"Error during database building: {e}")
             raise
         finally:
+            if kp_writer is not None:
+                kp_writer.release()
+                if kp_video_path:
+                    logger.success(f"Keypoint video saved: {kp_video_path}")
             if self.db_file:
                 self.db_file.close()
                 logger.info("HDF5 file closed")
@@ -112,6 +163,106 @@ class DatabaseBuilder:
             logger.info("Video capture released")
 
         logger.success(f"Database build completed successfully: {self.output_path}")
+
+    def _draw_keypoints_frame(self, frame_bgr: np.ndarray, keypoints: np.ndarray,
+                               static_mask: np.ndarray, frame_id: int,
+                               total_frames: int) -> np.ndarray:
+        """
+        Малює на кадрі:
+          - Червона напівпрозора зона: пікселі відфільтровані YOLO (рухомі об'єкти)
+          - Зелені кола: SuperPoint keypoints на статичних зонах
+          - Лічильник кадру та кількості точок у верхньому лівому куті
+
+        Повертає BGR зображення для запису у VideoWriter.
+        """
+        vis = frame_bgr.copy()
+
+        # 1. Червона маска: зони де YOLO знайшов рухомі об'єкти (mask == 0)
+        if static_mask is not None:
+            dynamic_zone = (static_mask == 0)
+            if dynamic_zone.any():
+                overlay = vis.copy()
+                overlay[dynamic_zone] = (0, 0, 200)  # BGR червоний
+                cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
+
+        # 2. Зелені точки: keypoints SuperPoint
+        for x, y in keypoints:
+            cx, cy = int(round(x)), int(round(y))
+            cv2.circle(vis, (cx, cy), radius=3, color=(0, 255, 0), thickness=-1)
+            cv2.circle(vis, (cx, cy), radius=4, color=(0, 180, 0), thickness=1)
+
+        # 3. Інформаційна панель у верхньому лівому куті
+        info_lines = [
+            f"Frame: {frame_id:05d} / {total_frames:05d}",
+            f"Keypoints: {len(keypoints)}",
+            f"Dynamic mask: {'YES' if static_mask is not None else 'NO'}",
+        ]
+        panel_h = len(info_lines) * 28 + 14
+        cv2.rectangle(vis, (0, 0), (340, panel_h), (0, 0, 0), -1)
+        cv2.rectangle(vis, (0, 0), (340, panel_h), (80, 80, 80), 1)
+
+        for idx, line in enumerate(info_lines):
+            cv2.putText(
+                vis, line,
+                (8, 22 + idx * 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                (0, 255, 0), 1, cv2.LINE_AA
+            )
+
+        # 4. Легенда внизу
+        legend_y = vis.shape[0] - 10
+        cv2.circle(vis, (12, legend_y - 4), 5, (0, 255, 0), -1)
+        cv2.putText(vis, "SuperPoint keypoint", (22, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.rectangle(vis, (200, legend_y - 10), (218, legend_y + 2), (0, 0, 200), -1)
+        cv2.putText(vis, "YOLO dynamic zone", (224, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1, cv2.LINE_AA)
+
+        return vis
+
+    def _compute_inter_frame_H(self, fa: dict, fb: dict,
+                                min_matches: int = 15,
+                                ransac_thresh: float = 3.0) -> np.ndarray | None:
+        """
+        Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
+        Використовує brute-force L2 матчинг дескрипторів SuperPoint
+        без LightGlue (щоб не тримати матчер у пам'яті під час побудови БД).
+        """
+        desc_a = fa['descriptors']  # (N, 256)
+        desc_b = fb['descriptors']  # (M, 256)
+        kpts_a = fa['keypoints']
+        kpts_b = fb['keypoints']
+
+        if len(kpts_a) < min_matches or len(kpts_b) < min_matches:
+            return None
+
+        # Нормалізація дескрипторів
+        desc_a_n = desc_a / (np.linalg.norm(desc_a, axis=1, keepdims=True) + 1e-8)
+        desc_b_n = desc_b / (np.linalg.norm(desc_b, axis=1, keepdims=True) + 1e-8)
+
+        # Косинусна відстань через dot product
+        sim = desc_b_n @ desc_a_n.T  # (M, N)
+
+        # Lowe's ratio test
+        sorted_idx = np.argsort(-sim, axis=1)
+        best = sim[np.arange(len(desc_b)), sorted_idx[:, 0]]
+        second = sim[np.arange(len(desc_b)), sorted_idx[:, 1]]
+        valid = (best / (second + 1e-8)) > 1.2  # ratio > 1.2 ≈ відстань ratio < 0.83
+
+        if valid.sum() < min_matches:
+            return None
+
+        mkpts_b = kpts_b[valid]
+        mkpts_a = kpts_a[sorted_idx[valid, 0]]
+
+        src = mkpts_b.reshape(-1, 1, 2).astype(np.float32)
+        dst = mkpts_a.reshape(-1, 1, 2).astype(np.float32)
+        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_thresh)
+
+        if H is None or int(np.sum(mask)) < min_matches:
+            return None
+
+        return H.astype(np.float32)
 
     def create_hdf5_structure(self, num_frames: int, width: int, height: int):
         """Create optimal HDF5 hierarchy with compression"""
