@@ -1,4 +1,8 @@
-﻿from PyQt6.QtWidgets import (QMainWindow, QDockWidget, QStatusBar,
+﻿import gc
+
+import numpy as np
+import torch
+from PyQt6.QtWidgets import (QMainWindow, QDockWidget, QStatusBar,
                              QFileDialog, QMessageBox, QProgressDialog)
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QPixmap
@@ -22,6 +26,8 @@ from src.localization.matcher import FeatureMatcher
 from src.localization.localizer import Localizer
 from src.utils.logging_utils import get_logger   # ВИПРАВЛЕНО: правильний шлях імпорту
 from config.config import APP_CONFIG
+from utils.image_utils import opencv_to_qpixmap
+from workers.panorama_overlay_worker import PanoramaOverlayWorker
 
 
 class MainWindow(QMainWindow):
@@ -100,55 +106,73 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def on_calibrate(self):
-        if not self.current_database_path:
-            QMessageBox.warning(
-                self, "Увага",
-                "Спочатку завантажте базу даних HDF5 для калібрування!"
-            )
+        if not self.database or self.database.db_file is None:
+            QMessageBox.warning(self, "Помилка", "Спочатку завантажте або створіть базу даних!")
             return
 
-        # Передаємо вже існуючі якорі щоб діалог показав їх
-        existing = list(self.calibration.anchor_frame_ids)
+        # ВИПРАВЛЕНО: Витягуємо frame_id з нових об'єктів AnchorCalibration
+        existing_ids = [anchor.frame_id for anchor in self.calibration.anchors]
 
         dialog = CalibrationDialog(
-            database_path=self.current_database_path,
-            existing_anchors=existing,
+            database_path=self.database.db_path,
+            existing_anchors=existing_ids,
             parent=self
         )
-        # Кожен доданий якір одразу обробляється
         dialog.anchor_added.connect(self.on_anchor_added)
-        # Завершення — запускаємо пропагацію
         dialog.calibration_complete.connect(self.on_run_propagation)
         dialog.exec()
 
-    @pyqtSlot(object)
-    def on_anchor_added(self, anchor_data: dict):
-        """
-        Обробляє кожен доданий якір одразу:
-          - обчислює affine матрицю
-          - додає до MultiAnchorCalibration
-          - показує RMSE у статус-барі
-        """
-        try:
-            result = self.calibration.add_anchor(
-                frame_id=anchor_data['calib_frame_id'],
-                points_2d=anchor_data['points_2d'],
-                points_gps=anchor_data['points_gps']
-            )
-            n = result['total_anchors']
-            rmse = result['rmse_meters']
-            fid = result['frame_id']
 
-            self.status_bar.showMessage(
-                f"⚓ Якір {n}: кадр {fid}, RMSE = {rmse:.2f} м  |  "
-                f"Всього якорів: {n}"
-            )
-            self.logger.info(
-                f"Anchor added: frame={fid}, rmse={rmse:.2f}m, total={n}"
-            )
+
+    @pyqtSlot(object)
+    def on_anchor_added(self, anchor_data):
+        try:
+            points_2d = anchor_data.get('points_2d')
+            points_gps = anchor_data.get('points_gps')
+            frame_id = anchor_data.get('calib_frame_id')
+
+            if not points_2d or not points_gps or len(points_2d) < 3:
+                QMessageBox.warning(self, "Помилка", "Потрібно мінімум 3 точки для створення якоря!")
+                return
+
+            # Імпортуємо необхідні модулі для математики
+            from src.geometry.coordinates import CoordinateConverter
+            from src.geometry.transformations import GeometryTransforms
+            import numpy as np
+
+            # Переводимо екранні пікселі у numpy масив
+            pts_2d_np = np.array(points_2d, dtype=np.float32)
+            pts_metric = []
+
+            # Переводимо GPS широту/довготу у фізичні метри
+            for lat, lon in points_gps:
+                x, y = CoordinateConverter.gps_to_metric(lat, lon)
+                pts_metric.append((x, y))
+
+            pts_metric_np = np.array(pts_metric, dtype=np.float32)
+
+            # Розраховуємо афінну матрицю для цього кадру
+            M, inliers = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
+
+            if M is None:
+                QMessageBox.critical(self, "Помилка",
+                                     "Не вдалося обчислити математичну матрицю з цих точок. Спробуйте розставити їх ширше!")
+                return
+
+            # Додаємо вже готовий якір у нову систему
+            self.calibration.add_anchor(frame_id=frame_id, affine_matrix=M)
+
+            # Зберігаємо оновлений файл калібрування
+            if self.database and self.database.db_path:
+                import os
+                calib_path = self.database.db_path.replace('.h5', '_calib.json')
+                self.calibration.save(calib_path)
+
+            self.status_bar.showMessage(f"Якір для кадру {frame_id} успішно створено та збережено!")
+
         except Exception as e:
             self.logger.error(f"Failed to add anchor: {e}", exc_info=True)
-            QMessageBox.critical(self, "Помилка якоря", str(e))
+            QMessageBox.critical(self, "Помилка", f"Не вдалося додати якір:\n{e}")
 
     @pyqtSlot()
     def on_run_propagation(self):
@@ -177,7 +201,10 @@ class MainWindow(QMainWindow):
             return
 
         n_anchors = len(self.calibration.anchors)
-        anchor_ids = self.calibration.anchor_frame_ids
+
+        # ВИПРАВЛЕНО: Збираємо ID з нових об'єктів якорів
+        anchor_ids = [a.frame_id for a in self.calibration.anchors]
+
         n_frames = self.database.get_num_frames()
 
         self.logger.info(
@@ -208,6 +235,39 @@ class MainWindow(QMainWindow):
         self._propagation_dialog.canceled.connect(self.propagation_worker.stop)
 
         self.propagation_worker.start()
+
+
+    @pyqtSlot(int, str)
+    def on_worker_progress(self, percent: int, message: str):
+        """Оновлює діалогове вікно прогресу під час роботи фонових потоків"""
+        if hasattr(self, 'progress_dialog') and self.progress_dialog is not None:
+            self.progress_dialog.setValue(percent)
+            self.progress_dialog.setLabelText(message)
+        else:
+            self.status_bar.showMessage(f"{message} ({percent}%)")
+
+    @pyqtSlot(str)
+    def on_worker_error(self, error_msg: str):
+        """Обробляє помилки, що надходять від фонових потоків"""
+        if hasattr(self, 'progress_dialog') and self.progress_dialog is not None:
+            self.progress_dialog.close()
+
+        self.logger.error(f"Worker Error: {error_msg}")
+        QMessageBox.critical(self, "Помилка обробки", f"Сталася помилка:\n{error_msg}")
+        self.status_bar.showMessage("Операцію перервано через помилку.")
+
+
+    @pyqtSlot()
+    def on_propagation_finished(self):
+        self.progress_dialog.close()
+        self.status_bar.showMessage("Пропагація завершена успішно. Базу оновлено.")
+
+        # Примусово очищуємо кеш відеокарти після важких обчислень LightGlue
+        self.model_manager.unload_model('lightglue')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
 
     @pyqtSlot(int, str)
     def on_propagation_progress(self, percent: int, message: str):
@@ -293,7 +353,10 @@ class MainWindow(QMainWindow):
         try:
             self.calibration.load(file_name)
             n = len(self.calibration.anchors)
-            ids = self.calibration.anchor_frame_ids
+
+            # ВИПРАВЛЕНО: Збираємо ID з нових об'єктів якорів
+            ids = [a.frame_id for a in self.calibration.anchors]
+
             self.status_bar.showMessage(
                 f"Калібрування завантажено: {n} якорів, кадри {ids}"
             )
@@ -306,7 +369,6 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
-
     # ──────────────────────────────────────────────────────────────────
     # Бази даних
     # ──────────────────────────────────────────────────────────────────
@@ -582,138 +644,31 @@ class MainWindow(QMainWindow):
         self.pano_worker.start()
 
     @pyqtSlot()
-    def on_show_panorama2(self):
-        if not self.calibration.is_calibrated or not getattr(self.calibration, 'anchors', None):
-            QMessageBox.warning(self, "Увага", "Спочатку виконайте калібрування бази!")
+    def on_show_panorama(self):
+        if not self.localizer:
+            QMessageBox.warning(self, "Помилка", "Спочатку завантажте базу даних!")
             return
 
-        image_path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "Виберіть зображення панорами", "", "Images (*.jpg *.png *.jpeg)"
         )
-        if not image_path: return
-
-        import cv2
-        import base64
-        import numpy as np
-        from src.geometry.coordinates import CoordinateConverter
-        from src.geometry.transformations import GeometryTransforms
-
-        img = cv2.imread(image_path)
-        if img is None:
-            QMessageBox.critical(self, "Помилка", "Не вдалося прочитати зображення.")
+        if not file_name:
             return
 
-        H_pano, W_pano = img.shape[:2]
-        self.logger.info(f"Панорама завантажена: {W_pano}x{H_pano} пікселів")
-        self.status_bar.showMessage("Автоматичний аналіз панорами (це може зайняти кілька секунд)...")
-        self.repaint()
+        self.status_bar.showMessage("Розпізнавання панорами у фоновому режимі...")
 
-        try:
-            # 1. Готуємо 3 шматки панорами для розпізнавання (зліва, центр, справа)
-            crop_size = min(H_pano, W_pano)
-            crops = []
+        # Запускаємо процес у фоновому потоці замість блокування інтерфейсу
+        self.panorama_overlay_worker = PanoramaOverlayWorker(file_name, self.localizer)
+        self.panorama_overlay_worker.success.connect(self.on_panorama_overlay_success)
+        self.panorama_overlay_worker.error.connect(self.on_worker_error)
+        self.panorama_overlay_worker.start()
 
-            if W_pano > H_pano:  # Горизонтальна панорама
-                crops.append((img[0:crop_size, 0:crop_size], 0, 0))
-                cx = W_pano // 2 - crop_size // 2
-                crops.append((img[0:crop_size, cx:cx + crop_size], cx, 0))
-                crops.append((img[0:crop_size, W_pano - crop_size:W_pano], W_pano - crop_size, 0))
-            else:  # Вертикальна панорама
-                crops.append((img[0:crop_size, 0:crop_size], 0, 0))
-                cy = H_pano // 2 - crop_size // 2
-                crops.append((img[cy:cy + crop_size, 0:crop_size], 0, cy))
-                crops.append((img[H_pano - crop_size:H_pano, 0:crop_size], 0, H_pano - crop_size))
-
-            # --- СТВОРЮЄМО ЛОКАЛІЗАТОР ---
-            from src.models.wrappers.feature_extractor import FeatureExtractor
-            from src.localization.matcher import FeatureMatcher
-            from src.localization.localizer import Localizer
-
-            sp_model = self.model_manager.load_superpoint()
-            nv_model = self.model_manager.load_netvlad()
-            lg_model = self.model_manager.load_lightglue()
-
-            fe = FeatureExtractor(sp_model, nv_model, self.model_manager.device)
-            matcher = FeatureMatcher(lg_model, self.model_manager.device)
-            localizer = Localizer(self.database, fe, matcher, self.calibration, self.config)
-
-            pts_pano = []
-            pts_metric = []
-
-            localizer.reset_cache()
-
-            # 2. Відправляємо шматки в локалізатор
-            for crop_img, offset_x, offset_y in crops:
-                crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-
-                res = localizer.localize_frame(crop_rgb)
-
-                if res.get('success') and 'fov_polygon' in res:
-                    crop_pts = [(0, 0), (crop_size, 0), (crop_size, crop_size), (0, crop_size)]
-
-                    for (cx, cy), (lat, lon) in zip(crop_pts, res['fov_polygon']):
-                        pano_x = cx + offset_x
-                        pano_y = cy + offset_y
-                        mx, my = CoordinateConverter.gps_to_metric(lat, lon)
-
-                        pts_pano.append((pano_x, pano_y))
-                        pts_metric.append((mx, my))
-
-            localizer.reset_cache()
-
-            # 3. Перевіряємо, чи локалізатор знайшов панораму
-            if len(pts_pano) < 3:
-                QMessageBox.warning(self, "Помилка",
-                                    "Не вдалося автоматично прив'язати панораму. Зображення занадто спотворене або не збігається з базою.")
-                self.status_bar.clearMessage()
-                return
-
-            # 4. Будуємо ідеальну афінну матрицю для цілої панорами
-            pts_pano_np = np.array(pts_pano, dtype=np.float32)
-            pts_metric_np = np.array(pts_metric, dtype=np.float32)
-
-            M, _ = cv2.estimateAffine2D(pts_pano_np, pts_metric_np)
-
-            if M is None:
-                QMessageBox.warning(self, "Помилка", "Математична помилка при розрахунку матриці панорами.")
-                return
-
-            # 5. Знаходимо 4 реальні кути всієї панорами
-            corners_pano = np.array([
-                [0, 0], [W_pano, 0], [W_pano, H_pano], [0, H_pano]
-            ], dtype=np.float32)
-
-            corners_metric = GeometryTransforms.apply_affine(corners_pano, M)
-
-            lat_tl, lon_tl = CoordinateConverter.metric_to_gps(*corners_metric[0])
-            lat_tr, lon_tr = CoordinateConverter.metric_to_gps(*corners_metric[1])
-            lat_br, lon_br = CoordinateConverter.metric_to_gps(*corners_metric[2])
-            lat_bl, lon_bl = CoordinateConverter.metric_to_gps(*corners_metric[3])
-
-            self.logger.info(f"Авто-GPS кути панорами: TL({lat_tl:.4f}, {lon_tl:.4f}), BR({lat_br:.4f}, {lon_br:.4f})")
-
-            # 6. Стискаємо і відправляємо на карту
-            max_dim = 2048
-            if W_pano > max_dim or H_pano > max_dim:
-                scale = max_dim / max(W_pano, H_pano)
-                img = cv2.resize(img, (int(W_pano * scale), int(H_pano * scale)))
-
-            _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            b64_string = base64.b64encode(buffer).decode('utf-8')
-            data_url = f"data:image/jpeg;base64,{b64_string}"
-
-            self.map_widget.set_panorama_overlay(
-                data_url,
-                lat_tl, lon_tl,
-                lat_tr, lon_tr,
-                lat_br, lon_br,
-                lat_bl, lon_bl
-            )
-            self.status_bar.showMessage("Панорама успішно розпізнана і накладена на карту!")
-
-        except Exception as e:
-            self.logger.error(f"Panorama auto-overlay failed: {e}", exc_info=True)
-            QMessageBox.critical(self, "Помилка", f"Не вдалося накласти панораму:\n{e}")
+    @pyqtSlot(str, float, float, float, float, float, float, float, float)
+    def on_panorama_overlay_success(self, data_url, lat_tl, lon_tl, lat_tr, lon_tr, lat_br, lon_br, lat_bl, lon_bl):
+        self.map_widget.set_panorama_overlay(
+            data_url, lat_tl, lon_tl, lat_tr, lon_tr, lat_br, lon_br, lat_bl, lon_bl
+        )
+        self.status_bar.showMessage("Панорама успішно розпізнана і накладена на карту!")
 
     @pyqtSlot()
     def on_show_panorama1(self):
@@ -1025,9 +980,11 @@ class MainWindow(QMainWindow):
     # Слоти відео/локалізації
     # ──────────────────────────────────────────────────────────────────
 
-    @pyqtSlot(QPixmap)
-    def on_frame_ready(self, pixmap):
+    @pyqtSlot(np.ndarray)
+    def on_frame_ready(self, frame_rgb):
+        # Конвертуємо безпечно у головному потоці
         if hasattr(self.video_widget, 'display_frame'):
+            pixmap = opencv_to_qpixmap(frame_rgb)
             self.video_widget.display_frame(pixmap)
 
     @pyqtSlot(float, float, float, int)
