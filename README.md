@@ -114,9 +114,6 @@ pytest tests/ -v
 python scripts/build_executable.py
 ```
 
-## 📄 Ліцензія
-
-MIT License - див. [LICENSE](LICENSE)
 
 ## 📧 Контакти
 
