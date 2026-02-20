@@ -42,7 +42,8 @@ class Localizer:
             measurement_noise=self.config.get('tracking', {}).get('kalman_measurement_noise', 10.0)
         )
         self.outlier_detector = OutlierDetector(
-            threshold_std=self.config.get('tracking', {}).get('outlier_threshold_std', 3.0)
+            threshold_std=self.config.get('tracking', {}).get('outlier_threshold_std', 100.0),
+            max_speed_mps=self.config.get('tracking', {}).get('max_speed_mps', 100.0)
         )
 
         # Runtime fallback кеш (якщо пропагація не виконана)
