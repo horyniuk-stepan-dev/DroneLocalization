@@ -3,6 +3,8 @@ from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QUrl
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from src.utils.logging_utils import get_logger
+from pathlib import Path
+
 
 class MapBridge(QObject):
     updateMarkerSignal = pyqtSignal(float, float)
@@ -32,7 +34,6 @@ class MapWidget(QWebEngineView):
         self.page().setWebChannel(self.channel)
 
     def load_map(self):
-        from pathlib import Path
 
         # Піднімаємось на 2 рівні вгору: map_widget.py -> widgets -> gui
         gui_folder = Path(__file__).resolve().parent.parent

@@ -1,11 +1,11 @@
 ﻿import cv2
 import numpy as np
 from src.geometry.transformations import GeometryTransforms
-from src.geometry.coordinates import CoordinateConverter
 from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
+from src.geometry.coordinates import CoordinateConverter
 
 logger = get_logger(__name__)
 
@@ -43,7 +43,7 @@ class Localizer:
         )
         self.outlier_detector = OutlierDetector(
             threshold_std=self.config.get('tracking', {}).get('outlier_threshold_std', 100.0),
-            max_speed_mps=self.config.get('tracking', {}).get('max_speed_mps', 100.0)
+            max_speed_mps=self.config.get('tracking', {}).get('max_speed_mps', 100000.0)
         )
 
         # Runtime fallback кеш (якщо пропагація не виконана)
@@ -314,7 +314,6 @@ class Localizer:
 
         self.outlier_detector.add_position(filtered_pt)
 
-        from src.geometry.coordinates import CoordinateConverter
         lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
 
         # 6. Розрахунок поля зору (FOV) для ПОВЕРНУТОГО кадру

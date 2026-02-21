@@ -7,6 +7,7 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
 class RealtimeTrackingWorker(QThread):
     """Real-time localization worker thread"""
 
@@ -24,7 +25,12 @@ class RealtimeTrackingWorker(QThread):
         self.model_manager = model_manager
         self.config = config or {}
         self._is_running = True
+
+        # FPS для швидкості оновлення графічного інтерфейсу
         self.target_fps = self.config.get('gui', {}).get('video_fps', 30)
+
+        # НОВИЙ ПАРАМЕТР: Скільки кадрів реально розпізнавати за секунду відео (за замовчуванням 1.0)
+        self.process_fps = self.config.get('tracking', {}).get('process_fps', 1.0)
 
     def run(self):
         from src.models.wrappers.yolo_wrapper import YOLOWrapper
@@ -41,14 +47,32 @@ class RealtimeTrackingWorker(QThread):
             self.error.emit(f"Failed to open video source: {self.video_source}")
             return
 
+        # Визначаємо оригінальний FPS відео
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        if video_fps <= 0 or np.isnan(video_fps):
+            video_fps = 30.0
+
+        # Математика пропусків та dt на основі параметра process_fps
+        frame_step = max(1, int(video_fps / self.process_fps))
+        frames_to_skip = frame_step - 1
+
+        # Точний проміжок часу між обробленими кадрами для фільтра Калмана
+        calculated_dt = float(frame_step) / video_fps
+
+        logger.info(f"Video original FPS: {video_fps}, Target Process FPS: {self.process_fps}")
+        logger.info(f"Skipping {frames_to_skip} frames per cycle. Kalman dt will be {calculated_dt:.3f}s")
+
         frame_time = 1.0 / self.target_fps
-        last_frame_time = time.time()
 
         while self._is_running:
             start_time = time.time()
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # Швидко прокручуємо непотрібні кадри без декодування
+            for _ in range(frames_to_skip):
+                cap.grab()
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -57,11 +81,8 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, _ = yolo_wrapper.detect_and_mask(frame_rgb)
 
-                current_time = time.time()
-                dt = current_time - last_frame_time
-                last_frame_time = current_time
-
-                loc_result = self.localizer.localize_frame(frame_rgb, static_mask=static_mask, dt=dt)
+                # Використовуємо стабільне розраховане dt
+                loc_result = self.localizer.localize_frame(frame_rgb, static_mask=static_mask, dt=calculated_dt)
 
                 if loc_result.get("success"):
                     self.location_found.emit(
@@ -70,11 +91,11 @@ class RealtimeTrackingWorker(QThread):
                     )
                     if "fov_polygon" in loc_result:
                         self.fov_found.emit(loc_result["fov_polygon"])
-                    self.status_update.emit(f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})")
+                    self.status_update.emit(
+                        f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})")
                 else:
                     self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 
-                # Передаємо сирий масив замість QPixmap
                 self.frame_ready.emit(frame_rgb)
 
             except Exception as e:

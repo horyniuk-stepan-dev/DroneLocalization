@@ -20,7 +20,7 @@ APP_CONFIG = {
     'tracking': {
         'kalman_process_noise': 0.1,
         'kalman_measurement_noise': 10.0,
-        'outlier_threshold_std': 100.0
+        'outlier_threshold_std': 100000.0
     },
     'localization': {
         'min_matches': 15,
@@ -29,5 +29,8 @@ APP_CONFIG = {
     },
     'gui': {
         'video_fps': 30
+    },
+    'preprocessing': {
+        'reference_image_path':"config/reference_style.png"
     }
 }

@@ -1,34 +1,36 @@
 ﻿import gc
-
+import os
+import cv2
+import base64
 import numpy as np
 import torch
 from PyQt6.QtWidgets import (QMainWindow, QDockWidget, QStatusBar,
                              QFileDialog, QMessageBox, QProgressDialog)
 from PyQt6.QtCore import Qt, pyqtSlot
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import QApplication
 
 from src.gui.widgets.video_widget import VideoWidget
 from src.gui.widgets.map_widget import MapWidget
 from src.gui.widgets.control_panel import ControlPanel
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
-
 from src.models.model_manager import ModelManager
 from src.workers.database_worker import DatabaseGenerationWorker
 from src.workers.tracking_worker import RealtimeTrackingWorker
 from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
-
 from src.database.database_loader import DatabaseLoader
-# ВИПРАВЛЕНО: використовуємо MultiAnchorCalibration замість GPSCalibration
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.utils.logging_utils import get_logger
+from src.workers.panorama_overlay_worker import PanoramaOverlayWorker
+from src.utils.image_utils import opencv_to_qpixmap
+from src.workers.panorama_worker import PanoramaWorker
+from src.geometry.coordinates import CoordinateConverter
+from src.geometry.transformations import GeometryTransforms
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.localization.matcher import FeatureMatcher
 from src.localization.localizer import Localizer
-from src.utils.logging_utils import get_logger   # ВИПРАВЛЕНО: правильний шлях імпорту
-from config.config import APP_CONFIG
-from utils.image_utils import opencv_to_qpixmap
-from workers.panorama_overlay_worker import PanoramaOverlayWorker
 
+from config.config import APP_CONFIG
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -135,10 +137,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Помилка", "Потрібно мінімум 3 точки для створення якоря!")
                 return
 
-            # Імпортуємо необхідні модулі для математики
-            from src.geometry.coordinates import CoordinateConverter
-            from src.geometry.transformations import GeometryTransforms
-            import numpy as np
+
 
             # Переводимо екранні пікселі у numpy масив
             pts_2d_np = np.array(points_2d, dtype=np.float32)
@@ -164,7 +163,6 @@ class MainWindow(QMainWindow):
 
             # Зберігаємо оновлений файл калібрування
             if self.database and self.database.db_path:
-                import os
                 calib_path = self.database.db_path.replace('.h5', '_calib.json')
                 self.calibration.save(calib_path)
 
@@ -542,9 +540,7 @@ class MainWindow(QMainWindow):
         if not image_path:
             return
 
-        import cv2
-        from PyQt6.QtWidgets import QApplication
-        from src.utils.image_utils import opencv_to_qpixmap
+
 
         frame = cv2.imread(image_path)
         if frame is None:
@@ -625,7 +621,6 @@ class MainWindow(QMainWindow):
         if not save_path:
             return
 
-        from src.workers.panorama_worker import PanoramaWorker
         self.pano_worker = PanoramaWorker(video_path, save_path, frame_step=20)
         self.control_panel.btn_gen_pano.setEnabled(False)
         self.pano_worker.progress.connect(self.on_db_progress)
@@ -681,12 +676,7 @@ class MainWindow(QMainWindow):
         )
         if not image_path: return
 
-        import cv2
-        import base64
-        import numpy as np
-        import torch
-        from src.geometry.coordinates import CoordinateConverter
-        from src.geometry.transformations import GeometryTransforms
+
 
         img = cv2.imread(image_path)
         if img is None:
@@ -715,9 +705,7 @@ class MainWindow(QMainWindow):
                 crops.append((img[H_pano - crop_size:H_pano, 0:crop_size], 0, H_pano - crop_size))
 
             # --- ПЕРЕКИДАЄМО МОДЕЛІ В ОПЕРАТИВНУ ПАМ'ЯТЬ (CPU) ---
-            from src.models.wrappers.feature_extractor import FeatureExtractor
-            from src.localization.matcher import FeatureMatcher
-            from src.localization.localizer import Localizer
+
 
             original_device = self.model_manager.device  # Запам'ятовуємо, де ми були (cuda)
 
@@ -824,12 +812,7 @@ class MainWindow(QMainWindow):
         )
         if not image_path: return
 
-        import cv2
-        import base64
-        import numpy as np
-        import torch
-        from src.geometry.coordinates import CoordinateConverter
-        from src.geometry.transformations import GeometryTransforms
+
 
         img = cv2.imread(image_path)
         if img is None:
@@ -876,9 +859,7 @@ class MainWindow(QMainWindow):
                 crops.append((crop_img, x1, y1))
 
             # --- ПЕРЕКИДАЄМО МОДЕЛІ В ОПЕРАТИВНУ ПАМ'ЯТЬ (CPU) ---
-            from src.models.wrappers.feature_extractor import FeatureExtractor
-            from src.localization.matcher import FeatureMatcher
-            from src.localization.localizer import Localizer
+
 
             original_device = self.model_manager.device  # Запам'ятовуємо, де ми були (cuda)
 

@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from src.utils.logging_utils import get_logger
+import os
 
 logger = get_logger(__name__)
 
@@ -8,58 +9,38 @@ logger = get_logger(__name__)
 class ImagePreprocessor:
     def __init__(self, config=None):
         self.config = config or {}
+        self.apply_matching = self.config.get('preprocessing', {}).get('histogram_matching', True)
 
-        self.apply_white_balance = self.config.get('preprocessing', {}).get('white_balance', True)
-        self.apply_gamma = self.config.get('preprocessing', {}).get('auto_gamma', True)
+        reference_path = self.config.get('preprocessing', {}).get('reference_image_path', '')
+        self.reference_image = None
 
-        # Ідеальна яскравість, до якої прагнемо (стандарт 120)
-        self.optimal_brightness = self.config.get('preprocessing', {}).get('optimal_brightness', 120.0)
-
-        # Коефіцієнт адаптивності (0.0 = жорстко тягнути до 120, 1.0 = взагалі нічого не змінювати)
-        self.adaptivity = self.config.get('preprocessing', {}).get('adaptivity', 0.5)
-
-        logger.info(
-            f"ImagePreprocessor initialized: WB={self.apply_white_balance}, Gamma={self.apply_gamma}, Adaptivity={self.adaptivity}")
+        if self.apply_matching and os.path.exists(reference_path):
+            ref_bgr = cv2.imread(reference_path)
+            if ref_bgr is not None:
+                self.reference_image = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
+                logger.info(f"ImagePreprocessor initialized with Histogram Matching. Reference: {reference_path}")
+            else:
+                logger.warning(f"Failed to load reference image at {reference_path}")
+        else:
+            logger.warning("Histogram Matching is enabled, but reference image path is invalid or missing.")
 
     def preprocess(self, image: np.ndarray) -> np.ndarray:
         if image is None or image.size == 0:
-            logger.warning("Empty image provided for preprocessing")
             return image
 
-        processed_img = image.copy()
+        if not self.apply_matching or self.reference_image is None:
+            return image
 
-        # ЕТАП 1: Автоматичний баланс білого (Gray World)
-        if self.apply_white_balance:
-            img_float = processed_img.astype(np.float32)
-            avg_r = np.mean(img_float[:, :, 0])
-            avg_g = np.mean(img_float[:, :, 1])
-            avg_b = np.mean(img_float[:, :, 2])
+        matched_image = np.empty_like(image)
 
-            avg_gray = (avg_r + avg_g + avg_b) / 3.0
+        for d in range(image.shape[2]):
+            s_val, bin_idx, s_counts = np.unique(image[:, :, d], return_inverse=True, return_counts=True)
+            t_val, t_counts = np.unique(self.reference_image[:, :, d], return_counts=True)
 
-            if avg_r > 1.0 and avg_g > 1.0 and avg_b > 1.0:
-                img_float[:, :, 0] *= (avg_gray / avg_r)
-                img_float[:, :, 1] *= (avg_gray / avg_g)
-                img_float[:, :, 2] *= (avg_gray / avg_b)
+            s_quantiles = np.cumsum(s_counts).astype(np.float64) / image[:, :, d].size
+            t_quantiles = np.cumsum(t_counts).astype(np.float64) / self.reference_image[:, :, d].size
 
-                processed_img = np.clip(img_float, 0, 255).astype(np.uint8)
+            interp_t_values = np.interp(s_quantiles, t_quantiles, t_val)
+            matched_image[:, :, d] = interp_t_values[bin_idx].reshape(image.shape[:2])
 
-        # ЕТАП 2: Адаптивна гамма-корекція (гнучке вирівнювання яскравості)
-        if self.apply_gamma:
-            gray = cv2.cvtColor(processed_img, cv2.COLOR_RGB2GRAY)
-            mean_brightness = np.mean(gray)
-
-            if mean_brightness > 1.0:
-                # Математично знаходимо "золоту середину" між поточним світлом та ідеальним
-                adaptive_target = (self.optimal_brightness * (1.0 - self.adaptivity)) + (
-                            mean_brightness * self.adaptivity)
-
-                gamma = np.log(adaptive_target / 255.0) / np.log(mean_brightness / 255.0)
-                gamma = np.clip(gamma, 0.4, 2.5)
-
-                inv_gamma = 1.0 / gamma
-                table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype(np.uint8)
-
-                processed_img = cv2.LUT(processed_img, table)
-
-        return processed_img
+        return matched_image.astype(np.uint8)

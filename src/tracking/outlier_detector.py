@@ -9,7 +9,7 @@ logger = get_logger(__name__)
 class OutlierDetector:
     """Detect anomalous measurements (outliers) based on trajectory history"""
 
-    def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=30.0):
+    def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=30000.0):
         self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
         self.max_speed_mps = max_speed_mps

@@ -1,6 +1,8 @@
 ﻿import h5py
 import numpy as np
 import cv2
+from pathlib import Path
+
 from datetime import datetime
 from src.utils.logging_utils import get_logger
 
@@ -59,7 +61,6 @@ class DatabaseBuilder:
         kp_video_path = None
         kp_writer = None
         if save_keypoint_video:
-            from pathlib import Path
             kp_video_path = str(Path(self.output_path).with_suffix('')) + '_keypoints.mp4'
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (width, height))
