@@ -77,7 +77,7 @@ class DatabaseBuilder:
 
         sp_model = model_manager.load_superpoint()
         nv_model = model_manager.load_netvlad()
-        feature_extractor = FeatureExtractor(sp_model, nv_model, model_manager.device)
+        feature_extractor = FeatureExtractor(sp_model, nv_model, model_manager.device,config = self.config)
         logger.success("All models loaded successfully")
 
         # Create empty database structure

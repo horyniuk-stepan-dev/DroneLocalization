@@ -475,7 +475,7 @@ class MainWindow(QMainWindow):
         nv_model = self.model_manager.load_netvlad()
         lg_model = self.model_manager.load_lightglue()
 
-        feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device)
+        feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device,config = self.config)
         matcher = FeatureMatcher(lg_model, self.model_manager.device)
         localizer = Localizer(
             self.database, feature_extractor, matcher,
@@ -540,7 +540,7 @@ class MainWindow(QMainWindow):
             nv_model = self.model_manager.load_netvlad()
             lg_model = self.model_manager.load_lightglue()
 
-            feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device)
+            feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device,config = self.config)
             matcher = FeatureMatcher(lg_model, self.model_manager.device)
             localizer = Localizer(
                 self.database, feature_extractor, matcher,
@@ -716,7 +716,7 @@ class MainWindow(QMainWindow):
             lg_model = self.model_manager.load_lightglue().to('cpu')
 
             # Ініціалізуємо екстрактори з примусовим вказуванням 'cpu'
-            fe = FeatureExtractor(sp_model, nv_model, device='cpu')
+            fe = FeatureExtractor(sp_model, nv_model, device='cpu',config = self.config)
             matcher = FeatureMatcher(lg_model, device='cpu')
             localizer = Localizer(self.database, fe, matcher, self.calibration, self.config)
 
