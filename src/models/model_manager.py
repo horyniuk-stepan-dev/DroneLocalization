@@ -162,57 +162,6 @@ class ModelManager:
         self._register_model_usage(name)
         return self.models[name]
 
-    def load_depth_anything(self):
-        name = 'depth_anything'
-        if name not in self.models:
-            logger.info(f"Loading Depth-Anything model...")
-            self._ensure_vram_available(3000.0)
-
-            try:
-                # Try importing Depth-Anything v2 (newer version)
-                try:
-                    from depth_anything_v2.dpt import DepthAnythingV2
-
-                    model_configs = {
-                        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-                        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-                        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-                    }
-
-                    # Use small model by default
-                    encoder = self.config.get('depth_anything', {}).get('encoder', 'vits')
-                    model = DepthAnythingV2(**model_configs[encoder])
-                    model.load_state_dict(
-                        torch.load(f'checkpoints/depth_anything_v2_{encoder}.pth', map_location='cpu'))
-
-                    logger.info(f"Using Depth-Anything V2 with {encoder} encoder")
-
-                except ImportError:
-                    # Fallback to v1
-                    from transformers import pipeline#                                                    &&&&&????????
-
-                    model = pipeline(
-                        task="depth-estimation",
-                        model="LiheYoung/depth-anything-large-hf",
-                        device=0 if self.device == 'cuda' else -1
-                    )
-
-                    logger.info("Using Depth-Anything V1 from HuggingFace")
-
-                model = model.eval().to(self.device) if hasattr(model, 'eval') else model
-                self.models[name] = model
-
-                logger.success(f"Depth-Anything model loaded successfully on {self.device}")
-
-            except Exception as e:
-                logger.error(f"Failed to load Depth-Anything model: {e}", exc_info=True)
-                raise
-        else:
-            logger.debug(f"Depth-Anything model already loaded, reusing cached instance")
-
-        self._register_model_usage(name)
-        return self.models[name]
-
     def unload_model(self, model_name: str):
         if model_name in self.models:
             logger.info(f"Unloading model: {model_name}")

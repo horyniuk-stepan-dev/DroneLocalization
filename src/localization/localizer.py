@@ -67,71 +67,6 @@ class Localizer:
     # H(ref → anchor) — з БД або fallback
     # ──────────────────────────────────────────────────────────────────
 
-    def _get_anchor_for_ref(self, candidate_id: int, ref_features: dict):
-        """
-        Повертає (H_ref_to_anchor, anchor) для candidate frame.
-        H_ref_to_anchor — матриця що переводить координати з простору
-        candidate frame у простір його найближчого якоря.
-
-        Якщо candidate_id == anchor.frame_id → H = None (identity).
-        """
-        if not self.calibration.is_calibrated:
-            return None, None
-
-        # 1. Pre-computed з БД — O(1)
-        db_result = self.database.get_h_to_anchor(candidate_id)
-        if db_result is not None:
-            H_to_anchor, anchor_fid = db_result
-            anchor = next(
-                (a for a in self.calibration.anchors if a.frame_id == anchor_fid), None
-            )
-            if anchor is not None:
-                # identity означає що candidate_id сам є якорем
-                if anchor_fid == candidate_id:
-                    return None, anchor
-                return H_to_anchor, anchor
-
-        # 2. Runtime fallback — ланцюжок до найближчого якоря
-        anchor = self._find_nearest_anchor(candidate_id)
-        if anchor is None:
-            return None, None
-
-        if candidate_id == anchor.frame_id:
-            return None, anchor
-
-        cache_key = (candidate_id, anchor.frame_id)
-        if cache_key in self._runtime_h_cache:
-            return self._runtime_h_cache[cache_key], anchor
-
-        logger.info(f"Runtime: computing H(frame_{candidate_id} → anchor_{anchor.frame_id})")
-        anchor_feat = self._load_anchor_features(anchor.frame_id)
-        if anchor_feat is None:
-            return None, anchor
-
-        H = self._build_chain(candidate_id, anchor.frame_id, ref_features, anchor_feat)
-        self._runtime_h_cache[cache_key] = H
-        return H, anchor
-
-    def _find_nearest_anchor(self, frame_id: int):
-        """Знайти найближчий якір за номером кадру"""
-        if not self.calibration.anchors:
-            return None
-        return min(
-            self.calibration.anchors,
-            key=lambda a: abs(a.frame_id - frame_id)
-        )
-
-    def _load_anchor_features(self, anchor_fid: int) -> dict | None:
-        if anchor_fid in self._anchor_features_cache:
-            return self._anchor_features_cache[anchor_fid]
-        try:
-            feat = self.database.get_local_features(anchor_fid)
-            self._anchor_features_cache[anchor_fid] = feat
-            return feat
-        except Exception as e:
-            logger.error(f"Cannot load anchor {anchor_fid} features: {e}")
-            return None
-
     def _match_pair(self, fa: dict, fb: dict) -> np.ndarray | None:
         try:
             mkpts_a, mkpts_b = self.matcher.match(fa, fb)
@@ -146,75 +81,7 @@ class Localizer:
         except Exception:
             return None
 
-    def _build_chain(
-            self, from_id: int, to_id: int,
-            from_features: dict, to_features: dict,
-            step: int = 10
-    ) -> np.ndarray | None:
-        """Ланцюжок H(from → to) через проміжні кадри"""
-        H = self._match_pair(from_features, to_features)
-        if H is not None:
-            return H
 
-        direction = 1 if to_id > from_id else -1
-        waypoints = list(range(from_id, to_id, direction * step))
-        if not waypoints or waypoints[-1] != to_id:
-            waypoints.append(to_id)
-
-        H_chain = []
-        prev_feat = from_features
-
-        for i in range(1, len(waypoints)):
-            wp_id = waypoints[i]
-            try:
-                next_feat = (to_features if wp_id == to_id
-                             else self.database.get_local_features(wp_id))
-            except Exception:
-                return None
-
-            H_step = self._match_pair(prev_feat, next_feat)
-            if H_step is None:
-                return None
-
-            H_chain.append(H_step)
-            prev_feat = next_feat
-
-        if not H_chain:
-            return None
-
-        H_result = np.eye(3, dtype=np.float64)
-        for H in H_chain:
-            H_result = H.astype(np.float64) @ H_result
-        return H_result.astype(np.float32)
-
-    # ──────────────────────────────────────────────────────────────────
-    # Трансформація точок
-    # ──────────────────────────────────────────────────────────────────
-
-    def _transform_pts(
-            self,
-            pts: np.ndarray,
-            H_query_to_ref: np.ndarray,
-            H_ref_to_anchor: np.ndarray | None
-    ) -> np.ndarray | None:
-        """
-        pts (query space) → anchor space.
-        H_ref_to_anchor=None означає ref і є якором.
-        """
-        pts_2d = pts.reshape(-1, 2)
-
-        in_ref = GeometryTransforms.apply_homography(pts_2d, H_query_to_ref)
-        if in_ref is None or len(in_ref) == 0:
-            return None
-
-        if H_ref_to_anchor is None:
-            return in_ref
-
-        in_anchor = GeometryTransforms.apply_homography(in_ref, H_ref_to_anchor)
-        if in_anchor is None or len(in_anchor) == 0:
-            return None
-
-        return in_anchor
 
     # ──────────────────────────────────────────────────────────────────
     # Локалізація (З AUTO-ROTATION)

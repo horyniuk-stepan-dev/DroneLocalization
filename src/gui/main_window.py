@@ -235,14 +235,6 @@ class MainWindow(QMainWindow):
         self.propagation_worker.start()
 
 
-    @pyqtSlot(int, str)
-    def on_worker_progress(self, percent: int, message: str):
-        """Оновлює діалогове вікно прогресу під час роботи фонових потоків"""
-        if hasattr(self, 'progress_dialog') and self.progress_dialog is not None:
-            self.progress_dialog.setValue(percent)
-            self.progress_dialog.setLabelText(message)
-        else:
-            self.status_bar.showMessage(f"{message} ({percent}%)")
 
     @pyqtSlot(str)
     def on_worker_error(self, error_msg: str):
@@ -255,16 +247,6 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Операцію перервано через помилку.")
 
 
-    @pyqtSlot()
-    def on_propagation_finished(self):
-        self.progress_dialog.close()
-        self.status_bar.showMessage("Пропагація завершена успішно. Базу оновлено.")
-
-        # Примусово очищуємо кеш відеокарти після важких обчислень LightGlue
-        self.model_manager.unload_model('lightglue')
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
 
 
     @pyqtSlot(int, str)
@@ -665,141 +647,6 @@ class MainWindow(QMainWindow):
         )
         self.status_bar.showMessage("Панорама успішно розпізнана і накладена на карту!")
 
-    @pyqtSlot()
-    def on_show_panorama1(self):
-        if not self.calibration.is_calibrated or not getattr(self.calibration, 'anchors', None):
-            QMessageBox.warning(self, "Увага", "Спочатку виконайте калібрування бази!")
-            return
-
-        image_path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
-        )
-        if not image_path: return
-
-
-
-        img = cv2.imread(image_path)
-        if img is None:
-            QMessageBox.critical(self, "Помилка", "Не вдалося прочитати зображення.")
-            return
-
-        H_pano, W_pano = img.shape[:2]
-        self.logger.info(f"Панорама завантажена: {W_pano}x{H_pano} пікселів")
-        self.status_bar.showMessage("Аналіз панорами в оперативній пам'яті (це може зайняти 10-20 секунд)...")
-        self.repaint()
-
-        try:
-            # 1. Готуємо 3 шматки панорами
-            crop_size = min(H_pano, W_pano)
-            crops = []
-
-            if W_pano > H_pano:  # Горизонтальна панорама
-                crops.append((img[0:crop_size, 0:crop_size], 0, 0))
-                cx = W_pano // 2 - crop_size // 2
-                crops.append((img[0:crop_size, cx:cx + crop_size], cx, 0))
-                crops.append((img[0:crop_size, W_pano - crop_size:W_pano], W_pano - crop_size, 0))
-            else:  # Вертикальна панорама
-                crops.append((img[0:crop_size, 0:crop_size], 0, 0))
-                cy = H_pano // 2 - crop_size // 2
-                crops.append((img[cy:cy + crop_size, 0:crop_size], 0, cy))
-                crops.append((img[H_pano - crop_size:H_pano, 0:crop_size], 0, H_pano - crop_size))
-
-            # --- ПЕРЕКИДАЄМО МОДЕЛІ В ОПЕРАТИВНУ ПАМ'ЯТЬ (CPU) ---
-
-
-            original_device = self.model_manager.device  # Запам'ятовуємо, де ми були (cuda)
-
-            # Переносимо моделі на процесор (щоб використовувати всю RAM комп'ютера)
-            sp_model = self.model_manager.load_superpoint().to('cpu')
-            nv_model = self.model_manager.load_netvlad().to('cpu')
-            lg_model = self.model_manager.load_lightglue().to('cpu')
-
-            # Ініціалізуємо екстрактори з примусовим вказуванням 'cpu'
-            fe = FeatureExtractor(sp_model, nv_model, device='cpu')
-            matcher = FeatureMatcher(lg_model, device='cpu')
-            localizer = Localizer(self.database, fe, matcher, self.calibration, self.config)
-
-            pts_pano = []
-            pts_metric = []
-
-            localizer.reset_cache()
-
-            # 2. Відправляємо ОРИГІНАЛЬНІ ВЕЛИЧЕЗНІ шматки в локалізатор
-            for i, (crop_img, offset_x, offset_y) in enumerate(crops):
-                self.status_bar.showMessage(f"Обробка шматка {i + 1}/3 в оперативній пам'яті...")
-                self.repaint()
-
-                crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-                res = localizer.localize_frame(crop_rgb)
-
-                if res.get('success') and 'fov_polygon' in res:
-                    crop_pts = [(0, 0), (crop_size, 0), (crop_size, crop_size), (0, crop_size)]
-                    for (cx, cy), (lat, lon) in zip(crop_pts, res['fov_polygon']):
-                        pano_x = cx + offset_x
-                        pano_y = cy + offset_y
-                        mx, my = CoordinateConverter.gps_to_metric(lat, lon)
-                        pts_pano.append((pano_x, pano_y))
-                        pts_metric.append((mx, my))
-
-            # --- ПОВЕРТАЄМО ВСЕ НА ВІДЕОКАРТУ ---
-            localizer.reset_cache()
-            sp_model.to(original_device)
-            nv_model.to(original_device)
-            lg_model.to(original_device)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # 3. Перевіряємо результати
-            if len(pts_pano) < 3:
-                QMessageBox.warning(self, "Помилка",
-                                    "Не вдалося автоматично прив'язати панораму. Зображення занадто спотворене або не збігається з базою.")
-                self.status_bar.clearMessage()
-                return
-
-            # 4. Будуємо ідеальну афінну матрицю
-            pts_pano_np = np.array(pts_pano, dtype=np.float32)
-            pts_metric_np = np.array(pts_metric, dtype=np.float32)
-            M, _ = cv2.estimateAffine2D(pts_pano_np, pts_metric_np)
-
-            if M is None:
-                QMessageBox.warning(self, "Помилка", "Математична помилка при розрахунку матриці панорами.")
-                return
-
-            # 5. Знаходимо координати кутів
-            corners_pano = np.array([
-                [0, 0], [W_pano, 0], [W_pano, H_pano], [0, H_pano]
-            ], dtype=np.float32)
-            corners_metric = GeometryTransforms.apply_affine(corners_pano, M)
-
-            lat_tl, lon_tl = CoordinateConverter.metric_to_gps(*corners_metric[0])
-            lat_tr, lon_tr = CoordinateConverter.metric_to_gps(*corners_metric[1])
-            lat_br, lon_br = CoordinateConverter.metric_to_gps(*corners_metric[2])
-            lat_bl, lon_bl = CoordinateConverter.metric_to_gps(*corners_metric[3])
-
-            self.logger.info(f"Авто-GPS кути панорами: TL({lat_tl:.4f}, {lon_tl:.4f}), BR({lat_br:.4f}, {lon_br:.4f})")
-
-            # 6. Стискаємо картинку суто для ВІДОБРАЖЕННЯ на карті (щоб браузер не завис)
-            max_dim = 2048
-            if W_pano > max_dim or H_pano > max_dim:
-                scale = max_dim / max(W_pano, H_pano)
-                img = cv2.resize(img, (int(W_pano * scale), int(H_pano * scale)))
-
-            _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            b64_string = base64.b64encode(buffer).decode('utf-8')
-            data_url = f"data:image/jpeg;base64,{b64_string}"
-
-            self.map_widget.set_panorama_overlay(
-                data_url,
-                lat_tl, lon_tl,
-                lat_tr, lon_tr,
-                lat_br, lon_br,
-                lat_bl, lon_bl
-            )
-            self.status_bar.showMessage("Панорама успішно розпізнана і накладена на карту!")
-
-        except Exception as e:
-            self.logger.error(f"Panorama auto-overlay failed: {e}", exc_info=True)
-            QMessageBox.critical(self, "Помилка", f"Не вдалося накласти панораму:\n{e}")
 
     @pyqtSlot()
     def on_show_panorama(self):
