@@ -78,3 +78,7 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+yolov8x-seg.pt
+scripts/data/models/superpoint_v1.pth
+scripts/data/models/lightglue_superpoint.pth
+scripts/data/models/depth_anything_vitl14.pth
