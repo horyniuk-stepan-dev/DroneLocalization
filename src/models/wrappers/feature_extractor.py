@@ -2,6 +2,7 @@
 import numpy as np
 import cv2
 from src.utils.logging_utils import get_logger
+from src.utils.image_preprocessor import ImagePreprocessor
 
 logger = get_logger(__name__)
 
@@ -9,10 +10,13 @@ logger = get_logger(__name__)
 class FeatureExtractor:
     """Combined feature extraction (SuperPoint + NetVLAD)"""
 
-    def __init__(self, superpoint_model, netvlad_model, device='cuda'):
+    def __init__(self, superpoint_model, netvlad_model, device='cuda', config=None):
         self.superpoint = superpoint_model
         self.netvlad = netvlad_model
         self.device = device
+
+        # Ініціалізуємо наш новий клас попередньої обробки
+        self.preprocessor = ImagePreprocessor(config)
         logger.info(f"FeatureExtractor initialized on device: {device}")
 
     @torch.no_grad()
@@ -29,16 +33,22 @@ class FeatureExtractor:
                 - keypoints: (N, 2) array
                 - descriptors: (N, 256) array
                 - global_desc: (D,) array
+                - coords_2d: (N, 2) array (for database builder)
         """
         logger.debug(f"Extracting features from image: {image.shape}")
 
+        # 0. Адаптивна попередня обробка освітлення (CLAHE)
+        enhanced_image = self.preprocessor.preprocess(image)
+
         # Prepare image for SuperPoint (needs grayscale, normalized to [0, 1])
-        gray_image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        # Використовуємо вже покращене зображення enhanced_image
+        gray_image = cv2.cvtColor(enhanced_image, cv2.COLOR_RGB2GRAY)
         gray_tensor = torch.from_numpy(gray_image).float() / 255.0
         gray_tensor = gray_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
 
         # Prepare image for NetVLAD (needs RGB, normalized)
-        rgb_tensor = torch.from_numpy(image).float() / 255.0
+        # Використовуємо вже покращене зображення enhanced_image
+        rgb_tensor = torch.from_numpy(enhanced_image).float() / 255.0
         rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device)
 
         # 1. Extract local features with SuperPoint
@@ -92,5 +102,6 @@ class FeatureExtractor:
         return {
             'keypoints': keypoints,
             'descriptors': descriptors,
-            'global_desc': global_desc
+            'global_desc': global_desc,
+            'coords_2d': keypoints.copy()  # Додано для сумісності з database_builder
         }
