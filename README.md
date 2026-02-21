@@ -44,7 +44,7 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # Встановлення hloc безпосередньо з GitHub (ОБОВ'ЯЗКОВО)
-pip install git+[https://github.com/cvg/Hierarchical-Localization.git](https://github.com/cvg/Hierarchical-Localization.git)
+pip install git+https://github.com/cvg/Hierarchical-Localization.git
 ```
 
 ### 2. Запуск програми
