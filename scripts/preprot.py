@@ -36,7 +36,7 @@ def run(source_path, reference_path):
     fig, axes = plt.subplots(1, 3, figsize=(20, 8))
 
     axes[0].imshow(src_rgb)
-    axes[0].set_title("Оригінал (похмурий/інший)", fontsize=14)
+    axes[0].set_title("Оригінал (інший)", fontsize=14)
     axes[0].axis('off')
 
     axes[1].imshow(ref_rgb)
@@ -53,7 +53,7 @@ def run(source_path, reference_path):
 
 if __name__ == "__main__":
     # Файл, який ми хочемо змінити (поточний кадр з камери)
-    SOURCE_IMAGE = "C:/Users/horyn/OneDrive/Desktop/big/3.png"
+    SOURCE_IMAGE = "C:/Users/horyn/OneDrive/Desktop/big/Screenshot1.png"
 
     # Файл, З ЯКОГО ми беремо ідеальні кольори (еталон з бази даних)
     REFERENCE_IMAGE = "C:/Users/horyn/OneDrive/Desktop/big/Screenshot.png"
