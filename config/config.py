@@ -6,8 +6,8 @@ APP_CONFIG = {
         'keypoint_threshold': 0.005,
         'max_keypoints': 2048,
     },
-    'netvlad': {
-        'descriptor_dim': 4096  # <--- Змінити тут з 32768 на 4096
+    'dinov2': {
+        'descriptor_dim': 384
     },
     'lightglue': {
         'depth_confidence': -1,
@@ -31,6 +31,7 @@ APP_CONFIG = {
         'video_fps': 30
     },
     'preprocessing': {
-        'reference_image_path':"config/reference_style.png"
+        'histogram_matching': True,
+        'reference_image_path':"E:/Dip/gsdfg/Ne/DroneLocalization/config/reference_style.png"
     }
 }

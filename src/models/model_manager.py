@@ -162,6 +162,29 @@ class ModelManager:
         self._register_model_usage(name)
         return self.models[name]
 
+    def load_dinov2(self):
+        name = 'dinov2'
+        if name not in self.models:
+            logger.info(f"Loading DINOv2 (vits14) model...")
+            self._ensure_vram_available(500.0)
+
+            try:
+                # Завантажуємо найшвидшу версію DINOv2 напряму з PyTorch Hub
+                model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+                model = model.eval().to(self.device)
+                self.models[name] = model
+
+                logger.success(f"DINOv2 model loaded successfully on {self.device}")
+
+            except Exception as e:
+                logger.error(f"Failed to load DINOv2 model: {e}", exc_info=True)
+                raise
+        else:
+            logger.debug(f"DINOv2 model already loaded, reusing cached instance")
+
+            self._register_model_usage(name)
+        return self.models[name]
+
     def unload_model(self, model_name: str):
         if model_name in self.models:
             logger.info(f"Unloading model: {model_name}")

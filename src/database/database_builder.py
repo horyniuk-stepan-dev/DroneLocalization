@@ -18,7 +18,7 @@ class DatabaseBuilder:
     def __init__(self, output_path, config=None):
         self.output_path = output_path
         self.config = config or {}
-        self.descriptor_dim = self.config.get('netvlad', {}).get('descriptor_dim', 32768)
+        self.descriptor_dim = self.config.get('dinov2', {}).get('descriptor_dim', 384)
         self.db_file = None
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
@@ -76,7 +76,7 @@ class DatabaseBuilder:
         yolo_wrapper = YOLOWrapper(yolo_model, model_manager.device)
 
         sp_model = model_manager.load_superpoint()
-        nv_model = model_manager.load_netvlad()
+        nv_model = model_manager.load_dinov2()
         feature_extractor = FeatureExtractor(sp_model, nv_model, model_manager.device,config = self.config)
         logger.success("All models loaded successfully")
 

@@ -32,6 +32,7 @@ from src.localization.localizer import Localizer
 
 from config.config import APP_CONFIG
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -366,11 +367,11 @@ class MainWindow(QMainWindow):
                 self, "Зберегти базу HDF5", "", "HDF5 Files (*.h5 *.hdf5)"
             )
             if save_path:
-                self.start_database_generation(video_path, save_path, mission_data)
+                self.start_database_generation(video_path, save_path)
         else:
             self.status_bar.showMessage("Створення місії скасовано")
 
-    def start_database_generation(self, video_path, save_path, config):
+    def start_database_generation(self, video_path, save_path, config = APP_CONFIG):
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
         self.control_panel.update_progress(0)
@@ -379,7 +380,7 @@ class MainWindow(QMainWindow):
             video_path=video_path,
             output_path=save_path,
             model_manager=self.model_manager,
-            config=APP_CONFIG
+            config=config
         )
         self.db_worker.progress.connect(self.on_db_progress)
         self.db_worker.completed.connect(self.on_db_completed)
@@ -472,7 +473,7 @@ class MainWindow(QMainWindow):
             return
 
         sp_model = self.model_manager.load_superpoint()
-        nv_model = self.model_manager.load_netvlad()
+        nv_model = self.model_manager.load_dinov2()
         lg_model = self.model_manager.load_lightglue()
 
         feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device,config = self.config)
@@ -537,7 +538,7 @@ class MainWindow(QMainWindow):
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             sp_model = self.model_manager.load_superpoint()
-            nv_model = self.model_manager.load_netvlad()
+            nv_model = self.model_manager.load_dinov2()
             lg_model = self.model_manager.load_lightglue()
 
             feature_extractor = FeatureExtractor(sp_model, nv_model, self.model_manager.device,config = self.config)
@@ -712,7 +713,7 @@ class MainWindow(QMainWindow):
 
             # Переносимо моделі на процесор (використовуємо RAM)
             sp_model = self.model_manager.load_superpoint().to('cpu')
-            nv_model = self.model_manager.load_netvlad().to('cpu')
+            nv_model = self.model_manager.load_dinov2().to('cpu')
             lg_model = self.model_manager.load_lightglue().to('cpu')
 
             # Ініціалізуємо екстрактори з примусовим вказуванням 'cpu'

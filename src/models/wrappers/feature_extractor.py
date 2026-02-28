@@ -1,6 +1,7 @@
 ﻿import torch
 import numpy as np
 import cv2
+import torchvision.transforms as T
 from src.utils.logging_utils import get_logger
 from src.utils.image_preprocessor import ImagePreprocessor
 
@@ -8,100 +9,74 @@ logger = get_logger(__name__)
 
 
 class FeatureExtractor:
-    """Combined feature extraction (SuperPoint + NetVLAD)"""
+    """Combined feature extraction (SuperPoint + DINOv2)"""
 
-    def __init__(self, superpoint_model, netvlad_model, device='cuda', config=None):
+    def __init__(self, superpoint_model, global_model, device='cuda', config=None):
         self.superpoint = superpoint_model
-        self.netvlad = netvlad_model
+        self.global_model = global_model
         self.device = device
-
-        # Ініціалізуємо наш новий клас попередньої обробки
         self.preprocessor = ImagePreprocessor(config)
+
+        # Трансформації для DINOv2 (ImageNet стандарти та розмір 224x224)
+        self.dinov2_transform = T.Compose([
+            T.Resize((224, 224), antialias=True),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
         logger.info(f"FeatureExtractor initialized on device: {device}")
 
     @torch.no_grad()
     def extract_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
-        """
-        Extract both local and global features
-
-        Args:
-            image: RGB numpy array (H, W, 3)
-            static_mask: Binary numpy array (H, W) where 255 is static and 0 is dynamic
-
-        Returns:
-            dict with keys:
-                - keypoints: (N, 2) array
-                - descriptors: (N, 256) array
-                - global_desc: (D,) array
-                - coords_2d: (N, 2) array (for database builder)
-        """
         logger.debug(f"Extracting features from image: {image.shape}")
 
-        # 0. Адаптивна попередня обробка освітлення (CLAHE)
         enhanced_image = self.preprocessor.preprocess(image)
 
-        # Prepare image for SuperPoint (needs grayscale, normalized to [0, 1])
-        # Використовуємо вже покращене зображення enhanced_image
+        # 1. Підготовка для SuperPoint (ЧБ)
         gray_image = cv2.cvtColor(enhanced_image, cv2.COLOR_RGB2GRAY)
         gray_tensor = torch.from_numpy(gray_image).float() / 255.0
         gray_tensor = gray_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
 
-        # Prepare image for NetVLAD (needs RGB, normalized)
-        # Використовуємо вже покращене зображення enhanced_image
+        # 2. Підготовка для DINOv2 (Колір, RGB тензор)
         rgb_tensor = torch.from_numpy(enhanced_image).float() / 255.0
         rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device)
 
-        # 1. Extract local features with SuperPoint
-        logger.debug("Extracting local features with SuperPoint...")
+        # 3. Витягування локальних ознак SuperPoint
         sp_input = {'image': gray_tensor}
         sp_out = self.superpoint(sp_input)
 
-        # SuperPoint returns dict with 'keypoints', 'scores', 'descriptors'
-        keypoints = sp_out['keypoints'][0].cpu().numpy()  # (N, 2)
-        descriptors = sp_out['descriptors'][0].cpu().numpy()  # (D, N)
+        keypoints = sp_out['keypoints'][0].cpu().numpy()
+        descriptors = sp_out['descriptors'][0].cpu().numpy()
 
-        # Transpose descriptors to (N, D) format
         if descriptors.ndim == 2 and descriptors.shape[0] == 256:
             descriptors = descriptors.T
 
-        logger.debug(f"SuperPoint detected {len(keypoints)} keypoints")
-
-        # 2. Filter points by moving object mask
+        # 4. Фільтрація точок за маскою (якщо є)
         if static_mask is not None and len(keypoints) > 0:
-            logger.debug("Filtering keypoints by static mask...")
             valid_indices = []
             for i, (x, y) in enumerate(keypoints):
                 ix, iy = int(round(x)), int(round(y))
                 if 0 <= iy < static_mask.shape[0] and 0 <= ix < static_mask.shape[1]:
-                    if static_mask[iy, ix] > 128:  # Point on static object
+                    if static_mask[iy, ix] > 128:
                         valid_indices.append(i)
 
             if len(valid_indices) > 0:
                 keypoints = keypoints[valid_indices]
                 descriptors = descriptors[valid_indices]
-                logger.debug(f"After filtering: {len(keypoints)} keypoints remain")
             else:
-                logger.warning("All keypoints filtered out by mask! Using unfiltered keypoints.")
+                logger.warning("All keypoints filtered out by mask!")
 
-        # 3. Extract global descriptor with NetVLAD
-        logger.debug("Extracting global descriptor with NetVLAD...")
-        nv_input = {'image': rgb_tensor}
-        nv_out = self.netvlad(nv_input)
+        # 5. Витягування ГЛОБАЛЬНОГО дескриптора з DINOv2
+        logger.debug("Extracting global descriptor with DINOv2...")
+        dino_input = self.dinov2_transform(rgb_tensor)
 
-        # NetVLAD returns dict with 'global_descriptor'
-        if isinstance(nv_out, dict):
-            global_desc = nv_out['global_descriptor'][0].cpu().numpy()
-        else:
-            # If it returns tensor directly
-            global_desc = nv_out[0].cpu().numpy()
+        # DINOv2 повертає тензор форми (1, 384). Беремо нульовий індекс.
+        global_desc = self.global_model(dino_input)[0].cpu().numpy()
 
-        logger.debug(f"NetVLAD descriptor shape: {global_desc.shape}")
-
-        logger.success(f"Feature extraction complete: {len(keypoints)} keypoints, global desc dim {len(global_desc)}")
+        logger.success(f"Extracted {len(keypoints)} keypoints, global desc dim {len(global_desc)}")
 
         return {
             'keypoints': keypoints,
             'descriptors': descriptors,
             'global_desc': global_desc,
-            'coords_2d': keypoints.copy()  # Додано для сумісності з database_builder
+            'coords_2d': keypoints.copy()
         }
