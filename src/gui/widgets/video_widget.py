@@ -2,76 +2,88 @@
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPen, QColor, QBrush, QPainter
 
-from src.utils.logging_utils import get_logger  # ВИПРАВЛЕНО: було 'from utils...'
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class VideoWidget(QGraphicsView):
-    """Віджет для відображення відео з накладеннями"""
+    """Displays video frames with optional overlay annotations (calibration points)."""
 
-    frame_clicked = pyqtSignal(int, int)
+    frame_clicked = pyqtSignal(int, int)   # pixel coords in image space
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.scene = QGraphicsScene(self)
-        self.setScene(self.scene)
-        self.logger = get_logger('VideoWidget')
+
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
 
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setBackgroundBrush(QBrush(QColor(0, 0, 0)))
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        self.video_item = QGraphicsPixmapItem()
-        self.scene.addItem(self.video_item)
+        self._video_item    = QGraphicsPixmapItem()
+        self._overlay_items: list = []
+        self._scene.addItem(self._video_item)
 
-        self.overlay_items = []
+    # ── Display ──────────────────────────────────────────────────────────────
 
     def display_frame(self, pixmap: QPixmap):
-        self.video_item.setPixmap(pixmap)
-        self.scene.setSceneRect(self.video_item.boundingRect())
-        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._video_item.setPixmap(pixmap)
+        self._scene.setSceneRect(self._video_item.boundingRect())
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        logger.debug(f"Frame: {pixmap.width()}×{pixmap.height()}")
 
-    def draw_numbered_point(self, x: int, y: int, text: str, color: QColor):
-        """Малює велику точку з номером поруч"""
-        pen = QPen(color)
-        pen.setWidth(2)
-        brush = QBrush(color)
+    # ── Overlays ─────────────────────────────────────────────────────────────
+
+    def draw_numbered_point(self, x: int, y: int, label: str, color: QColor):
+        """Draw a filled circle with a label at (x, y) in image pixel coordinates."""
+        pen    = QPen(color, 2)
+        brush  = QBrush(color)
         radius = 8
 
-        ellipse_item = self.scene.addEllipse(x - radius, y - radius, radius * 2, radius * 2, pen, brush)
-        self.overlay_items.append(ellipse_item)
+        ellipse = self._scene.addEllipse(
+            x - radius, y - radius, radius * 2, radius * 2, pen, brush
+        )
+        self._overlay_items.append(ellipse)
 
-        text_item = self.scene.addText(text)
-        text_item.setDefaultTextColor(QColor(255, 255, 255))
+        text = self._scene.addText(label)
+        text.setDefaultTextColor(QColor(255, 255, 255))
 
-        font = text_item.font()
+        font = text.font()
         font.setBold(True)
-        font.setPointSize(16)
-        text_item.setFont(font)
+        # Scale text relative to image width, not screen pt — stays readable at any zoom
+        img_width = self._video_item.pixmap().width()
+        font.setPixelSize(max(12, img_width // 80))
+        text.setFont(font)
+        text.setPos(x + radius + 2, y - radius - font.pixelSize())
 
-        text_item.setPos(x + radius + 2, y - radius - 20)
-        self.overlay_items.append(text_item)
+        self._overlay_items.append(text)
 
     def clear_overlays(self):
-        for item in self.overlay_items:
-            self.scene.removeItem(item)
-        self.overlay_items.clear()
+        for item in self._overlay_items:
+            self._scene.removeItem(item)
+            item.setParentItem(None)   # break Qt ownership before Python GC
+        self._overlay_items.clear()
+
+    # ── Events ───────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
-        if self.video_item.pixmap().isNull():
+        if self._video_item.pixmap().isNull():
             super().mousePressEvent(event)
             return
 
-        scene_pos = self.mapToScene(event.pos())
-        x = int(scene_pos.x())
-        y = int(scene_pos.y())
-
-        if 0 <= x <= self.video_item.pixmap().width() and 0 <= y <= self.video_item.pixmap().height():
-            self.frame_clicked.emit(x, y)
+        # Map viewport → scene → item (image) coordinates
+        item_pos = self._video_item.mapFromScene(
+            self.mapToScene(event.pos())
+        )
+        if self._video_item.contains(item_pos):
+            self.frame_clicked.emit(int(item_pos.x()), int(item_pos.y()))
 
         super().mousePressEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if not self.video_item.pixmap().isNull():
-            self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if not self._video_item.pixmap().isNull():
+            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
