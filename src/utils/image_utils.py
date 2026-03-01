@@ -3,50 +3,62 @@ import numpy as np
 from PyQt6.QtGui import QImage, QPixmap
 
 
-def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
-    """Перетворення зображення OpenCV (BGR) у QPixmap (RGB) для PyQt6"""
-    if cv_image is None or cv_image.size == 0:
+def rgb_to_qpixmap(rgb_image: np.ndarray) -> QPixmap:
+    """Convert RGB numpy array (project-internal format) to QPixmap.
+
+    Args:
+        rgb_image: HxWx3 uint8 array in RGB order (as used throughout the project).
+    """
+    if rgb_image is None or rgb_image.size == 0:
         return QPixmap()
 
-    if len(cv_image.shape) == 3:
-        height, width, channel = cv_image.shape
-        bytes_per_line = 3 * width
-        cv_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-
-        # ВИПРАВЛЕНО: використовуємо .copy() щоб гарантувати неперервність
-        # буфера в пам'яті та захистити від його знищення GC раніше QPixmap.
-        # Без copy() буфер numpy може стати недійсним до відображення → segfault.
-        cv_rgb = np.ascontiguousarray(cv_rgb)
-        q_img = QImage(cv_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
-
-        # Копіюємо в QPixmap одразу, поки cv_rgb ще існує в цьому scope
+    if rgb_image.ndim == 3:
+        height, width, channels = rgb_image.shape
+        img = np.ascontiguousarray(rgb_image)
+        bytes_per_line = channels * width
+        fmt = QImage.Format.Format_RGB888
+        q_img = QImage(img.data, width, height, bytes_per_line, fmt)
         return QPixmap.fromImage(q_img.copy())
 
-    elif len(cv_image.shape) == 2:
-        height, width = cv_image.shape
-        bytes_per_line = width
-
-        gray = np.ascontiguousarray(cv_image)
-        q_img = QImage(gray.data, width, height, bytes_per_line, QImage.Format.Format_Grayscale8)
-
+    if rgb_image.ndim == 2:
+        height, width = rgb_image.shape
+        img = np.ascontiguousarray(rgb_image)
+        q_img = QImage(img.data, width, height, width, QImage.Format.Format_Grayscale8)
         return QPixmap.fromImage(q_img.copy())
 
     return QPixmap()
 
 
-def qpixmap_to_opencv(pixmap: QPixmap) -> np.ndarray:
-    """Перетворення QPixmap (RGB) у масив OpenCV (BGR)"""
-    q_img = pixmap.toImage()
-    q_img = q_img.convertToFormat(QImage.Format.Format_RGB888)
+def bgr_to_qpixmap(bgr_image: np.ndarray) -> QPixmap:
+    """Convert BGR numpy array (cv2.VideoCapture/imread output) to QPixmap."""
+    if bgr_image is None or bgr_image.size == 0:
+        return QPixmap()
+    if bgr_image.ndim == 3:
+        return rgb_to_qpixmap(cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB))
+    return rgb_to_qpixmap(bgr_image)
 
-    width = q_img.width()
-    height = q_img.height()
+
+# Backward-compatible alias — callers that passed BGR can keep using this
+opencv_to_qpixmap = bgr_to_qpixmap
+
+
+def qpixmap_to_opencv(pixmap: QPixmap) -> np.ndarray:
+    """Convert QPixmap to BGR numpy array (OpenCV format).
+
+    Returns an empty array if pixmap is null.
+    """
+    if pixmap is None or pixmap.isNull():
+        return np.zeros((0, 0, 3), dtype=np.uint8)
+
+    q_img = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+    width, height = q_img.width(), q_img.height()
 
     ptr = q_img.bits()
-    ptr.setsize(height * width * 3)
+    # bytesPerLine accounts for stride/alignment padding (avoids reshape error on odd widths)
+    bytes_per_line = q_img.bytesPerLine()
+    ptr.setsize(height * bytes_per_line)
 
-    # ВИПРАВЛЕНО: робимо copy() щоб масив numpy не залежав від буфера
-    # QImage, який може бути знищений після виходу з функції
-    arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 3)).copy()
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, bytes_per_line))
+    arr = arr[:, :width * 3].reshape((height, width, 3)).copy()
 
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)

@@ -1,6 +1,6 @@
-﻿import torch
+﻿import cv2
 import numpy as np
-import cv2
+import torch
 import torchvision.transforms as T
 from src.utils.logging_utils import get_logger
 from src.utils.image_preprocessor import ImagePreprocessor
@@ -9,74 +9,101 @@ logger = get_logger(__name__)
 
 
 class FeatureExtractor:
-    """Combined feature extraction (SuperPoint + DINOv2)"""
+    """Combined local (XFeat) + global (DINOv2) feature extraction."""
 
-    def __init__(self, superpoint_model, global_model, device='cuda', config=None):
+    def __init__(self, superpoint_model, global_model, device: str = 'cuda', config=None):
         self.superpoint = superpoint_model
         self.global_model = global_model
         self.device = device
         self.preprocessor = ImagePreprocessor(config)
 
-        # Трансформації для DINOv2 (ImageNet стандарти та розмір 224x224)
+        # Трансформації для DINOv2 (чудово працюють прямо на GPU)
         self.dinov2_transform = T.Compose([
             T.Resize((224, 224), antialias=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-
         logger.info(f"FeatureExtractor initialized on device: {device}")
 
     @torch.no_grad()
-    def extract_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
+    def extract_features(
+            self,
+            image: np.ndarray,
+            static_mask: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
         logger.debug(f"Extracting features from image: {image.shape}")
 
-        enhanced_image = self.preprocessor.preprocess(image)
+        enhanced = self.preprocessor.preprocess(image)
 
-        # 1. Підготовка для SuperPoint (ЧБ)
-        gray_image = cv2.cvtColor(enhanced_image, cv2.COLOR_RGB2GRAY)
-        gray_tensor = torch.from_numpy(gray_image).float() / 255.0
-        gray_tensor = gray_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
+        # Нормалізація до [0, 1]
+        img_f = enhanced.astype(np.float32)
+        if img_f.max() > 1.0:
+            img_f /= 255.0
 
-        # 2. Підготовка для DINOv2 (Колір, RGB тензор)
-        rgb_tensor = torch.from_numpy(enhanced_image).float() / 255.0
-        rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device)
+        # 1. Локальні ознаки через XFeat (RGB)
+        rgb_tensor = torch.from_numpy(img_f).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        sp_out = self.superpoint({'image': rgb_tensor})
 
-        # 3. Витягування локальних ознак SuperPoint
-        sp_input = {'image': gray_tensor}
-        sp_out = self.superpoint(sp_input)
+        keypoints = sp_out['keypoints'][0].cpu().numpy()  # (N, 2)
+        descriptors = sp_out['descriptors'][0].cpu().numpy()  # (N, D)
 
-        keypoints = sp_out['keypoints'][0].cpu().numpy()
-        descriptors = sp_out['descriptors'][0].cpu().numpy()
+        # ВИДАЛЕНО небезпечну логіку транспонування, XFeatAdapter вже гарантує (N, D)
 
-        if descriptors.ndim == 2 and descriptors.shape[0] == 256:
-            descriptors = descriptors.T
-
-        # 4. Фільтрація точок за маскою (якщо є)
+        # 2. Фільтрація точок за статичною маскою
         if static_mask is not None and len(keypoints) > 0:
-            valid_indices = []
-            for i, (x, y) in enumerate(keypoints):
-                ix, iy = int(round(x)), int(round(y))
-                if 0 <= iy < static_mask.shape[0] and 0 <= ix < static_mask.shape[1]:
-                    if static_mask[iy, ix] > 128:
-                        valid_indices.append(i)
-
-            if len(valid_indices) > 0:
-                keypoints = keypoints[valid_indices]
-                descriptors = descriptors[valid_indices]
+            coords = np.round(keypoints).astype(int)
+            cx = np.clip(coords[:, 0], 0, static_mask.shape[1] - 1)
+            cy = np.clip(coords[:, 1], 0, static_mask.shape[0] - 1)
+            valid = static_mask[cy, cx] > 128
+            if valid.any():
+                keypoints = keypoints[valid]
+                descriptors = descriptors[valid]
             else:
-                logger.warning("All keypoints filtered out by mask!")
+                logger.warning("All keypoints filtered out by static mask!")
 
-        # 5. Витягування ГЛОБАЛЬНОГО дескриптора з DINOv2
-        logger.debug("Extracting global descriptor with DINOv2...")
+        # 3. Глобальний дескриптор через DINOv2 (трансформація виконується прямо на GPU)
         dino_input = self.dinov2_transform(rgb_tensor)
+        global_desc = self.global_model(dino_input)[0].cpu().numpy()  # (D,)
 
-        # DINOv2 повертає тензор форми (1, 384). Беремо нульовий індекс.
-        global_desc = self.global_model(dino_input)[0].cpu().numpy()
-
-        logger.success(f"Extracted {len(keypoints)} keypoints, global desc dim {len(global_desc)}")
+        logger.success(f"Extracted {len(keypoints)} keypoints, global desc dim: {len(global_desc)}")
 
         return {
             'keypoints': keypoints,
             'descriptors': descriptors,
             'global_desc': global_desc,
-            'coords_2d': keypoints.copy()
+        }
+
+    @torch.no_grad()
+    def extract_local_features(
+            self,
+            image: np.ndarray,
+            static_mask: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Швидке витягування ТІЛЬКИ локальних точок XFeat (для перебору поворотів)"""
+        enhanced = self.preprocessor.preprocess(image)
+
+        img_f = enhanced.astype(np.float32)
+        if img_f.max() > 1.0:
+            img_f /= 255.0
+
+        # Тільки локальні ознаки через XFeat
+        rgb_tensor = torch.from_numpy(img_f).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        sp_out = self.superpoint({'image': rgb_tensor})
+
+        keypoints = sp_out['keypoints'][0].cpu().numpy()  # (N, 2)
+        descriptors = sp_out['descriptors'][0].cpu().numpy()  # (N, 64)
+
+        # Фільтрація за маскою
+        if static_mask is not None and len(keypoints) > 0:
+            coords = np.round(keypoints).astype(int)
+            cx = np.clip(coords[:, 0], 0, static_mask.shape[1] - 1)
+            cy = np.clip(coords[:, 1], 0, static_mask.shape[0] - 1)
+            valid = static_mask[cy, cx] > 128
+            if valid.any():
+                keypoints = keypoints[valid]
+                descriptors = descriptors[valid]
+
+        return {
+            'keypoints': keypoints,
+            'descriptors': descriptors,
+            # Не повертаємо global_desc, щоб зекономити час
         }

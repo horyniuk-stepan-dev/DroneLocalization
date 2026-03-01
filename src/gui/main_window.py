@@ -621,33 +621,6 @@ class MainWindow(QMainWindow):
         self.pano_worker.error.connect(on_error)
         self.pano_worker.start()
 
-    @pyqtSlot()
-    def on_show_panorama(self):
-        if not self.localizer:
-            QMessageBox.warning(self, "Помилка", "Спочатку завантажте базу даних!")
-            return
-
-        file_name, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть зображення панорами", "", "Images (*.jpg *.png *.jpeg)"
-        )
-        if not file_name:
-            return
-
-        self.status_bar.showMessage("Розпізнавання панорами у фоновому режимі...")
-
-        # Запускаємо процес у фоновому потоці замість блокування інтерфейсу
-        self.panorama_overlay_worker = PanoramaOverlayWorker(file_name, self.localizer)
-        self.panorama_overlay_worker.success.connect(self.on_panorama_overlay_success)
-        self.panorama_overlay_worker.error.connect(self.on_worker_error)
-        self.panorama_overlay_worker.start()
-
-    @pyqtSlot(str, float, float, float, float, float, float, float, float)
-    def on_panorama_overlay_success(self, data_url, lat_tl, lon_tl, lat_tr, lon_tr, lat_br, lon_br, lat_bl, lon_bl):
-        self.map_widget.set_panorama_overlay(
-            data_url, lat_tl, lon_tl, lat_tr, lon_tr, lat_br, lon_br, lat_bl, lon_bl
-        )
-        self.status_bar.showMessage("Панорама успішно розпізнана і накладена на карту!")
-
 
     @pyqtSlot()
     def on_show_panorama(self):

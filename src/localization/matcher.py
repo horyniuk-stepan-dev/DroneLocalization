@@ -39,7 +39,7 @@ class FastRetrieval:
 
 
 class FeatureMatcher:
-    """Precise keypoint matching using LightGlue"""
+    """Precise keypoint matching using LightGlue or PyTorch Fast-NN"""
 
     def __init__(self, lightglue_model, device='cuda'):
         self.lightglue = lightglue_model
@@ -48,7 +48,7 @@ class FeatureMatcher:
 
     @torch.no_grad()
     def match(self, query_features: dict, ref_features: dict) -> tuple:
-        logger.debug("Starting feature matching with LightGlue...")
+        logger.debug("Starting feature matching...")
 
         # --- ЗАХИСТ ВІД БАГУ З ФОРМОЮ МАТРИЦЬ ---
         # Якщо в базі HDF5 або з FeatureExtractor прийшла матриця (256, N) замість (N, 256)
@@ -60,6 +60,17 @@ class FeatureMatcher:
                 ref_features['descriptors'].shape[1] != 256:
             ref_features['descriptors'] = ref_features['descriptors'].T
         # ----------------------------------------
+
+        # РОЗУМНИЙ ПЕРЕМИКАЧ:
+        # Якщо це нові ультра-компактні дескриптори XFeat (64 виміри),
+        # ми минаємо LightGlue і використовуємо блискавичний GPU-матчер.
+        if query_features['descriptors'].shape[-1] == 64:
+            return self._fast_gpu_nn_match(query_features, ref_features)
+
+        # =========================================================
+        # СТАРИЙ ШЛЯХ ДЛЯ SUPERPOINT + LIGHTGLUE (256 вимірів)
+        # =========================================================
+        logger.debug("Using LightGlue for 256D descriptors...")
 
         # Prepare query features
         kpts_q = torch.from_numpy(query_features['keypoints']).float().unsqueeze(0).to(self.device)
@@ -127,9 +138,40 @@ class FeatureMatcher:
             logger.warning("Falling back to simple L2 distance matching")
             return self._fallback_match(query_features, ref_features)
 
+    def _fast_gpu_nn_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.82) -> tuple:
+        """Блискавичний пошук найближчих сусідів на відеокарті для XFeat"""
+        logger.debug("Using fast GPU PyTorch matcher for 64D descriptors...")
 
+        if len(query_features['keypoints']) < 2 or len(ref_features['keypoints']) < 2:
+            return np.array([]), np.array([])
 
+        # Завантажуємо дескриптори прямо у відеопам'ять
+        desc_q = torch.from_numpy(query_features['descriptors']).float().to(self.device)
+        desc_r = torch.from_numpy(ref_features['descriptors']).float().to(self.device)
 
+        # Нормалізуємо для покращення точності пошуку (L2)
+        desc_q = torch.nn.functional.normalize(desc_q, p=2, dim=1)
+        desc_r = torch.nn.functional.normalize(desc_r, p=2, dim=1)
+
+        # Магічна функція cdist: миттєво розраховує всі можливі відстані між тисячами точок
+        dists = torch.cdist(desc_q, desc_r)
+
+        # Знаходимо 2 найближчих точки для розрахунку порогу Lowe (Ratio Test)
+        min_dists, indices = torch.topk(dists, k=2, dim=1, largest=False)
+
+        # Lowe's ratio test (фільтруємо погані і неоднозначні точки)
+        ratio = min_dists[:, 0] / (min_dists[:, 1] + 1e-8)
+        valid = ratio < ratio_threshold
+
+        query_indices = torch.where(valid)[0].cpu().numpy()
+        ref_indices = indices[valid, 0].cpu().numpy()
+
+        mkpts_query = query_features['keypoints'][query_indices]
+        mkpts_ref = ref_features['keypoints'][ref_indices]
+
+        logger.debug(f"Fast GPU matcher found {len(mkpts_query)} matches")
+
+        return mkpts_query, mkpts_ref
 
     def _fallback_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.8) -> tuple:
         """Fallback matching using descriptor L2 distance and Lowe's ratio test"""

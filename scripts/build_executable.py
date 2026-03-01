@@ -1,88 +1,72 @@
-﻿#!/usr/bin/env python3
-"""
-Build executable using PyInstaller
-"""
-
-import subprocess
-import sys
+﻿import PyInstaller.__main__
+import os
 from pathlib import Path
 
 
-def build_executable():
-    """Build executable with PyInstaller"""
-    
-    spec_file = """
-# -*- mode: python ; coding: utf-8 -*-
+def build_app():
+    # Визначаємо кореневу директорію проєкту (на одну папку вище за scripts)
+    root_dir = Path(__file__).parent.parent.absolute()
+    main_script = str(root_dir / "main.py")
 
-block_cipher = None
+    # Створюємо абсолютний шлях до папки з ресурсами
+    resources_dir = str(root_dir / "src" / "gui" / "resources")
 
-a = Analysis(
-    ['../main.py'],
-    pathex=[],
-    binaries=[],
-    datas=[
-        ('../data/models', 'data/models'),
-        ('../config', 'config'),
-        ('../src/gui/resources', 'src/gui/resources'),
-    ],
-    hiddenimports=[
-        'PyQt6',
-        'torch',
-        'ultralytics',
-        'filterpy',
-    ],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
-    noarchive=False,
-)
+    print(f"Починаємо збірку проєкту з кореня: {root_dir}")
+    print("Це може зайняти кілька хвилин через великий розмір PyTorch...")
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+    # Переходимо в корінь
+    os.chdir(root_dir)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name='DroneLocalizer',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+    args = [
+        main_script,
+        '--name=DroneLocalization',
+        '--noconfirm',
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='DroneLocalizer'
-)
-"""
-    
-    # Write spec file
-    spec_path = Path("DroneLocalizer.spec")
-    spec_path.write_text(spec_file)
-    
-    print("Building executable...")
-    # TODO: Run PyInstaller
-    # subprocess.run([sys.executable, "-m", "PyInstaller", str(spec_path)])
-    
-    print("Build complete! Check dist/ folder")
+        # Режим папки (швидкий запуск, ідеально для AI додатків)
+        '--onedir',
+
+        # Вимикаємо консоль (змініть на --console для дебагу)
+        '--windowed',
+
+        # Абсолютний шлях до джерела ресурсів
+        f'--add-data={resources_dir};src/gui/resources',
+
+        # Примусово вказуємо PyInstaller запакувати ці бібліотеки
+        '--hidden-import=PyQt6.QtWebEngineWidgets',
+        '--hidden-import=PyQt6.QtWebEngineCore',
+        '--hidden-import=torch',
+        '--hidden-import=torchvision',
+        '--hidden-import=ultralytics',
+        '--hidden-import=lightglue',
+        '--hidden-import=h5py',
+        '--hidden-import=cv2',
+        '--hidden-import=filterpy',
+        '--hidden-import=pyproj',
+
+        # --- ФІКС ПОМИЛКИ JARACO ---
+        '--hidden-import=pkg_resources',
+        '--hidden-import=jaraco.text',
+        '--hidden-import=jaraco.functools',
+        '--hidden-import=jaraco.context',
+        '--hidden-import=pkg_resources._vendor.jaraco.text',
+        '--hidden-import=pkg_resources._vendor.jaraco.functools',
+        '--hidden-import=pkg_resources._vendor.jaraco.context',
+        # ---------------------------
+
+        # Очищуємо кеш попередніх збірок
+        '--clean',
+
+        # Явно вказуємо, куди класти готові файли (в корінь проєкту)
+        f'--distpath={str(root_dir / "dist")}',
+        f'--workpath={str(root_dir / "build")}'
+    ]
+
+    # Запускаємо процес збірки
+    PyInstaller.__main__.run(args)
+    print("========================================")
+    print("✅ Збірка успішно завершена!")
+    print(f"📂 Шукайте готову програму у папці: {root_dir / 'dist' / 'DroneLocalization'}")
 
 
 if __name__ == "__main__":
-    build_executable()
+    build_app()

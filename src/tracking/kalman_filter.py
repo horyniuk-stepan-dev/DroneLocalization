@@ -1,113 +1,97 @@
 ﻿import numpy as np
 from filterpy.kalman import KalmanFilter
-
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
 class TrajectoryFilter:
-    """Kalman filter for GPS trajectory smoothing"""
+    """
+    Kalman filter for GPS/metric trajectory smoothing.
+    State: [x, y, vx, vy] — constant velocity kinematic model.
+    """
 
-    def __init__(self, process_noise=0.1, measurement_noise=10.0, dt=1.0):
-        # Filter state: [x, y, vx, vy]
+    def __init__(self, process_noise: float = 0.1, measurement_noise: float = 10.0):
+        self.process_noise = process_noise
+        self.measurement_noise = measurement_noise
+        self.is_initialized = False
+
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
-        self.process_noise = process_noise  # зберігаємо для _update_matrices_for_dt
+        self.kf.P *= 1000.0  # high initial uncertainty
 
-        logger.info("Initializing Kalman filter for trajectory smoothing")
-        logger.info(f"Parameters: process_noise={process_noise}, measurement_noise={measurement_noise}, dt={dt}")
-
-        # Initial state covariance (high uncertainty at start)
-        self.kf.P *= 1000.0
-
-        # State transition matrix (constant velocity kinematic model)
-        self.kf.F = np.array([
-            [1.0, 0.0, dt, 0.0],
-            [0.0, 1.0, 0.0, dt],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0]
-        ])
-
-        # Measurement matrix (we only measure x and y)
+        # Measurement matrix: observe x and y only
         self.kf.H = np.array([
             [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0]
+            [0.0, 1.0, 0.0, 0.0],
         ])
-
-        # Process noise covariance (unpredictable drone maneuvers)
-        self.kf.Q = np.array([
-            [dt ** 4 / 4, 0, dt ** 3 / 2, 0],
-            [0, dt ** 4 / 4, 0, dt ** 3 / 2],
-            [dt ** 3 / 2, 0, dt ** 2, 0],
-            [0, dt ** 3 / 2, 0, dt ** 2]
-        ]) * process_noise
-
-        # Measurement noise covariance (neural network localization error)
         self.kf.R = np.eye(2) * measurement_noise
 
-        self.is_initialized = False
-        logger.success("Kalman filter initialized successfully")
+        # Initialize F and Q via shared method (single source of truth)
+        self._update_matrices_for_dt(1.0)
 
-    def _update_matrices_for_dt(self, dt: float):
-        """Оновлює матриці F та Q під реальний dt між кадрами"""
+        logger.info(
+            f"Kalman filter ready | "
+            f"process_noise={process_noise}, measurement_noise={measurement_noise}"
+        )
+
+    def _update_matrices_for_dt(self, dt: float) -> None:
+        """Recompute F and Q for given time step (Wiener process model)."""
+        pn = self.process_noise
         self.kf.F = np.array([
             [1.0, 0.0,  dt, 0.0],
             [0.0, 1.0, 0.0,  dt],
             [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0]
+            [0.0, 0.0, 0.0, 1.0],
         ])
-        pn = self.process_noise
         self.kf.Q = np.array([
             [dt**4/4,       0, dt**3/2,       0],
             [      0, dt**4/4,       0, dt**3/2],
             [dt**3/2,       0,   dt**2,       0],
-            [      0, dt**3/2,       0,   dt**2]
+            [      0, dt**3/2,       0,   dt**2],
         ]) * pn
 
-    def update(self, measurement: tuple) -> tuple:
-        """Update filter state with new coordinates (x, y). Використовує dt=1.0."""
+    def update(self, measurement) -> tuple[float, float]:
+        """Update with new (x, y) measurement using default dt=1.0."""
         return self.update_with_dt(measurement, dt=1.0)
 
-    def update_with_dt(self, measurement: tuple, dt: float) -> tuple:
+    def update_with_dt(self, measurement, dt: float) -> tuple[float, float]:
         """
-        Update filter з реальним часовим кроком dt (секунди).
-        Перераховує матриці F та Q під кожен конкретний dt,
-        що усуває похибку при нерівномірній частоті кадрів.
+        Update filter with real inter-frame time dt (seconds).
+        On first call: initializes state without filtering.
         """
-        z = np.array([[measurement[0]], [measurement[1]]])
-
         if not self.is_initialized:
-            self.kf.x = np.array([[measurement[0]], [measurement[1]], [0.0], [0.0]])
+            self.kf.x = np.array([[float(measurement[0])],
+                                   [float(measurement[1])],
+                                   [0.0], [0.0]])
             self.is_initialized = True
-            logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
-            return measurement
+            logger.info(f"Kalman initialized at ({measurement[0]:.2f}, {measurement[1]:.2f})")
+            return float(measurement[0]), float(measurement[1])
 
-        # Клампуємо dt: захист від зависань і занадто малих значень
         dt = max(0.01, min(dt, 5.0))
-
         self._update_matrices_for_dt(dt)
 
-        logger.debug(f"Kalman update dt={dt:.3f}s: ({measurement[0]:.2f}, {measurement[1]:.2f})")
-
+        z = np.array([[float(measurement[0])], [float(measurement[1])]])
         self.kf.predict()
         self.kf.update(z)
 
-        filtered_x = float(self.kf.x[0, 0])
-        filtered_y = float(self.kf.x[1, 0])
+        fx, fy = float(self.kf.x[0, 0]), float(self.kf.x[1, 0])
+        logger.debug(f"Kalman update dt={dt:.3f}s → ({fx:.2f}, {fy:.2f})")
+        return fx, fy
 
-        logger.debug(f"Filtered position: ({filtered_x:.2f}, {filtered_y:.2f})")
-
-        return filtered_x, filtered_y
-
-    def get_velocity(self) -> tuple:
-        """Get current drone velocity estimate"""
+    def get_velocity(self) -> tuple[float, float, float]:
+        """Return (vx, vy, speed) in metric units. Returns zeros if not initialized."""
         if not self.is_initialized:
-            return 0.0, 0.0
-
+            return 0.0, 0.0, 0.0
         vx = float(self.kf.x[2, 0])
         vy = float(self.kf.x[3, 0])
-        speed = np.sqrt(vx ** 2 + vy ** 2)
+        speed = float(np.hypot(vx, vy))
+        logger.debug(f"Velocity: vx={vx:.2f}, vy={vy:.2f}, speed={speed:.2f} m/s")
+        return vx, vy, speed
 
-        logger.debug(f"Current velocity: vx={vx:.2f}, vy={vy:.2f}, speed={speed:.2f} m/s")
-
-        return vx, vy
+    def reset(self) -> None:
+        """Reset filter state — call before starting a new tracking session."""
+        self.is_initialized = False
+        self.kf.x = np.zeros((4, 1))
+        self.kf.P = np.eye(4) * 1000.0
+        self._update_matrices_for_dt(1.0)
+        logger.info("Kalman filter reset")

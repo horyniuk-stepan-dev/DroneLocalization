@@ -7,22 +7,24 @@ def setup_logging(log_level="INFO", log_file="logs/app.log"):
     """Налаштування системи логування для всієї програми"""
     logger.remove()
 
-    logger.add(
-        sys.stdout,
-        level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-    )
-
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 1. ЗАХИСТ ВІД NONETYPE: Виводимо в консоль, ТІЛЬКИ якщо вона фізично існує
+    if sys.stderr is not None:
+        logger.add(
+            sys.stderr,
+            format="{time:YYYY-MM-DD HH:mm:ss} | <level>{level: <8}</level> | {name}:{function}:{line} - <level>{message}</level>",
+            level="INFO"
+        )
+
+    # 2. ЗАВЖДИ пишемо логи у файл (дуже корисно для відлагодження готового .exe)
     logger.add(
-        str(log_path),
-        level=log_level,
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+        "logs/app_run.log",
         rotation="10 MB",
-        retention="7 days",
-        compression="zip"
+        retention="1 week",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
     )
 
 
