@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 
 
 class DatabaseBuilder:
-    """Builds HDF5 topometric database from reference video"""
+    """Builds HDF5 topometric database from reference video using XFeat & DINOv2"""
 
     def __init__(self, output_path, config=None):
         self.output_path = output_path
@@ -22,7 +22,7 @@ class DatabaseBuilder:
         self.db_file = None
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
-        logger.info(f"NetVLAD descriptor dimension: {self.descriptor_dim}")
+        logger.info(f"DINOv2 descriptor dimension: {self.descriptor_dim}")
 
     def build_from_video(self, video_path: str, model_manager, progress_callback=None,
                          save_keypoint_video: bool = True):
@@ -32,7 +32,7 @@ class DatabaseBuilder:
         Args:
             save_keypoint_video: якщо True — поруч з HDF5 збережеться відео
                                   *_keypoints.mp4 де на кожному кадрі намальовані
-                                  точки SuperPoint (зелені) і маска YOLO (червона зона).
+                                  точки XFeat (зелені) і маска YOLO (червона зона).
                                   Це допомагає визначити найкращі кадри для GPS калібрування.
         """
         logger.info(f"Starting database build from video: {video_path}")
@@ -75,9 +75,10 @@ class DatabaseBuilder:
         yolo_model = model_manager.load_yolo()
         yolo_wrapper = YOLOWrapper(yolo_model, model_manager.device)
 
-        sp_model = model_manager.load_superpoint()
+        # ОНОВЛЕНО: Використовуємо XFeat замість SuperPoint
+        local_model = model_manager.load_xfeat()
         nv_model = model_manager.load_dinov2()
-        feature_extractor = FeatureExtractor(sp_model, nv_model, model_manager.device,config = self.config)
+        feature_extractor = FeatureExtractor(local_model, nv_model, model_manager.device, config=self.config)
         logger.success("All models loaded successfully")
 
         # Create empty database structure
@@ -140,7 +141,6 @@ class DatabaseBuilder:
                 # Step 5: Save data to HDF5
                 self.save_frame_data(i, features, current_pose)
 
-                # ВИПРАВЛЕНО: progress_percent тепер завжди визначена в цьому блоці
                 progress_percent = int((i + 1) / num_frames * 100)
 
                 if progress_callback:
@@ -171,7 +171,7 @@ class DatabaseBuilder:
         """
         Малює на кадрі:
           - Червона напівпрозора зона: пікселі відфільтровані YOLO (рухомі об'єкти)
-          - Зелені кола: SuperPoint keypoints на статичних зонах
+          - Зелені кола: XFeat keypoints на статичних зонах
           - Лічильник кадру та кількості точок у верхньому лівому куті
 
         Повертає BGR зображення для запису у VideoWriter.
@@ -186,7 +186,7 @@ class DatabaseBuilder:
                 overlay[dynamic_zone] = (0, 0, 200)  # BGR червоний
                 cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
 
-        # 2. Зелені точки: keypoints SuperPoint
+        # 2. Зелені точки: keypoints XFeat
         for x, y in keypoints:
             cx, cy = int(round(x)), int(round(y))
             cv2.circle(vis, (cx, cy), radius=3, color=(0, 255, 0), thickness=-1)
@@ -213,7 +213,7 @@ class DatabaseBuilder:
         # 4. Легенда внизу
         legend_y = vis.shape[0] - 10
         cv2.circle(vis, (12, legend_y - 4), 5, (0, 255, 0), -1)
-        cv2.putText(vis, "SuperPoint keypoint", (22, legend_y),
+        cv2.putText(vis, "XFeat keypoint", (22, legend_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
         cv2.rectangle(vis, (200, legend_y - 10), (218, legend_y + 2), (0, 0, 200), -1)
         cv2.putText(vis, "YOLO dynamic zone", (224, legend_y),
@@ -226,11 +226,11 @@ class DatabaseBuilder:
                                 ransac_thresh: float = 3.0) -> np.ndarray | None:
         """
         Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
-        Використовує brute-force L2 матчинг дескрипторів SuperPoint
+        Використовує brute-force L2 матчинг дескрипторів XFeat
         без LightGlue (щоб не тримати матчер у пам'яті під час побудови БД).
         """
-        desc_a = fa['descriptors']  # (N, 256)
-        desc_b = fb['descriptors']  # (M, 256)
+        desc_a = fa['descriptors']  # Тепер це (N, 64) для XFeat
+        desc_b = fb['descriptors']  # Тепер це (M, 64) для XFeat
         kpts_a = fa['keypoints']
         kpts_b = fb['keypoints']
 

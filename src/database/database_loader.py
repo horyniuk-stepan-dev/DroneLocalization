@@ -7,7 +7,7 @@ logger = get_logger(__name__)
 
 
 class DatabaseLoader:
-    """Loads and manages access to the HDF5 topometric database"""
+    """Loads and manages access to the HDF5 topometric database (XFeat + DINOv2)"""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -26,7 +26,7 @@ class DatabaseLoader:
         self._load_hot_data()
 
     def _load_hot_data(self):
-        """Load global descriptors, poses and propagation data into RAM"""
+        """Load global descriptors (DINOv2), poses and propagation data into RAM"""
         logger.info("Loading hot data into RAM...")
 
         try:
@@ -102,6 +102,7 @@ class DatabaseLoader:
         return None
 
     def get_local_features(self, frame_id: int) -> dict:
+        """Повертає локальні ознаки XFeat для вказаного кадру"""
         group_name = f'local_features/frame_{frame_id}'
         if group_name not in self.db_file:
             raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")

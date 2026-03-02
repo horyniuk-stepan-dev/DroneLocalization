@@ -1,5 +1,6 @@
 ﻿import numpy as np
 from filterpy.kalman import KalmanFilter
+from filterpy.common import Q_discrete_white_noise
 
 from src.utils.logging_utils import get_logger
 
@@ -7,20 +8,22 @@ logger = get_logger(__name__)
 
 
 class TrajectoryFilter:
-    """Kalman filter for GPS trajectory smoothing"""
+    """Kalman filter for GPS trajectory smoothing optimized for high speeds"""
 
-    def __init__(self, process_noise=0.1, measurement_noise=10.0, dt=1.0):
+    def __init__(self, process_noise=2.0, measurement_noise=5.0, dt=1.0):
         # Filter state: [x, y, vx, vy]
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
-        self.process_noise = process_noise  # зберігаємо для _update_matrices_for_dt
 
-        logger.info("Initializing Kalman filter for trajectory smoothing")
+        # Збільшений шум процесу та зменшений шум вимірювання
+        # дозволяють фільтру швидше реагувати на зміни курсу на високих швидкостях
+        self.process_noise = process_noise
+        self.is_initialized = False
+
+        logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(f"Parameters: process_noise={process_noise}, measurement_noise={measurement_noise}, dt={dt}")
 
-        # Initial state covariance (high uncertainty at start)
         self.kf.P *= 1000.0
 
-        # State transition matrix (constant velocity kinematic model)
         self.kf.F = np.array([
             [1.0, 0.0, dt, 0.0],
             [0.0, 1.0, 0.0, dt],
@@ -28,52 +31,28 @@ class TrajectoryFilter:
             [0.0, 0.0, 0.0, 1.0]
         ])
 
-        # Measurement matrix (we only measure x and y)
         self.kf.H = np.array([
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0]
         ])
 
-        # Process noise covariance (unpredictable drone maneuvers)
-        self.kf.Q = np.array([
-            [dt ** 4 / 4, 0, dt ** 3 / 2, 0],
-            [0, dt ** 4 / 4, 0, dt ** 3 / 2],
-            [dt ** 3 / 2, 0, dt ** 2, 0],
-            [0, dt ** 3 / 2, 0, dt ** 2]
-        ]) * process_noise
+        self.kf.R = np.array([
+            [measurement_noise, 0.0],
+            [0.0, measurement_noise]
+        ])
 
-        # Measurement noise covariance (neural network localization error)
-        self.kf.R = np.eye(2) * measurement_noise
-
-        self.is_initialized = False
-        logger.success("Kalman filter initialized successfully")
+        self._update_matrices_for_dt(dt)
 
     def _update_matrices_for_dt(self, dt: float):
-        """Оновлює матриці F та Q під реальний dt між кадрами"""
-        self.kf.F = np.array([
-            [1.0, 0.0,  dt, 0.0],
-            [0.0, 1.0, 0.0,  dt],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0]
-        ])
-        pn = self.process_noise
-        self.kf.Q = np.array([
-            [dt**4/4,       0, dt**3/2,       0],
-            [      0, dt**4/4,       0, dt**3/2],
-            [dt**3/2,       0,   dt**2,       0],
-            [      0, dt**3/2,       0,   dt**2]
-        ]) * pn
+        self.kf.F[0, 2] = dt
+        self.kf.F[1, 3] = dt
 
-    def update(self, measurement: tuple) -> tuple:
-        """Update filter state with new coordinates (x, y). Використовує dt=1.0."""
-        return self.update_with_dt(measurement, dt=1.0)
+        q_var = Q_discrete_white_noise(dim=2, dt=dt, var=self.process_noise)
+        self.kf.Q = np.zeros((4, 4))
+        self.kf.Q[0:2, 0:2] = q_var
+        self.kf.Q[2:4, 2:4] = q_var
 
-    def update_with_dt(self, measurement: tuple, dt: float) -> tuple:
-        """
-        Update filter з реальним часовим кроком dt (секунди).
-        Перераховує матриці F та Q під кожен конкретний dt,
-        що усуває похибку при нерівномірній частоті кадрів.
-        """
+    def update(self, measurement: tuple, dt: float = 1.0) -> tuple:
         z = np.array([[measurement[0]], [measurement[1]]])
 
         if not self.is_initialized:
@@ -82,12 +61,8 @@ class TrajectoryFilter:
             logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
             return measurement
 
-        # Клампуємо dt: захист від зависань і занадто малих значень
         dt = max(0.01, min(dt, 5.0))
-
         self._update_matrices_for_dt(dt)
-
-        logger.debug(f"Kalman update dt={dt:.3f}s: ({measurement[0]:.2f}, {measurement[1]:.2f})")
 
         self.kf.predict()
         self.kf.update(z)
@@ -95,19 +70,4 @@ class TrajectoryFilter:
         filtered_x = float(self.kf.x[0, 0])
         filtered_y = float(self.kf.x[1, 0])
 
-        logger.debug(f"Filtered position: ({filtered_x:.2f}, {filtered_y:.2f})")
-
         return filtered_x, filtered_y
-
-    def get_velocity(self) -> tuple:
-        """Get current drone velocity estimate"""
-        if not self.is_initialized:
-            return 0.0, 0.0
-
-        vx = float(self.kf.x[2, 0])
-        vy = float(self.kf.x[3, 0])
-        speed = np.sqrt(vx ** 2 + vy ** 2)
-
-        logger.debug(f"Current velocity: vx={vx:.2f}, vy={vy:.2f}, speed={speed:.2f} m/s")
-
-        return vx, vy

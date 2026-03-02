@@ -6,6 +6,8 @@ logger = get_logger(__name__)
 
 
 class DatabaseGenerationWorker(QThread):
+    """Фоновий потік для генерації HDF5 бази даних (XFeat + DINOv2)"""
+
     progress = pyqtSignal(int, str)
     frame_processed = pyqtSignal(int)
     completed = pyqtSignal(str)
@@ -27,7 +29,7 @@ class DatabaseGenerationWorker(QThread):
         logger.info("DatabaseGenerationWorker thread started")
 
         try:
-            self.progress.emit(0, "Ініціалізація бази даних та моделей...")
+            self.progress.emit(0, "Ініціалізація бази даних (XFeat + DINOv2)...")
             logger.info("Initializing database builder...")
 
             builder = DatabaseBuilder(self.output_path, self.config)
@@ -58,5 +60,5 @@ class DatabaseGenerationWorker(QThread):
             self.error.emit(f"Критична помилка: {str(e)}")
 
     def stop(self):
-        logger.info("Stopping database generation worker...")
+        logger.info("Stopping DatabaseGenerationWorker...")
         self._is_running = False
