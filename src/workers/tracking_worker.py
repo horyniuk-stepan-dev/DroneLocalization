@@ -28,11 +28,11 @@ class RealtimeTrackingWorker(QThread):
         self._is_running = True
 
         # FPS для швидкості відображення відео в GUI (зазвичай 30)
-        self.target_fps = self.config.get('gui', {}).get('video_fps', 30)
+        self.target_fps = self.config.get('gui', {}).get('video_fps', 1)
 
         # Скільки кадрів реально розпізнавати за секунду.
         # Завдяки XFeat можна сміливо ставити 10.0 замість 1.0!
-        self.process_fps = self.config.get('tracking', {}).get('process_fps', 10.0)
+        self.process_fps = self.config.get('tracking', {}).get('process_fps', 1.0)
 
     def run(self):
         logger.info(f"Starting real-time tracking from source: {self.video_source}")

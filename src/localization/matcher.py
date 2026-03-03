@@ -64,7 +64,7 @@ class FeatureMatcher:
         # Для XFeat (64) або якщо LightGlue не завантажено
         return self._fast_numpy_match(query_features, ref_features)
 
-    def _fast_numpy_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.8) -> tuple:
+    def _fast_numpy_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.95) -> tuple:
         """
         Highly optimized L2 matching using dot product and Mutual Nearest Neighbor (MNN).
         """

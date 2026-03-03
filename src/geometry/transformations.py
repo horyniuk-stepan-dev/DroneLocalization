@@ -96,3 +96,19 @@ class GeometryTransforms:
         logger.debug(f"Affine transformation applied successfully")
 
         return result
+
+    @staticmethod
+    def estimate_affine_partial(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
+        """Compute strict Affine transformation (Translation + Rotation + Uniform Scale ONLY)"""
+        if len(src_pts) < 4 or len(dst_pts) < 4:
+            return None, None
+
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+
+        M, mask = cv2.estimateAffinePartial2D(
+            src_pts_cv, dst_pts_cv,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_threshold
+        )
+        return M, mask

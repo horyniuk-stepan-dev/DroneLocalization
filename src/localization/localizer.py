@@ -51,16 +51,16 @@ class Localizer:
     def localize_frame(self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0) -> dict:
         """
         Локалізація поточного кадру (query).
-        Повертає GPS координати центру та кути FOV.
+        Повертає GPS координати центру та кути FOV без ризику деформацій.
         """
         logger.debug("Starting frame localization...")
         height, width = query_frame.shape[:2]
 
         # 1. Швидкий пошук кандидатів через глобальний дескриптор DINOv2
         query_features = self.feature_extractor.extract_features(query_frame, static_mask)
+        from src.localization.matcher import FastRetrieval
         retriever = FastRetrieval(self.database.global_descriptors)
 
-        # Беремо top_k кандидатів
         top_k = self.config.get('localization', {}).get('top_k_candidates', 10)
         candidates = retriever.find_similar_frames(query_features['global_desc'], top_k=top_k)
 
@@ -69,60 +69,57 @@ class Localizer:
 
         best_inliers = 0
         best_candidate_id = -1
-        best_H_query_to_ref = None
+        best_M_query_to_ref = None
         best_rot_angle = 0
 
-        angles_to_try = [0]
-        if self.enable_auto_rotation:
-            angles_to_try = [0, 90, 180, 270]
+        angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
+        features_cache = {0: query_features}
 
-        # 2. Перебір кандидатів і можливих обертань для метчингу XFeat
+        # 2. Перебір кандидатів і можливих обертань для матчингу XFeat
         for candidate_id, score in candidates:
             ref_features = self.database.get_local_features(candidate_id)
 
             for angle in angles_to_try:
-                if angle == 0:
-                    rot_features = query_features
-                else:
+                if angle not in features_cache:
                     k = angle // 90
                     rotated_frame = np.rot90(query_frame, k=k)
                     rotated_mask = np.rot90(static_mask, k=k) if static_mask is not None else None
-                    rot_features = self.feature_extractor.extract_features(rotated_frame, static_mask=rotated_mask)
+                    features_cache[angle] = self.feature_extractor.extract_features(rotated_frame,
+                                                                                    static_mask=rotated_mask)
 
+                rot_features = features_cache[angle]
                 mkpts_q, mkpts_r = self.matcher.match(rot_features, ref_features)
 
                 if len(mkpts_q) >= self.min_matches:
-                    H, mask = GeometryTransforms.estimate_homography(
+                    # ВИКОРИСТОВУЄМО ЖОРСТКЕ АФІННЕ ПЕРЕТВОРЕННЯ (Без віддзеркалень)
+                    M, mask = GeometryTransforms.estimate_affine_partial(
                         mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
                     )
 
-                    if H is not None:
+                    if M is not None:
                         inliers = int(np.sum(mask))
                         if inliers > best_inliers:
                             best_inliers = inliers
                             best_candidate_id = candidate_id
                             best_rot_angle = angle
+                            best_M_query_to_ref = M
 
-                            if angle != 0:
-                                # Компенсація обертання матриці
-                                H_rot = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
-                                H_rot_3x3 = np.eye(3)
-                                H_rot_3x3[:2, :] = H_rot
-                                best_H_query_to_ref = H @ H_rot_3x3
-                            else:
-                                best_H_query_to_ref = H
+        if best_inliers < self.min_matches or best_M_query_to_ref is None:
+            return {"success": False, "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})"}
 
-        if best_inliers < self.min_matches or best_H_query_to_ref is None:
-            return {"success": False, "error": f"Not enough XFeat inliers ({best_inliers} < {self.min_matches})"}
+        if best_rot_angle in [90, 270]:
+            rot_height, rot_width = width, height
+        else:
+            rot_height, rot_width = height, width
 
-        # 3. Трансформація координат: query -> ref
-        center_query = np.array([[width / 2.0, height / 2.0]], dtype=np.float32)
-        center_ref = GeometryTransforms.apply_homography(center_query, best_H_query_to_ref)
+        # 3. Трансформація координат: беремо центр ПОВЕРНУТОГО кадру
+        center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float32)
+        center_ref = GeometryTransforms.apply_affine(center_query, best_M_query_to_ref)
 
-        if center_ref is None:
-            return {"success": False, "error": "Homography projection failed"}
+        if center_ref is None or len(center_ref) == 0:
+            return {"success": False, "error": "Rigid projection failed"}
 
-        # 4. Перехід до метричних координат через пропаговану афінну матрицю
+        # 4. Перехід до метричних координат
         affine_ref = self.database.get_frame_affine(best_candidate_id)
         if affine_ref is None:
             return {"success": False, "error": f"Frame {best_candidate_id} has no valid propagated calibration"}
@@ -133,17 +130,22 @@ class Localizer:
 
         metric_pt = metric_pt[0]
 
-        # 5. Фільтрація траєкторії та відхилення аномалій
+        # 5. Фільтрація траєкторії
         if self.outlier_detector.is_outlier((metric_pt[0], metric_pt[1]), dt=dt):
             return {"success": False, "error": "Anomaly detected (velocity or Z-score)"}
 
-        filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
+        if hasattr(self.trajectory_filter, 'update_with_dt'):
+            filtered_pt = self.trajectory_filter.update_with_dt(metric_pt, dt)
+        else:
+            filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
+
         self.outlier_detector.add_position(filtered_pt)
+        from src.geometry.coordinates import CoordinateConverter
         lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
 
-        # 6. Розрахунок поля зору (FOV) для ПОВЕРНУТОГО кадру
-        corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
-        ref_corners = GeometryTransforms.apply_homography(corners, best_H_query_to_ref)
+        # 6. Розрахунок поля зору (FOV) від кутів ПОВЕРНУТОГО кадру
+        corners = np.array([[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]], dtype=np.float32)
+        ref_corners = GeometryTransforms.apply_affine(corners, best_M_query_to_ref)
 
         gps_corners = []
         if ref_corners is not None:

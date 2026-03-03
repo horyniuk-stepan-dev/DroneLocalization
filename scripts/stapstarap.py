@@ -29,4 +29,4 @@ def collect_files(source_dir: str, output_dir: str) -> None:
 
 
 if __name__ == "__main__":
-    collect_files("E:/Dip/budyak/DroneLocalization/src/gui", "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFilesgui")
+    collect_files("E:/Dip/budyak/DroneLocalization/src", "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFiles")

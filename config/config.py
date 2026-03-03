@@ -25,7 +25,7 @@ APP_CONFIG = {
         'model_path': 'yolo11n-seg.pt',
         'conf_threshold': 0.25,
         # Класи COCO для маскування (транспорт, люди, тварини)
-        'dynamic_classes': [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 33, 36, 37]
+        'dynamic_classes': [0, 1, 2, 3, 4]#, 5, 6, 7, 8, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 33, 36, 37]
     },
 
     'lightglue': {
@@ -47,15 +47,15 @@ APP_CONFIG = {
     },
 
     'localization': {
-        'min_matches': 15,
-        'ransac_threshold': 3.0,
+        'min_matches': 5,
+        'ransac_threshold': 7.0,
         'top_k_candidates': 5,
         # Автоматичне обертання кадру (0, 90, 180, 270) при втраті локалізації
         'auto_rotation': True
     },
 
     'gui': {
-        'video_fps': 30
+        'video_fps': 1
     },
 
     'preprocessing': {

@@ -1,6 +1,6 @@
 ﻿import h5py
 import numpy as np
-
+from functools import lru_cache
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -101,6 +101,7 @@ class DatabaseLoader:
         """
         return None
 
+    @lru_cache(maxsize=100)
     def get_local_features(self, frame_id: int) -> dict:
         """Повертає локальні ознаки XFeat для вказаного кадру"""
         group_name = f'local_features/frame_{frame_id}'
