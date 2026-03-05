@@ -1,5 +1,4 @@
-﻿# requirements_python311.txt
-# Оптимізовано для Python 3.11 + Windows + PyQt6
+﻿# Оптимізовано для Python 3.11 + Windows + PyQt6
 
 # ========================================
 # CORE DEPENDENCIES
@@ -15,6 +14,7 @@ scipy==1.12.0
 torch==2.2.0
 torchvision==0.17.0
 --extra-index-url https://download.pytorch.org/whl/cu121
+
 # ========================================
 # PYQT6 - СТАБІЛЬНІ ВЕРСІЇ для Python 3.11
 # ========================================
@@ -27,8 +27,9 @@ PyQt6-WebEngine-Qt6==6.4.0
 # ========================================
 # COMPUTER VISION MODELS
 # ========================================
-ultralytics==8.1.24
+ultralytics==8.4.19
 kornia==0.7.1
+lightglue @ git+https://github.com/cvg/LightGlue.git
 
 # ========================================
 # TRACKING & FILTERING
@@ -70,3 +71,6 @@ flake8==7.0.0
 # BUILD
 # ========================================
 pyinstaller==6.3.0
+jaraco.context==6.1.0
+jaraco.functools==4.4.0
+jaraco.text==4.2.0
