@@ -1,15 +1,15 @@
-from datetime import datetime
-from pathlib import Path
-from queue import Queue
-from threading import Thread
-
-import cv2
-import h5py
+﻿import h5py
 import numpy as np
+import cv2
+from pathlib import Path
+from threading import Thread
+from queue import Queue
 
-from src.models.wrappers.feature_extractor import FeatureExtractor
-from src.models.wrappers.yolo_wrapper import YOLOWrapper
+from datetime import datetime
 from src.utils.logging_utils import get_logger
+
+from src.models.wrappers.yolo_wrapper import YOLOWrapper
+from src.models.wrappers.feature_extractor import FeatureExtractor
 
 logger = get_logger(__name__)
 
@@ -20,19 +20,14 @@ class DatabaseBuilder:
     def __init__(self, output_path, config=None):
         self.output_path = output_path
         self.config = config or {}
-        self.descriptor_dim = self.config.get("dinov2", {}).get("descriptor_dim", 384)
+        self.descriptor_dim = self.config.get('dinov2', {}).get('descriptor_dim', 384)
         self.db_file = None
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
         logger.info(f"DINOv2 descriptor dimension: {self.descriptor_dim}")
 
-    def build_from_video(
-        self,
-        video_path: str,
-        model_manager,
-        progress_callback=None,
-        save_keypoint_video: bool = True,
-    ):
+    def build_from_video(self, video_path: str, model_manager, progress_callback=None,
+                         save_keypoint_video: bool = True):
         """
         Process video and build database.
 
@@ -56,9 +51,7 @@ class DatabaseBuilder:
 
         if num_frames <= 0:
             cap.release()
-            logger.error(
-                f"Invalid frame count ({num_frames}). Video might be corrupted or uses unsupported codec."
-            )
+            logger.error(f"Invalid frame count ({num_frames}). Video might be corrupted or uses unsupported codec.")
             raise ValueError(
                 "OpenCV не зміг розпізнати відео. Файл пошкоджений або використовує непідтримуваний кодек. "
                 "Спробуйте переконвертувати відео у стандартний MP4 (H.264)."
@@ -74,24 +67,22 @@ class DatabaseBuilder:
             # Зменшуємо роздільну здатність для великих відео (наприклад, 1080p і вище) щоб зекономити місце
             if width >= 1920:
                 kp_scale = 0.5
-
+                
             kp_width = int(width * kp_scale)
             kp_height = int(height * kp_scale)
-
-            kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
+            
+            kp_video_path = str(Path(self.output_path).with_suffix('')) + '_keypoints.mp4'
             # Використовуємо H.264 (avc1) кодек для кращої компресії замість старого mp4v
-            fourcc = cv2.VideoWriter_fourcc(*"avc1")
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
             kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (kp_width, kp_height))
-
+            
             if not kp_writer.isOpened():
                 logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (kp_width, kp_height))
 
             if kp_writer.isOpened():
-                logger.info(
-                    f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})"
-                )
+                logger.info(f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})")
             else:
                 logger.warning("Failed to initialize keypoint video writer, skipping")
                 kp_writer = None
@@ -104,9 +95,7 @@ class DatabaseBuilder:
         # ОНОВЛЕНО: Використовуємо XFeat замість SuperPoint
         local_model = model_manager.load_xfeat()
         nv_model = model_manager.load_dinov2()
-        feature_extractor = FeatureExtractor(
-            local_model, nv_model, model_manager.device, config=self.config
-        )
+        feature_extractor = FeatureExtractor(local_model, nv_model, model_manager.device, config=self.config)
         logger.success("All models loaded successfully")
 
         # Create empty database structure
@@ -119,7 +108,6 @@ class DatabaseBuilder:
 
         # cuDNN benchmark для прискорення (input size не змінюється)
         import torch
-
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
             logger.info("cuDNN benchmark ENABLED for consistent input sizes")
@@ -141,7 +129,7 @@ class DatabaseBuilder:
         prefetch_thread.start()
 
         try:
-            self.db_file = h5py.File(self.output_path, "a")
+            self.db_file = h5py.File(self.output_path, 'a')
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
             while True:
@@ -165,19 +153,17 @@ class DatabaseBuilder:
                 logger.debug(f"Frame {i}: Extracted {len(features['keypoints'])} keypoints")
 
                 # Step 3: Transform coordinates
-                features["coords_2d"] = features["keypoints"]
+                features['coords_2d'] = features['keypoints']
 
                 # Step 4: Малюємо keypoints на кадрі і записуємо у відео
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
-                        frame, features["keypoints"], static_mask, i, num_frames
+                        frame, features['keypoints'], static_mask, i, num_frames
                     )
                     if kp_scale != 1.0:
                         kp_width = int(width * kp_scale)
                         kp_height = int(height * kp_scale)
-                        kp_frame = cv2.resize(
-                            kp_frame, (kp_width, kp_height), interpolation=cv2.INTER_AREA
-                        )
+                        kp_frame = cv2.resize(kp_frame, (kp_width, kp_height), interpolation=cv2.INTER_AREA)
                     kp_writer.write(kp_frame)
 
                 # Step 5: Оновлюємо накопичену позу H(frame_i → frame_0)
@@ -188,14 +174,11 @@ class DatabaseBuilder:
                     H_step = self._compute_inter_frame_H(prev_features, features)
                     if H_step is not None:
                         # current_pose = H(prev→frame_0) @ H(curr→prev) = H(curr→frame_0)
-                        current_pose = (
-                            current_pose.astype(np.float64) @ H_step.astype(np.float64)
-                        ).astype(np.float32)
+                        current_pose = (current_pose.astype(np.float64)
+                                        @ H_step.astype(np.float64)).astype(np.float32)
                     else:
                         # Якщо матч не вдався — залишаємо попередню позу як апроксимацію
-                        logger.warning(
-                            f"Frame {i}: inter-frame match failed, reusing previous pose"
-                        )
+                        logger.warning(f"Frame {i}: inter-frame match failed, reusing previous pose")
 
                 prev_features = features
 
@@ -227,14 +210,9 @@ class DatabaseBuilder:
 
         logger.success(f"Database build completed successfully: {self.output_path}")
 
-    def _draw_keypoints_frame(
-        self,
-        frame_bgr: np.ndarray,
-        keypoints: np.ndarray,
-        static_mask: np.ndarray,
-        frame_id: int,
-        total_frames: int,
-    ) -> np.ndarray:
+    def _draw_keypoints_frame(self, frame_bgr: np.ndarray, keypoints: np.ndarray,
+                               static_mask: np.ndarray, frame_id: int,
+                               total_frames: int) -> np.ndarray:
         """
         Малює на кадрі:
           - Червона напівпрозора зона: пікселі відфільтровані YOLO (рухомі об'єкти)
@@ -247,7 +225,7 @@ class DatabaseBuilder:
 
         # 1. Червона маска: зони де YOLO знайшов рухомі об'єкти (mask == 0)
         if static_mask is not None:
-            dynamic_zone = static_mask == 0
+            dynamic_zone = (static_mask == 0)
             if dynamic_zone.any():
                 overlay = vis.copy()
                 overlay[dynamic_zone] = (0, 0, 200)  # BGR червоний
@@ -271,55 +249,35 @@ class DatabaseBuilder:
 
         for idx, line in enumerate(info_lines):
             cv2.putText(
-                vis,
-                line,
+                vis, line,
                 (8, 22 + idx * 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                (0, 255, 0), 1, cv2.LINE_AA
             )
 
         # 4. Легенда внизу
         legend_y = vis.shape[0] - 10
         cv2.circle(vis, (12, legend_y - 4), 5, (0, 255, 0), -1)
-        cv2.putText(
-            vis,
-            "XFeat keypoint",
-            (22, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(vis, "XFeat keypoint", (22, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
         cv2.rectangle(vis, (200, legend_y - 10), (218, legend_y + 2), (0, 0, 200), -1)
-        cv2.putText(
-            vis,
-            "YOLO dynamic zone",
-            (224, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 200),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(vis, "YOLO dynamic zone", (224, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1, cv2.LINE_AA)
 
         return vis
 
-    def _compute_inter_frame_H(
-        self, fa: dict, fb: dict, min_matches: int = 15, ransac_thresh: float = 3.0
-    ) -> np.ndarray | None:
+    def _compute_inter_frame_H(self, fa: dict, fb: dict,
+                                min_matches: int = 15,
+                                ransac_thresh: float = 3.0) -> np.ndarray | None:
         """
         Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
         Використовує brute-force L2 матчинг дескрипторів XFeat
         без LightGlue (щоб не тримати матчер у пам'яті під час побудови БД).
         """
-        desc_a = fa["descriptors"]  # Тепер це (N, 64) для XFeat
-        desc_b = fb["descriptors"]  # Тепер це (M, 64) для XFeat
-        kpts_a = fa["keypoints"]
-        kpts_b = fb["keypoints"]
+        desc_a = fa['descriptors']  # Тепер це (N, 64) для XFeat
+        desc_b = fb['descriptors']  # Тепер це (M, 64) для XFeat
+        kpts_a = fa['keypoints']
+        kpts_b = fb['keypoints']
 
         if len(kpts_a) < min_matches or len(kpts_b) < min_matches:
             return None
@@ -363,31 +321,26 @@ class DatabaseBuilder:
         """Create optimal HDF5 hierarchy with compression"""
         logger.info(f"Creating HDF5 structure for {num_frames} frames")
 
-        with h5py.File(self.output_path, "w") as f:
+        with h5py.File(self.output_path, 'w') as f:
             # Group 1: Global data (kept in RAM)
-            g1 = f.create_group("global_descriptors")
-            g1.create_dataset(
-                "descriptors",
-                shape=(num_frames, self.descriptor_dim),
-                dtype="float32",
-                compression="gzip",
-            )
-            g1.create_dataset(
-                "frame_poses", shape=(num_frames, 3, 3), dtype="float32", compression="gzip"
-            )
+            g1 = f.create_group('global_descriptors')
+            g1.create_dataset('descriptors', shape=(num_frames, self.descriptor_dim),
+                              dtype='float32', compression='gzip')
+            g1.create_dataset('frame_poses', shape=(num_frames, 3, 3),
+                              dtype='float32', compression='gzip')
             logger.debug("Created global_descriptors group")
 
             # Group 2: Local features (lazy loading)
-            f.create_group("local_features")
+            f.create_group('local_features')
             logger.debug("Created local_features group")
 
             # Group 3: Project metadata
-            g3 = f.create_group("metadata")
-            g3.attrs["num_frames"] = num_frames
-            g3.attrs["creation_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            g3.attrs["frame_width"] = width
-            g3.attrs["frame_height"] = height
-            g3.attrs["descriptor_dim"] = self.descriptor_dim
+            g3 = f.create_group('metadata')
+            g3.attrs['num_frames'] = num_frames
+            g3.attrs['creation_date'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            g3.attrs['frame_width'] = width
+            g3.attrs['frame_height'] = height
+            g3.attrs['descriptor_dim'] = self.descriptor_dim
             logger.debug("Created metadata group")
 
         logger.success("HDF5 structure created successfully")
@@ -396,18 +349,15 @@ class DatabaseBuilder:
         """Save extracted data for a single frame"""
         logger.debug(f"Saving frame {frame_id} data to database")
 
-        self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
-        self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
+        self.db_file['global_descriptors']['descriptors'][frame_id] = features['global_desc']
+        self.db_file['global_descriptors']['frame_poses'][frame_id] = pose_2d
 
-        frame_group = self.db_file["local_features"].create_group(f"frame_{frame_id}")
-        frame_group.create_dataset(
-            "keypoints", data=features["keypoints"], dtype="float32", compression="gzip"
-        )
-        frame_group.create_dataset(
-            "descriptors", data=features["descriptors"], dtype="float32", compression="gzip"
-        )
-        frame_group.create_dataset(
-            "coords_2d", data=features["coords_2d"], dtype="float32", compression="gzip"
-        )
+        frame_group = self.db_file['local_features'].create_group(f'frame_{frame_id}')
+        frame_group.create_dataset('keypoints', data=features['keypoints'],
+                                   dtype='float32', compression='gzip')
+        frame_group.create_dataset('descriptors', data=features['descriptors'],
+                                   dtype='float32', compression='gzip')
+        frame_group.create_dataset('coords_2d', data=features['coords_2d'],
+                                   dtype='float32', compression='gzip')
 
         logger.debug(f"Frame {frame_id}: Saved {len(features['keypoints'])} keypoints")

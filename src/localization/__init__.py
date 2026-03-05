@@ -1,1 +1,1 @@
-"""Localization module"""
+﻿"""Localization module"""

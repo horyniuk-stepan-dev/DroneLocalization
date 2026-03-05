@@ -1,8 +1,6 @@
-from functools import lru_cache
-
-import h5py
+﻿import h5py
 import numpy as np
-
+from functools import lru_cache
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -19,9 +17,9 @@ class DatabaseLoader:
         self.metadata = {}
 
         # Дані пропагації калібрування (заповнюються після калібрування)
-        self.h_to_calib = None  # (N, 3, 3) — H(frame_i → calib_frame)
-        self.frame_gps = None  # (N, 2)    — (lat, lon) центру кожного кадру
-        self.frame_valid = None  # (N,)      — True якщо кадр має GPS
+        self.h_to_calib = None      # (N, 3, 3) — H(frame_i → calib_frame)
+        self.frame_gps = None       # (N, 2)    — (lat, lon) центру кожного кадру
+        self.frame_valid = None     # (N,)      — True якщо кадр має GPS
         self.calib_frame_id = None  # int
 
         logger.info(f"Initializing DatabaseLoader with path: {db_path}")
@@ -32,15 +30,15 @@ class DatabaseLoader:
         logger.info("Loading hot data into RAM...")
 
         try:
-            self.db_file = h5py.File(self.db_path, "r")
+            self.db_file = h5py.File(self.db_path, 'r')
 
-            self.global_descriptors = self.db_file["global_descriptors"]["descriptors"][:]
-            self.frame_poses = self.db_file["global_descriptors"]["frame_poses"][:]
+            self.global_descriptors = self.db_file['global_descriptors']['descriptors'][:]
+            self.frame_poses = self.db_file['global_descriptors']['frame_poses'][:]
 
             logger.info(f"Loaded global descriptors: shape {self.global_descriptors.shape}")
             logger.info(f"Loaded frame poses: shape {self.frame_poses.shape}")
 
-            for key, value in self.db_file["metadata"].attrs.items():
+            for key, value in self.db_file['metadata'].attrs.items():
                 self.metadata[key] = value
                 logger.debug(f"Metadata - {key}: {value}")
 
@@ -54,27 +52,25 @@ class DatabaseLoader:
             raise
 
     def _load_propagation_data(self):
-        if "calibration" not in self.db_file:
+        if 'calibration' not in self.db_file:
             logger.info("No propagation data in database (not calibrated yet)")
             self.frame_affine = None
             self.frame_valid = None
             return
         try:
-            grp = self.db_file["calibration"]
-            if "frame_affine" in grp:
-                self.frame_affine = grp["frame_affine"][:]
-                self.frame_valid = grp["frame_valid"][:].astype(bool)
+            grp = self.db_file['calibration']
+            if 'frame_affine' in grp:
+                self.frame_affine = grp['frame_affine'][:]
+                self.frame_valid = grp['frame_valid'][:].astype(bool)
                 valid_count = int(np.sum(self.frame_valid))
                 logger.success(f"Propagation data loaded: {valid_count} frames valid")
 
                 # Автоматична ініціалізація UTM з reference_gps у HDF5
-                if "reference_gps" in grp.attrs:
+                if 'reference_gps' in grp.attrs:
                     import json
-
                     from src.geometry.coordinates import CoordinateConverter
-
                     try:
-                        ref_gps = json.loads(grp.attrs["reference_gps"])
+                        ref_gps = json.loads(grp.attrs['reference_gps'])
                         CoordinateConverter.gps_to_metric(ref_gps[0], ref_gps[1])
                         logger.success(f"UTM auto-initialized from HDF5 reference GPS: {ref_gps}")
                     except Exception as e:
@@ -90,7 +86,7 @@ class DatabaseLoader:
 
     @property
     def is_propagated(self) -> bool:
-        return getattr(self, "frame_affine", None) is not None
+        return getattr(self, 'frame_affine', None) is not None
 
     def get_frame_affine(self, frame_id: int) -> np.ndarray | None:
         """Повертає унікальну афінну матрицю для конкретного кадру"""
@@ -116,21 +112,21 @@ class DatabaseLoader:
         """
         return None
 
-    @lru_cache(maxsize=100)  # noqa: B019
+    @lru_cache(maxsize=100)
     def get_local_features(self, frame_id: int) -> dict:
         """Повертає локальні ознаки XFeat для вказаного кадру"""
-        group_name = f"local_features/frame_{frame_id}"
+        group_name = f'local_features/frame_{frame_id}'
         if group_name not in self.db_file:
             raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
         g = self.db_file[group_name]
         return {
-            "keypoints": g["keypoints"][:],
-            "descriptors": g["descriptors"][:],
-            "coords_2d": g["coords_2d"][:],
+            'keypoints': g['keypoints'][:],
+            'descriptors': g['descriptors'][:],
+            'coords_2d': g['coords_2d'][:]
         }
 
     def get_num_frames(self) -> int:
-        return int(self.metadata.get("num_frames", 0))
+        return int(self.metadata.get('num_frames', 0))
 
     def close(self):
         if self.db_file is not None:

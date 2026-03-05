@@ -1,9 +1,7 @@
-import json
-
 import numpy as np
-
-from src.geometry.coordinates import CoordinateConverter
+import json
 from src.geometry.transformations import GeometryTransforms
+from src.geometry.coordinates import CoordinateConverter
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -22,13 +20,16 @@ class AnchorCalibration:
         return float(result[0]), float(result[1])
 
     def to_dict(self) -> dict:
-        return {"frame_id": self.frame_id, "affine_matrix": self.affine_matrix.tolist()}
+        return {
+            "frame_id": self.frame_id,
+            "affine_matrix": self.affine_matrix.tolist()
+        }
 
     @staticmethod
     def from_dict(data: dict) -> "AnchorCalibration":
         return AnchorCalibration(
             frame_id=int(data["frame_id"]),
-            affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
+            affine_matrix=np.array(data["affine_matrix"], dtype=np.float32)
         )
 
 
@@ -52,9 +53,7 @@ class MultiAnchorCalibration:
         else:
             self.anchors.append(AnchorCalibration(frame_id, affine_matrix))
             self.anchors.sort(key=lambda a: a.frame_id)
-            logger.info(
-                f"Added new anchor for frame {frame_id}. Total anchors: {len(self.anchors)}"
-            )
+            logger.info(f"Added new anchor for frame {frame_id}. Total anchors: {len(self.anchors)}")
 
     def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple | None:
         if not self.is_calibrated:
@@ -101,16 +100,16 @@ class MultiAnchorCalibration:
 
         data = {
             "reference_gps": self.reference_gps,  # Зберігаємо базову координату
-            "anchors": [a.to_dict() for a in self.anchors],
+            "anchors": [a.to_dict() for a in self.anchors]
         }
 
-        with open(path, "w") as f:
+        with open(path, 'w') as f:
             json.dump(data, f, indent=2)
         logger.success(f"MultiAnchorCalibration saved: {path} ({len(self.anchors)} anchors)")
 
     def load(self, path: str):
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
-        with open(path) as f:
+        with open(path, 'r') as f:
             data = json.load(f)
 
         self.anchors.clear()
@@ -119,19 +118,15 @@ class MultiAnchorCalibration:
         if "reference_gps" in data and data["reference_gps"] is not None:
             self.reference_gps = data["reference_gps"]
             CoordinateConverter.gps_to_metric(self.reference_gps[0], self.reference_gps[1])
-            logger.info(
-                f"UTM Projection initialized from loaded reference GPS: {self.reference_gps}"
-            )
+            logger.info(f"UTM Projection initialized from loaded reference GPS: {self.reference_gps}")
         else:
-            logger.warning(
-                "No reference GPS found in calibration file. UTM converter is not initialized."
-            )
+            logger.warning("No reference GPS found in calibration file. UTM converter is not initialized.")
 
         # Підтримка старого формату файлів
         if "affine_matrix" in data and "calib_frame_id" in data:
             anchor = AnchorCalibration(
                 frame_id=int(data.get("calib_frame_id", 0)),
-                affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
+                affine_matrix=np.array(data["affine_matrix"], dtype=np.float32)
             )
             self.anchors.append(anchor)
         # Новий формат файлів

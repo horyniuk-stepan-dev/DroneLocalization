@@ -1,16 +1,17 @@
-import cv2
 import numpy as np
+import cv2
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QMessageBox, QFileDialog
 
-from src.localization.localizer import Localizer
-from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
-from src.utils.image_utils import opencv_to_qpixmap
+from src.localization.matcher import FeatureMatcher
+from src.localization.localizer import Localizer
 from src.workers.tracking_worker import RealtimeTrackingWorker
+from src.utils.image_utils import opencv_to_qpixmap
 
 
 class TrackingMixin:
+
     def _build_localizer(self) -> Localizer:
         """Shared factory — used by tracking and single-image localization."""
         # ОНОВЛЕНО: Завантажуємо надшвидкий XFeat та DINOv2
@@ -23,28 +24,24 @@ class TrackingMixin:
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
 
         # Передаємо model_manager у конфіг для SuperPoint+LightGlue fallback
-        localizer_config = {**self.config, "_model_manager": self.model_manager}
+        localizer_config = {**self.config, '_model_manager': self.model_manager}
         return Localizer(self.database, fe, matcher, self.calibration, config=localizer_config)
 
     def _ensure_utm_initialized(self) -> bool:
         """Перевіряє чи ініціалізована проєкція UTM, якщо ні - пробує ініціалізувати з калібрування."""
         from src.geometry.coordinates import CoordinateConverter
-
         if CoordinateConverter._initialized:
             return True
-
+        
         if self.calibration and self.calibration.reference_gps:
-            CoordinateConverter.gps_to_metric(
-                self.calibration.reference_gps[0], self.calibration.reference_gps[1]
-            )
+            CoordinateConverter.gps_to_metric(self.calibration.reference_gps[0], self.calibration.reference_gps[1])
             return True
-
+            
         QMessageBox.warning(
-            self,
-            "Помилка формату",
+            self, "Помилка формату", 
             "Проєкція UTM не ініціалізована.\n\n"
             "Схоже, що база даних створена у старій версії програми, або не була завантажена GPS-прив'язка.\n"
-            "Будь ласка, завантажте файл калібрування (.json) або виконайте додавання GPS-якорів наново.",
+            "Будь ласка, завантажте файл калібрування (.json) або виконайте додавання GPS-якорів наново."
         )
         return False
 
@@ -53,17 +50,12 @@ class TrackingMixin:
         if not self.database:
             QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
             return
-        if not self.calibration.is_calibrated and not (
-            self.database and self.database.is_propagated
-        ):
-            QMessageBox.warning(
-                self, "Увага", "Виконайте калібрування GPS або завантажте базу з пропагацією."
-            )
+        if not self.calibration.is_calibrated and not (self.database and self.database.is_propagated):
+            QMessageBox.warning(self, "Увага", "Виконайте калібрування GPS або завантажте базу з пропагацією.")
             return
         if not self.database.is_propagated:
             reply = QMessageBox.question(
-                self,
-                "Увага",
+                self, "Увага",
                 "Пропагація GPS ще не виконана.\nТочність буде знижена.\n\nПродовжити?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
@@ -85,8 +77,7 @@ class TrackingMixin:
 
         localizer = self._build_localizer()
         self.tracking_worker = RealtimeTrackingWorker(
-            video_path,
-            localizer,
+            video_path, localizer,
             model_manager=self.model_manager,
             config=self.config,
         )
@@ -110,12 +101,8 @@ class TrackingMixin:
         if not self.database:
             QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
             return
-        if not self.calibration.is_calibrated and not (
-            self.database and self.database.is_propagated
-        ):
-            QMessageBox.warning(
-                self, "Увага", "Виконайте калібрування GPS або завантажте базу з пропагацією."
-            )
+        if not self.calibration.is_calibrated and not (self.database and self.database.is_propagated):
+            QMessageBox.warning(self, "Увага", "Виконайте калібрування GPS або завантажте базу з пропагацією.")
             return
 
         default_dir = ""
@@ -132,7 +119,7 @@ class TrackingMixin:
         if frame is None:
             QMessageBox.warning(self, "Помилка", "Не вдалося прочитати зображення.")
             return
-
+            
         if not self._ensure_utm_initialized():
             return
 
@@ -143,7 +130,7 @@ class TrackingMixin:
             localizer = self._build_localizer()
             result = localizer.localize_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-            if hasattr(self.video_widget, "display_frame"):
+            if hasattr(self.video_widget, 'display_frame'):
                 self.video_widget.display_frame(opencv_to_qpixmap(frame))
 
             if result.get("success"):
@@ -161,16 +148,13 @@ class TrackingMixin:
                     f"Впевненість: {conf:.2f} | Точок: {inliers} | Якір: {anchor}"
                 )
                 self.control_panel.update_status("Фото локалізовано")
-                QMessageBox.information(
-                    self,
-                    "Успіх",
-                    f"Координати знайдено!\n\n"
-                    f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
-                    f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
-                    f"Якір: кадр {anchor}",
-                )
+                QMessageBox.information(self, "Успіх",
+                                        f"Координати знайдено!\n\n"
+                                        f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
+                                        f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
+                                        f"Якір: кадр {anchor}")
             else:
-                err = result.get("error", "Невідома помилка")
+                err = result.get('error', 'Невідома помилка')
                 self.status_bar.showMessage(f"Помилка: {err}")
                 self.control_panel.update_status("Помилка локалізації")
                 QMessageBox.warning(self, "Помилка", f"Не вдалося знайти координати:\n{err}")
@@ -182,7 +166,7 @@ class TrackingMixin:
 
     @pyqtSlot(np.ndarray)
     def on_frame_ready(self, frame_rgb: np.ndarray):
-        if hasattr(self.video_widget, "display_frame"):
+        if hasattr(self.video_widget, 'display_frame'):
             self.video_widget.display_frame(opencv_to_qpixmap(frame_rgb))
 
     @pyqtSlot(float, float, float, int)
@@ -190,5 +174,6 @@ class TrackingMixin:
         self.map_widget.update_marker(lat, lon)
         self.map_widget.add_trajectory_point(lat, lon)
         self.status_bar.showMessage(
-            f"Локалізація: {lat:.6f}, {lon:.6f} | Впевненість: {confidence:.2f} | Точок: {inliers}"
+            f"Локалізація: {lat:.6f}, {lon:.6f} | "
+            f"Впевненість: {confidence:.2f} | Точок: {inliers}"
         )

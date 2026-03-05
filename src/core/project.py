@@ -1,25 +1,23 @@
 import json
-from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
-
+from dataclasses import dataclass, asdict
+from typing import Optional
+from datetime import datetime
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-
 @dataclass
 class ProjectSettings:
     """Stores metadata about a Drone Localization Project"""
-
     project_name: str
     created_at: str
     video_path: str
-
+    
     # Internal relative paths
     database_filename: str = "database.h5"
     calibration_filename: str = "calibration.json"
-
+    
     # Optional mission parameters inherited from NewMissionDialog
     altitude_m: float = 100.0
     focal_length_mm: float = 13.2
@@ -36,10 +34,10 @@ class ProjectManager:
     Manages the workspace directory, saving/loading project configuration,
     and resolving absolute paths to project files.
     """
-
+    
     def __init__(self):
-        self.project_dir: Path | None = None
-        self.settings: ProjectSettings | None = None
+        self.project_dir: Optional[Path] = None
+        self.settings: Optional[ProjectSettings] = None
 
     @property
     def is_loaded(self) -> bool:
@@ -50,13 +48,13 @@ class ProjectManager:
         return self.settings.project_name if self.settings else "No Project"
 
     @property
-    def database_path(self) -> str | None:
+    def database_path(self) -> Optional[str]:
         if not self.is_loaded:
             return None
         return str(self.project_dir / self.settings.database_filename)
 
     @property
-    def calibration_path(self) -> str | None:
+    def calibration_path(self) -> Optional[str]:
         if not self.is_loaded:
             return None
         return str(self.project_dir / self.settings.calibration_filename)
@@ -71,15 +69,15 @@ class ProjectManager:
             # Create a safe folder name
             safe_folder_name = "".join([c if c.isalnum() else "_" for c in name])
             self.project_dir = Path(workspace_dir) / safe_folder_name
-
+            
             # Ensure the directory exists
             self.project_dir.mkdir(parents=True, exist_ok=True)
-
+            
             # Create subfolders for organization
             (self.project_dir / "panoramas").mkdir(exist_ok=True)
             (self.project_dir / "test_photos").mkdir(exist_ok=True)
             (self.project_dir / "test_videos").mkdir(exist_ok=True)
-
+            
             self.settings = ProjectSettings(
                 project_name=name,
                 created_at=datetime.now().isoformat(),
@@ -87,13 +85,13 @@ class ProjectManager:
                 altitude_m=mission_data.get("altitude_m", 100.0),
                 focal_length_mm=mission_data.get("focal_length_mm", 13.2),
                 sensor_width_mm=mission_data.get("sensor_width_mm", 8.8),
-                image_width_px=mission_data.get("image_width_px", 4000),
+                image_width_px=mission_data.get("image_width_px", 4000)
             )
-
+            
             self.save_project()
             logger.info(f"Project created successfully at: {self.project_dir}")
             return True
-
+            
         except Exception as e:
             logger.error(f"Failed to create project: {e}", exc_info=True)
             self.project_dir = None
@@ -107,21 +105,21 @@ class ProjectManager:
             if not dir_path.is_dir():
                 logger.error(f"Project directory does not exist: {project_dir}")
                 return False
-
+                
             json_file = dir_path / "project.json"
             if not json_file.exists():
                 logger.error(f"Valid project not found. Missing project.json in: {project_dir}")
                 return False
-
-            with open(json_file, encoding="utf-8") as f:
+                
+            with open(json_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
+                
             self.settings = ProjectSettings.from_dict(data)
             self.project_dir = dir_path
-
+            
             logger.info(f"Project loaded successfully: {self.settings.project_name}")
             return True
-
+            
         except Exception as e:
             logger.error(f"Failed to load project: {e}", exc_info=True)
             self.project_dir = None
@@ -132,10 +130,10 @@ class ProjectManager:
         """Saves current ProjectSettings to project.json"""
         if not self.is_loaded:
             return False
-
+            
         try:
             json_file = self.project_dir / "project.json"
-            with open(json_file, "w", encoding="utf-8") as f:
+            with open(json_file, 'w', encoding='utf-8') as f:
                 json.dump(asdict(self.settings), f, indent=4, ensure_ascii=False)
             return True
         except Exception as e:

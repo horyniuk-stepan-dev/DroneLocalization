@@ -1,22 +1,17 @@
-import cv2
+﻿import cv2
 import numpy as np
-
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
-
 
 class GeometryTransforms:
     """Geometric transformations for localization"""
 
     @staticmethod
-    def estimate_homography(
-        src_pts: np.ndarray,
-        dst_pts: np.ndarray,
-        ransac_threshold: float = 3.0,
-        max_iters: int = 5000,
-        confidence: float = 0.999,
-    ):
+    def estimate_homography(src_pts: np.ndarray, dst_pts: np.ndarray,
+                            ransac_threshold: float = 3.0,
+                            max_iters: int = 5000,
+                            confidence: float = 0.999):
         logger.debug(f"Estimating homography from {len(src_pts)} point pairs")
         if len(src_pts) < 4 or len(dst_pts) < 4:
             return None, None
@@ -25,12 +20,11 @@ class GeometryTransforms:
         dst_pts_cv = dst_pts.reshape(-1, 1, 2)
 
         H, mask = cv2.findHomography(
-            src_pts_cv,
-            dst_pts_cv,
+            src_pts_cv, dst_pts_cv,
             method=cv2.RANSAC,
             ransacReprojThreshold=ransac_threshold,
             maxIters=max_iters,
-            confidence=confidence,
+            confidence=confidence
         )
         return H, mask
 
@@ -52,14 +46,14 @@ class GeometryTransforms:
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
         M, mask = cv2.estimateAffine2D(
-            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_threshold
         )
         return M, mask
 
     @staticmethod
-    def estimate_affine_partial(
-        src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0
-    ):
+    def estimate_affine_partial(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
         """Compute STRICT Affine transformation (Rotation + Translation + Uniform Scale ONLY)"""
         if len(src_pts) < 3 or len(dst_pts) < 3:
             return None, None
@@ -69,7 +63,9 @@ class GeometryTransforms:
 
         # Використовуємо Partial2D для заборони деформацій (shear) та віддзеркалень
         M, mask = cv2.estimateAffinePartial2D(
-            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=ransac_threshold
         )
         return M, mask
 

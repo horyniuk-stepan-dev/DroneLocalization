@@ -1,6 +1,5 @@
 import cv2
 from PyQt6.QtCore import QThread, pyqtSignal
-
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -69,9 +68,7 @@ class PanoramaWorker(QThread):
                 self.progress.emit(100, "Панораму збережено!")
                 self.completed.emit(self.output_path)
             else:
-                raise ValueError(
-                    f"Помилка зшивання (Код OpenCV: {status}). Спробуйте змінити крок кадрів."
-                )
+                raise ValueError(f"Помилка зшивання (Код OpenCV: {status}). Спробуйте змінити крок кадрів.")
 
         except Exception as e:
             logger.error(f"Panorama generation failed: {e}")

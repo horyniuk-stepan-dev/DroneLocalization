@@ -1,4 +1,4 @@
-import cv2
+﻿import cv2
 import numpy as np
 from PyQt6.QtGui import QImage, QPixmap
 
