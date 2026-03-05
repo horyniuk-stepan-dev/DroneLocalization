@@ -42,12 +42,16 @@ class FeatureMatcher:
     """Matches local keypoints (XFeat or SuperPoint+LightGlue)"""
 
     def __init__(self, model_manager: Any | None = None, config: dict | None = None):
+    def __init__(self, model_manager: Any | None = None, config: dict | None = None):
         self.config = config or {}
         self.model_manager = model_manager
+        self.ratio_threshold = self.config.get("localization", {}).get("ratio_threshold", 0.95)
         self.ratio_threshold = self.config.get("localization", {}).get("ratio_threshold", 0.95)
 
         # Намагаємося завантажити LightGlue, якщо він потрібен
         self.lightglue = None
+        if self.model_manager and "lightglue" in self.model_manager.models:
+            self.lightglue = self.model_manager.models["lightglue"]
         if self.model_manager and "lightglue" in self.model_manager.models:
             self.lightglue = self.model_manager.models["lightglue"]
             logger.info("FeatureMatcher configured to use LightGlue (if descriptor dims match)")
@@ -62,6 +66,9 @@ class FeatureMatcher:
         desc_dim = (
             query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
         )
+        desc_dim = (
+            query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
+        )
 
         # Якщо є LightGlue і розмірність дескриптора 256 (SuperPoint)
         if self.lightglue is not None and desc_dim == 256:
@@ -73,9 +80,16 @@ class FeatureMatcher:
     def _fast_numpy_match(
         self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80
     ) -> tuple:
+    def _fast_numpy_match(
+        self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80
+    ) -> tuple:
         """
         Highly optimized L2 matching using dot product and Mutual Nearest Neighbor (MNN).
         """
+        desc_q = query_features["descriptors"]
+        desc_r = ref_features["descriptors"]
+        kpts_q = query_features["keypoints"]
+        kpts_r = ref_features["keypoints"]
         desc_q = query_features["descriptors"]
         desc_r = ref_features["descriptors"]
         kpts_q = query_features["keypoints"]
@@ -135,6 +149,21 @@ class FeatureMatcher:
                     "descriptors": torch.from_numpy(query_features["descriptors"])
                     .float()[None]
                     .to(device),
+                "image0": {
+                    "keypoints": torch.from_numpy(query_features["keypoints"])
+                    .float()[None]
+                    .to(device),
+                    "descriptors": torch.from_numpy(query_features["descriptors"])
+                    .float()[None]
+                    .to(device),
+                },
+                "image1": {
+                    "keypoints": torch.from_numpy(ref_features["keypoints"])
+                    .float()[None]
+                    .to(device),
+                    "descriptors": torch.from_numpy(ref_features["descriptors"])
+                    .float()[None]
+                    .to(device),
                 },
                 "image1": {
                     "keypoints": torch.from_numpy(ref_features["keypoints"])
@@ -150,6 +179,7 @@ class FeatureMatcher:
                 res = self.lightglue(data)
 
             matches = res["matches"][0].cpu().numpy()
+            matches = res["matches"][0].cpu().numpy()
 
             if len(matches) == 0:
                 return np.empty((0, 2)), np.empty((0, 2))
@@ -159,9 +189,12 @@ class FeatureMatcher:
 
             mkpts_q = query_features["keypoints"][m_q]
             mkpts_r = ref_features["keypoints"][m_r]
+            mkpts_q = query_features["keypoints"][m_q]
+            mkpts_r = ref_features["keypoints"][m_r]
 
             return mkpts_q, mkpts_r
 
         except Exception as e:
             logger.error(f"LightGlue match failed: {e}")
             return np.empty((0, 2)), np.empty((0, 2))
+

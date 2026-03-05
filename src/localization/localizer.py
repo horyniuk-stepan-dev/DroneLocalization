@@ -2,6 +2,9 @@ import numpy as np
 import torch
 
 from src.geometry.coordinates import CoordinateConverter
+import torch
+
+from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
@@ -13,10 +16,24 @@ from src.database.database_loader import DatabaseLoader
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.localization.matcher import FeatureMatcher
 
+from typing import Any
+from src.database.database_loader import DatabaseLoader
+from src.models.wrappers.feature_extractor import FeatureExtractor
+from src.localization.matcher import FeatureMatcher
+
 logger = get_logger(__name__)
 
 
+
 class Localizer:
+    def __init__(
+        self,
+        database: DatabaseLoader,
+        feature_extractor: FeatureExtractor,
+        matcher: FeatureMatcher,
+        calibration: Any,
+        config: dict | None = None,
+    ):
     def __init__(
         self,
         database: DatabaseLoader,
@@ -34,13 +51,22 @@ class Localizer:
         self.min_matches = self.config.get("localization", {}).get("min_matches", 8)
         self.ransac_thresh = self.config.get("localization", {}).get("ransac_threshold", 5.0)
         self.enable_auto_rotation = self.config.get("localization", {}).get("auto_rotation", True)
+        self.min_matches = self.config.get("localization", {}).get("min_matches", 8)
+        self.ransac_thresh = self.config.get("localization", {}).get("ransac_threshold", 5.0)
+        self.enable_auto_rotation = self.config.get("localization", {}).get("auto_rotation", True)
 
         self.trajectory_filter = TrajectoryFilter(
             process_noise=self.config.get("tracking", {}).get("kalman_process_noise", 2.0),
             measurement_noise=self.config.get("tracking", {}).get("kalman_measurement_noise", 5.0),
             dt=1.0,
+            process_noise=self.config.get("tracking", {}).get("kalman_process_noise", 2.0),
+            measurement_noise=self.config.get("tracking", {}).get("kalman_measurement_noise", 5.0),
+            dt=1.0,
         )
         self.outlier_detector = OutlierDetector(
+            window_size=self.config.get("tracking", {}).get("outlier_window", 10),
+            threshold_std=self.config.get("tracking", {}).get("outlier_threshold_std", 3.0),
+            max_speed_mps=self.config.get("tracking", {}).get("max_speed_mps", 1000.0),
             window_size=self.config.get("tracking", {}).get("outlier_window", 10),
             threshold_std=self.config.get("tracking", {}).get("outlier_threshold_std", 3.0),
             max_speed_mps=self.config.get("tracking", {}).get("max_speed_mps", 1000.0),
@@ -57,7 +83,17 @@ class Localizer:
         self.min_inliers_for_accept = self.config.get("localization", {}).get(
             "min_inliers_accept", 8
         )
+        self.model_manager = self.config.get("_model_manager", None)
+        self.fallback_enabled = self.config.get("localization", {}).get(
+            "enable_lightglue_fallback", True
+        )
+        self.min_inliers_for_accept = self.config.get("localization", {}).get(
+            "min_inliers_accept", 8
+        )
 
+    def localize_frame(
+        self, query_frame: np.ndarray, static_mask: np.ndarray | None = None, dt: float = 1.0
+    ) -> dict:
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray | None = None, dt: float = 1.0
     ) -> dict:
@@ -127,12 +163,14 @@ class Localizer:
         best_global_angle = 0
         best_global_candidates = []
         top_k = self.config.get("localization", {}).get("retrieval_top_k", 8)
+        top_k = self.config.get("localization", {}).get("retrieval_top_k", 8)
 
         for angle in angles_to_try:
             k = angle // 90
             rotated_frame = np.rot90(query_frame, k=k).copy()
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
             candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
+
 
             if candidates:
                 top_score = candidates[0][1]
@@ -141,6 +179,10 @@ class Localizer:
                     best_global_angle = angle
                     best_global_candidates = candidates
 
+        if best_global_candidates:
+            logger.info(
+                f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
+            )
         if best_global_candidates:
             logger.info(
                 f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
@@ -170,9 +212,12 @@ class Localizer:
         best_mkpts_r_inliers = None
         best_total_matches = 0
         early_stop = self.config.get("localization", {}).get("early_stop_inliers", 30)
+        early_stop = self.config.get("localization", {}).get("early_stop_inliers", 30)
 
         for candidate_id, _score in candidates:
+        for candidate_id, _score in candidates:
             ref_features = self.database.get_local_features(candidate_id)
+            mkpts_q, mkpts_r = self.matcher.match(query_features, ref_features)
             mkpts_q, mkpts_r = self.matcher.match(query_features, ref_features)
 
             if len(mkpts_q) >= self.min_matches:
@@ -190,6 +235,9 @@ class Localizer:
                         best_total_matches = len(mkpts_q)
 
             if best_inliers >= early_stop:
+                logger.info(
+                    f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
+                )
                 logger.info(
                     f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
                 )
@@ -235,16 +283,21 @@ class Localizer:
         """Перетворює координати, фільтрує викиди та розраховує кінцеві GPS координати."""
         # Фізичні розміри ПОВЕРНУТОГО кадру
         if global_angle in {90, 270}:
+        if global_angle in {90, 270}:
             rot_height, rot_width = width, height
         else:
             rot_height, rot_width = height, width
 
         centroid_ref = np.mean(mkpts_r, axis=0)
         centroid_query = np.mean(mkpts_q, axis=0)
+        centroid_ref = np.mean(mkpts_r, axis=0)
+        centroid_query = np.mean(mkpts_q, axis=0)
 
         center_query = np.array([rot_width / 2.0, rot_height / 2.0], dtype=np.float32)
         offset_px = center_query - centroid_query
+        offset_px = center_query - centroid_query
 
+        affine_ref = self.database.get_frame_affine(candidate_id)
         affine_ref = self.database.get_frame_affine(candidate_id)
         if affine_ref is None:
             return {"success": False, "error": "No propagated calibration"}
@@ -291,6 +344,7 @@ class Localizer:
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
         if hasattr(self.trajectory_filter, "update_with_dt"):
+        if hasattr(self.trajectory_filter, "update_with_dt"):
             filtered_pt = self.trajectory_filter.update_with_dt(metric_pt, dt)
         else:
             filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
@@ -312,8 +366,18 @@ class Localizer:
             f"Localization: ({lat:.6f}, {lon:.6f}), matched frame={candidate_id}, "
             f"rot={global_angle}°, confidence={confidence:.2f}"
         )
+            f"Localization: ({lat:.6f}, {lon:.6f}), matched frame={candidate_id}, "
+            f"rot={global_angle}°, confidence={confidence:.2f}"
+        )
 
         return {
+            "success": True,
+            "lat": lat,
+            "lon": lon,
+            "confidence": confidence,
+            "matched_frame": candidate_id,
+            "inliers": inliers,
+            "fov_polygon": gps_corners,
             "success": True,
             "lat": lat,
             "lon": lon,
@@ -389,9 +453,18 @@ class Localizer:
                 best_rot_angle,
                 best_total_matches,
             )
+            return (
+                best_inliers,
+                best_candidate_id,
+                best_mkpts_q_inliers,
+                best_mkpts_r_inliers,
+                best_rot_angle,
+                best_total_matches,
+            )
 
         # Підготовка запиту для SuperPoint
         from lightglue.utils import numpy_image_to_torch
+
 
         query_tensor = numpy_image_to_torch(query_frame).to(device)
 
@@ -401,8 +474,12 @@ class Localizer:
         # Фільтрація точок за маскою
         if static_mask is not None:
             kpts = sp_query["keypoints"][0].cpu().numpy()
+            kpts = sp_query["keypoints"][0].cpu().numpy()
             ix = np.round(kpts[:, 0]).astype(np.intp)
             iy = np.round(kpts[:, 1]).astype(np.intp)
+            in_bounds = (
+                (iy >= 0) & (iy < static_mask.shape[0]) & (ix >= 0) & (ix < static_mask.shape[1])
+            )
             in_bounds = (
                 (iy >= 0) & (iy < static_mask.shape[0]) & (ix >= 0) & (ix < static_mask.shape[1])
             )
@@ -416,20 +493,31 @@ class Localizer:
                     "keypoint_scores": sp_query["keypoint_scores"][:, valid_t]
                     if "keypoint_scores" in sp_query
                     else None,
+                    "keypoints": sp_query["keypoints"][:, valid_t],
+                    "descriptors": sp_query["descriptors"][:, valid_t],
+                    "keypoint_scores": sp_query["keypoint_scores"][:, valid_t]
+                    if "keypoint_scores" in sp_query
+                    else None,
                 }
                 # Видаляємо None
                 sp_query = {k: v for k, v in sp_query.items() if v is not None}
 
         # Перебір top-3 кандидатів (менше для швидкості)
         for candidate_id, _score in candidates[:3]:
+        for candidate_id, _score in candidates[:3]:
             ref_features = self.database.get_local_features(candidate_id)
 
             # Підготовка ref для LightGlue
             ref_kpts = torch.from_numpy(ref_features["keypoints"]).float()[None].to(device)
             ref_desc = torch.from_numpy(ref_features["descriptors"]).float()[None].to(device)
+            ref_kpts = torch.from_numpy(ref_features["keypoints"]).float()[None].to(device)
+            ref_desc = torch.from_numpy(ref_features["descriptors"]).float()[None].to(device)
 
             # Якщо ref дескриптори 64-dim (XFeat), fallback не підходить
             if ref_desc.shape[-1] != 256:
+                logger.debug(
+                    f"Skipping LightGlue fallback for frame {candidate_id}: ref desc dim={ref_desc.shape[-1]}"
+                )
                 logger.debug(
                     f"Skipping LightGlue fallback for frame {candidate_id}: ref desc dim={ref_desc.shape[-1]}"
                 )
@@ -440,13 +528,18 @@ class Localizer:
                     data = {
                         "image0": sp_query,
                         "image1": {"keypoints": ref_kpts, "descriptors": ref_desc},
+                        "image0": sp_query,
+                        "image1": {"keypoints": ref_kpts, "descriptors": ref_desc},
                     }
                     res = lg_model(data)
+                    matches = res["matches"][0].cpu().numpy()
                     matches = res["matches"][0].cpu().numpy()
 
                 if len(matches) >= self.min_matches:
                     q_kpts = sp_query["keypoints"][0].cpu().numpy()
+                    q_kpts = sp_query["keypoints"][0].cpu().numpy()
                     mkpts_q = q_kpts[matches[:, 0]]
+                    mkpts_r = ref_features["keypoints"][matches[:, 1]]
                     mkpts_r = ref_features["keypoints"][matches[:, 1]]
 
                     M, mask = GeometryTransforms.estimate_affine(
@@ -465,9 +558,21 @@ class Localizer:
                             logger.info(
                                 f"LightGlue fallback: {inliers} inliers on frame {candidate_id}"
                             )
+                            logger.info(
+                                f"LightGlue fallback: {inliers} inliers on frame {candidate_id}"
+                            )
             except Exception as e:
                 logger.debug(f"LightGlue fallback failed for frame {candidate_id}: {e}")
                 continue
+
+        return (
+            best_inliers,
+            best_candidate_id,
+            best_mkpts_q_inliers,
+            best_mkpts_r_inliers,
+            best_rot_angle,
+            best_total_matches,
+        )
 
         return (
             best_inliers,
