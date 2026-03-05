@@ -1,1 +1,1 @@
-﻿"""Neural network models module"""
+"""Neural network models module"""

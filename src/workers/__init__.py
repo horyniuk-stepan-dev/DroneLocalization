@@ -1,1 +1,1 @@
-﻿"""Worker threads module"""
+"""Worker threads module"""

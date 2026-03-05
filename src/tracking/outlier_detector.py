@@ -1,5 +1,6 @@
-﻿import numpy as np
 from collections import deque
+
+import numpy as np
 
 from src.utils.logging_utils import get_logger
 
@@ -18,7 +19,8 @@ class OutlierDetector:
 
         logger.info("Initializing OutlierDetector")
         logger.info(
-            f"Parameters: window_size={window_size}, threshold_std={threshold_std}, max_speed_mps={max_speed_mps}")
+            f"Parameters: window_size={window_size}, threshold_std={threshold_std}, max_speed_mps={max_speed_mps}"
+        )
 
     def add_position(self, position: tuple):
         self.window.append(np.array(position, dtype=np.float32))
@@ -61,9 +63,13 @@ class OutlierDetector:
                 return False  # Приймаємо нову позицію
 
             if is_speed_outlier:
-                logger.warning(f"OUTLIER DETECTED: Speed too high ({instantaneous_speed:.2f} m/s > {self.max_speed_mps} m/s)")
+                logger.warning(
+                    f"OUTLIER DETECTED: Speed too high ({instantaneous_speed:.2f} m/s > {self.max_speed_mps} m/s)"
+                )
             else:
-                logger.warning(f"OUTLIER DETECTED: Z-score {z_score:.2f} > {self.threshold_std}, distance {distance:.0f}m")
+                logger.warning(
+                    f"OUTLIER DETECTED: Z-score {z_score:.2f} > {self.threshold_std}, distance {distance:.0f}m"
+                )
             return True
 
         self._consecutive_outliers = 0

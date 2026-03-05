@@ -1,29 +1,29 @@
 import base64
+
 import cv2
 import numpy as np
 import torch
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QMessageBox, QFileDialog
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
-from src.models.wrappers.feature_extractor import FeatureExtractor
-from src.localization.matcher import FeatureMatcher
 from src.localization.localizer import Localizer
+from src.localization.matcher import FeatureMatcher
+from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.workers.panorama_worker import PanoramaWorker
 
 _MAX_DISPLAY_PX = 2048
-_CROP_SIZE_MAX  = 800
-_JPEG_QUALITY   = 80
+_CROP_SIZE_MAX = 800
+_JPEG_QUALITY = 80
 
 
 class PanoramaMixin:
-
     @pyqtSlot()
     def on_generate_panorama(self):
         default_video = ""
         default_save = "panorama.jpg"
-        
+
         if self.project_manager and self.project_manager.is_loaded:
             default_video = self.project_manager.settings.video_path
             default_save = str(self.project_manager.project_dir / "panoramas" / "panorama.jpg")
@@ -33,7 +33,7 @@ class PanoramaMixin:
         )
         if not video_path:
             return
-            
+
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Зберегти панораму", default_save, "Images (*.jpg *.png)"
         )
@@ -91,17 +91,23 @@ class PanoramaMixin:
                 scale = _MAX_DISPLAY_PX / max(W, H)
                 img = cv2.resize(img, (int(W * scale), int(H * scale)))
 
-            ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
             if not ok:
                 raise RuntimeError("Не вдалося закодувати зображення")
 
-            data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
+            data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
             (lat_tl, lon_tl), (lat_tr, lon_tr), (lat_br, lon_br), (lat_bl, lon_bl) = corners_gps
 
             self.map_widget.set_panorama_overlay(
                 data_url,
-                lat_tl, lon_tl, lat_tr, lon_tr,
-                lat_br, lon_br, lat_bl, lon_bl,
+                lat_tl,
+                lon_tl,
+                lat_tr,
+                lon_tr,
+                lat_br,
+                lon_br,
+                lat_bl,
+                lon_bl,
             )
             self.status_bar.showMessage("Панораму накладено на карту!")
 
@@ -135,17 +141,22 @@ class PanoramaMixin:
         for cx, cy in centers:
             x1 = max(0, cx - crop_size // 2)
             y1 = max(0, cy - crop_size // 2)
-            crops.append((img[y1:y1 + crop_size, x1:x1 + crop_size], x1, y1))
+            crops.append((img[y1 : y1 + crop_size, x1 : x1 + crop_size], x1, y1))
 
         # ОНОВЛЕНО: Переміщуємо XFeat та DINOv2 на CPU для економії VRAM під час обробки великої панорами
         device = self.model_manager.device
-        xf = self.model_manager.load_xfeat().to('cpu')
-        nv = self.model_manager.load_dinov2().to('cpu')
+        xf = self.model_manager.load_xfeat().to("cpu")
+        nv = self.model_manager.load_dinov2().to("cpu")
 
-        fe = FeatureExtractor(xf, nv, device='cpu', config=self.config)
+        fe = FeatureExtractor(xf, nv, device="cpu", config=self.config)
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
-        localizer = Localizer(self.database, fe, matcher, self.calibration,
-                              {**self.config, '_model_manager': self.model_manager})
+        localizer = Localizer(
+            self.database,
+            fe,
+            matcher,
+            self.calibration,
+            {**self.config, "_model_manager": self.model_manager},
+        )
 
         pts_pano, pts_metric = [], []
         try:
@@ -154,26 +165,24 @@ class PanoramaMixin:
                 self.repaint()
 
                 res = localizer.localize_frame(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                if not res.get('success') or 'fov_polygon' in res is False:
+                if not res.get("success") or "fov_polygon" in res is False:
                     continue
 
                 ch, cw = crop.shape[:2]
                 for (px, py), (lat, lon) in zip(
-                        [(0, 0), (cw, 0), (cw, ch), (0, ch)],
-                        res['fov_polygon']
+                    [(0, 0), (cw, 0), (cw, ch), (0, ch)], res["fov_polygon"], strict=True
                 ):
                     pts_pano.append((px + off_x, py + off_y))
                     pts_metric.append(CoordinateConverter.gps_to_metric(lat, lon))
         finally:
             # ОНОВЛЕНО: Повертаємо XFeat назад на основний пристрій
-            xf.to(device);
+            xf.to(device)
             nv.to(device)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         if len(pts_pano) < 3:
-            QMessageBox.warning(self, "Помилка",
-                                "Замало точок для прив'язки панорами.")
+            QMessageBox.warning(self, "Помилка", "Замало точок для прив'язки панорами.")
             return None
 
         M, _ = cv2.estimateAffine2D(

@@ -1,37 +1,36 @@
-﻿from PyQt6.QtWidgets import QMainWindow, QDockWidget, QStatusBar
+from config.config import APP_CONFIG
 from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QDockWidget, QMainWindow, QStatusBar
 
-from src.gui.widgets.video_widget import VideoWidget
-from src.gui.widgets.map_widget import MapWidget
-from src.gui.widgets.control_panel import ControlPanel
-from src.models.model_manager import ModelManager
-from src.database.database_loader import DatabaseLoader
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.core.project import ProjectManager
+from src.database.database_loader import DatabaseLoader
+from src.gui.mixins import CalibrationMixin, DatabaseMixin, PanoramaMixin, TrackingMixin
+from src.gui.widgets.control_panel import ControlPanel
+from src.gui.widgets.map_widget import MapWidget
+from src.gui.widgets.video_widget import VideoWidget
+from src.models.model_manager import ModelManager
 from src.utils.logging_utils import get_logger
-from src.gui.mixins import CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin
-from config.config import APP_CONFIG
 
 
 class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, QMainWindow):
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Drone Topometric Localizer")
         self.setGeometry(100, 100, 1600, 900)
-        self.logger = get_logger('MainWindow')
+        self.logger = get_logger("MainWindow")
 
-        self.config                = APP_CONFIG
-        self.model_manager         = ModelManager(config=APP_CONFIG)
-        self.project_manager       = ProjectManager()
+        self.config = APP_CONFIG
+        self.model_manager = ModelManager(config=APP_CONFIG)
+        self.project_manager = ProjectManager()
         self.database: DatabaseLoader | None = None
-        self.calibration           = MultiAnchorCalibration()
+        self.calibration = MultiAnchorCalibration()
 
         # Workers
-        self.db_worker           = None
-        self.tracking_worker     = None
-        self.propagation_worker  = None
-        self.pano_worker         = None
+        self.db_worker = None
+        self.tracking_worker = None
+        self.propagation_worker = None
+        self.pano_worker = None
         self._propagation_dialog = None
 
         self._init_ui()
@@ -61,17 +60,17 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
     def _create_menu_bar(self):
         menubar = self.menuBar()
 
-        file_menu = menubar.addMenu('Файл')
-        file_menu.addAction('Вихід', self.close)
+        file_menu = menubar.addMenu("Файл")
+        file_menu.addAction("Вихід", self.close)
 
-        calib_menu = menubar.addMenu('Калібрування')
-        calib_menu.addAction('Додати якір...', self.on_calibrate)
-        calib_menu.addAction('Завантажити калібрування...', self.on_load_calibration)
-        calib_menu.addAction('Зберегти калібрування...', self.on_save_calibration)
+        calib_menu = menubar.addMenu("Калібрування")
+        calib_menu.addAction("Додати якір...", self.on_calibrate)
+        calib_menu.addAction("Завантажити калібрування...", self.on_load_calibration)
+        calib_menu.addAction("Зберегти калібрування...", self.on_save_calibration)
         calib_menu.addSeparator()
-        calib_menu.addAction('Запустити пропагацію вручну', self.on_run_propagation)
+        calib_menu.addAction("Запустити пропагацію вручну", self.on_run_propagation)
 
-        view_menu = menubar.addMenu('Вигляд')
+        view_menu = menubar.addMenu("Вигляд")
         view_menu.addAction(self.control_dock.toggleViewAction())
         view_menu.addAction(self.map_dock.toggleViewAction())
 

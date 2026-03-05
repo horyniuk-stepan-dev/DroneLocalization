@@ -1,9 +1,18 @@
-﻿from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLineEdit, QPushButton, QDoubleSpinBox, QSpinBox,
-    QFileDialog, QDialogButtonBox, QMessageBox,
-)
 from PyQt6.QtCore import pyqtSlot
+from PyQt6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+)
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -84,16 +93,16 @@ class NewMissionDialog(QDialog):
 
     @pyqtSlot()
     def _browse_workspace(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Виберіть робочу папку (Workspace)", ""
-        )
+        path = QFileDialog.getExistingDirectory(self, "Виберіть робочу папку (Workspace)", "")
         if path:
             self.workspace_path_edit.setText(path)
 
     @pyqtSlot()
     def _browse_video(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть еталонне відео", "",
+            self,
+            "Виберіть еталонне відео",
+            "",
             "Video Files (*.mp4 *.avi *.mkv);;All Files (*)",
         )
         if path:
@@ -117,13 +126,13 @@ class NewMissionDialog(QDialog):
 
     def get_mission_data(self) -> dict:
         data = {
-            "mission_name":    self.mission_name_edit.text().strip(),
-            "workspace_dir":   self.workspace_path_edit.text(),
-            "video_path":      self.video_path_edit.text(),
-            "altitude_m":      self.altitude_spinbox.value(),
+            "mission_name": self.mission_name_edit.text().strip(),
+            "workspace_dir": self.workspace_path_edit.text(),
+            "video_path": self.video_path_edit.text(),
+            "altitude_m": self.altitude_spinbox.value(),
             "focal_length_mm": self.focal_length_spinbox.value(),
             "sensor_width_mm": self.sensor_width_spinbox.value(),
-            "image_width_px":  self.image_width_spinbox.value(),
+            "image_width_px": self.image_width_spinbox.value(),
         }
         logger.info(
             f"Mission: '{data['mission_name']}' in '{data['workspace_dir']}' | "

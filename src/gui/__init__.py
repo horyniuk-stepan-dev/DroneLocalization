@@ -1,1 +1,1 @@
-﻿"""GUI module - PyQt6 interface"""
+"""GUI module - PyQt6 interface"""
