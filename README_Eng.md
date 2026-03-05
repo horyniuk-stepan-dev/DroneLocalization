@@ -6,7 +6,7 @@ A professional system for topometric localization and visual navigation of drone
 
 - **Desktop GUI (PyQt6)**: A multi-threaded graphical interface for Windows, optimized for real-time operation.
 - **Semantic Global Localization (DINOv2)**: Uses Meta's transformer model to understand the physical nature and geometry of objects. Allows the system to recognize terrain regardless of whether it is sunlit or in shadow.
-- **Dynamic Object Filtering (YOLOv8-Seg)**: Automatic neural network masking of cars, people, and other moving objects during reference database creation, ensuring anchoring only to stable geometry (roads, buildings).
+- **Dynamic Object Filtering (YOLOv11-Seg)**: Automatic neural network masking of cars, people, and other moving objects during reference database creation, ensuring anchoring only to stable geometry (roads, buildings).
 - **Adaptive Preprocessing (CLAHE)**: A local contrast equalization algorithm that "pulls out" textures and edges even from the deepest shadows for reliable local recognition.
 - **Precise Feature Matching**: A combination of SuperPoint (keypoint extraction) and LightGlue (fast and robust match search).
 - **Multi-Anchor Calibration & Wave Propagation**: Interactive assignment of GPS coordinates to several key frames, followed by automatic mathematical propagation (affine transformations) across all thousands of intermediate frames in the database.
@@ -42,8 +42,6 @@ python -m venv .venv
 # Install dependencies
 pip install -r requirements.txt
 
-# Install hloc directly from GitHub (REQUIRED)
-pip install git+https://github.com/cvg/Hierarchical-Localization.git
 ```
 
 ### 2. Running the Application

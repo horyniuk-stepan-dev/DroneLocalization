@@ -7,6 +7,7 @@ from src.gui.widgets.control_panel import ControlPanel
 from src.models.model_manager import ModelManager
 from src.database.database_loader import DatabaseLoader
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.core.project import ProjectManager
 from src.utils.logging_utils import get_logger
 from src.gui.mixins import CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin
 from config.config import APP_CONFIG
@@ -22,9 +23,9 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
 
         self.config                = APP_CONFIG
         self.model_manager         = ModelManager(config=APP_CONFIG)
+        self.project_manager       = ProjectManager()
         self.database: DatabaseLoader | None = None
         self.calibration           = MultiAnchorCalibration()
-        self.current_database_path = None
 
         # Workers
         self.db_worker           = None

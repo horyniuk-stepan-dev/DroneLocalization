@@ -2,6 +2,8 @@
 import numpy as np
 import cv2
 from pathlib import Path
+from threading import Thread
+from queue import Queue
 
 from datetime import datetime
 from src.utils.logging_utils import get_logger
@@ -60,12 +62,27 @@ class DatabaseBuilder:
         # Ініціалізуємо запис відео з keypoints
         kp_video_path = None
         kp_writer = None
+        kp_scale = 1.0
         if save_keypoint_video:
+            # Зменшуємо роздільну здатність для великих відео (наприклад, 1080p і вище) щоб зекономити місце
+            if width >= 1920:
+                kp_scale = 0.5
+                
+            kp_width = int(width * kp_scale)
+            kp_height = int(height * kp_scale)
+            
             kp_video_path = str(Path(self.output_path).with_suffix('')) + '_keypoints.mp4'
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (width, height))
+            # Використовуємо H.264 (avc1) кодек для кращої компресії замість старого mp4v
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (kp_width, kp_height))
+            
+            if not kp_writer.isOpened():
+                logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (kp_width, kp_height))
+
             if kp_writer.isOpened():
-                logger.info(f"Keypoint video will be saved to: {kp_video_path}")
+                logger.info(f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})")
             else:
                 logger.warning("Failed to initialize keypoint video writer, skipping")
                 kp_writer = None
@@ -89,18 +106,41 @@ class DatabaseBuilder:
         current_pose = np.eye(3, dtype=np.float32)
         prev_features = None  # фічі попереднього кадру для матчингу
 
+        # cuDNN benchmark для прискорення (input size не змінюється)
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            logger.info("cuDNN benchmark ENABLED for consistent input sizes")
+
+        # Тредовий prefetch відеокадрів — CPU декодує наступний кадр поки GPU обробляє поточний
+        frame_queue = Queue(maxsize=4)
+
+        def prefetch_frames():
+            for i in range(num_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    frame_queue.put((i, None))
+                    break
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_queue.put((i, (frame, frame_rgb)))
+            frame_queue.put((-1, None))  # sentinel
+
+        prefetch_thread = Thread(target=prefetch_frames, daemon=True)
+        prefetch_thread.start()
+
         try:
             self.db_file = h5py.File(self.output_path, 'a')
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
-            for i in range(num_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    logger.warning(f"Failed to read frame {i}, stopping processing")
+            while True:
+                idx, data = frame_queue.get()
+                if idx == -1 or data is None:
+                    if idx != -1:
+                        logger.warning(f"Failed to read frame {idx}, stopping processing")
                     break
 
-                # Convert BGR to RGB for neural networks
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame, frame_rgb = data
+                i = idx
 
                 # Step 1: Get static mask (discard moving objects)
                 logger.debug(f"Frame {i}/{num_frames}: Detecting dynamic objects...")
@@ -120,6 +160,10 @@ class DatabaseBuilder:
                     kp_frame = self._draw_keypoints_frame(
                         frame, features['keypoints'], static_mask, i, num_frames
                     )
+                    if kp_scale != 1.0:
+                        kp_width = int(width * kp_scale)
+                        kp_height = int(height * kp_scale)
+                        kp_frame = cv2.resize(kp_frame, (kp_width, kp_height), interpolation=cv2.INTER_AREA)
                     kp_writer.write(kp_frame)
 
                 # Step 5: Оновлюємо накопичену позу H(frame_i → frame_0)
@@ -153,6 +197,7 @@ class DatabaseBuilder:
             logger.error(f"Error during database building: {e}")
             raise
         finally:
+            prefetch_thread.join(timeout=5)
             if kp_writer is not None:
                 kp_writer.release()
                 if kp_video_path:
@@ -248,7 +293,14 @@ class DatabaseBuilder:
         sorted_idx = np.argsort(-sim, axis=1)
         best = sim[np.arange(len(desc_b)), sorted_idx[:, 0]]
         second = sim[np.arange(len(desc_b)), sorted_idx[:, 1]]
-        valid = (best / (second + 1e-8)) > 1.2  # ratio > 1.2 ≈ відстань ratio < 0.83
+        ratio_valid = (best / (second + 1e-8)) > 1.2  # ratio > 1.2 ≈ відстань ratio < 0.83
+
+        # Mutual Nearest Neighbor (MNN) — перевірка двосторонньої консистентності
+        best_b_to_a = sorted_idx[:, 0]  # Найкращий збіг B→A
+        best_a_to_b = np.argmax(sim, axis=0)  # Найкращий збіг A→B
+        is_mutual = best_a_to_b[best_b_to_a] == np.arange(len(desc_b))
+
+        valid = ratio_valid & is_mutual
 
         if valid.sum() < min_matches:
             return None

@@ -41,7 +41,7 @@ class FeatureMatcher:
     def __init__(self, model_manager=None, config=None):
         self.config = config or {}
         self.model_manager = model_manager
-        self.ratio_threshold = self.config.get('localization', {}).get('ratio_threshold', 0.90)
+        self.ratio_threshold = self.config.get('localization', {}).get('ratio_threshold', 0.95)
 
         # Намагаємося завантажити LightGlue, якщо він потрібен
         self.lightglue = None

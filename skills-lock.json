@@ -6,6 +6,16 @@
       "sourceType": "github",
       "computedHash": "18c248ee75adf4ebffb009c3d98b374629d6c7b9abafd31ab5f01e3c5d812981"
     },
+    "python-code-quality": {
+      "source": "laurigates/claude-plugins",
+      "sourceType": "github",
+      "computedHash": "32a1a8c964c078a848edbe3c813d5029ca4d1e3fe3434fd24d4e05fa4c6ce4fb"
+    },
+    "python-refactor": {
+      "source": "acaprino/alfio-claude-plugins",
+      "sourceType": "github",
+      "computedHash": "335ed5deff81c2006d6346ada3dd6938ff49f180aaa6f25ab5709fc0bd9fa694"
+    },
     "python-testing": {
       "source": "affaan-m/everything-claude-code",
       "sourceType": "github",

@@ -10,20 +10,25 @@ class DatabaseMixin:
 
     @pyqtSlot()
     def on_new_mission(self):
+        # Отримуємо дані про нову місію з діалогу
         dialog = NewMissionDialog(self)
         if not dialog.exec():
             return
-        video_path = dialog.get_mission_data().get('video_path')
-        if not video_path:
-            QMessageBox.warning(self, "Помилка", "Виберіть еталонне відео.")
+            
+        mission_data = dialog.get_mission_data()
+        workspace_dir = mission_data.get('workspace_dir')
+        video_path = mission_data.get('video_path')
+        
+        if not workspace_dir or not video_path:
             return
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти базу HDF5", "", "HDF5 Files (*.h5 *.hdf5)"
-        )
-        if save_path:
-            self._start_database_generation(video_path, save_path)
-        else:
-            self.status_bar.showMessage("Створення місії скасовано")
+
+        # Створюємо структуру проєкту
+        if not self.project_manager.create_project(workspace_dir, mission_data):
+            QMessageBox.critical(self, "Помилка", "Не вдалося створити проєкт!")
+            return
+            
+        self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+        self._start_database_generation(video_path, self.project_manager.database_path)
 
     def _start_database_generation(self, video_path: str, save_path: str):
         self.control_panel.btn_new_mission.setEnabled(False)
@@ -57,8 +62,8 @@ class DatabaseMixin:
         self.database = DatabaseLoader(db_path)
         self.control_panel.update_progress(100)
         self.control_panel.update_status("Базу успішно створено")
-        self.status_bar.showMessage(f"Нова база: {db_path}")
-        QMessageBox.information(self, "Успіх", "Базу даних успішно згенеровано!")
+        self.status_bar.showMessage(f"Проєкт: {self.project_manager.project_name} | База: {db_path}")
+        QMessageBox.information(self, "Успіх", "Проєкт та базу даних успішно згенеровано!")
 
     @pyqtSlot(str)
     def on_db_error(self, error_msg: str):
@@ -70,24 +75,38 @@ class DatabaseMixin:
 
     @pyqtSlot()
     def on_load_database(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть базу HDF5", "", "HDF5 Files (*.h5 *.hdf5);;All Files (*)"
+        path = QFileDialog.getExistingDirectory(
+            self, "Виберіть папку проєкту", ""
         )
         if not path:
-            self.status_bar.showMessage("Вибір скасовано")
+            self.status_bar.showMessage("Вибір проєкту скасовано")
             return
+            
+        if not self.project_manager.load_project(path):
+            QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
+            return
+            
         try:
+            db_path = self.project_manager.database_path
+            
             # Закриваємо попередню базу щоб звільнити HDF5 handle
             if self.database:
                 self.database.close()
-            self.database = DatabaseLoader(path)
-            self.current_database_path = path
+                
+            self.database = DatabaseLoader(db_path)
+            self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+            
             if self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
-                self.status_bar.showMessage(f"База: {path} (GPS: {n_valid}/{n_total} кадрів)")
+                self.status_bar.showMessage(
+                    f"Проєкт: {self.project_manager.project_name} (GPS: {n_valid}/{n_total} кадрів)"
+                )
             else:
-                self.status_bar.showMessage(f"База: {path} (без GPS пропагації)")
-            self.control_panel.update_status("База завантажена")
+                self.status_bar.showMessage(
+                    f"Проєкт: {self.project_manager.project_name} (без GPS пропагації)"
+                )
+            self.control_panel.update_status("Проєкт завантажено")
+            
         except Exception as e:
-            QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу:\n{e}")
+            QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу проєкту:\n{e}")

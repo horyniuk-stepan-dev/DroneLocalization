@@ -40,15 +40,15 @@ class ModelManager:
     def load_yolo(self):
         name = 'yolo'
         if name not in self.models:
-            logger.info(f"Loading YOLOv11n-seg model...")
-            self._ensure_vram_available(300.0) # YOLO11n дуже легка
+            logger.info(f"Loading YOLOv11x-seg (Extra Large) model...")
+            self._ensure_vram_available(1200.0) # YOLO11x потребує ~1.2GB+
             try:
                 from ultralytics import YOLO
-                # Ultralytics автоматично завантажить архітектуру YOLOv11
-                model = YOLO('yolo11n-seg.pt')
+                # Ultralytics автоматично завантажить архітектуру YOLOv11x
+                model = YOLO('yolo11x-seg.pt')
                 model.to(self.device)
                 self.models[name] = model
-                logger.success(f"YOLOv11n-seg model loaded successfully on {self.device}")
+                logger.success(f"YOLOv11x-seg model loaded successfully on {self.device}")
             except Exception as e:
                 logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
                 raise
@@ -81,7 +81,7 @@ class ModelManager:
                 from lightglue import SuperPoint
                 sp_config = {
                     'nms_radius': self.config.get('superpoint', {}).get('nms_radius', 4),
-                    'max_num_keypoints': self.config.get('superpoint', {}).get('max_keypoints', 2048),
+                    'max_num_keypoints': self.config.get('superpoint', {}).get('max_keypoints', 4096),
                 }
                 model = SuperPoint(**sp_config).eval().to(self.device)
                 self.models[name] = model
@@ -115,13 +115,13 @@ class ModelManager:
     def load_dinov2(self):
         name = 'dinov2'
         if name not in self.models:
-            logger.info(f"Loading DINOv2 (vits14) model...")
-            self._ensure_vram_available(500.0)
+            logger.info(f"Loading DINOv2 (vitl14) Large model...")
+            self._ensure_vram_available(1600.0) # Large важить ~1.2-1.5 GB
             try:
-                model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+                model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
                 model = model.eval().to(self.device)
                 self.models[name] = model
-                logger.success(f"DINOv2 model loaded successfully")
+                logger.success(f"DINOv2 Large model loaded successfully")
             except Exception as e:
                 logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
                 raise

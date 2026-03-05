@@ -21,13 +21,21 @@ class PanoramaMixin:
 
     @pyqtSlot()
     def on_generate_panorama(self):
+        default_video = ""
+        default_save = "panorama.jpg"
+        
+        if self.project_manager and self.project_manager.is_loaded:
+            default_video = self.project_manager.settings.video_path
+            default_save = str(self.project_manager.project_dir / "panoramas" / "panorama.jpg")
+
         video_path, _ = QFileDialog.getOpenFileName(
-            self, "Відео для панорами", "", "Video Files (*.mp4 *.avi *.mkv)"
+            self, "Відео для панорами", default_video, "Video Files (*.mp4 *.avi *.mkv)"
         )
         if not video_path:
             return
+            
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти панораму", "panorama.jpg", "Images (*.jpg *.png)"
+            self, "Зберегти панораму", default_save, "Images (*.jpg *.png)"
         )
         if not save_path:
             return
@@ -55,8 +63,12 @@ class PanoramaMixin:
             QMessageBox.warning(self, "Увага", "Спочатку виконайте калібрування!")
             return
 
+        default_dir = ""
+        if self.project_manager and self.project_manager.is_loaded:
+            default_dir = str(self.project_manager.project_dir / "panoramas")
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
+            self, "Виберіть панораму", default_dir, "Images (*.png *.jpg *.jpeg);;All Files (*)"
         )
         if not path:
             return
@@ -132,7 +144,8 @@ class PanoramaMixin:
 
         fe = FeatureExtractor(xf, nv, device='cpu', config=self.config)
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
-        localizer = Localizer(self.database, fe, matcher, self.calibration, self.config)
+        localizer = Localizer(self.database, fe, matcher, self.calibration,
+                              {**self.config, '_model_manager': self.model_manager})
 
         pts_pano, pts_metric = [], []
         try:

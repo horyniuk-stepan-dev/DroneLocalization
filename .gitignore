@@ -89,4 +89,4 @@ scripts/data/models/depth_anything_vitl14.pth
 .agent/
 .agents/
 .claude/
-.
+all_merged.py

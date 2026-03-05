@@ -33,12 +33,12 @@ class ControlPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # Database group
-        db_group  = QGroupBox("Управління базою даних")
+        # Project group
+        db_group  = QGroupBox("Управління проєктом")
         db_layout = QVBoxLayout(db_group)
 
-        self.btn_new_mission = QPushButton("Створити нову базу (Video → HDF5)")
-        self.btn_load_db     = QPushButton("Завантажити існуючу базу (HDF5)")
+        self.btn_new_mission = QPushButton("Створити новий проєкт")
+        self.btn_load_db     = QPushButton("Відкрити проєкт")
         self.btn_gen_pano    = QPushButton("Згенерувати панораму з відео")
         self.btn_show_pano   = QPushButton("Накласти панораму на карту")
 

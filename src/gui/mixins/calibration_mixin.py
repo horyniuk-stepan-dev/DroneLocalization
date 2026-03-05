@@ -61,8 +61,8 @@ class CalibrationMixin:
 
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=M)
 
-            if self.database and self.database.db_path:
-                calib_path = self.database.db_path.replace('.h5', '_calib.json')
+            if self.project_manager and self.project_manager.is_loaded:
+                calib_path = self.project_manager.calibration_path
                 self.calibration.save(calib_path)
 
             self.status_bar.showMessage(f"Якір для кадру {frame_id} успішно створено!")
@@ -165,8 +165,13 @@ class CalibrationMixin:
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
+            
+        default_path = "calibration.json"
+        if self.project_manager and self.project_manager.is_loaded:
+            default_path = str(self.project_manager.project_dir / default_path)
+            
         path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти калібрування", "calibration.json", "JSON Files (*.json)"
+            self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
         )
         if not path:
             return
@@ -181,8 +186,12 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_load_calibration(self):
+        default_dir = ""
+        if self.project_manager and self.project_manager.is_loaded:
+            default_dir = str(self.project_manager.project_dir)
+            
         path, _ = QFileDialog.getOpenFileName(
-            self, "Завантажити калібрування", "", "JSON Files (*.json);;All Files (*)"
+            self, "Завантажити калібрування", default_dir, "JSON Files (*.json);;All Files (*)"
         )
         if not path:
             return

@@ -22,7 +22,7 @@ APP_CONFIG = {
         # dinov2_vits14 → 384, dinov2_vitb14 → 768, dinov2_vitl14 → 1024
         # ⚠️ Має збігатися з моделлю у ModelManager.load_dinov2()
         # Читає: DatabaseBuilder.__init__ → HDF5 розмір datasets
-        'descriptor_dim': 384,
+        'descriptor_dim': 1024,
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -50,22 +50,25 @@ APP_CONFIG = {
     'localization': {
         # Мінімальна кількість збігів для прийняття гомографії
         # Читає: Localizer, CalibrationPropagationWorker
-        'min_matches': 4,
+        'min_matches': 8,
 
-        # Поріг репроєкційної помилки для MAGSAC++ (пікселі)
-        # Читає: Localizer, CalibrationPropagationWorker
-        'ransac_threshold': 3.0,
+        # Мінімальна кількість інлієрів для прийняття результату (інакше fallback)
+        'min_inliers_accept': 8,
+
+        # Поріг відношення Lowe (чим ближче до 1.0, тим більше збігів пропускає)
+        'ratio_threshold': 0.95,
+
+        # Поріг репроєкційної помилки для RANSAC/MAGSAC++ (пікселі)
+        # Більше значення = більше "шумних" збігів вважатимуться валідними
+        'ransac_threshold': 5.0,
 
         # Кількість кандидатів з DINOv2-пошуку для перебору
-        # Читає: Localizer → FastRetrieval.find_similar_frames(top_k=...)
-        'retrieval_top_k': 5,
+        'retrieval_top_k': 8,
 
         # Кількість inliers для дострокового виходу з перебору ротацій/кандидатів
-        # Читає: Localizer — якщо inliers >= цього, зупиняємо пошук
         'early_stop_inliers': 20,
 
         # Масштабний множник впевненості: confidence = inliers / confidence_max_inliers
-        # Читає: Localizer — при 50 inliers → confidence = 1.0
         'confidence_max_inliers': 50,
     },
 
@@ -96,7 +99,7 @@ APP_CONFIG = {
         # Бажана частота обробки кадрів локалізатором (кадрів/секунду)
         # frame_step = round(video_fps / process_fps), dt = frame_step / video_fps
         # Читає: RealtimeTrackingWorker.__init__
-        'process_fps': 10.0,
+        'process_fps': 1.0,
     },
 
     # ══════════════════════════════════════════════════════════════════════════
