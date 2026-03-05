@@ -4,14 +4,14 @@ A professional system for topometric localization and visual navigation of drone
 
 ## 🎯 Key Features
 
-- **Desktop GUI (PyQt6)**: A multi-threaded graphical interface for Windows, optimized for real-time operation.
-- **Semantic Global Localization (DINOv2)**: Uses Meta's transformer model to understand the physical nature and geometry of objects. Allows the system to recognize terrain regardless of whether it is sunlit or in shadow.
-- **Dynamic Object Filtering (YOLOv11-Seg)**: Automatic neural network masking of cars, people, and other moving objects during reference database creation, ensuring anchoring only to stable geometry (roads, buildings).
-- **Adaptive Preprocessing (CLAHE)**: A local contrast equalization algorithm that "pulls out" textures and edges even from the deepest shadows for reliable local recognition.
-- **Precise Feature Matching**: A combination of SuperPoint (keypoint extraction) and LightGlue (fast and robust match search).
-- **Multi-Anchor Calibration & Wave Propagation**: Interactive assignment of GPS coordinates to several key frames, followed by automatic mathematical propagation (affine transformations) across all thousands of intermediate frames in the database.
-- **Robust Trajectory Filtering**: A built-in Kalman Filter for trajectory smoothing and a statistical anomaly detector (Z-score + Speed limit) to eliminate false localization jumps.
-- **Interactive Map & Panoramas**: Display of the drone, its trajectory, and field of view (FOV) on a Leaflet map. Generation of panoramas from video and their automatic geospatial overlay on the satellite map.
+- **Desktop GUI (PyQt6)**: Multi-threaded graphical interface for Windows, optimized for real-time operation.
+- **Semantic Global Localization (DINOv2)**: Leverages Meta's Foundation Model for global descriptors resistant to lighting, shadows, and seasonal changes.
+- **Dynamic Object Filtering (YOLOv11-Seg)**: Automatic neural masking of moving objects (cars, people) to ensure anchoring only to stable geometry.
+- **Adaptive Preprocessing (CLAHE)**: Local contrast equalization to extract textures from deep shadows.
+- **Hybrid Feature Matching**: Uses **XFeat** for speed or **SuperPoint + LightGlue** for maximum precision in challenging scenarios.
+- **Multi-Anchor Calibration**: Interactive GPS anchoring with automatic "wave" propagation of coordinates via affine transforms.
+- **Intelligent Tracking**: Trajectory smoothing via **Kalman Filter** and anomaly detection using Z-score.
+- **Interactive Map**: Real-time visualization of Drone FOV (Field of View) and path on a Leaflet-based map.
 
 ## 📋 System Requirements
 
@@ -86,15 +86,15 @@ python main.py
 
 ```
 src/
-├── gui/              # PyQt6 graphical interface
+├── gui/              # PyQt6 GUI and map components
 ├── workers/          # QThread background threads (tracking, DB, panoramas)
-├── models/           # Neural network wrappers (YOLO, SuperPoint, NetVLAD, LightGlue)
-├── database/         # HDF5 generation and reading
-├── localization/     # Recognition pipeline
-├── geometry/         # Geometric transformations (affine, homography)
-├── calibration/      # Multi-anchor calibration and wave propagation
-├── tracking/         # Kalman filter and outlier detection (Z-test)
-└── utils/            # Helper functions and logging
+├── models/           # AI wrappers (YOLOv11, DINOv2, XFeat, LightGlue)
+├── database/         # HDF5 management (Builder, Loader)
+├── localization/     # Core pipeline (Localizer, Matcher)
+├── geometry/         # Math (Affine, Homography, UTM coordinates)
+├── calibration/      # GPS Calibration and propagation system
+├── tracking/         # Kalman Filter and Outlier Detector
+└── utils/            # Logging, config, and utility scripts
 ```
 
 ## 🔧 Development
