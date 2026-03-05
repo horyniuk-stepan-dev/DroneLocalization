@@ -9,7 +9,9 @@ class ImagePreprocessor:
         self.config = config or {}
         # Ініціалізуємо алгоритм локального контрасту CLAHE
         # clipLimit=3.0 дає сильне витягування тіней, tileGridSize=(8,8) - розмір блоку
-        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        clip = self.config.get('preprocessing', {}).get('clahe_clip_limit', 3.0)
+        tile = self.config.get('preprocessing', {}).get('clahe_tile_size', 8)
+        self.clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
         logger.info("ImagePreprocessor initialized with CLAHE (Local Contrast Enhancement)")
 
     def preprocess(self, image: np.ndarray) -> np.ndarray:

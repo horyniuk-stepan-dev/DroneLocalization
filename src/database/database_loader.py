@@ -64,6 +64,17 @@ class DatabaseLoader:
                 self.frame_valid = grp['frame_valid'][:].astype(bool)
                 valid_count = int(np.sum(self.frame_valid))
                 logger.success(f"Propagation data loaded: {valid_count} frames valid")
+
+                # Автоматична ініціалізація UTM з reference_gps у HDF5
+                if 'reference_gps' in grp.attrs:
+                    import json
+                    from src.geometry.coordinates import CoordinateConverter
+                    try:
+                        ref_gps = json.loads(grp.attrs['reference_gps'])
+                        CoordinateConverter.gps_to_metric(ref_gps[0], ref_gps[1])
+                        logger.success(f"UTM auto-initialized from HDF5 reference GPS: {ref_gps}")
+                    except Exception as e:
+                        logger.warning(f"Could not auto-initialize UTM from HDF5: {e}")
             else:
                 logger.warning("Found old calibration format. Please run propagation again.")
                 self.frame_affine = None

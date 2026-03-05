@@ -41,6 +41,7 @@ class FeatureMatcher:
     def __init__(self, model_manager=None, config=None):
         self.config = config or {}
         self.model_manager = model_manager
+        self.ratio_threshold = self.config.get('localization', {}).get('ratio_threshold', 0.90)
 
         # Намагаємося завантажити LightGlue, якщо він потрібен
         self.lightglue = None
@@ -62,9 +63,9 @@ class FeatureMatcher:
             return self._lightglue_match(query_features, ref_features)
 
         # Для XFeat (64) або якщо LightGlue не завантажено
-        return self._fast_numpy_match(query_features, ref_features)
+        return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
-    def _fast_numpy_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.95) -> tuple:
+    def _fast_numpy_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80) -> tuple:
         """
         Highly optimized L2 matching using dot product and Mutual Nearest Neighbor (MNN).
         """
@@ -81,32 +82,31 @@ class FeatureMatcher:
         desc_r_n = desc_r / (np.linalg.norm(desc_r, axis=1, keepdims=True) + 1e-8)
 
         # 2. Розрахунок косинусної схожості через швидке матричне множення
-        # sim має розмірність (N, M), де значення від -1 до 1 (1 = ідентичні)
         sim = np.dot(desc_q_n, desc_r_n.T)
 
-        # 3. Lowe's Ratio Test (для подібності шукаємо максимум, а не мінімум)
-        # Отримуємо індекси двох найсхожіших кандидатів
-        sorted_indices = np.argsort(-sim, axis=1)
+        # 3. Lowe's Ratio Test — argpartition O(n) замість argsort O(n log n)
+        # Потрібні лише top-2 для ratio test
+        top2_idx = np.argpartition(-sim, kth=1, axis=1)[:, :2]
+        top2_sim = np.take_along_axis(sim, top2_idx, axis=1)
+        # Сортуємо лише 2 елементи щоб best >= second_best
+        order = np.argsort(-top2_sim, axis=1)
+        top2_idx = np.take_along_axis(top2_idx, order, axis=1)
+        top2_sim = np.take_along_axis(top2_sim, order, axis=1)
 
-        best_sim = sim[np.arange(len(desc_q)), sorted_indices[:, 0]]
-        second_best_sim = sim[np.arange(len(desc_q)), sorted_indices[:, 1]]
+        best_sim = top2_sim[:, 0]
+        second_best_sim = top2_sim[:, 1]
+        best_matches_indices = top2_idx[:, 0]
 
-        # Переводимо схожість у L2-відстань: D^2 = 2 - 2*sim
-        # D = sqrt(2 - 2*sim)
+        # Переводимо схожість у L2-відстань: D = sqrt(2 - 2*sim)
         best_dist = np.sqrt(np.clip(2.0 - 2.0 * best_sim, 0, None))
         second_best_dist = np.sqrt(np.clip(2.0 - 2.0 * second_best_sim, 0, None))
 
-        # ratio_threshold: best_dist / second_best_dist < 0.8
         valid_ratio = (best_dist / (second_best_dist + 1e-8)) < ratio_threshold
 
         # 4. Mutual Nearest Neighbor (MNN) check
-        # Перевіряємо, чи є точка B найближчою для точки A у зворотному напрямку
-        best_matches_indices = sorted_indices[:, 0]
-        reverse_best_indices = np.argmax(sim, axis=0)  # Найкращі збіги для ref_features
-
+        reverse_best_indices = np.argmax(sim, axis=0)
         is_mutual = reverse_best_indices[best_matches_indices] == np.arange(len(desc_q))
 
-        # Об'єднуємо обидві умови: і тест Лоу, і взаємний збіг
         valid_matches = valid_ratio & is_mutual
 
         mkpts_q = kpts_q[valid_matches]

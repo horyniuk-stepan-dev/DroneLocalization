@@ -12,8 +12,9 @@ class OutlierDetector:
     def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=1000.0):
         self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
-        # Обмеження у 1000 м/с (1 км/с) для відсікання помилок гомографії
         self.max_speed_mps = max_speed_mps
+        self._consecutive_outliers = 0
+        self._max_consecutive = 5  # Після 5 підряд outliers — скидаємо (дрон реально перемістився)
 
         logger.info("Initializing OutlierDetector")
         logger.info(
@@ -21,44 +22,49 @@ class OutlierDetector:
 
     def add_position(self, position: tuple):
         self.window.append(np.array(position, dtype=np.float32))
-        logger.debug(
-            f"Added position to history: ({position[0]:.2f}, {position[1]:.2f}), window size: {len(self.window)}")
+        self._consecutive_outliers = 0  # Скидаємо лічильник — позиція прийнята
 
     def is_outlier(self, new_position: tuple, dt: float = 1.0) -> bool:
         if len(self.window) < 3:
-            logger.debug("Insufficient history for outlier detection, accepting measurement")
             return False
 
         new_pos_np = np.array(new_position, dtype=np.float32)
         last_pos = self.window[-1]
 
-        # 1. Перевірка максимально допустимої швидкості (1 км/с)
+        # 1. Перевірка максимально допустимої швидкості
         distance = float(np.linalg.norm(new_pos_np - last_pos))
-        instantaneous_speed = distance / dt
+        instantaneous_speed = distance / max(dt, 0.01)
 
-        if instantaneous_speed > self.max_speed_mps:
-            logger.warning(
-                f"OUTLIER DETECTED: Speed too high ({instantaneous_speed:.2f} m/s > {self.max_speed_mps} m/s)")
-            logger.warning(f"Distance: {distance:.2f} m in {dt:.2f} s")
-            return True
+        is_speed_outlier = instantaneous_speed > self.max_speed_mps
 
-        # 2. Статистичний Z-score тест з буфером для маневрів
+        # 2. Статистичний Z-score тест
         history = list(self.window)
         distances = [np.linalg.norm(history[i] - history[i - 1]) for i in range(1, len(history))]
 
         mean_dist = np.mean(distances)
-        std_dist = np.std(distances)
-
-        if std_dist < 1e-3:
-            std_dist = 1.0
+        std_dist = max(np.std(distances), 1.0)
 
         z_score = abs(distance - mean_dist) / std_dist
+        is_zscore_outlier = z_score > self.threshold_std and abs(distance - mean_dist) > 50.0
 
-        # Відхиляємо координату лише якщо стрибок і статистично аномальний,
-        # і фізично перевищує 50 метрів (щоб не блокувати різкі розвороти дрона)
-        if z_score > self.threshold_std and abs(distance - mean_dist) > 50.0:
-            logger.warning(f"OUTLIER DETECTED: Z-score too high ({z_score:.2f} > {self.threshold_std})")
-            logger.warning(f"Distance: {distance:.2f} m, Mean: {mean_dist:.2f} m, Std: {std_dist:.2f} m")
+        if is_speed_outlier or is_zscore_outlier:
+            self._consecutive_outliers += 1
+
+            # Якщо забагато підряд — дрон реально перемістився, скидаємо вікно
+            if self._consecutive_outliers >= self._max_consecutive:
+                logger.warning(
+                    f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
+                    f"accepting new position as legitimate movement"
+                )
+                self.window.clear()
+                self._consecutive_outliers = 0
+                return False  # Приймаємо нову позицію
+
+            if is_speed_outlier:
+                logger.warning(f"OUTLIER DETECTED: Speed too high ({instantaneous_speed:.2f} m/s > {self.max_speed_mps} m/s)")
+            else:
+                logger.warning(f"OUTLIER DETECTED: Z-score {z_score:.2f} > {self.threshold_std}, distance {distance:.0f}m")
             return True
 
+        self._consecutive_outliers = 0
         return False

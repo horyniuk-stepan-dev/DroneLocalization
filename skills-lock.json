@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skills": {
+    "computer-vision-opencv": {
+      "source": "mindrally/skills",
+      "sourceType": "github",
+      "computedHash": "18c248ee75adf4ebffb009c3d98b374629d6c7b9abafd31ab5f01e3c5d812981"
+    },
+    "python-testing": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "computedHash": "9bb9ccc595dbc4fd6ea1e70ba14e0d9c17f0ed0dc55331d593b1e0965d31df39"
+    },
+    "pytorch": {
+      "source": "mindrally/skills",
+      "sourceType": "github",
+      "computedHash": "10be97afa3db48bbe64ee9c507809fe9e56be8b651d179d9d48bb0e5bacf9c9c"
+    },
+    "senior-computer-vision": {
+      "source": "davila7/claude-code-templates",
+      "sourceType": "github",
+      "computedHash": "9bc4400ddfe302fd2406ba1cec5e69d77e59b6b27548df20246328c656a1ca73"
+    }
+  }
+}

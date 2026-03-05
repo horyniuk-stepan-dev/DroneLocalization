@@ -39,8 +39,11 @@ class PanoramaWorker(QThread):
                     break
 
                 if frame_count % self.frame_step == 0:
-                    # Зменшуємо кадр для швидкості та економії пам'яті (опціонально)
-                    # frame = cv2.resize(frame, (1280, 720))
+                    # Зменшуємо кадр для економії пам'яті (4K→Full HD)
+                    h, w = frame.shape[:2]
+                    if w > 1920:
+                        scale = 1920.0 / w
+                        frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
                     frames_to_stitch.append(frame)
 
                 frame_count += 1

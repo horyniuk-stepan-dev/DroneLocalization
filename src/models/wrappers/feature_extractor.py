@@ -58,8 +58,11 @@ class FeatureExtractor:
                 logger.warning("All keypoints filtered out by YOLO mask!")
 
         # 3. Витягування ГЛОБАЛЬНОГО дескриптора з DINOv2
+        # DINOv2 — семантична модель, їй потрібне натуральне зображення без CLAHE
         logger.debug("Extracting global descriptor with DINOv2...")
-        dino_input = self.dinov2_transform(rgb_tensor)
+        dino_tensor = torch.from_numpy(image).float() / 255.0
+        dino_tensor = dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device)
+        dino_input = self.dinov2_transform(dino_tensor)
 
         # DINOv2 повертає тензор форми (1, 384)
         global_desc = self.global_model(dino_input)[0].cpu().numpy()

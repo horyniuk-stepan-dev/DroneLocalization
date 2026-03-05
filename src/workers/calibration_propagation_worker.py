@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 
 class CalibrationPropagationWorker(QThread):
     """
-    Хвильова пропагація на основі візуального матчингу (LightGlue/SuperPoint).
+    Хвильова пропагація на основі візуального матчингу.
     Генерує фінальну метричну афінну матрицю (2x3) для кожного кадру в базі.
     """
 
@@ -66,11 +66,24 @@ class CalibrationPropagationWorker(QThread):
         frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float32)
         frame_valid = np.zeros(num_frames, dtype=bool)
 
-        self.progress.emit(0, "Завантаження фіч якорів...")
+        # Оптимізація A: Batch prefetch всіх фіч у RAM (прибирає повторну gzip-декомпресію)
+        self.progress.emit(0, "Передзавантаження фіч у RAM...")
+        self._all_features = {}
+        for i in range(num_frames):
+            if not self._is_running:
+                return
+            try:
+                self._all_features[i] = self.database.get_local_features(i)
+            except Exception:
+                pass
+            if i % 500 == 0:
+                self.progress.emit(int(i / num_frames * 10), f"Prefetch: {i}/{num_frames}")
+        logger.info(f"Prefetched features for {len(self._all_features)} frames")
+
         anchor_features = {}
         for anchor in anchors:
             try:
-                anchor_features[anchor.frame_id] = self.database.get_local_features(anchor.frame_id)
+                anchor_features[anchor.frame_id] = self._all_features[anchor.frame_id]
                 frame_affine[anchor.frame_id] = anchor.affine_matrix
                 frame_valid[anchor.frame_id] = True
             except Exception as e:
@@ -176,7 +189,8 @@ class CalibrationPropagationWorker(QThread):
                     final_metric_corners = metric_right
 
                 if final_metric_corners is not None:
-                    M, _ = cv2.estimateAffine2D(self.corners, final_metric_corners)
+                    # ВИПРАВЛЕНО: Жорстка фіксація форми без віддзеркалень та деформацій
+                    M, _ = cv2.estimateAffinePartial2D(self.corners, final_metric_corners)
                     if M is not None:
                         frame_affine[frame_id] = M
                         frame_valid[frame_id] = True
@@ -197,37 +211,75 @@ class CalibrationPropagationWorker(QThread):
             if H_to_anchor is not None:
                 metric_corners = self._project_to_metric(H_to_anchor, anchor)
                 if metric_corners is not None:
-                    M, _ = cv2.estimateAffine2D(self.corners, metric_corners)
+                    # ВИПРАВЛЕНО: Жорстка фіксація форми без віддзеркалень та деформацій
+                    M, _ = cv2.estimateAffinePartial2D(self.corners, metric_corners)
                     if M is not None:
                         frame_affine[frame_id] = M
                         frame_valid[frame_id] = True
 
+    def _get_stored_relative_H(self, frame_from: int, frame_to: int):
+        """Обчислює H(frame_from → frame_to) з уже збережених pose у базі.
+        Це ~100x швидше ніж feature matching."""
+        try:
+            pose_from = self.database.frame_poses[frame_from]  # H(from→frame_0)
+            pose_to = self.database.frame_poses[frame_to]      # H(to→frame_0)
+            # H(from→to) = inv(pose_to) @ pose_from
+            H = np.linalg.inv(pose_to.astype(np.float64)) @ pose_from.astype(np.float64)
+            return H.astype(np.float32)
+        except (np.linalg.LinAlgError, IndexError):
+            return None
+
     def _build_homography_chain(self, frames, anchor, anchor_feat):
-        h_cache = {anchor.frame_id: np.eye(3, dtype=np.float32)}
-        prev_features = anchor_feat
-        prev_frame_id = anchor.frame_id
         result = {}
 
-        for frame_id in frames:
-            if not self._is_running: break
-            try:
-                curr_features = self.database.get_local_features(frame_id)
-                H_curr_to_prev = self._match_pair(curr_features, prev_features)
+        # Спроба 1: Обчислити H(frame→anchor) напряму зі збережених поз (без дрейфу)
+        anchor_id = anchor.frame_id
+        pose_anchor = None
+        try:
+            pose_anchor = self.database.frame_poses[anchor_id].astype(np.float64)
+            inv_pose_anchor = np.linalg.inv(pose_anchor)
+        except (IndexError, np.linalg.LinAlgError):
+            inv_pose_anchor = None
 
-                if H_curr_to_prev is None:
+        if inv_pose_anchor is not None:
+            for frame_id in frames:
+                if not self._is_running:
+                    break
+                try:
+                    pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
+                    # H(frame→anchor) = inv(pose_anchor) @ pose_frame
+                    H = (inv_pose_anchor @ pose_frame).astype(np.float32)
+                    result[frame_id] = H
+                except (IndexError, np.linalg.LinAlgError):
                     continue
+        else:
+            # Fallback: ланцюг через feature matching (повільно але надійно)
+            h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
+            prev_features = anchor_feat
+            prev_frame_id = anchor_id
 
-                H_prev_to_anchor = h_cache[prev_frame_id]
-                H_curr_to_anchor = (H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)).astype(
-                    np.float32)
+            for frame_id in frames:
+                if not self._is_running:
+                    break
+                try:
+                    curr_features = self._all_features.get(frame_id)
+                    if curr_features is None:
+                        continue
+                    H_curr_to_prev = self._match_pair(curr_features, prev_features)
+                    if H_curr_to_prev is None:
+                        continue
 
-                h_cache[frame_id] = H_curr_to_anchor
-                result[frame_id] = H_curr_to_anchor
+                    H_prev_to_anchor = h_cache[prev_frame_id]
+                    H_curr_to_anchor = (H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)).astype(
+                        np.float32)
 
-                prev_features = curr_features
-                prev_frame_id = frame_id
-            except Exception:
-                continue
+                    h_cache[frame_id] = H_curr_to_anchor
+                    result[frame_id] = H_curr_to_anchor
+
+                    prev_features = curr_features
+                    prev_frame_id = frame_id
+                except Exception:
+                    continue
 
         return result
 
@@ -243,8 +295,10 @@ class CalibrationPropagationWorker(QThread):
             mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
             if len(mkpts_a) < self.min_matches:
                 return None
+            # Оптимізація C: 1000 ітерацій замість 5000 — сусідні кадри мають мінімальну різницю
             H, mask = GeometryTransforms.estimate_homography(
-                mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
+                mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh,
+                max_iters=1000, confidence=0.995
             )
             if H is None or int(np.sum(mask)) < self.min_matches:
                 return None
@@ -265,6 +319,9 @@ class CalibrationPropagationWorker(QThread):
                 anchors_json = json.dumps([a.to_dict() for a in anchors])
                 grp.attrs['anchors_json'] = anchors_json
                 grp.attrs['num_anchors'] = len(anchors)
+                # Зберігаємо reference GPS для авто-ініціалізації UTM при завантаженні бази
+                if hasattr(self.calibration, 'reference_gps') and self.calibration.reference_gps:
+                    grp.attrs['reference_gps'] = json.dumps(self.calibration.reference_gps)
             logger.success("Visual metric propagation saved successfully to HDF5")
         finally:
             self.database._load_hot_data()

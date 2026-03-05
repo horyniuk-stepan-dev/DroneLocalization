@@ -8,7 +8,7 @@ logger = get_logger(__name__)
 
 class ModelManager:
     def __init__(self, config=None, device='cuda'):
-        self.config = config
+        self.config = config or {}
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.models = {}
         self.model_usage = {}
