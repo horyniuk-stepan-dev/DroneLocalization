@@ -85,8 +85,8 @@ scripts/data/models/depth_anything_vitl14.pth
 *.pt
 
 
-
-.agent/
-.agents/
-.claude/
+.agent
+.agents
+.claude
+./scripts/allFiles/*
 all_merged.py
