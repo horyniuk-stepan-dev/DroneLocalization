@@ -21,25 +21,33 @@ class CalibrationMixin:
             return
 
         existing_ids = [a.frame_id for a in self.calibration.anchors]
-        dialog = CalibrationDialog(
+
+        # ОНОВЛЕНО: Зберігаємо посилання на діалог як атрибут класу
+        self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
             existing_anchors=existing_ids,
             parent=self,
         )
-        dialog.anchor_added.connect(self.on_anchor_added)
-        dialog.calibration_complete.connect(self.on_run_propagation)
-        dialog.exec()
+        self._calib_dialog.anchor_added.connect(self.on_anchor_added)
+        self._calib_dialog.calibration_complete.connect(self.on_run_propagation)
+        self._calib_dialog.exec()
+
+        # Очищуємо посилання після закриття діалогу
+        self._calib_dialog = None
 
     @pyqtSlot(object)
     def on_anchor_added(self, anchor_data: dict):
         try:
-            points_2d  = anchor_data.get('points_2d')
+            points_2d = anchor_data.get('points_2d')
             points_gps = anchor_data.get('points_gps')
-            frame_id   = anchor_data.get('calib_frame_id')
+            frame_id = anchor_data.get('calib_frame_id')
 
             if not points_2d or not points_gps or len(points_2d) < 3:
                 QMessageBox.warning(self, "Помилка", "Потрібно мінімум 3 точки для якоря!")
                 return
+
+            if not getattr(self.calibration, 'reference_gps', None):
+                self.calibration.reference_gps = points_gps[0]
 
             pts_2d_np = np.array(points_2d, dtype=np.float32)
             pts_metric = [CoordinateConverter.gps_to_metric(lat, lon) for lat, lon in points_gps]
@@ -48,21 +56,24 @@ class CalibrationMixin:
             M, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
             if M is None:
                 QMessageBox.critical(self, "Помилка",
-                    "Не вдалося обчислити матрицю. Спробуйте розставити точки ширше!")
+                                     "Не вдалося обчислити матрицю. Спробуйте розставити точки ширше!")
                 return
 
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=M)
 
-            if self.database and self.database.db_path:
-                calib_path = self.database.db_path.replace('.h5', '_calib.json')
+            if self.project_manager and self.project_manager.is_loaded:
+                calib_path = self.project_manager.calibration_path
                 self.calibration.save(calib_path)
 
             self.status_bar.showMessage(f"Якір для кадру {frame_id} успішно створено!")
 
+            # ОНОВЛЕНО: Повідомляємо діалогове вікно про успіх, щоб воно оновило список UI
+            if hasattr(self, '_calib_dialog') and self._calib_dialog is not None:
+                self._calib_dialog.on_anchor_confirmed(frame_id)
+
         except Exception as e:
             self.logger.error(f"Failed to add anchor: {e}", exc_info=True)
             QMessageBox.critical(self, "Помилка", f"Не вдалося додати якір:\n{e}")
-
     # ── Propagation ──────────────────────────────────────────────────────────
 
     @pyqtSlot()
@@ -75,14 +86,15 @@ class CalibrationMixin:
             return
 
         try:
-            lg_model = self.model_manager.load_lightglue()
-            matcher  = FeatureMatcher(lg_model, self.model_manager.device)
+            # ОНОВЛЕНО: Ініціалізуємо FeatureMatcher, він автоматично підлаштується
+            # під розмірність дескрипторів (64 для XFeat) та використає Numpy L2
+            matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
         except Exception as e:
-            QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити LightGlue:\n{e}")
+            QMessageBox.critical(self, "Помилка", f"Не вдалося ініціалізувати матчер:\n{e}")
             return
 
         anchor_ids = [a.frame_id for a in self.calibration.anchors]
-        n_frames   = self.database.get_num_frames()
+        n_frames = self.database.get_num_frames()
         self.logger.info(f"Propagation: {len(anchor_ids)} anchors {anchor_ids}, {n_frames} frames")
 
         self._propagation_dialog = QProgressDialog(
@@ -136,8 +148,7 @@ class CalibrationMixin:
             self.on_save_calibration()
 
         if self.tracking_worker and self.tracking_worker.isRunning():
-            if hasattr(self.tracking_worker, 'localizer'):
-                self.tracking_worker.localizer.reset_cache()
+            self.logger.info("Propagation completed while tracking is running. Tracker will use updated data.")
 
     @pyqtSlot(str)
     def on_propagation_error(self, error_msg: str):
@@ -154,8 +165,13 @@ class CalibrationMixin:
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
+            
+        default_path = "calibration.json"
+        if self.project_manager and self.project_manager.is_loaded:
+            default_path = str(self.project_manager.project_dir / default_path)
+            
         path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти калібрування", "calibration.json", "JSON Files (*.json)"
+            self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
         )
         if not path:
             return
@@ -170,8 +186,12 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_load_calibration(self):
+        default_dir = ""
+        if self.project_manager and self.project_manager.is_loaded:
+            default_dir = str(self.project_manager.project_dir)
+            
         path, _ = QFileDialog.getOpenFileName(
-            self, "Завантажити калібрування", "", "JSON Files (*.json);;All Files (*)"
+            self, "Завантажити калібрування", default_dir, "JSON Files (*.json);;All Files (*)"
         )
         if not path:
             return

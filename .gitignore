@@ -82,8 +82,11 @@ yolov8x-seg.pt
 scripts/data/models/superpoint_v1.pth
 scripts/data/models/lightglue_superpoint.pth
 scripts/data/models/depth_anything_vitl14.pth
+*.pt
 
 
 
-
-yolo11n-seg.pt
+.agent/
+.agents/
+.claude/
+all_merged.py

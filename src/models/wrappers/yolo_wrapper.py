@@ -1,61 +1,62 @@
-﻿import numpy as np
+﻿import torch
+import numpy as np
 import cv2
-import torch
-from src.utils.logging_utils import get_logger
-
-logger = get_logger(__name__)
-
-# COCO class IDs for dynamic objects:
-# 0: person, 1: bicycle, 2: car, 3: motorcycle,
-# 5: bus, 6: train, 7: truck
-DYNAMIC_COCO_CLASSES: frozenset[int] = frozenset({0, 1, 2, 3, 5, 6, 7})
 
 
 class YOLOWrapper:
-    """Wrapper for YOLO11 segmentation — filters dynamic objects for static mask generation."""
+    """Wrapper for YOLOv11 segmentation (compatible with YOLOv8 API)"""
 
-    def __init__(self, model, device: str = 'cuda', confidence_threshold: float = 0.4):
+    def __init__(self, model, device='cuda'):
         self.model = model
         self.device = device
-        self.confidence_threshold = confidence_threshold
-        self.dynamic_classes = DYNAMIC_COCO_CLASSES
+        # Класи COCO: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 6=train, 7=truck
+        self.dynamic_classes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 33, 36, 37}
 
-    def detect_and_mask(self, image: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+        # FP16 для YOLO — прискорює інференс на ~40%
+        # Ultralytics керує FP16 через параметр half=True при виклику
+        self.use_half = (device == 'cuda' and torch.cuda.is_available())
+
+    @torch.no_grad()
+    def detect_and_mask(self, image: np.ndarray) -> tuple:
         """
-        Detect dynamic objects and produce a binary static-area mask.
+        Detect objects and create static mask
 
         Returns:
-            static_mask: uint8 array (255 = static, 0 = dynamic object)
-            detections:  list of dicts with class_id, confidence, bbox, is_dynamic
+            static_mask: Binary mask of static areas (255 for static, 0 for dynamic)
+            detections: List of detection dicts
         """
-        results = self.model(image, verbose=False, device=self.device)
+        # verbose=False вимикає зайве логування кожного кадру в консоль
+        # half=True для FP16 інференсу
+        results = self.model(image, verbose=False, half=self.use_half)
         result = results[0]
 
         height, width = image.shape[:2]
-        static_mask = np.full((height, width), 255, dtype=np.uint8)
+        static_mask = np.ones((height, width), dtype=np.uint8) * 255
+
         detections = []
 
-        if result.masks is None:
-            return static_mask, detections
+        if result.masks is not None:
+            masks = result.masks.data.cpu().numpy()
+            boxes = result.boxes.data.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy().astype(int)
+            confidences = result.boxes.conf.cpu().numpy()
 
-        masks = result.masks.data.cpu().numpy()
-        classes = result.boxes.cls.cpu().numpy()
-        confidences = result.boxes.conf.cpu().numpy()
-        boxes = result.boxes.data.cpu().numpy()
+            # Vectorized: знайти всі динамічні маски одразу
+            dynamic_mask_indices = [i for i, cls in enumerate(classes) if cls in self.dynamic_classes]
 
-        for mask, cls, conf, box in zip(masks, classes, confidences, boxes):
-            class_id = int(cls)
-            is_dynamic = class_id in self.dynamic_classes
+            for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
+                detections.append({
+                    "class_id": int(cls),
+                    "confidence": float(conf),
+                    "bbox": box[:4].tolist()
+                })
 
-            detections.append({
-                'class_id': class_id,
-                'confidence': float(conf),
-                'bbox': box[:4].tolist(),
-                'is_dynamic': is_dynamic,
-            })
-
-            if is_dynamic and conf >= self.confidence_threshold:
-                mask_resized = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                static_mask[mask_resized > 0.5] = 0
+            # Об'єднуємо всі динамічні маски за один раз
+            if dynamic_mask_indices:
+                combined_dynamic = np.zeros((height, width), dtype=np.float32)
+                for idx in dynamic_mask_indices:
+                    mask_resized = cv2.resize(masks[idx], (width, height), interpolation=cv2.INTER_NEAREST)
+                    combined_dynamic = np.maximum(combined_dynamic, mask_resized)
+                static_mask[combined_dynamic > 0.5] = 0
 
         return static_mask, detections

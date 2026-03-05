@@ -21,13 +21,21 @@ class PanoramaMixin:
 
     @pyqtSlot()
     def on_generate_panorama(self):
+        default_video = ""
+        default_save = "panorama.jpg"
+        
+        if self.project_manager and self.project_manager.is_loaded:
+            default_video = self.project_manager.settings.video_path
+            default_save = str(self.project_manager.project_dir / "panoramas" / "panorama.jpg")
+
         video_path, _ = QFileDialog.getOpenFileName(
-            self, "Відео для панорами", "", "Video Files (*.mp4 *.avi *.mkv)"
+            self, "Відео для панорами", default_video, "Video Files (*.mp4 *.avi *.mkv)"
         )
         if not video_path:
             return
+            
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти панораму", "panorama.jpg", "Images (*.jpg *.png)"
+            self, "Зберегти панораму", default_save, "Images (*.jpg *.png)"
         )
         if not save_path:
             return
@@ -55,8 +63,12 @@ class PanoramaMixin:
             QMessageBox.warning(self, "Увага", "Спочатку виконайте калібрування!")
             return
 
+        default_dir = ""
+        if self.project_manager and self.project_manager.is_loaded:
+            default_dir = str(self.project_manager.project_dir / "panoramas")
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть панораму", "", "Images (*.png *.jpg *.jpeg)"
+            self, "Виберіть панораму", default_dir, "Images (*.png *.jpg *.jpeg);;All Files (*)"
         )
         if not path:
             return
@@ -104,7 +116,6 @@ class PanoramaMixin:
         """
         H, W = img.shape[:2]
 
-        # Find valid (non-black) bounding box
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         coords = cv2.findNonZero(cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)[1])
         if coords is None:
@@ -115,31 +126,31 @@ class PanoramaMixin:
         crop_size = min(_CROP_SIZE_MAX, min(w, h) // 2)
 
         centers = [
-            (x + w // 4,     y + h // 4),
-            (x + 3*w // 4,   y + h // 4),
-            (x + w // 4,     y + 3*h // 4),
-            (x + 3*w // 4,   y + 3*h // 4),
+            (x + w // 4, y + h // 4),
+            (x + 3 * w // 4, y + h // 4),
+            (x + w // 4, y + 3 * h // 4),
+            (x + 3 * w // 4, y + 3 * h // 4),
         ]
         crops = []
         for cx, cy in centers:
             x1 = max(0, cx - crop_size // 2)
             y1 = max(0, cy - crop_size // 2)
-            crops.append((img[y1:y1+crop_size, x1:x1+crop_size], x1, y1))
+            crops.append((img[y1:y1 + crop_size, x1:x1 + crop_size], x1, y1))
 
-        # Move models to CPU temporarily to free VRAM
+        # ОНОВЛЕНО: Переміщуємо XFeat та DINOv2 на CPU для економії VRAM під час обробки великої панорами
         device = self.model_manager.device
-        sp = self.model_manager.load_superpoint().to('cpu')
+        xf = self.model_manager.load_xfeat().to('cpu')
         nv = self.model_manager.load_dinov2().to('cpu')
-        lg = self.model_manager.load_lightglue().to('cpu')
 
-        fe       = FeatureExtractor(sp, nv, device='cpu', config=self.config)
-        matcher  = FeatureMatcher(lg, device='cpu')
-        localizer = Localizer(self.database, fe, matcher, self.calibration, self.config)
+        fe = FeatureExtractor(xf, nv, device='cpu', config=self.config)
+        matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
+        localizer = Localizer(self.database, fe, matcher, self.calibration,
+                              {**self.config, '_model_manager': self.model_manager})
 
         pts_pano, pts_metric = [], []
         try:
             for i, (crop, off_x, off_y) in enumerate(crops):
-                self.status_bar.showMessage(f"Розпізнавання чверті {i+1}/4...")
+                self.status_bar.showMessage(f"Розпізнавання чверті {i + 1}/4...")
                 self.repaint()
 
                 res = localizer.localize_frame(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
@@ -148,20 +159,21 @@ class PanoramaMixin:
 
                 ch, cw = crop.shape[:2]
                 for (px, py), (lat, lon) in zip(
-                    [(0, 0), (cw, 0), (cw, ch), (0, ch)],
-                    res['fov_polygon']
+                        [(0, 0), (cw, 0), (cw, ch), (0, ch)],
+                        res['fov_polygon']
                 ):
                     pts_pano.append((px + off_x, py + off_y))
                     pts_metric.append(CoordinateConverter.gps_to_metric(lat, lon))
         finally:
-            localizer.reset_cache()
-            sp.to(device); nv.to(device); lg.to(device)
+            # ОНОВЛЕНО: Повертаємо XFeat назад на основний пристрій
+            xf.to(device);
+            nv.to(device)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         if len(pts_pano) < 3:
             QMessageBox.warning(self, "Помилка",
-                "Замало точок для прив'язки панорами.")
+                                "Замало точок для прив'язки панорами.")
             return None
 
         M, _ = cv2.estimateAffine2D(
@@ -172,6 +184,6 @@ class PanoramaMixin:
             QMessageBox.warning(self, "Помилка", "Помилка розрахунку матриці панорами.")
             return None
 
-        corners_px = np.array([[0,0],[W,0],[W,H],[0,H]], dtype=np.float32)
-        corners_m  = GeometryTransforms.apply_affine(corners_px, M)
+        corners_px = np.array([[0, 0], [W, 0], [W, H], [0, H]], dtype=np.float32)
+        corners_m = GeometryTransforms.apply_affine(corners_px, M)
         return [CoordinateConverter.metric_to_gps(*pt) for pt in corners_m]

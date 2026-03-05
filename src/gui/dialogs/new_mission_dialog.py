@@ -23,8 +23,18 @@ class NewMissionDialog(QDialog):
         form = QFormLayout()
 
         self.mission_name_edit = QLineEdit()
-        self.mission_name_edit.setPlaceholderText("Введіть назву місії")
-        form.addRow("Назва місії:", self.mission_name_edit)
+        self.mission_name_edit.setPlaceholderText("Введіть назву проєкту")
+        form.addRow("Назва проєкту:", self.mission_name_edit)
+
+        workspace_row = QHBoxLayout()
+        self.workspace_path_edit = QLineEdit()
+        self.workspace_path_edit.setReadOnly(True)
+        self.workspace_path_edit.setPlaceholderText("Шлях до робочої папки не вибрано")
+        btn_browse_workspace = QPushButton("Огляд...")
+        btn_browse_workspace.clicked.connect(self._browse_workspace)
+        workspace_row.addWidget(self.workspace_path_edit)
+        workspace_row.addWidget(btn_browse_workspace)
+        form.addRow("Робоча папка (Workspace):", workspace_row)
 
         video_row = QHBoxLayout()
         self.video_path_edit = QLineEdit()
@@ -73,6 +83,14 @@ class NewMissionDialog(QDialog):
     # ── Slots ────────────────────────────────────────────────────────────────
 
     @pyqtSlot()
+    def _browse_workspace(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Виберіть робочу папку (Workspace)", ""
+        )
+        if path:
+            self.workspace_path_edit.setText(path)
+
+    @pyqtSlot()
     def _browse_video(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Виберіть еталонне відео", "",
@@ -84,8 +102,11 @@ class NewMissionDialog(QDialog):
     @pyqtSlot()
     def _on_accept(self):
         if not self.mission_name_edit.text().strip():
-            QMessageBox.warning(self, "Помилка", "Введіть назву місії!")
+            QMessageBox.warning(self, "Помилка", "Введіть назву проєкту!")
             self.mission_name_edit.setFocus()
+            return
+        if not self.workspace_path_edit.text():
+            QMessageBox.warning(self, "Помилка", "Виберіть робочу папку (Workspace)!")
             return
         if not self.video_path_edit.text():
             QMessageBox.warning(self, "Помилка", "Виберіть еталонне відео!")
@@ -97,6 +118,7 @@ class NewMissionDialog(QDialog):
     def get_mission_data(self) -> dict:
         data = {
             "mission_name":    self.mission_name_edit.text().strip(),
+            "workspace_dir":   self.workspace_path_edit.text(),
             "video_path":      self.video_path_edit.text(),
             "altitude_m":      self.altitude_spinbox.value(),
             "focal_length_mm": self.focal_length_spinbox.value(),
@@ -104,7 +126,7 @@ class NewMissionDialog(QDialog):
             "image_width_px":  self.image_width_spinbox.value(),
         }
         logger.info(
-            f"Mission: '{data['mission_name']}' | "
+            f"Mission: '{data['mission_name']}' in '{data['workspace_dir']}' | "
             f"video={data['video_path']} | alt={data['altitude_m']}m"
         )
         return data

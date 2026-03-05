@@ -80,20 +80,13 @@ class MapWidget(QWebEngineView):
     def clear_trajectory(self):
         self.bridge.clearTrajectorySignal.emit()
 
-    @pyqtSlot(str)
-    def update_fov(self, fov_json: str):
+    @pyqtSlot(list)
+    def update_fov(self, fov: list):
         """
-        Accepts FOV as JSON string: [[lat0,lon0],[lat1,lon1],[lat2,lon2],[lat3,lon3]]
-        JSON string is safe for cross-thread Qt signal delivery.
+        Accepts FOV as a Python list: [(lat0,lon0), (lat1,lon1), (lat2,lon2), (lat3,lon3)]
         """
-        try:
-            fov = json.loads(fov_json)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning(f"update_fov: invalid JSON: {e}")
-            return
-
-        if len(fov) != 4:
-            logger.warning(f"update_fov: expected 4 points, got {len(fov)}")
+        if not fov or len(fov) != 4:
+            logger.warning(f"update_fov: expected 4 points, got {len(fov) if fov else 0}")
             return
 
         try:

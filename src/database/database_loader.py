@@ -1,151 +1,135 @@
 ﻿import h5py
 import numpy as np
+from functools import lru_cache
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
 class DatabaseLoader:
-    """
-    Loads and manages access to the HDF5 topometric database.
-
-    Hot data (global descriptors, poses, propagation affines) is loaded into RAM on init.
-    Local features are read lazily from disk with an in-memory LRU-style cache.
-    """
+    """Loads and manages access to the HDF5 topometric database (XFeat + DINOv2)"""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.db_file: h5py.File | None = None
+        self.db_file = None
+        self.global_descriptors = None
+        self.frame_poses = None
+        self.metadata = {}
 
-        # Hot data — loaded into RAM
-        self.global_descriptors: np.ndarray | None = None
-        self.frame_poses: np.ndarray | None = None
-        self.metadata: dict = {}
+        # Дані пропагації калібрування (заповнюються після калібрування)
+        self.h_to_calib = None      # (N, 3, 3) — H(frame_i → calib_frame)
+        self.frame_gps = None       # (N, 2)    — (lat, lon) центру кожного кадру
+        self.frame_valid = None     # (N,)      — True якщо кадр має GPS
+        self.calib_frame_id = None  # int
 
-        # Propagation data — filled by CalibrationPropagationWorker
-        self.frame_affine: np.ndarray | None = None  # (N, 2, 3) affine per frame
-        self.frame_valid:  np.ndarray | None = None  # (N,) bool
-
-        # Local features LRU cache
-        self._local_features_cache: dict[int, dict] = {}
-        self._cache_max_size = 256
-
-        logger.info(f"DatabaseLoader: {db_path}")
+        logger.info(f"Initializing DatabaseLoader with path: {db_path}")
         self._load_hot_data()
 
-    # ── Context manager support
+    def _load_hot_data(self):
+        """Load global descriptors (DINOv2), poses and propagation data into RAM"""
+        logger.info("Loading hot data into RAM...")
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.close()
-
-    def __del__(self):
-        self.close()
-
-    # ── Loading
-
-    def _load_hot_data(self) -> None:
         try:
             self.db_file = h5py.File(self.db_path, 'r')
 
             self.global_descriptors = self.db_file['global_descriptors']['descriptors'][:]
-            self.frame_poses        = self.db_file['global_descriptors']['frame_poses'][:]
+            self.frame_poses = self.db_file['global_descriptors']['frame_poses'][:]
+
+            logger.info(f"Loaded global descriptors: shape {self.global_descriptors.shape}")
+            logger.info(f"Loaded frame poses: shape {self.frame_poses.shape}")
 
             for key, value in self.db_file['metadata'].attrs.items():
                 self.metadata[key] = value
+                logger.debug(f"Metadata - {key}: {value}")
 
+            # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
 
-            logger.success(
-                f"Database loaded | "
-                f"frames={self.global_descriptors.shape[0]}, "
-                f"desc_dim={self.global_descriptors.shape[1]}, "
-                f"propagated={self.is_propagated}"
-            )
+            logger.success("Hot data loaded successfully into RAM")
+
         except Exception as e:
-            logger.error(f"Failed to load database: {e}", exc_info=True)
+            logger.error(f"Failed to load database: {e}")
             raise
 
-    def _load_propagation_data(self) -> None:
+    def _load_propagation_data(self):
         if 'calibration' not in self.db_file:
-            logger.info("No propagation data found — run calibration first")
+            logger.info("No propagation data in database (not calibrated yet)")
+            self.frame_affine = None
+            self.frame_valid = None
             return
-
         try:
             grp = self.db_file['calibration']
-            if 'frame_affine' not in grp:
-                logger.warning("Old calibration format detected — please re-run propagation")
-                return
+            if 'frame_affine' in grp:
+                self.frame_affine = grp['frame_affine'][:]
+                self.frame_valid = grp['frame_valid'][:].astype(bool)
+                valid_count = int(np.sum(self.frame_valid))
+                logger.success(f"Propagation data loaded: {valid_count} frames valid")
 
-            self.frame_affine = grp['frame_affine'][:]
-            self.frame_valid  = grp['frame_valid'][:].astype(bool)
-            logger.success(f"Propagation data loaded: {int(np.sum(self.frame_valid))} valid frames")
-
+                # Автоматична ініціалізація UTM з reference_gps у HDF5
+                if 'reference_gps' in grp.attrs:
+                    import json
+                    from src.geometry.coordinates import CoordinateConverter
+                    try:
+                        ref_gps = json.loads(grp.attrs['reference_gps'])
+                        CoordinateConverter.gps_to_metric(ref_gps[0], ref_gps[1])
+                        logger.success(f"UTM auto-initialized from HDF5 reference GPS: {ref_gps}")
+                    except Exception as e:
+                        logger.warning(f"Could not auto-initialize UTM from HDF5: {e}")
+            else:
+                logger.warning("Found old calibration format. Please run propagation again.")
+                self.frame_affine = None
+                self.frame_valid = None
         except Exception as e:
             logger.warning(f"Failed to load propagation data: {e}")
             self.frame_affine = None
-            self.frame_valid  = None
-
-    # ── Properties
+            self.frame_valid = None
 
     @property
     def is_propagated(self) -> bool:
-        return self.frame_affine is not None
-
-    def get_num_frames(self) -> int:
-        return int(self.metadata.get('num_frames', 0))
-
-    # ── Data access
+        return getattr(self, 'frame_affine', None) is not None
 
     def get_frame_affine(self, frame_id: int) -> np.ndarray | None:
-        """Return pre-computed affine matrix for frame_id, or None if unavailable."""
+        """Повертає унікальну афінну матрицю для конкретного кадру"""
         if not self.is_propagated:
             return None
-        if not (0 <= frame_id < len(self.frame_valid)):
+        if frame_id < 0 or frame_id >= len(self.frame_valid):
             return None
         if not self.frame_valid[frame_id]:
             return None
         return self.frame_affine[frame_id]
 
-    def get_local_features(self, frame_id: int) -> dict:
+    def get_h_to_anchor(self, frame_id: int):
         """
-        Return local features for frame_id.
-        Cached in RAM (up to _cache_max_size entries) to avoid repeated HDF5 reads
-        for frequently-retrieved candidate frames.
-        """
-        if frame_id in self._local_features_cache:
-            return self._local_features_cache[frame_id]
+        Повертає (H_to_anchor, anchor_frame_id) для вказаного frame_id,
+        або None якщо пропагація не виконана.
 
+        Поточна реалізація: CalibrationPropagationWorker зберігає вже готову
+        affine матрицю для кожного кадру напряму (через інтерполяцію між якорями),
+        тому окремий H(ref→anchor) не потрібен — localizer читає frame_affine напряму
+        через get_frame_affine(). Метод залишений для сумісності з API
+        localizer._get_anchor_for_ref() і завжди повертає None,
+        щоб localizer йшов основним шляхом через get_frame_affine().
+        """
+        return None
+
+    @lru_cache(maxsize=100)
+    def get_local_features(self, frame_id: int) -> dict:
+        """Повертає локальні ознаки XFeat для вказаного кадру"""
         group_name = f'local_features/frame_{frame_id}'
         if group_name not in self.db_file:
-            raise ValueError(f"Frame {frame_id} not found in database")
-
+            raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
         g = self.db_file[group_name]
-        features = {
-            'keypoints':   g['keypoints'][:],
+        return {
+            'keypoints': g['keypoints'][:],
             'descriptors': g['descriptors'][:],
-            # backward-compat: coords_2d removed in new builder, fall back to keypoints
-            'coords_2d':   g['coords_2d'][:] if 'coords_2d' in g else g['keypoints'][:],
+            'coords_2d': g['coords_2d'][:]
         }
 
-        # Simple FIFO eviction when cache is full
-        if len(self._local_features_cache) >= self._cache_max_size:
-            oldest_key = next(iter(self._local_features_cache))
-            del self._local_features_cache[oldest_key]
+    def get_num_frames(self) -> int:
+        return int(self.metadata.get('num_frames', 0))
 
-        self._local_features_cache[frame_id] = features
-        return features
-
-    # Lifecycle
-
-    def close(self) -> None:
+    def close(self):
         if self.db_file is not None:
-            try:
-                self.db_file.close()
-            except Exception:
-                pass
+            self.db_file.close()
             self.db_file = None
-            self._local_features_cache.clear()
-            logger.info("Database closed")
+            logger.info("Database file closed")

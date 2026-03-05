@@ -1,22 +1,24 @@
 ﻿import cv2
 import time
+import threading
 import numpy as np
-from collections import deque
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
 class RealtimeTrackingWorker(QThread):
-    """Real-time localization worker thread."""
+    """Real-time localization worker thread (Optimized for XFeat + YOLO11)"""
 
-    frame_ready     = pyqtSignal(np.ndarray)
-    location_found  = pyqtSignal(float, float, float, int)
-    fps_updated     = pyqtSignal(float)
-    error           = pyqtSignal(str)
-    status_update   = pyqtSignal(str)
-    fov_found       = pyqtSignal(list)
+    frame_ready = pyqtSignal(np.ndarray)
+    location_found = pyqtSignal(float, float, float, int)
+    fps_updated = pyqtSignal(float)
+    error = pyqtSignal(str)
+    status_update = pyqtSignal(str)
+    fov_found = pyqtSignal(list)
 
     def __init__(self, video_source: str, localizer, model_manager=None, config=None):
         super().__init__()
@@ -24,111 +26,117 @@ class RealtimeTrackingWorker(QThread):
         self.localizer = localizer
         self.model_manager = model_manager
         self.config = config or {}
-        self._is_running = False
+        self._stop_event = threading.Event()
 
-        self.target_fps  = self.config.get('gui', {}).get('video_fps', 30)
+        # Скільки кадрів розпізнавати за одну секунду ВІДЕО.
+        # 1.0 = 1 кадр в секунду; 2.0 = кожні 0.5 секунд; 0.5 = кожні 2 секунди відео.
+        # Ти можеш змінити це число прямо тут для тестів:
         self.process_fps = self.config.get('tracking', {}).get('process_fps', 1.0)
 
-        self._fps_buffer: deque[float] = deque(maxlen=10)
-
     def run(self):
-        self._is_running = True
+        logger.info(f"Starting tracking from source: {self.video_source}")
 
-        # Reset stateful components for new session
-        if hasattr(self.localizer, 'kalman_filter'):
-            self.localizer.kalman_filter.reset()
-        if hasattr(self.localizer, 'outlier_detector'):
-            self.localizer.outlier_detector.reset()
-
-        # Load YOLO (cached by ModelManager)
         yolo_wrapper = None
-        if self.model_manager is not None:
+        if self.model_manager:
             try:
-                from src.models.wrappers.yolo_wrapper import YOLOWrapper
                 yolo_model = self.model_manager.load_yolo()
                 yolo_wrapper = YOLOWrapper(yolo_model, self.model_manager.device)
+                logger.success("YOLO loaded for dynamic object masking in tracking loop")
             except Exception as e:
-                logger.warning(f"YOLO unavailable: {e}")
+                logger.error(f"Failed to load YOLO: {e}")
+                self.error.emit(f"YOLO load error: {e}")
+                return
 
         cap = cv2.VideoCapture(self.video_source)
         if not cap.isOpened():
             self.error.emit(f"Failed to open video source: {self.video_source}")
             return
 
+        # Визначаємо натуральну швидкість відео (зазвичай 30 FPS)
         video_fps = cap.get(cv2.CAP_PROP_FPS)
-        if video_fps <= 0 or np.isnan(video_fps):
+        if video_fps <= 0:
             video_fps = 30.0
+        frame_duration_sec = 1.0 / video_fps
 
-        frame_step    = max(1, int(video_fps / self.process_fps))
-        calculated_dt = frame_step / video_fps
-        frame_time    = 1.0 / self.target_fps
+        # Інтервал обробки у секундах відео (наприклад, 1.0 / 2.0 = 0.5 секунд)
+        process_interval_sec = 1.0 / self.process_fps if self.process_fps > 0 else 1.0
 
-        logger.info(
-            f"Tracking started | video_fps={video_fps:.1f}, "
-            f"process_fps={self.process_fps}, frame_step={frame_step}, "
-            f"kalman_dt={calculated_dt:.3f}s"
-        )
+        # Ставимо від'ємний час, щоб гарантовано обробити найперший кадр
+        last_process_video_time = -process_interval_sec
+        last_localization_real_time = time.time()
 
-        try:
-            while self._is_running:
-                start_time = time.time()
+        while not self._stop_event.is_set():
+            loop_start = time.time()
 
-                ret, frame = cap.read()
-                if not ret:
-                    self.status_update.emit("Відео завершено")
-                    break
+            ret, frame = cap.read()
+            if not ret:
+                logger.info("End of video stream reached.")
+                self.status_update.emit("Відеопотік завершено.")
+                break
 
-                # Skip frames without decoding
-                for _ in range(frame_step - 1):
-                    cap.grab()
+            # Отримуємо поточний час САМОГО ВІДЕО у секундах (не залежить від швидкості комп'ютера)
+            current_video_time_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            # Fallback: деякі кодеки повертають 0 — рахуємо за номером кадру
+            if current_video_time_sec <= 0:
+                current_video_time_sec = cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                self.frame_ready.emit(frame_rgb)
+            # 1. Завжди відправляємо кадр в GUI для плавного відтворення
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.frame_ready.emit(frame_rgb)
 
+            # 2. Локалізація (спрацьовує тільки якщо відео пройшло заданий інтервал)
+            if current_video_time_sec - last_process_video_time >= process_interval_sec:
+                start_process = time.time()
+
+                static_mask = None
+                if yolo_wrapper:
+                    static_mask, _ = yolo_wrapper.detect_and_mask(frame_rgb)
+
+                # Розраховуємо реальний dt для фільтра Калмана
+                current_real_time = time.time()
+                calculated_dt = current_real_time - last_localization_real_time
+
+                # БЛОК TRY-EXCEPT для запобігання "зависанню на першому кадрі"
                 try:
-                    static_mask = None
-                    if yolo_wrapper:
-                        static_mask, _ = yolo_wrapper.detect_and_mask(frame_rgb)
-
-                    loc_result = self.localizer.localize_frame(
-                        frame_rgb, static_mask=static_mask, dt=calculated_dt
-                    )
-
-                    if loc_result.get("success"):
-                        self.location_found.emit(
-                            loc_result["lat"], loc_result["lon"],
-                            loc_result["confidence"], loc_result["inliers"],
-                        )
-                        if loc_result.get("fov_polygon"):
-                            self.fov_found.emit(loc_result["fov_polygon"])
-                        self.status_update.emit(
-                            f"Знайдено (Inliers: {loc_result['inliers']}, "
-                            f"Кадр: {loc_result['matched_frame']})"
-                        )
-                    else:
-                        self.status_update.emit(
-                            f"Втрата: {loc_result.get('error', 'Невідома помилка')}"
-                        )
-
+                    loc_result = self.localizer.localize_frame(frame_rgb, static_mask=static_mask, dt=calculated_dt)
                 except Exception as e:
-                    logger.error(f"Localization error: {e}", exc_info=True)
-                    self.error.emit(str(e))
+                    logger.error(f"Localization exception: {e}", exc_info=True)
+                    loc_result = {"success": False, "error": str(e)}
 
-                # FPS measured before sleep, after all processing
-                process_time = time.time() - start_time
-                if process_time > 0:
-                    self._fps_buffer.append(1.0 / process_time)
-                if len(self._fps_buffer) == self._fps_buffer.maxlen:
-                    self.fps_updated.emit(sum(self._fps_buffer) / len(self._fps_buffer))
+                if loc_result.get("success"):
+                    self.location_found.emit(
+                        loc_result["lat"], loc_result["lon"],
+                        loc_result["confidence"], loc_result["inliers"]
+                    )
+                    if "fov_polygon" in loc_result:
+                        self.fov_found.emit(loc_result["fov_polygon"])
 
-                sleep_time = frame_time - process_time
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                    self.status_update.emit(
+                        f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})"
+                    )
+                else:
+                    self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 
-        finally:
-            cap.release()  # ← єдине місце звільнення
-            logger.info("VideoCapture released")
+                # Оновлюємо завжди — інакше dt накопичується і Kalman робить стрибок
+                last_localization_real_time = current_real_time
+
+                last_process_video_time = current_video_time_sec
+
+                # Рахуємо швидкість самого алгоритму
+                process_duration = time.time() - start_process
+                self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
+
+            # 3. Синхронізація відтворення: щоб відео не "пролітало" за секунду,
+            # змушуємо потік почекати, імітуючи реальну швидкість відео (1x)
+            elapsed_in_loop = time.time() - loop_start
+            sleep_time = frame_duration_sec - elapsed_in_loop
+            if sleep_time > 0:
+                self.msleep(int(sleep_time * 1000))
+
+        cap.release()
+        logger.info("Tracking worker thread finished cleanly.")
 
     def stop(self):
-        self._is_running = False
-        self.wait()  # дочекатись завершення потоку перед знищенням об'єктів
+        logger.info("Stopping tracking worker...")
+        self._stop_event.set()
+        self.wait(5000)  # чекаємо максимум 5 секунд

@@ -1,5 +1,6 @@
 ﻿import cv2
 import numpy as np
+import re
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QFileDialog, QLineEdit, QListWidget, QMessageBox, QSlider,
@@ -136,6 +137,13 @@ class CalibrationDialog(QDialog):
             "background: #E3F2FD; border-radius: 4px;"
         )
 
+        combined_row = QHBoxLayout()
+        self.input_combined = QLineEdit()
+        self.input_combined.setPlaceholderText("Вставте координати: 47.820343, 34.927702")
+        self.input_combined.textChanged.connect(self.parse_combined_gps)
+        combined_row.addWidget(QLabel("Разом:"))
+        combined_row.addWidget(self.input_combined)
+
         coords_row = QHBoxLayout()
         self.input_lat = QLineEdit()
         self.input_lat.setPlaceholderText("Широта")
@@ -158,6 +166,7 @@ class CalibrationDialog(QDialog):
         self.btn_clear_points.clicked.connect(self.clear_current_points)
 
         pts.addWidget(self.lbl_selected_px)
+        pts.addLayout(combined_row)
         pts.addLayout(coords_row)
         pts.addWidget(self.btn_add_point)
         pts.addWidget(self.points_list)
@@ -201,6 +210,14 @@ class CalibrationDialog(QDialog):
 
         main_layout.addLayout(left, stretch=2)
         main_layout.addLayout(right, stretch=1)
+
+    # ── Parsing GPS ──────────────────────────────────────────────────────────
+
+    def parse_combined_gps(self, text: str):
+        matches = re.findall(r'-?\d+\.\d+', text)
+        if len(matches) >= 2:
+            self.input_lat.setText(matches[0])
+            self.input_lon.setText(matches[1])
 
     # ── Anchor list ──────────────────────────────────────────────────────────
 
@@ -309,7 +326,6 @@ class CalibrationDialog(QDialog):
             "⚠ Статичне зображення: вкажіть вручну ID кадру з відео бази даних."
         )
 
-        # cv2.imread fails on non-ASCII (Cyrillic) paths on Windows
         with open(path, "rb") as f:
             raw = bytearray(f.read())
         frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -360,13 +376,12 @@ class CalibrationDialog(QDialog):
         if not (self.cap and self.cap.isOpened()):
             return
         cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        # POS_FRAMES points to next-to-read frame after read(), so -2 = previous
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, cur - 2))
         self.play_next_frame()
 
     def on_slider_changed(self, value: int):
         if self.is_playing:
-            return   # slider updated by play_next_frame — no dialog during playback
+            return
 
         if not (self.cap and self.cap.isOpened()):
             return
@@ -374,7 +389,6 @@ class CalibrationDialog(QDialog):
         if value == self.last_slider_value:
             return
 
-        # Roll back slider immediately BEFORE showing dialog (prevents double signal)
         if self.points_2d or self.current_2d_point:
             self.slider.blockSignals(True)
             self.slider.setValue(self.last_slider_value)
@@ -390,7 +404,6 @@ class CalibrationDialog(QDialog):
 
             self.clear_current_points()
 
-            # User confirmed — advance to requested value
             self.slider.blockSignals(True)
             self.slider.setValue(value)
             self.slider.blockSignals(False)
@@ -399,7 +412,6 @@ class CalibrationDialog(QDialog):
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, value)
         ret, frame = self.cap.read()
 
-        # Fallback for codecs that don't support POS_FRAMES seek
         if not ret:
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             if fps > 0:
@@ -438,6 +450,7 @@ class CalibrationDialog(QDialog):
         )
         self.current_2d_point = None
         self.lbl_selected_px.setText("Клікніть на наступний орієнтир")
+        self.input_combined.clear()
         self.input_lat.clear()
         self.input_lon.clear()
         self._redraw_points()
@@ -447,6 +460,7 @@ class CalibrationDialog(QDialog):
         self.points_gps.clear()
         self.current_2d_point = None
         self.points_list.clear()
+        self.input_combined.clear()
         self.video_widget.clear_overlays()
         self.lbl_selected_px.setText("Клікніть на орієнтир у відео ↖")
 
@@ -477,13 +491,11 @@ class CalibrationDialog(QDialog):
             if reply == QMessageBox.StandardButton.No:
                 return
 
-        # Emit to MainWindow — it computes affine and calls on_anchor_confirmed() on success
         self.anchor_added.emit({
             'points_2d':      list(self.points_2d),
             'points_gps':     list(self.points_gps),
             'calib_frame_id': frame_id,
         })
-        # List update happens in on_anchor_confirmed() after MainWindow validates
 
     # ── Finish ───────────────────────────────────────────────────────────────
 
@@ -504,7 +516,7 @@ class CalibrationDialog(QDialog):
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.add_anchor()
-                return   # on_anchor_confirmed will not auto-call finish — user re-clicks Done
+                return
             elif reply == QMessageBox.StandardButton.Cancel:
                 return
 

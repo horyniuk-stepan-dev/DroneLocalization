@@ -1,0 +1,991 @@
+{
+  "functions": [
+    {
+      "complexity": 0,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "AnchorCalibration::__init__",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "AnchorCalibration::from_dict",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "AnchorCalibration::pixel_to_metric",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "AnchorCalibration::to_dict",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "MultiAnchorCalibration::__init__",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "MultiAnchorCalibration::is_calibrated",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "MultiAnchorCalibration::save",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "MultiAnchorCalibration::add_anchor",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 8,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "MultiAnchorCalibration::get_metric_position",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 8,
+      "file_name": "multi_anchor_calibration.py",
+      "function_name": "MultiAnchorCalibration::load",
+      "path": "src/calibration\\multi_anchor_calibration.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_builder.py",
+      "function_name": "DatabaseBuilder::create_hdf5_structure",
+      "path": "src/database\\database_builder.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_builder.py",
+      "function_name": "DatabaseBuilder::save_frame_data",
+      "path": "src/database\\database_builder.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "database_builder.py",
+      "function_name": "DatabaseBuilder::__init__",
+      "path": "src/database\\database_builder.py"
+    },
+    {
+      "complexity": 5,
+      "file_name": "database_builder.py",
+      "function_name": "DatabaseBuilder::_compute_inter_frame_H",
+      "path": "src/database\\database_builder.py"
+    },
+    {
+      "complexity": 6,
+      "file_name": "database_builder.py",
+      "function_name": "DatabaseBuilder::_draw_keypoints_frame",
+      "path": "src/database\\database_builder.py"
+    },
+    {
+      "complexity": 49,
+      "file_name": "database_builder.py",
+      "function_name": "DatabaseBuilder::build_from_video",
+      "path": "src/database\\database_builder.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::__init__",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::get_h_to_anchor",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::get_num_frames",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::is_propagated",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::close",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::get_local_features",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::_load_hot_data",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 4,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::get_frame_affine",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 9,
+      "file_name": "database_loader.py",
+      "function_name": "DatabaseLoader::_load_propagation_data",
+      "path": "src/database\\database_loader.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "coordinates.py",
+      "function_name": "CoordinateConverter::_initialize_utm",
+      "path": "src/geometry\\coordinates.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "coordinates.py",
+      "function_name": "CoordinateConverter::haversine_distance",
+      "path": "src/geometry\\coordinates.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "coordinates.py",
+      "function_name": "CoordinateConverter::gps_to_metric",
+      "path": "src/geometry\\coordinates.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "coordinates.py",
+      "function_name": "CoordinateConverter::metric_to_gps",
+      "path": "src/geometry\\coordinates.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "transformations.py",
+      "function_name": "GeometryTransforms::apply_affine",
+      "path": "src/geometry\\transformations.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "transformations.py",
+      "function_name": "GeometryTransforms::apply_homography",
+      "path": "src/geometry\\transformations.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "transformations.py",
+      "function_name": "GeometryTransforms::estimate_affine",
+      "path": "src/geometry\\transformations.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "transformations.py",
+      "function_name": "GeometryTransforms::estimate_affine_partial",
+      "path": "src/geometry\\transformations.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "transformations.py",
+      "function_name": "GeometryTransforms::estimate_homography",
+      "path": "src/geometry\\transformations.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::clear_current_points",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::on_video_clicked",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::__init__",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::_init_ui",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::on_anchor_confirmed",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::parse_combined_gps",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::step_forward",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::_redraw_points",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::add_point_pair",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::closeEvent",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::load_frame",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::play_next_frame",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::step_backward",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 4,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::_load_image",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 4,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::add_anchor",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 4,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::toggle_playback",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 5,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::_load_video",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 5,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::finish_calibration",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 6,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::_refresh_anchors_list",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 13,
+      "file_name": "calibration_dialog.py",
+      "function_name": "CalibrationDialog::on_slider_changed",
+      "path": "src/gui\\dialogs\\calibration_dialog.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "new_mission_dialog.py",
+      "function_name": "NewMissionDialog::__init__",
+      "path": "src/gui\\dialogs\\new_mission_dialog.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "new_mission_dialog.py",
+      "function_name": "NewMissionDialog::_init_ui",
+      "path": "src/gui\\dialogs\\new_mission_dialog.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "new_mission_dialog.py",
+      "function_name": "NewMissionDialog::get_mission_data",
+      "path": "src/gui\\dialogs\\new_mission_dialog.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "new_mission_dialog.py",
+      "function_name": "NewMissionDialog::_browse_video",
+      "path": "src/gui\\dialogs\\new_mission_dialog.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "new_mission_dialog.py",
+      "function_name": "NewMissionDialog::_on_accept",
+      "path": "src/gui\\dialogs\\new_mission_dialog.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "main_window.py",
+      "function_name": "MainWindow::__init__",
+      "path": "src/gui\\main_window.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "main_window.py",
+      "function_name": "MainWindow::_connect_signals",
+      "path": "src/gui\\main_window.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "main_window.py",
+      "function_name": "MainWindow::_create_menu_bar",
+      "path": "src/gui\\main_window.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "main_window.py",
+      "function_name": "MainWindow::_init_ui",
+      "path": "src/gui\\main_window.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_propagation_error",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_calibrate",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_propagation_progress",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_load_calibration",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_run_propagation",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_save_calibration",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 5,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_propagation_completed",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 14,
+      "file_name": "calibration_mixin.py",
+      "function_name": "CalibrationMixin::on_anchor_added",
+      "path": "src/gui\\mixins\\calibration_mixin.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_mixin.py",
+      "function_name": "DatabaseMixin::_start_database_generation",
+      "path": "src/gui\\mixins\\database_mixin.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_mixin.py",
+      "function_name": "DatabaseMixin::on_db_error",
+      "path": "src/gui\\mixins\\database_mixin.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_mixin.py",
+      "function_name": "DatabaseMixin::on_db_progress",
+      "path": "src/gui\\mixins\\database_mixin.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "database_mixin.py",
+      "function_name": "DatabaseMixin::on_db_completed",
+      "path": "src/gui\\mixins\\database_mixin.py"
+    },
+    {
+      "complexity": 4,
+      "file_name": "database_mixin.py",
+      "function_name": "DatabaseMixin::on_new_mission",
+      "path": "src/gui\\mixins\\database_mixin.py"
+    },
+    {
+      "complexity": 7,
+      "file_name": "database_mixin.py",
+      "function_name": "DatabaseMixin::on_load_database",
+      "path": "src/gui\\mixins\\database_mixin.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "panorama_mixin.py",
+      "function_name": "PanoramaMixin::on_generate_panorama",
+      "path": "src/gui\\mixins\\panorama_mixin.py"
+    },
+    {
+      "complexity": 10,
+      "file_name": "panorama_mixin.py",
+      "function_name": "PanoramaMixin::on_show_panorama",
+      "path": "src/gui\\mixins\\panorama_mixin.py"
+    },
+    {
+      "complexity": 15,
+      "file_name": "panorama_mixin.py",
+      "function_name": "PanoramaMixin::_localize_panorama_corners",
+      "path": "src/gui\\mixins\\panorama_mixin.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "tracking_mixin.py",
+      "function_name": "TrackingMixin::_build_localizer",
+      "path": "src/gui\\mixins\\tracking_mixin.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "tracking_mixin.py",
+      "function_name": "TrackingMixin::on_location_found",
+      "path": "src/gui\\mixins\\tracking_mixin.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "tracking_mixin.py",
+      "function_name": "TrackingMixin::on_frame_ready",
+      "path": "src/gui\\mixins\\tracking_mixin.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "tracking_mixin.py",
+      "function_name": "TrackingMixin::on_stop_tracking",
+      "path": "src/gui\\mixins\\tracking_mixin.py"
+    },
+    {
+      "complexity": 9,
+      "file_name": "tracking_mixin.py",
+      "function_name": "TrackingMixin::on_start_tracking",
+      "path": "src/gui\\mixins\\tracking_mixin.py"
+    },
+    {
+      "complexity": 16,
+      "file_name": "tracking_mixin.py",
+      "function_name": "TrackingMixin::on_localize_image",
+      "path": "src/gui\\mixins\\tracking_mixin.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "control_panel.py",
+      "function_name": "ControlPanel::__init__",
+      "path": "src/gui\\widgets\\control_panel.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "control_panel.py",
+      "function_name": "ControlPanel::update_progress",
+      "path": "src/gui\\widgets\\control_panel.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "control_panel.py",
+      "function_name": "ControlPanel::update_status",
+      "path": "src/gui\\widgets\\control_panel.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "control_panel.py",
+      "function_name": "ControlPanel::set_tracking_enabled",
+      "path": "src/gui\\widgets\\control_panel.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "control_panel.py",
+      "function_name": "ControlPanel::_init_ui",
+      "path": "src/gui\\widgets\\control_panel.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "map_widget.py",
+      "function_name": "MapWidget::__init__",
+      "path": "src/gui\\widgets\\map_widget.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "map_widget.py",
+      "function_name": "MapWidget::add_trajectory_point",
+      "path": "src/gui\\widgets\\map_widget.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "map_widget.py",
+      "function_name": "MapWidget::clear_trajectory",
+      "path": "src/gui\\widgets\\map_widget.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "map_widget.py",
+      "function_name": "MapWidget::set_panorama_overlay",
+      "path": "src/gui\\widgets\\map_widget.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "map_widget.py",
+      "function_name": "MapWidget::update_marker",
+      "path": "src/gui\\widgets\\map_widget.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "map_widget.py",
+      "function_name": "MapWidget::_load_map",
+      "path": "src/gui\\widgets\\map_widget.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "map_widget.py",
+      "function_name": "MapWidget::update_fov",
+      "path": "src/gui\\widgets\\map_widget.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "video_widget.py",
+      "function_name": "VideoWidget::__init__",
+      "path": "src/gui\\widgets\\video_widget.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "video_widget.py",
+      "function_name": "VideoWidget::display_frame",
+      "path": "src/gui\\widgets\\video_widget.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "video_widget.py",
+      "function_name": "VideoWidget::draw_numbered_point",
+      "path": "src/gui\\widgets\\video_widget.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "video_widget.py",
+      "function_name": "VideoWidget::clear_overlays",
+      "path": "src/gui\\widgets\\video_widget.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "video_widget.py",
+      "function_name": "VideoWidget::resizeEvent",
+      "path": "src/gui\\widgets\\video_widget.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "video_widget.py",
+      "function_name": "VideoWidget::mousePressEvent",
+      "path": "src/gui\\widgets\\video_widget.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "localizer.py",
+      "function_name": "Localizer::__init__",
+      "path": "src/localization\\localizer.py"
+    },
+    {
+      "complexity": 23,
+      "file_name": "localizer.py",
+      "function_name": "Localizer::_try_lightglue_fallback",
+      "path": "src/localization\\localizer.py"
+    },
+    {
+      "complexity": 43,
+      "file_name": "localizer.py",
+      "function_name": "Localizer::localize_frame",
+      "path": "src/localization\\localizer.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "matcher.py",
+      "function_name": "FastRetrieval::__init__",
+      "path": "src/localization\\matcher.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "matcher.py",
+      "function_name": "FastRetrieval::find_similar_frames",
+      "path": "src/localization\\matcher.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "matcher.py",
+      "function_name": "FastRetrieval::normalize_vectors",
+      "path": "src/localization\\matcher.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "matcher.py",
+      "function_name": "FeatureMatcher::_fast_numpy_match",
+      "path": "src/localization\\matcher.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "matcher.py",
+      "function_name": "FeatureMatcher::_lightglue_match",
+      "path": "src/localization\\matcher.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "matcher.py",
+      "function_name": "FeatureMatcher::match",
+      "path": "src/localization\\matcher.py"
+    },
+    {
+      "complexity": 4,
+      "file_name": "matcher.py",
+      "function_name": "FeatureMatcher::__init__",
+      "path": "src/localization\\matcher.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::_register_model_usage",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::get_available_vram_mb",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::inference_context",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::load_dinov2",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::load_lightglue",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::load_superpoint",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::load_xfeat",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::load_yolo",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::__init__",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::_ensure_vram_available",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "model_manager.py",
+      "function_name": "ModelManager::unload_model",
+      "path": "src/models\\model_manager.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "feature_extractor.py",
+      "function_name": "FeatureExtractor::__init__",
+      "path": "src/models\\wrappers\\feature_extractor.py"
+    },
+    {
+      "complexity": 9,
+      "file_name": "feature_extractor.py",
+      "function_name": "FeatureExtractor::extract_features",
+      "path": "src/models\\wrappers\\feature_extractor.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "yolo_wrapper.py",
+      "function_name": "YOLOWrapper::__init__",
+      "path": "src/models\\wrappers\\yolo_wrapper.py"
+    },
+    {
+      "complexity": 8,
+      "file_name": "yolo_wrapper.py",
+      "function_name": "YOLOWrapper::detect_and_mask",
+      "path": "src/models\\wrappers\\yolo_wrapper.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "kalman_filter.py",
+      "function_name": "TrajectoryFilter::__init__",
+      "path": "src/tracking\\kalman_filter.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "kalman_filter.py",
+      "function_name": "TrajectoryFilter::_update_matrices_for_dt",
+      "path": "src/tracking\\kalman_filter.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "kalman_filter.py",
+      "function_name": "TrajectoryFilter::update",
+      "path": "src/tracking\\kalman_filter.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "outlier_detector.py",
+      "function_name": "OutlierDetector::__init__",
+      "path": "src/tracking\\outlier_detector.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "outlier_detector.py",
+      "function_name": "OutlierDetector::add_position",
+      "path": "src/tracking\\outlier_detector.py"
+    },
+    {
+      "complexity": 9,
+      "file_name": "outlier_detector.py",
+      "function_name": "OutlierDetector::is_outlier",
+      "path": "src/tracking\\outlier_detector.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "image_preprocessor.py",
+      "function_name": "ImagePreprocessor::__init__",
+      "path": "src/utils\\image_preprocessor.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "image_preprocessor.py",
+      "function_name": "ImagePreprocessor::preprocess",
+      "path": "src/utils\\image_preprocessor.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "image_utils.py",
+      "function_name": "qpixmap_to_opencv",
+      "path": "src/utils\\image_utils.py"
+    },
+    {
+      "complexity": 4,
+      "file_name": "image_utils.py",
+      "function_name": "opencv_to_qpixmap",
+      "path": "src/utils\\image_utils.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "logging_utils.py",
+      "function_name": "setup_logging",
+      "path": "src/utils\\logging_utils.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "logging_utils.py",
+      "function_name": "get_logger",
+      "path": "src/utils\\logging_utils.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::stop",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::__init__",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_get_stored_relative_H",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::run",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 2,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_project_to_metric",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 3,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_build_segments",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 6,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_match_pair",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 7,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_save_to_hdf5",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 12,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_propagate",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 14,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_wave_from_anchor",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 23,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_build_homography_chain",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 29,
+      "file_name": "calibration_propagation_worker.py",
+      "function_name": "CalibrationPropagationWorker::_process_segment",
+      "path": "src/workers\\calibration_propagation_worker.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "database_worker.py",
+      "function_name": "DatabaseGenerationWorker::stop",
+      "path": "src/workers\\database_worker.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "database_worker.py",
+      "function_name": "DatabaseGenerationWorker::__init__",
+      "path": "src/workers\\database_worker.py"
+    },
+    {
+      "complexity": 6,
+      "file_name": "database_worker.py",
+      "function_name": "DatabaseGenerationWorker::run",
+      "path": "src/workers\\database_worker.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "panorama_overlay_worker.py",
+      "function_name": "PanoramaOverlayWorker::__init__",
+      "path": "src/workers\\panorama_overlay_worker.py"
+    },
+    {
+      "complexity": 10,
+      "file_name": "panorama_overlay_worker.py",
+      "function_name": "PanoramaOverlayWorker::run",
+      "path": "src/workers\\panorama_overlay_worker.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "panorama_worker.py",
+      "function_name": "PanoramaWorker::__init__",
+      "path": "src/workers\\panorama_worker.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "panorama_worker.py",
+      "function_name": "PanoramaWorker::stop",
+      "path": "src/workers\\panorama_worker.py"
+    },
+    {
+      "complexity": 26,
+      "file_name": "panorama_worker.py",
+      "function_name": "PanoramaWorker::run",
+      "path": "src/workers\\panorama_worker.py"
+    },
+    {
+      "complexity": 0,
+      "file_name": "tracking_worker.py",
+      "function_name": "RealtimeTrackingWorker::stop",
+      "path": "src/workers\\tracking_worker.py"
+    },
+    {
+      "complexity": 1,
+      "file_name": "tracking_worker.py",
+      "function_name": "RealtimeTrackingWorker::__init__",
+      "path": "src/workers\\tracking_worker.py"
+    },
+    {
+      "complexity": 26,
+      "file_name": "tracking_worker.py",
+      "function_name": "RealtimeTrackingWorker::run",
+      "path": "src/workers\\tracking_worker.py"
+    }
+  ],
+  "targets": [
+    "E:/Dip/gsdfg/New/DroneLocalization/src"
+  ]
+}

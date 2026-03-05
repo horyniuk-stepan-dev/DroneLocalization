@@ -1,111 +1,70 @@
 ﻿import numpy as np
 from collections import deque
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
 class OutlierDetector:
-    """
-    Detects anomalous localization measurements.
-    Includes freeze-recovery: auto-resets after too many consecutive rejections.
-    """
+    """Detect anomalous measurements (outliers) based on trajectory history"""
 
-    def __init__(
-        self,
-        window_size: int = 10,
-        threshold_std: float = 3.0,
-        max_speed_mps: float = 80.0,
-        max_consecutive_rejections: int = 5,
-    ):
-        self.window_size = window_size
+    def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=1000.0):
+        self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
         self.max_speed_mps = max_speed_mps
-        self.max_consecutive_rejections = max_consecutive_rejections
+        self._consecutive_outliers = 0
+        self._max_consecutive = 5  # Після 5 підряд outliers — скидаємо (дрон реально перемістився)
 
-        self.window: deque[np.ndarray] = deque(maxlen=window_size)
-        self._last_seen_pos: np.ndarray | None = None  # оновлюється ЗАВЖДИ
-        self._consecutive_rejections: int = 0
-
+        logger.info("Initializing OutlierDetector")
         logger.info(
-            f"OutlierDetector ready | window={window_size}, "
-            f"threshold_std={threshold_std}, max_speed={max_speed_mps} m/s, "
-            f"max_consecutive_rejections={max_consecutive_rejections}"
-        )
+            f"Parameters: window_size={window_size}, threshold_std={threshold_std}, max_speed_mps={max_speed_mps}")
 
-    def _to_array(self, pos) -> np.ndarray:
-        return np.asarray(pos, dtype=np.float64)
+    def add_position(self, position: tuple):
+        self.window.append(np.array(position, dtype=np.float32))
+        self._consecutive_outliers = 0  # Скидаємо лічильник — позиція прийнята
 
-    def add_position(self, position) -> None:
-        arr = self._to_array(position)
-        self.window.append(arr)
-        self._last_seen_pos = arr          # також оновлюємо last_seen
-        self._consecutive_rejections = 0   # скидаємо лічильник при прийнятті
-        logger.debug(f"Position accepted | window={len(self.window)}/{self.window_size}")
-
-    def is_outlier(self, new_position, dt: float = 1.0) -> bool:
-        new_pos = self._to_array(new_position)
-
-        # Авто-відновлення після серії відхилень
-        # (дрон реально перемістився, скидаємо вікно і приймаємо нову позицію)
-        if self._consecutive_rejections >= self.max_consecutive_rejections:
-            logger.warning(
-                f"Auto-reset after {self._consecutive_rejections} consecutive rejections "
-                f"— accepting new anchor position"
-            )
-            self.reset()
-            # Одразу зберігаємо нову позицію як точку відліку
-            self._last_seen_pos = new_pos
-            return False
-
+    def is_outlier(self, new_position: tuple, dt: float = 1.0) -> bool:
         if len(self.window) < 3:
-            self._last_seen_pos = new_pos
-            logger.debug("Insufficient history — accepting measurement")
             return False
 
-        # Порівнюємо з _last_seen_pos (не window[-1]!)
-        # Це не дає відстані рости при заморозці вікна
-        ref_pos = self._last_seen_pos if self._last_seen_pos is not None else self.window[-1]
-        distance = float(np.linalg.norm(new_pos - ref_pos))
-        self._last_seen_pos = new_pos  # ← оновлюємо ЗАВЖДИ, навіть при відхиленні
+        new_pos_np = np.array(new_position, dtype=np.float32)
+        last_pos = self.window[-1]
 
-        # Check 1: Physics — max plausible drone speed
-        speed = distance / max(dt, 1e-3)
-        if speed > self.max_speed_mps:
-            self._consecutive_rejections += 1
-            logger.warning(
-                f"OUTLIER [{self._consecutive_rejections}/{self.max_consecutive_rejections}]: "
-                f"speed {speed:.1f} m/s > {self.max_speed_mps} m/s"
-            )
+        # 1. Перевірка максимально допустимої швидкості
+        distance = float(np.linalg.norm(new_pos_np - last_pos))
+        instantaneous_speed = distance / max(dt, 0.01)
+
+        is_speed_outlier = instantaneous_speed > self.max_speed_mps
+
+        # 2. Статистичний Z-score тест
+        history = list(self.window)
+        distances = [np.linalg.norm(history[i] - history[i - 1]) for i in range(1, len(history))]
+
+        mean_dist = np.mean(distances)
+        std_dist = max(np.std(distances), 1.0)
+
+        z_score = abs(distance - mean_dist) / std_dist
+        is_zscore_outlier = z_score > self.threshold_std and abs(distance - mean_dist) > 50.0
+
+        if is_speed_outlier or is_zscore_outlier:
+            self._consecutive_outliers += 1
+
+            # Якщо забагато підряд — дрон реально перемістився, скидаємо вікно
+            if self._consecutive_outliers >= self._max_consecutive:
+                logger.warning(
+                    f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
+                    f"accepting new position as legitimate movement"
+                )
+                self.window.clear()
+                self._consecutive_outliers = 0
+                return False  # Приймаємо нову позицію
+
+            if is_speed_outlier:
+                logger.warning(f"OUTLIER DETECTED: Speed too high ({instantaneous_speed:.2f} m/s > {self.max_speed_mps} m/s)")
+            else:
+                logger.warning(f"OUTLIER DETECTED: Z-score {z_score:.2f} > {self.threshold_std}, distance {distance:.0f}m")
             return True
 
-        # Check 2: Z-score vs historical step sizes
-        hist = np.array(self.window)
-        step_dists = np.linalg.norm(np.diff(hist, axis=0), axis=1)
-
-        mean_d = float(np.mean(step_dists))
-        std_d = float(np.std(step_dists))
-
-        if std_d < 1e-3:
-            logger.debug("Stationary history — skipping Z-score test")
-            return False
-
-        z_score = abs(distance - mean_d) / std_d
-        if z_score > self.threshold_std:
-            self._consecutive_rejections += 1
-            logger.warning(
-                f"OUTLIER [{self._consecutive_rejections}/{self.max_consecutive_rejections}]: "
-                f"Z={z_score:.2f} > {self.threshold_std} "
-                f"(dist={distance:.1f} m, mean={mean_d:.1f}, std={std_d:.1f})"
-            )
-            return True
-
-        self._consecutive_rejections = 0
-        logger.debug(f"OK | dist={distance:.1f} m, speed={speed:.1f} m/s, Z={z_score:.2f}")
+        self._consecutive_outliers = 0
         return False
-
-    def reset(self) -> None:
-        self.window.clear()
-        self._last_seen_pos = None
-        self._consecutive_rejections = 0
-        logger.info("OutlierDetector reset")

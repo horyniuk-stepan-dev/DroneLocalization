@@ -1,144 +1,138 @@
-import json
-import os
-import shutil
 import numpy as np
+import json
 from src.geometry.transformations import GeometryTransforms
+from src.geometry.coordinates import CoordinateConverter
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-_VALID_AFFINE_SHAPES = {(2, 3), (3, 3)}
-
 
 class AnchorCalibration:
-    """Single GPS anchor — a reference frame with its affine matrix (pixel → metric)."""
+    """Одна точка прив'язки GPS — конкретний кадр з affine матрицею"""
 
     def __init__(self, frame_id: int, affine_matrix: np.ndarray):
-        if affine_matrix is None or tuple(affine_matrix.shape) not in _VALID_AFFINE_SHAPES:
-            raise ValueError(
-                f"affine_matrix must be (2,3) or (3,3), got {getattr(affine_matrix, 'shape', None)}"
-            )
         self.frame_id = frame_id
-        self.affine_matrix = affine_matrix.astype(np.float32)
+        self.affine_matrix = affine_matrix
 
-    def pixel_to_metric(self, x: float, y: float) -> tuple[float, float]:
+    def pixel_to_metric(self, x: float, y: float) -> tuple:
         pt = np.array([[x, y]], dtype=np.float32)
         result = GeometryTransforms.apply_affine(pt, self.affine_matrix)[0]
         return float(result[0]), float(result[1])
 
     def to_dict(self) -> dict:
         return {
-            "frame_id":     self.frame_id,
-            "affine_matrix": self.affine_matrix.tolist(),
+            "frame_id": self.frame_id,
+            "affine_matrix": self.affine_matrix.tolist()
         }
 
     @staticmethod
     def from_dict(data: dict) -> "AnchorCalibration":
-        matrix = np.array(data["affine_matrix"], dtype=np.float32)
         return AnchorCalibration(
             frame_id=int(data["frame_id"]),
-            affine_matrix=matrix,
+            affine_matrix=np.array(data["affine_matrix"], dtype=np.float32)
         )
 
 
 class MultiAnchorCalibration:
-    """Manages multiple GPS anchor points for localization calibration."""
+    """Менеджер декількох якорів калібрування"""
 
     def __init__(self):
-        self.anchors: list[AnchorCalibration] = []
-        self.is_calibrated: bool = False
+        self.anchors = []
+        # Додано референсну точку для ініціалізації UTM
+        self.reference_gps = None
 
-    # ── Anchor management ────────────────────────────────────────────────────
+    @property
+    def is_calibrated(self) -> bool:
+        return len(self.anchors) > 0
 
-    def add_anchor(self, frame_id: int, affine_matrix: np.ndarray) -> None:
-        """Add or replace anchor for frame_id. Keeps list sorted by frame_id."""
-        anchor = AnchorCalibration(frame_id, affine_matrix)  # validates shape
-        self.anchors = [a for a in self.anchors if a.frame_id != frame_id]
-        self.anchors.append(anchor)
-        self.anchors.sort(key=lambda a: a.frame_id)
-        self.is_calibrated = True
-        logger.info(f"Anchor added: frame={frame_id}, total={len(self.anchors)}")
+    def add_anchor(self, frame_id: int, affine_matrix: np.ndarray):
+        existing = next((a for a in self.anchors if a.frame_id == frame_id), None)
+        if existing:
+            existing.affine_matrix = affine_matrix
+            logger.info(f"Updated anchor for frame {frame_id}")
+        else:
+            self.anchors.append(AnchorCalibration(frame_id, affine_matrix))
+            self.anchors.sort(key=lambda a: a.frame_id)
+            logger.info(f"Added new anchor for frame {frame_id}. Total anchors: {len(self.anchors)}")
 
-    def remove_anchor(self, frame_id: int) -> bool:
-        """Remove anchor by frame_id. Returns True if found and removed."""
-        before = len(self.anchors)
-        self.anchors = [a for a in self.anchors if a.frame_id != frame_id]
-        removed = len(self.anchors) < before
-        if removed:
-            self.is_calibrated = len(self.anchors) > 0
-            logger.info(f"Anchor removed: frame={frame_id}, remaining={len(self.anchors)}")
-        return removed
+    def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple | None:
+        if not self.is_calibrated:
+            return None
 
-    def reset(self) -> None:
-        """Clear all anchors."""
-        self.anchors.clear()
-        self.is_calibrated = False
-        logger.info("MultiAnchorCalibration reset")
+        if len(self.anchors) == 1:
+            return self.anchors[0].pixel_to_metric(x, y)
 
-    # ── Interpolation ────────────────────────────────────────────────────────
+        anchor_1 = self.anchors[0]
+        anchor_2 = self.anchors[-1]
 
-    def blend_metric(
-        self,
-        frame_id: int,
-        metric_1: tuple,
-        metric_2: tuple,
-        anchor_1: AnchorCalibration,
-        anchor_2: AnchorCalibration,
-    ) -> tuple[float, float]:
-        """Linear interpolation between two anchor metric coordinates by frame distance."""
+        for i in range(len(self.anchors) - 1):
+            if self.anchors[i].frame_id <= frame_id <= self.anchors[i + 1].frame_id:
+                anchor_1 = self.anchors[i]
+                anchor_2 = self.anchors[i + 1]
+                break
+
+        if frame_id <= self.anchors[0].frame_id:
+            anchor_1 = anchor_2 = self.anchors[0]
+        elif frame_id >= self.anchors[-1].frame_id:
+            anchor_1 = anchor_2 = self.anchors[-1]
+
+        metric_1 = anchor_1.pixel_to_metric(x, y)
+        metric_2 = anchor_2.pixel_to_metric(x, y)
+
         dist_1 = abs(frame_id - anchor_1.frame_id)
         dist_2 = abs(frame_id - anchor_2.frame_id)
-        total  = dist_1 + dist_2
-        if total == 0:
+        total_dist = dist_1 + dist_2
+
+        if total_dist == 0:
             return metric_1
-        w1 = dist_2 / total
-        w2 = dist_1 / total
-        return metric_1[0] * w1 + metric_2[0] * w2, metric_1[1] * w1 + metric_2[1] * w2
 
-    # ── Serialization ────────────────────────────────────────────────────────
+        weight_1 = dist_2 / total_dist
+        weight_2 = dist_1 / total_dist
 
-    def save(self, path: str) -> None:
+        blend_x = metric_1[0] * weight_1 + metric_2[0] * weight_2
+        blend_y = metric_1[1] * weight_1 + metric_2[1] * weight_2
+
+        return blend_x, blend_y
+
+    def save(self, path: str):
         if not self.is_calibrated:
-            raise RuntimeError("No calibration data to save")
+            raise RuntimeError("Немає даних для збереження")
 
-        data = {"anchors": [a.to_dict() for a in self.anchors]}
+        data = {
+            "reference_gps": self.reference_gps,  # Зберігаємо базову координату
+            "anchors": [a.to_dict() for a in self.anchors]
+        }
 
-        # Atomic write — prevent corrupt file on crash
-        tmp_path = path + '.tmp'
-        try:
-            with open(tmp_path, 'w') as f:
-                json.dump(data, f, indent=2)
-            shutil.move(tmp_path, path)
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.success(f"MultiAnchorCalibration saved: {path} ({len(self.anchors)} anchors)")
 
-        logger.success(f"Calibration saved: {path} ({len(self.anchors)} anchors)")
+    def load(self, path: str):
+        logger.info(f"Loading MultiAnchorCalibration from: {path}")
+        with open(path, 'r') as f:
+            data = json.load(f)
 
-    def load(self, path: str) -> None:
-        logger.info(f"Loading calibration: {path}")
-        try:
-            with open(path, 'r') as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Calibration file not found: {path}")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Corrupt calibration file: {e}")
+        self.anchors.clear()
 
-        # Backward-compat: legacy single-anchor format
-        if "affine_matrix" in data and "calib_frame_id" in data:
-            logger.warning("Legacy single-anchor format detected — consider re-calibrating")
-            anchors = [AnchorCalibration(
-                frame_id=int(data["calib_frame_id"]),
-                affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
-            )]
-        elif "anchors" in data:
-            anchors = [AnchorCalibration.from_dict(a) for a in data["anchors"]]
+        # Ініціалізація UTM конвертера, якщо у файлі збережено референсну GPS точку
+        if "reference_gps" in data and data["reference_gps"] is not None:
+            self.reference_gps = data["reference_gps"]
+            CoordinateConverter.gps_to_metric(self.reference_gps[0], self.reference_gps[1])
+            logger.info(f"UTM Projection initialized from loaded reference GPS: {self.reference_gps}")
         else:
-            raise ValueError(f"Unknown calibration format: keys={list(data.keys())}")
+            logger.warning("No reference GPS found in calibration file. UTM converter is not initialized.")
 
-        anchors.sort(key=lambda a: a.frame_id)
-        self.anchors = anchors
-        self.is_calibrated = True
+        # Підтримка старого формату файлів
+        if "affine_matrix" in data and "calib_frame_id" in data:
+            anchor = AnchorCalibration(
+                frame_id=int(data.get("calib_frame_id", 0)),
+                affine_matrix=np.array(data["affine_matrix"], dtype=np.float32)
+            )
+            self.anchors.append(anchor)
+        # Новий формат файлів
+        elif "anchors" in data:
+            for item in data["anchors"]:
+                self.anchors.append(AnchorCalibration.from_dict(item))
+
+        self.anchors.sort(key=lambda a: a.frame_id)
         logger.success(f"Loaded {len(self.anchors)} anchors")

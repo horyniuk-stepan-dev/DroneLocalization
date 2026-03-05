@@ -14,20 +14,44 @@ class TrackingMixin:
 
     def _build_localizer(self) -> Localizer:
         """Shared factory — used by tracking and single-image localization."""
-        sp = self.model_manager.load_superpoint()
+        # ОНОВЛЕНО: Завантажуємо надшвидкий XFeat та DINOv2
+        xf = self.model_manager.load_xfeat()
         nv = self.model_manager.load_dinov2()
-        lg = self.model_manager.load_lightglue()
-        fe      = FeatureExtractor(sp, nv, self.model_manager.device, config=self.config)
-        matcher = FeatureMatcher(lg, self.model_manager.device)
-        return Localizer(self.database, fe, matcher, self.calibration, config=self.config)
+
+        fe = FeatureExtractor(xf, nv, self.model_manager.device, config=self.config)
+
+        # ОНОВЛЕНО: Матчер сам вирішить (Numpy для XFeat або LightGlue для SuperPoint)
+        matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
+
+        # Передаємо model_manager у конфіг для SuperPoint+LightGlue fallback
+        localizer_config = {**self.config, '_model_manager': self.model_manager}
+        return Localizer(self.database, fe, matcher, self.calibration, config=localizer_config)
+
+    def _ensure_utm_initialized(self) -> bool:
+        """Перевіряє чи ініціалізована проєкція UTM, якщо ні - пробує ініціалізувати з калібрування."""
+        from src.geometry.coordinates import CoordinateConverter
+        if CoordinateConverter._initialized:
+            return True
+        
+        if self.calibration and self.calibration.reference_gps:
+            CoordinateConverter.gps_to_metric(self.calibration.reference_gps[0], self.calibration.reference_gps[1])
+            return True
+            
+        QMessageBox.warning(
+            self, "Помилка формату", 
+            "Проєкція UTM не ініціалізована.\n\n"
+            "Схоже, що база даних створена у старій версії програми, або не була завантажена GPS-прив'язка.\n"
+            "Будь ласка, завантажте файл калібрування (.json) або виконайте додавання GPS-якорів наново."
+        )
+        return False
 
     @pyqtSlot()
     def on_start_tracking(self):
         if not self.database:
             QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
             return
-        if not self.calibration.is_calibrated:
-            QMessageBox.warning(self, "Увага", "Виконайте калібрування GPS.")
+        if not self.calibration.is_calibrated and not (self.database and self.database.is_propagated):
+            QMessageBox.warning(self, "Увага", "Виконайте калібрування GPS або завантажте базу з пропагацією.")
             return
         if not self.database.is_propagated:
             reply = QMessageBox.question(
@@ -38,10 +62,17 @@ class TrackingMixin:
             if reply == QMessageBox.StandardButton.No:
                 return
 
+        default_dir = ""
+        if self.project_manager and self.project_manager.is_loaded:
+            default_dir = str(self.project_manager.project_dir / "test_videos")
+
         video_path, _ = QFileDialog.getOpenFileName(
-            self, "Відео з дрона", "", "Video Files (*.mp4 *.avi *.mkv)"
+            self, "Відео з дрона", default_dir, "Video Files (*.mp4 *.avi *.mkv)"
         )
         if not video_path:
+            return
+
+        if not self._ensure_utm_initialized():
             return
 
         localizer = self._build_localizer()
@@ -70,12 +101,16 @@ class TrackingMixin:
         if not self.database:
             QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
             return
-        if not self.calibration.is_calibrated:
-            QMessageBox.warning(self, "Увага", "Виконайте калібрування GPS.")
+        if not self.calibration.is_calibrated and not (self.database and self.database.is_propagated):
+            QMessageBox.warning(self, "Увага", "Виконайте калібрування GPS або завантажте базу з пропагацією.")
             return
 
+        default_dir = ""
+        if self.project_manager and self.project_manager.is_loaded:
+            default_dir = str(self.project_manager.project_dir / "test_photos")
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "Виберіть зображення", "", "Images (*.png *.jpg *.jpeg)"
+            self, "Виберіть зображення", default_dir, "Images (*.png *.jpg *.jpeg)"
         )
         if not path:
             return
@@ -83,6 +118,9 @@ class TrackingMixin:
         frame = cv2.imread(path)
         if frame is None:
             QMessageBox.warning(self, "Помилка", "Не вдалося прочитати зображення.")
+            return
+            
+        if not self._ensure_utm_initialized():
             return
 
         self.status_bar.showMessage("Локалізація зображення...")
@@ -96,10 +134,10 @@ class TrackingMixin:
                 self.video_widget.display_frame(opencv_to_qpixmap(frame))
 
             if result.get("success"):
-                lat, lon  = result["lat"], result["lon"]
-                conf      = result["confidence"]
-                inliers   = result.get("inliers", 0)
-                anchor    = result.get("anchor_frame", "?")
+                lat, lon = result["lat"], result["lon"]
+                conf = result["confidence"]
+                inliers = result.get("inliers", 0)
+                anchor = result.get("matched_frame", "?")  # ВИПРАВЛЕНО КЛЮЧ
 
                 self.map_widget.update_marker(lat, lon)
                 if "fov_polygon" in result:
@@ -111,10 +149,10 @@ class TrackingMixin:
                 )
                 self.control_panel.update_status("Фото локалізовано")
                 QMessageBox.information(self, "Успіх",
-                    f"Координати знайдено!\n\n"
-                    f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
-                    f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
-                    f"Якір: кадр {anchor}")
+                                        f"Координати знайдено!\n\n"
+                                        f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
+                                        f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
+                                        f"Якір: кадр {anchor}")
             else:
                 err = result.get('error', 'Невідома помилка')
                 self.status_bar.showMessage(f"Помилка: {err}")
