@@ -1,20 +1,16 @@
-﻿import json
 from pathlib import Path
 
-from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QUrl
 from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 # Resolved once at import time — safe for both dev and frozen builds
-_MAP_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "resources" / "maps" / "map_template.html"
-)
+_MAP_PATH = Path(__file__).resolve().parent.parent / "resources" / "maps" / "map_template.html"
 
 
 class MapBridge(QObject):
@@ -22,15 +18,16 @@ class MapBridge(QObject):
     Qt↔JavaScript signal bus via QWebChannel.
     Signals here are consumed by map_template.html — not connected to Python slots.
     """
-    updateMarkerSignal    = pyqtSignal(float, float)
-    addTrajectorySignal   = pyqtSignal(float, float)
+
+    updateMarkerSignal = pyqtSignal(float, float)
+    addTrajectorySignal = pyqtSignal(float, float)
     clearTrajectorySignal = pyqtSignal()
 
     # 8 floats: TL, TR, BR, BL corners (lat, lon each)
-    updateFOVSignal       = pyqtSignal(float, float, float, float, float, float, float, float)
+    updateFOVSignal = pyqtSignal(float, float, float, float, float, float, float, float)
 
     # data_url (base64 JPEG) + 8 corner coords
-    setPanoramaSignal     = pyqtSignal(str, float, float, float, float, float, float, float, float)
+    setPanoramaSignal = pyqtSignal(str, float, float, float, float, float, float, float, float)
 
 
 class MapWidget(QWebEngineView):
@@ -91,26 +88,39 @@ class MapWidget(QWebEngineView):
 
         try:
             self.bridge.updateFOVSignal.emit(
-                float(fov[0][0]), float(fov[0][1]),
-                float(fov[1][0]), float(fov[1][1]),
-                float(fov[2][0]), float(fov[2][1]),
-                float(fov[3][0]), float(fov[3][1]),
+                float(fov[0][0]),
+                float(fov[0][1]),
+                float(fov[1][0]),
+                float(fov[1][1]),
+                float(fov[2][0]),
+                float(fov[2][1]),
+                float(fov[3][0]),
+                float(fov[3][1]),
             )
         except (IndexError, TypeError, ValueError) as e:
             logger.warning(f"update_fov: malformed point data: {e}")
 
     @pyqtSlot(str, float, float, float, float, float, float, float, float)
     def set_panorama_overlay(
-        self, data_url: str,
-        lat_tl: float, lon_tl: float,
-        lat_tr: float, lon_tr: float,
-        lat_br: float, lon_br: float,
-        lat_bl: float, lon_bl: float,
+        self,
+        data_url: str,
+        lat_tl: float,
+        lon_tl: float,
+        lat_tr: float,
+        lon_tr: float,
+        lat_br: float,
+        lon_br: float,
+        lat_bl: float,
+        lon_bl: float,
     ):
         self.bridge.setPanoramaSignal.emit(
             data_url,
-            lat_tl, lon_tl,
-            lat_tr, lon_tr,
-            lat_br, lon_br,
-            lat_bl, lon_bl,
+            lat_tl,
+            lon_tl,
+            lat_tr,
+            lon_tr,
+            lat_br,
+            lon_br,
+            lat_bl,
+            lon_bl,
         )

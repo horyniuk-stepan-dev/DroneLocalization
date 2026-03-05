@@ -1,1 +1,1 @@
-﻿"""Geometry module"""
+"""Geometry module"""

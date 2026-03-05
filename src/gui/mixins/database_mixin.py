@@ -1,24 +1,23 @@
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QMessageBox, QFileDialog
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from src.database.database_loader import DatabaseLoader
-from src.workers.database_worker import DatabaseGenerationWorker
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
+from src.workers.database_worker import DatabaseGenerationWorker
 
 
 class DatabaseMixin:
-
     @pyqtSlot()
     def on_new_mission(self):
         # Отримуємо дані про нову місію з діалогу
         dialog = NewMissionDialog(self)
         if not dialog.exec():
             return
-            
+
         mission_data = dialog.get_mission_data()
-        workspace_dir = mission_data.get('workspace_dir')
-        video_path = mission_data.get('video_path')
-        
+        workspace_dir = mission_data.get("workspace_dir")
+        video_path = mission_data.get("video_path")
+
         if not workspace_dir or not video_path:
             return
 
@@ -26,7 +25,7 @@ class DatabaseMixin:
         if not self.project_manager.create_project(workspace_dir, mission_data):
             QMessageBox.critical(self, "Помилка", "Не вдалося створити проєкт!")
             return
-            
+
         self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
         self._start_database_generation(video_path, self.project_manager.database_path)
 
@@ -39,7 +38,7 @@ class DatabaseMixin:
             video_path=video_path,
             output_path=save_path,
             model_manager=self.model_manager,
-            config=self.config,     # ← завжди self.config, не APP_CONFIG напряму
+            config=self.config,  # ← завжди self.config, не APP_CONFIG напряму
         )
         self.db_worker.progress.connect(self.on_db_progress)
         self.db_worker.completed.connect(self.on_db_completed)
@@ -62,7 +61,9 @@ class DatabaseMixin:
         self.database = DatabaseLoader(db_path)
         self.control_panel.update_progress(100)
         self.control_panel.update_status("Базу успішно створено")
-        self.status_bar.showMessage(f"Проєкт: {self.project_manager.project_name} | База: {db_path}")
+        self.status_bar.showMessage(
+            f"Проєкт: {self.project_manager.project_name} | База: {db_path}"
+        )
         QMessageBox.information(self, "Успіх", "Проєкт та базу даних успішно згенеровано!")
 
     @pyqtSlot(str)
@@ -75,27 +76,25 @@ class DatabaseMixin:
 
     @pyqtSlot()
     def on_load_database(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Виберіть папку проєкту", ""
-        )
+        path = QFileDialog.getExistingDirectory(self, "Виберіть папку проєкту", "")
         if not path:
             self.status_bar.showMessage("Вибір проєкту скасовано")
             return
-            
+
         if not self.project_manager.load_project(path):
             QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
             return
-            
+
         try:
             db_path = self.project_manager.database_path
-            
+
             # Закриваємо попередню базу щоб звільнити HDF5 handle
             if self.database:
                 self.database.close()
-                
+
             self.database = DatabaseLoader(db_path)
             self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
-            
+
             if self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
@@ -107,6 +106,6 @@ class DatabaseMixin:
                     f"Проєкт: {self.project_manager.project_name} (без GPS пропагації)"
                 )
             self.control_panel.update_status("Проєкт завантажено")
-            
+
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу проєкту:\n{e}")

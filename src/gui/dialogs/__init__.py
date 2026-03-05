@@ -1,1 +1,1 @@
-﻿"""Dialogs module"""
+"""Dialogs module"""

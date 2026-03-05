@@ -1,6 +1,7 @@
-﻿import cv2
-import time
 import threading
+import time
+
+import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -31,7 +32,7 @@ class RealtimeTrackingWorker(QThread):
         # Скільки кадрів розпізнавати за одну секунду ВІДЕО.
         # 1.0 = 1 кадр в секунду; 2.0 = кожні 0.5 секунд; 0.5 = кожні 2 секунди відео.
         # Ти можеш змінити це число прямо тут для тестів:
-        self.process_fps = self.config.get('tracking', {}).get('process_fps', 1.0)
+        self.process_fps = self.config.get("tracking", {}).get("process_fps", 1.0)
 
     def run(self):
         logger.info(f"Starting tracking from source: {self.video_source}")
@@ -98,15 +99,19 @@ class RealtimeTrackingWorker(QThread):
 
                 # БЛОК TRY-EXCEPT для запобігання "зависанню на першому кадрі"
                 try:
-                    loc_result = self.localizer.localize_frame(frame_rgb, static_mask=static_mask, dt=calculated_dt)
+                    loc_result = self.localizer.localize_frame(
+                        frame_rgb, static_mask=static_mask, dt=calculated_dt
+                    )
                 except Exception as e:
                     logger.error(f"Localization exception: {e}", exc_info=True)
                     loc_result = {"success": False, "error": str(e)}
 
                 if loc_result.get("success"):
                     self.location_found.emit(
-                        loc_result["lat"], loc_result["lon"],
-                        loc_result["confidence"], loc_result["inliers"]
+                        loc_result["lat"],
+                        loc_result["lon"],
+                        loc_result["confidence"],
+                        loc_result["inliers"],
                     )
                     if "fov_polygon" in loc_result:
                         self.fov_found.emit(loc_result["fov_polygon"])
@@ -115,7 +120,9 @@ class RealtimeTrackingWorker(QThread):
                         f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})"
                     )
                 else:
-                    self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
+                    self.status_update.emit(
+                        f"Втрата: {loc_result.get('error', 'Невідома помилка')}"
+                    )
 
                 # Оновлюємо завжди — інакше dt накопичується і Kalman робить стрибок
                 last_localization_real_time = current_real_time

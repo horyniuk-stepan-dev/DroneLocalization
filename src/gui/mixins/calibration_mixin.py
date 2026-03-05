@@ -1,17 +1,15 @@
 import numpy as np
-from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QMessageBox, QFileDialog, QProgressDialog
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
+from src.gui.dialogs.calibration_dialog import CalibrationDialog
 from src.localization.matcher import FeatureMatcher
 from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
-from src.gui.dialogs.calibration_dialog import CalibrationDialog
 
 
 class CalibrationMixin:
-
     # ── Calibration dialog ───────────────────────────────────────────────────
 
     @pyqtSlot()
@@ -38,15 +36,15 @@ class CalibrationMixin:
     @pyqtSlot(object)
     def on_anchor_added(self, anchor_data: dict):
         try:
-            points_2d = anchor_data.get('points_2d')
-            points_gps = anchor_data.get('points_gps')
-            frame_id = anchor_data.get('calib_frame_id')
+            points_2d = anchor_data.get("points_2d")
+            points_gps = anchor_data.get("points_gps")
+            frame_id = anchor_data.get("calib_frame_id")
 
             if not points_2d or not points_gps or len(points_2d) < 3:
                 QMessageBox.warning(self, "Помилка", "Потрібно мінімум 3 точки для якоря!")
                 return
 
-            if not getattr(self.calibration, 'reference_gps', None):
+            if not getattr(self.calibration, "reference_gps", None):
                 self.calibration.reference_gps = points_gps[0]
 
             pts_2d_np = np.array(points_2d, dtype=np.float32)
@@ -55,8 +53,11 @@ class CalibrationMixin:
 
             M, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
             if M is None:
-                QMessageBox.critical(self, "Помилка",
-                                     "Не вдалося обчислити матрицю. Спробуйте розставити точки ширше!")
+                QMessageBox.critical(
+                    self,
+                    "Помилка",
+                    "Не вдалося обчислити матрицю. Спробуйте розставити точки ширше!",
+                )
                 return
 
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=M)
@@ -68,12 +69,13 @@ class CalibrationMixin:
             self.status_bar.showMessage(f"Якір для кадру {frame_id} успішно створено!")
 
             # ОНОВЛЕНО: Повідомляємо діалогове вікно про успіх, щоб воно оновило список UI
-            if hasattr(self, '_calib_dialog') and self._calib_dialog is not None:
+            if hasattr(self, "_calib_dialog") and self._calib_dialog is not None:
                 self._calib_dialog.on_anchor_confirmed(frame_id)
 
         except Exception as e:
             self.logger.error(f"Failed to add anchor: {e}", exc_info=True)
             QMessageBox.critical(self, "Помилка", f"Не вдалося додати якір:\n{e}")
+
     # ── Propagation ──────────────────────────────────────────────────────────
 
     @pyqtSlot()
@@ -99,7 +101,10 @@ class CalibrationMixin:
 
         self._propagation_dialog = QProgressDialog(
             f"Пропагація GPS від {len(anchor_ids)} якорів на {n_frames} кадрів...",
-            "Скасувати", 0, 100, self,
+            "Скасувати",
+            0,
+            100,
+            self,
         )
         self._propagation_dialog.setWindowTitle("Розповсюдження GPS координат")
         self._propagation_dialog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -135,12 +140,15 @@ class CalibrationMixin:
             self._propagation_dialog.close()
             self._propagation_dialog = None
 
-        n_valid = int(self.database.frame_valid.sum()) if self.database.frame_valid is not None else 0
+        n_valid = (
+            int(self.database.frame_valid.sum()) if self.database.frame_valid is not None else 0
+        )
         n_total = self.database.get_num_frames()
         self.status_bar.showMessage(f"✅ Пропагація: {n_valid}/{n_total} кадрів")
 
         reply = QMessageBox.question(
-            self, "Пропагація завершена",
+            self,
+            "Пропагація завершена",
             f"GPS розповсюджено на {n_valid}/{n_total} кадрів!\n\nЗберегти файл калібрування?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
@@ -148,7 +156,9 @@ class CalibrationMixin:
             self.on_save_calibration()
 
         if self.tracking_worker and self.tracking_worker.isRunning():
-            self.logger.info("Propagation completed while tracking is running. Tracker will use updated data.")
+            self.logger.info(
+                "Propagation completed while tracking is running. Tracker will use updated data."
+            )
 
     @pyqtSlot(str)
     def on_propagation_error(self, error_msg: str):
@@ -165,11 +175,11 @@ class CalibrationMixin:
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
-            
+
         default_path = "calibration.json"
         if self.project_manager and self.project_manager.is_loaded:
             default_path = str(self.project_manager.project_dir / default_path)
-            
+
         path, _ = QFileDialog.getSaveFileName(
             self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
         )
@@ -179,8 +189,9 @@ class CalibrationMixin:
             self.calibration.save(path)
             n = len(self.calibration.anchors)
             self.status_bar.showMessage(f"Калібрування збережено: {path} ({n} якорів)")
-            QMessageBox.information(self, "Збережено",
-                f"Калібрування збережено!\nЯкорів: {n}\nФайл: {path}")
+            QMessageBox.information(
+                self, "Збережено", f"Калібрування збережено!\nЯкорів: {n}\nФайл: {path}"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося зберегти:\n{e}")
 
@@ -189,7 +200,7 @@ class CalibrationMixin:
         default_dir = ""
         if self.project_manager and self.project_manager.is_loaded:
             default_dir = str(self.project_manager.project_dir)
-            
+
         path, _ = QFileDialog.getOpenFileName(
             self, "Завантажити калібрування", default_dir, "JSON Files (*.json);;All Files (*)"
         )
@@ -201,8 +212,11 @@ class CalibrationMixin:
             propagated = self.database and self.database.is_propagated
             self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
             self.control_panel.update_status("Калібрування завантажено")
-            QMessageBox.information(self, "Успіх",
+            QMessageBox.information(
+                self,
+                "Успіх",
                 f"Завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
-                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}")
+                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}",
+            )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
