@@ -12,7 +12,12 @@ class ModelManager:
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.models = {}
         self.model_usage = {}
-        self.max_vram_ratio = 0.8
+        
+        # Конфігурація VRAM
+        m_cfg = self.config.get('models', {})
+        vram_cfg = m_cfg.get('vram_management', {})
+        self.max_vram_ratio = vram_cfg.get('max_vram_ratio', 0.8)
+        self.default_vram_required = vram_cfg.get('default_required_mb', 2000.0)
 
         logger.info(f"ModelManager initialized with device: {self.device}")
         if self.device == 'cuda':
@@ -26,10 +31,13 @@ class ModelManager:
         available_mb = free_mem / (1024 * 1024)
         return available_mb
 
-    def _ensure_vram_available(self, required_mb: float = 2000.0):
+    def _ensure_vram_available(self, required_mb: float | None = None):
         if self.device == 'cpu':
             return
-        while self.get_available_vram_mb() < required_mb and self.models:
+        
+        req = required_mb if required_mb is not None else self.default_vram_required
+        
+        while self.get_available_vram_mb() < req and self.models:
             least_used = min(self.model_usage.items(), key=lambda x: x[1])[0]
             logger.warning(f"VRAM insufficient. Unloading least used model: {least_used}")
             self.unload_model(least_used)
@@ -40,15 +48,18 @@ class ModelManager:
     def load_yolo(self):
         name = 'yolo'
         if name not in self.models:
-            logger.info(f"Loading YOLOv11x-seg (Extra Large) model...")
-            self._ensure_vram_available(1200.0) # YOLO11x потребує ~1.2GB+
+            cfg = self.config.get('models', {}).get(name, {})
+            model_path = cfg.get('model_path', 'yolo11x-seg.pt')
+            vram_req = cfg.get('vram_required_mb', 1200.0)
+
+            logger.info(f"Loading YOLO model: {model_path}...")
+            self._ensure_vram_available(vram_req)
             try:
                 from ultralytics import YOLO
-                # Ultralytics автоматично завантажить архітектуру YOLOv11x
-                model = YOLO('yolo11x-seg.pt')
+                model = YOLO(model_path)
                 model.to(self.device)
                 self.models[name] = model
-                logger.success(f"YOLOv11x-seg model loaded successfully on {self.device}")
+                logger.success(f"YOLO model {model_path} loaded successfully on {self.device}")
             except Exception as e:
                 logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
                 raise
@@ -58,11 +69,16 @@ class ModelManager:
     def load_xfeat(self):
         name = 'xfeat'
         if name not in self.models:
-            logger.info(f"Loading XFeat model...")
-            self._ensure_vram_available(300.0)
+            cfg = self.config.get('models', {}).get(name, {})
+            repo = cfg.get('hub_repo', 'verlab/accelerated_features')
+            model_name = cfg.get('hub_model', 'XFeat')
+            top_k = cfg.get('top_k', 2048)
+            vram_req = cfg.get('vram_required_mb', 300.0)
+
+            logger.info(f"Loading XFeat model ({repo}/{model_name})...")
+            self._ensure_vram_available(vram_req)
             try:
-                # Завантаження XFeat з PyTorch Hub
-                model = torch.hub.load('verlab/accelerated_features', 'XFeat', pretrained=True, top_k=2048)
+                model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
                 model = model.eval().to(self.device)
                 self.models[name] = model
                 logger.success(f"XFeat loaded successfully on {self.device}")
@@ -75,8 +91,11 @@ class ModelManager:
     def load_superpoint(self):
         name = 'superpoint'
         if name not in self.models:
+            cfg = self.config.get('models', {}).get(name, {})
+            vram_req = cfg.get('vram_required_mb', 500.0)
+            
             logger.info(f"Loading SuperPoint model (for LightGlue compatibility)...")
-            self._ensure_vram_available(500.0)
+            self._ensure_vram_available(vram_req)
             try:
                 from lightglue import SuperPoint
                 sp_config = {
@@ -95,13 +114,16 @@ class ModelManager:
     def load_lightglue(self):
         name = 'lightglue'
         if name not in self.models:
+            cfg = self.config.get('models', {}).get(name, {})
+            vram_req = cfg.get('vram_required_mb', 1000.0)
+
             logger.info(f"Loading LightGlue model...")
-            self._ensure_vram_available(1000.0)
+            self._ensure_vram_available(vram_req)
             try:
                 from lightglue import LightGlue
                 lg_config = {
-                    'depth_confidence': self.config.get('lightglue', {}).get('depth_confidence', -1),
-                    'width_confidence': self.config.get('lightglue', {}).get('width_confidence', -1),
+                    'depth_confidence': cfg.get('depth_confidence', -1),
+                    'width_confidence': cfg.get('width_confidence', -1),
                 }
                 model = LightGlue(features='superpoint', **lg_config).eval().to(self.device)
                 self.models[name] = model
@@ -115,13 +137,18 @@ class ModelManager:
     def load_dinov2(self):
         name = 'dinov2'
         if name not in self.models:
-            logger.info(f"Loading DINOv2 (vitl14) Large model...")
-            self._ensure_vram_available(1600.0) # Large важить ~1.2-1.5 GB
+            cfg = self.config.get('models', {}).get(name, {})
+            repo = cfg.get('hub_repo', 'facebookresearch/dinov2')
+            model_name = cfg.get('hub_model', 'dinov2_vitl14')
+            vram_req = cfg.get('vram_required_mb', 1600.0)
+
+            logger.info(f"Loading DINOv2 ({model_name}) model...")
+            self._ensure_vram_available(vram_req)
             try:
-                model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+                model = torch.hub.load(repo, model_name)
                 model = model.eval().to(self.device)
                 self.models[name] = model
-                logger.success(f"DINOv2 Large model loaded successfully")
+                logger.success(f"DINOv2 model {model_name} loaded successfully")
             except Exception as e:
                 logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
                 raise

@@ -5,27 +5,104 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 class GeometryTransforms:
-    """Geometric transformations for localization"""
+    """Geometric transformations for localization with robust estimation (MAGSAC++)"""
+
+    @staticmethod
+    def is_matrix_valid(M: np.ndarray, is_homography: bool = False,
+                        min_scale: float = 0.1, max_scale: float = 10.0,
+                        max_shear: float = 0.5) -> bool:
+        """
+        Check if the transformation matrix is physically realistic for drone imagery.
+        
+        Args:
+            M: Transformation matrix (2x3 for Affine or 3x3 for Homography)
+            is_homography: True if M is a 3x3 Homography matrix
+            min_scale: Minimum allowed scale factor
+            max_scale: Maximum allowed scale factor
+            max_shear: Maximum allowed shear (dot product of normalized basis vectors)
+        """
+        if M is None:
+            return False
+
+        try:
+            if is_homography:
+                # For Homography, we care about the affine part for stability checks
+                if M.shape != (3, 3): return False
+                # Normalize by M[2,2] if possible
+                if abs(M[2, 2]) < 1e-9: return False
+                M = M / M[2, 2]
+                A = M[:2, :2]
+                det = np.linalg.det(A)
+            else:
+                if M.shape != (2, 3): return False
+                A = M[:2, :2]
+                det = np.linalg.det(A)
+
+            # 1. Determinant must be positive (no mirroring)
+            if det <= 0:
+                logger.debug("Matrix invalid: Negative or zero determinant (mirroring/degenerate)")
+                return False
+
+            # 2. Extract scale and shear from basis vectors
+            u = A[:, 0]
+            v = A[:, 1]
+            scale_u = np.linalg.norm(u)
+            scale_v = np.linalg.norm(v)
+
+            # Check scale bounds (drone altitude/zoom sanity)
+            if not (min_scale < scale_u < max_scale and min_scale < scale_v < max_scale):
+                logger.debug(f"Matrix invalid: Scale out of bounds ({scale_u:.2f}, {scale_v:.2f})")
+                return False
+
+            # 3. Check Aspect Ratio (should be close to 1.0 for drone imagery)
+            aspect_ratio = scale_u / (scale_v + 1e-9)
+            if not (0.5 < aspect_ratio < 2.0):
+                logger.debug(f"Matrix invalid: Extreme aspect ratio distortion ({aspect_ratio:.2f})")
+                return False
+
+            # 4. Check Shear (cos of angle between basis vectors)
+            shear = abs(np.dot(u, v) / (scale_u * scale_v + 1e-9))
+            if shear > max_shear:
+                logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f})")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error during matrix validation: {e}")
+            return False
 
     @staticmethod
     def estimate_homography(src_pts: np.ndarray, dst_pts: np.ndarray,
-                            ransac_threshold: float = 3.0,
-                            max_iters: int = 5000,
-                            confidence: float = 0.999):
-        logger.debug(f"Estimating homography from {len(src_pts)} point pairs")
-        if len(src_pts) < 4 or len(dst_pts) < 4:
+                             ransac_threshold: float = 3.0,
+                             max_iters: int = 2000,
+                             confidence: float = 0.99,
+                             fallback_to_affine: bool = True):
+        """
+        Estimate Homography using MAGSAC++ with validation and optional fallback.
+        """
+        if len(src_pts) < 4:
             return None, None
 
-        src_pts_cv = src_pts.reshape(-1, 1, 2)
-        dst_pts_cv = dst_pts.reshape(-1, 1, 2)
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
+        # USAC_MAGSAC (MAGSAC++) - State of the art robust estimator
         H, mask = cv2.findHomography(
             src_pts_cv, dst_pts_cv,
-            method=cv2.RANSAC,
+            method=cv2.USAC_MAGSAC,
             ransacReprojThreshold=ransac_threshold,
             maxIters=max_iters,
             confidence=confidence
         )
+
+        # Validate Homography
+        if not GeometryTransforms.is_matrix_valid(H, is_homography=True):
+            if fallback_to_affine:
+                logger.warning("Homography invalid/degenerate, falling back to Partial Affine")
+                return GeometryTransforms.estimate_affine_partial(src_pts, dst_pts, ransac_threshold)
+            return None, None
+
         return H, mask
 
     @staticmethod
@@ -38,8 +115,8 @@ class GeometryTransforms:
 
     @staticmethod
     def estimate_affine(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
-        """Compute full Affine transformation (6 DoF: Rotation + Translation + Scale + Shear)"""
-        if len(src_pts) < 3 or len(dst_pts) < 3:
+        """Compute full Affine transformation (6 DoF) using MAGSAC++"""
+        if len(src_pts) < 3:
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
@@ -47,26 +124,33 @@ class GeometryTransforms:
 
         M, mask = cv2.estimateAffine2D(
             src_pts_cv, dst_pts_cv,
-            method=cv2.RANSAC,
+            method=cv2.USAC_MAGSAC,
             ransacReprojThreshold=ransac_threshold
         )
+        
+        if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
+            return None, None
+            
         return M, mask
 
     @staticmethod
     def estimate_affine_partial(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
-        """Compute STRICT Affine transformation (Rotation + Translation + Uniform Scale ONLY)"""
-        if len(src_pts) < 3 or len(dst_pts) < 3:
+        """Compute STRICT Affine transformation (4 DoF: R+T+S only) using MAGSAC++"""
+        if len(src_pts) < 2: # Partial needs only 2 points minimum
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
-        # Використовуємо Partial2D для заборони деформацій (shear) та віддзеркалень
         M, mask = cv2.estimateAffinePartial2D(
             src_pts_cv, dst_pts_cv,
-            method=cv2.RANSAC,
+            method=cv2.USAC_MAGSAC,
             ransacReprojThreshold=ransac_threshold
         )
+        
+        if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
+            return None, None
+            
         return M, mask
 
     @staticmethod

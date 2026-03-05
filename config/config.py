@@ -135,4 +135,42 @@ APP_CONFIG = {
         # Читає: RealtimeTrackingWorker → frame_time = 1.0 / target_fps
         'video_fps': 30,
     },
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Моделі — назви файлів, репозиторії та вимоги до VRAM
+    # Читає: ModelManager
+    # ══════════════════════════════════════════════════════════════════════════
+    'models': {
+        'yolo': {
+            'model_path': 'yolo11x-seg.pt',
+            'vram_required_mb': 1200.0,
+            'description': 'YOLOv11x-seg (Extra Large) for dynamic object masking'
+        },
+        'xfeat': {
+            'hub_repo': 'verlab/accelerated_features',
+            'hub_model': 'XFeat',
+            'top_k': 2048,
+            'vram_required_mb': 300.0
+        },
+        'superpoint': {
+            'nms_radius': 4,
+            'max_keypoints': 4096,
+            'vram_required_mb': 500.0
+        },
+        'lightglue': {
+            'depth_confidence': -1,
+            'width_confidence': -1,
+            'vram_required_mb': 1000.0
+        },
+        'dinov2': {
+            'hub_repo': 'facebookresearch/dinov2',
+            'hub_model': 'dinov2_vitl14',
+            'vram_required_mb': 1600.0
+        },
+        'vram_management': {
+            'enabled': True,
+            'max_vram_ratio': 0.8,
+            'default_required_mb': 2000.0
+        }
+    },
 }

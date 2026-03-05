@@ -88,5 +88,7 @@ scripts/data/models/depth_anything_vitl14.pth
 .agent
 .agents
 .claude
+.complexipy_cache
+.ruff_cache
 ./scripts/allFiles/*
 all_merged.py
