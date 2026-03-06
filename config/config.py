@@ -141,6 +141,7 @@ APP_CONFIG = {
     # Читає: ModelManager
     # ══════════════════════════════════════════════════════════════════════════
     'models': {
+        'use_cuda': True,  # Дозволяє вимкнути CUDA навіть якщо вона доступна
         'yolo': {
             'model_path': 'yolo11x-seg.pt',
             'vram_required_mb': 1200.0,

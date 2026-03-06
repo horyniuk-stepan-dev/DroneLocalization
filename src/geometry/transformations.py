@@ -144,7 +144,7 @@ class GeometryTransforms:
 
         M, mask = cv2.estimateAffinePartial2D(
             src_pts_cv, dst_pts_cv,
-            method=cv2.USAC_MAGSAC,
+            method=cv2.RANSAC,
             ransacReprojThreshold=ransac_threshold
         )
         

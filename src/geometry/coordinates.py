@@ -10,22 +10,41 @@ class CoordinateConverter:
     _transformer_to_metric = None
     _transformer_to_gps = None
     _initialized = False
+    _projection_mode = 'UTM'
 
     @classmethod
-    def _initialize_utm(cls, lat: float, lon: float):
-        zone_number = int((lon + 180) / 6) + 1
-        utm_crs = CRS(proj='utm', zone=zone_number, ellps='WGS84')
+    def set_projection_mode(cls, mode: str):
+        """Зміна режиму проєкції (UTM або WEB_MERCATOR)"""
+        mode = mode.upper()
+        if mode not in ['UTM', 'WEB_MERCATOR']:
+            raise ValueError(f"Unsupported projection mode: {mode}")
+        if cls._projection_mode != mode:
+            cls._projection_mode = mode
+            cls._initialized = False
+            cls._transformer_to_metric = None
+            cls._transformer_to_gps = None
+            logger.info(f"Projection mode changed to {mode}")
+
+    @classmethod
+    def _initialize_projection(cls, lat: float, lon: float):
         wgs84_crs = CRS("EPSG:4326")
 
-        cls._transformer_to_metric = Transformer.from_crs(wgs84_crs, utm_crs, always_xy=True)
-        cls._transformer_to_gps = Transformer.from_crs(utm_crs, wgs84_crs, always_xy=True)
+        if cls._projection_mode == 'UTM':
+            zone_number = int((lon + 180) / 6) + 1
+            target_crs = CRS(proj='utm', zone=zone_number, ellps='WGS84')
+            logger.info(f"Initialized UTM projection for zone {zone_number} based on ({lat:.4f}, {lon:.4f})")
+        else:
+            target_crs = CRS("EPSG:3857")
+            logger.info("Initialized WEB_MERCATOR projection")
+
+        cls._transformer_to_metric = Transformer.from_crs(wgs84_crs, target_crs, always_xy=True)
+        cls._transformer_to_gps = Transformer.from_crs(target_crs, wgs84_crs, always_xy=True)
         cls._initialized = True
-        logger.info(f"Initialized UTM projection for zone {zone_number} based on ({lat:.4f}, {lon:.4f})")
 
     @staticmethod
     def gps_to_metric(lat: float, lon: float) -> tuple:
         if not CoordinateConverter._initialized:
-            CoordinateConverter._initialize_utm(lat, lon)
+            CoordinateConverter._initialize_projection(lat, lon)
         x, y = CoordinateConverter._transformer_to_metric.transform(lon, lat)
         return x, y
 

@@ -59,7 +59,7 @@ class PanoramaMixin:
 
     @pyqtSlot()
     def on_show_panorama(self):
-        if not self.calibration.is_calibrated:
+        if not (self.calibration.is_calibrated or getattr(self.database, 'is_propagated', False)):
             QMessageBox.warning(self, "Увага", "Спочатку виконайте калібрування!")
             return
 
@@ -125,24 +125,58 @@ class PanoramaMixin:
         x, y, w, h = cv2.boundingRect(coords)
         crop_size = min(_CROP_SIZE_MAX, min(w, h) // 2)
 
-        centers = [
-            (x + w // 4, y + h // 4),
-            (x + 3 * w // 4, y + h // 4),
-            (x + w // 4, y + 3 * h // 4),
-            (x + 3 * w // 4, y + 3 * h // 4),
+        # Обчислюємо відстань від кожного пікселя до чорного фону
+        # Це допоможе нам вибрати центри, які знаходяться глибоко всередині зображення
+        dist = cv2.distanceTransform(cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)[1], cv2.DIST_L2, 5)
+        
+        # Визначаємо "безпечну зону", де можна брати центр кропу, щоб він (майже) не захоплював чорні краї
+        # Якщо панорама тонка, беремо хоча б 80% від її максимальної товщини
+        safe_dist = min(crop_size // 2, dist.max() * 0.8)
+        safe_mask = dist >= safe_dist
+        
+        safe_y, safe_x = np.where(safe_mask > 0)
+        
+        if len(safe_x) == 0:
+            QMessageBox.warning(self, "Помилка", "Панорама занадто тонка для аналізу.")
+            return None
+
+        # Цільові ідеальні 4 кути рамки
+        target_corners = [
+            (x, y),                 # Top-Left
+            (x + w, y),             # Top-Right
+            (x, y + h),             # Bottom-Left
+            (x + w, y + h)          # Bottom-Right
         ]
+        
+        # Формуємо 4 центри, знаходячи найближчу "безпечну" точку до кожного ідеального кута
+        centers = []
+        for tx, ty in target_corners:
+            dists_sq = (safe_x - tx)**2 + (safe_y - ty)**2
+            best_idx = np.argmin(dists_sq)
+            centers.append((safe_x[best_idx], safe_y[best_idx]))
+
         crops = []
         for cx, cy in centers:
+            # Зміщуємо так, щоб центр crop співпадав з cx, cy (або якомога ближче, враховуючи межі)
             x1 = max(0, cx - crop_size // 2)
             y1 = max(0, cy - crop_size // 2)
+            
+            # Коригуємо межі, щоб не вилізти за межі зображення
+            x1 = min(x1, W - crop_size)
+            y1 = min(y1, H - crop_size)
+            
+            # Якщо розмір менший за crop_size (наприклад зображення мале)
+            x1, y1 = max(0, x1), max(0, y1)
+
             crops.append((img[y1:y1 + crop_size, x1:x1 + crop_size], x1, y1))
 
-        # ОНОВЛЕНО: Переміщуємо XFeat та DINOv2 на CPU для економії VRAM під час обробки великої панорами
         device = self.model_manager.device
-        xf = self.model_manager.load_xfeat().to('cpu')
-        nv = self.model_manager.load_dinov2().to('cpu')
+        xf = self.model_manager.load_xfeat()
+        nv = self.model_manager.load_dinov2()
 
-        fe = FeatureExtractor(xf, nv, device='cpu', config=self.config)
+        # Вилучено штучне переведення на CPU:
+        # Моделі залишаються там, де вони були ініціалізовані (device з config).
+        fe = FeatureExtractor(xf, nv, device=device, config=self.config)
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
         localizer = Localizer(self.database, fe, matcher, self.calibration,
                               {**self.config, '_model_manager': self.model_manager})
@@ -165,9 +199,6 @@ class PanoramaMixin:
                     pts_pano.append((px + off_x, py + off_y))
                     pts_metric.append(CoordinateConverter.gps_to_metric(lat, lon))
         finally:
-            # ОНОВЛЕНО: Повертаємо XFeat назад на основний пристрій
-            xf.to(device);
-            nv.to(device)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 

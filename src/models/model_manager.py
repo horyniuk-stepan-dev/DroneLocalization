@@ -9,7 +9,12 @@ logger = get_logger(__name__)
 class ModelManager:
     def __init__(self, config=None, device='cuda'):
         self.config = config or {}
-        self.device = device if torch.cuda.is_available() else 'cpu'
+        
+        use_cuda = self.config.get('models', {}).get('use_cuda', True)
+        if not use_cuda:
+            logger.info("CUDA force disabled in configuration")
+            
+        self.device = device if (use_cuda and torch.cuda.is_available() and device == 'cuda') else 'cpu'
         self.models = {}
         self.model_usage = {}
         
@@ -79,6 +84,9 @@ class ModelManager:
             self._ensure_vram_available(vram_req)
             try:
                 model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
+                # FIX: XFeat hardcodes self.dev='cuda' if available, causing crashes if we move to CPU
+                if hasattr(model, 'dev'):
+                    model.dev = torch.device(self.device)
                 model = model.eval().to(self.device)
                 self.models[name] = model
                 logger.success(f"XFeat loaded successfully on {self.device}")

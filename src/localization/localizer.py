@@ -87,6 +87,7 @@ class Localizer:
 
         best_inliers = 0
         best_candidate_id = -1
+        best_H_query_to_ref = None
         best_mkpts_q_inliers = None
         best_mkpts_r_inliers = None
         best_total_matches = 0
@@ -100,17 +101,18 @@ class Localizer:
             mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
 
             if len(mkpts_q) >= self.min_matches:
-                # Affine (6 DoF) замість Homography (8 DoF) — стабільніше для аерофото
-                M, mask = GeometryTransforms.estimate_affine(
+                # Використовуємо ту саму гомографію (8 DoF), що й в оригінальному коді all_merged
+                H_eval, mask = GeometryTransforms.estimate_homography(
                     mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
                 )
 
-                if M is not None:
+                if H_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     inliers = int(np.sum(inlier_mask))
-                    if inliers > best_inliers:
+                    if inliers > best_inliers and inliers >= self.min_matches:
                         best_inliers = inliers
                         best_candidate_id = candidate_id
+                        best_H_query_to_ref = H_eval
                         best_mkpts_q_inliers = mkpts_q[inlier_mask]
                         best_mkpts_r_inliers = mkpts_r[inlier_mask]
                         best_total_matches = len(mkpts_q)
@@ -138,6 +140,7 @@ class Localizer:
             if fb_inliers > best_inliers:
                  best_inliers = fb_inliers
                  best_candidate_id = fb_candidate_id
+                 best_H_query_to_ref = fb_H_to_ref
                  best_mkpts_q_inliers = fb_mkpts_q
                  best_mkpts_r_inliers = fb_mkpts_r
                  best_total_matches = fb_total
@@ -145,73 +148,62 @@ class Localizer:
         if best_inliers < self.min_matches or best_mkpts_r_inliers is None:
             return {"success": False, "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})"}
 
-        # Фізичні розміри ПОВЕРНУТОГО кадру
-        if best_global_angle in [90, 270]:
-            rot_height, rot_width = width, height
-        else:
-            rot_height, rot_width = height, width
-
-        # 3. Трансформація координат — через центроїд інлієрів (завжди в межах кадру!)
-        centroid_ref = np.mean(best_mkpts_r_inliers, axis=0)  # Центр збігу в ref (в межах кадру)
-        centroid_query = np.mean(best_mkpts_q_inliers, axis=0)
-
-        # Зсув від центроїда збігу до центру кадру (в пікселях запиту)
-        center_query = np.array([rot_width / 2.0, rot_height / 2.0], dtype=np.float32)
-        offset_px = center_query - centroid_query  # Зсув в пікселях
-
+        # 3. Отримуємо матрицю знайденого кадру з бази
         affine_ref = self.database.get_frame_affine(best_candidate_id)
         if affine_ref is None:
             return {"success": False, "error": "No propagated calibration"}
 
-        # Центроїд ref → metric
-        centroid_ref_arr = np.array([centroid_ref], dtype=np.float32)
-        metric_centroid = GeometryTransforms.apply_affine(centroid_ref_arr, affine_ref)
-        if metric_centroid is None or len(metric_centroid) == 0:
-            return {"success": False, "error": "Projection failed"}
-        metric_centroid = metric_centroid[0]
+        # 4. Рахуємо розміри ПОВЕРНУТОГО зображення
+        if best_global_angle in [90, 270]:
+            rot_height, rot_width = width, height
+        else:
+            rot_height, rot_width = height, width
+            
+        center_pt = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float32)
 
-        # Перетворити піксельний зсув в метричний (через масштаб affine)
-        scale_x = np.linalg.norm(affine_ref[0, :2])  # м/піксель по X
-        scale_y = np.linalg.norm(affine_ref[1, :2])  # м/піксель по Y
-        metric_offset = np.array([offset_px[0] * scale_x, offset_px[1] * scale_y], dtype=np.float32)
+        # Використовуємо гомографію з найкращого збігу
+        H_query_to_ref = best_H_query_to_ref
+        
+        if H_query_to_ref is None:
+            return {"success": False, "error": "Failed to compute homography"}
 
-        metric_pt = metric_centroid + metric_offset
+        # 5. Трансформуємо центр у систему знайденого кадру
+        pt_in_ref = GeometryTransforms.apply_homography(center_pt, H_query_to_ref)
+        if pt_in_ref is None or len(pt_in_ref) == 0:
+            return {"success": False, "error": "Помилка трансформації координат через гомографію"}
 
-        # DEBUG: показати кожен крок
-        logger.info(f"COORD DEBUG: centroid_ref=({centroid_ref[0]:.1f}, {centroid_ref[1]:.1f}), "
-                     f"offset_px=({offset_px[0]:.1f}, {offset_px[1]:.1f}), frame={best_candidate_id}")
-        logger.info(f"COORD DEBUG: metric_pt=({metric_pt[0]:.2f}, {metric_pt[1]:.2f})")
+        # 6. Переводимо в метрику і перевіряємо на аномалії (через affine)
+        metric_pt = GeometryTransforms.apply_affine(pt_in_ref, affine_ref)[0]
 
         # Перевіряємо чи нова точка — аномалія (стрибок координат)
         if self.outlier_detector.is_outlier(metric_pt, dt):
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
-        # 4. Фільтр Калмана
+        # Оновлення Калмана з dt
         if hasattr(self.trajectory_filter, 'update_with_dt'):
             filtered_pt = self.trajectory_filter.update_with_dt(metric_pt, dt)
         else:
             filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
 
         self.outlier_detector.add_position(filtered_pt)
+
         lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
 
-        # 5. Розрахунок FOV навколо метричної точки
-        half_w = (rot_width / 2.0) * scale_x
-        half_h = (rot_height / 2.0) * scale_y
+        # 7. Розрахунок поля зору (FOV) для ПОВЕРНУТОГО кадру
+        corners = np.array([[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]], dtype=np.float32)
+        ref_corners = GeometryTransforms.apply_homography(corners, H_query_to_ref)
 
         gps_corners = []
-        fov_metric_corners = [
-            (filtered_pt[0] - half_w, filtered_pt[1] - half_h),
-            (filtered_pt[0] + half_w, filtered_pt[1] - half_h),
-            (filtered_pt[0] + half_w, filtered_pt[1] + half_h),
-            (filtered_pt[0] - half_w, filtered_pt[1] + half_h),
-        ]
-        for cx, cy in fov_metric_corners:
-            try:
-                clat, clon = CoordinateConverter.metric_to_gps(cx, cy)
-                gps_corners.append((clat, clon))
-            except Exception:
-                pass
+        if ref_corners is not None:
+            metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
+            if metric_corners is not None:
+                for cx, cy in metric_corners:
+                    try:
+                        clat, clon = CoordinateConverter.metric_to_gps(cx, cy)
+                        gps_corners.append((clat, clon))
+                    except Exception:
+                        pass
+
 
         # Покращена формула confidence: враховує inlier ratio + кількість
         max_inliers = self.config.get('localization', {}).get('confidence_max_inliers', 50)
@@ -299,13 +291,13 @@ class Localizer:
                     mkpts_q = q_kpts[matches[:, 0]]
                     mkpts_r = ref_features['keypoints'][matches[:, 1]]
 
-                    M, mask = GeometryTransforms.estimate_affine(
+                    H_eval, mask = GeometryTransforms.estimate_homography(
                         mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
                     )
-                    if M is not None:
+                    if H_eval is not None:
                         inlier_mask = mask.ravel().astype(bool)
                         inliers = int(np.sum(inlier_mask))
-                        if inliers > best_inliers:
+                        if inliers > best_inliers and inliers >= self.min_matches:
                             best_inliers = inliers
                             best_candidate_id = candidate_id
                             best_mkpts_q_inliers = mkpts_q[inlier_mask]

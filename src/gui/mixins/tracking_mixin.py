@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QMessageBox, QFileDialog
+from PyQt6.QtWidgets import QMessageBox, QFileDialog, QApplication, QPushButton
 
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.localization.matcher import FeatureMatcher
@@ -148,11 +148,26 @@ class TrackingMixin:
                     f"Впевненість: {conf:.2f} | Точок: {inliers} | Якір: {anchor}"
                 )
                 self.control_panel.update_status("Фото локалізовано")
-                QMessageBox.information(self, "Успіх",
-                                        f"Координати знайдено!\n\n"
-                                        f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
-                                        f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
-                                        f"Якір: кадр {anchor}")
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("Успіх")
+                msg_box.setText(f"Координати знайдено!\n\n"
+                                f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
+                                f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
+                                f"Якір: кадр {anchor}")
+                msg_box.setIcon(QMessageBox.Icon.Information)
+                
+                # Default OK button
+                ok_btn = msg_box.addButton(QMessageBox.StandardButton.Ok)
+                
+                # Custom Copy button
+                copy_btn = msg_box.addButton("📋 Копіювати координати", QMessageBox.ButtonRole.ActionRole)
+                
+                msg_box.exec()
+                
+                if msg_box.clickedButton() == copy_btn:
+                    cb = QApplication.clipboard()
+                    cb.setText(f"{lat:.6f}, {lon:.6f}")
+
             else:
                 err = result.get('error', 'Невідома помилка')
                 self.status_bar.showMessage(f"Помилка: {err}")
