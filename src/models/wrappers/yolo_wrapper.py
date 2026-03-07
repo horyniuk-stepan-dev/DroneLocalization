@@ -27,11 +27,15 @@ class YOLOWrapper:
         """
         # verbose=False вимикає зайве логування кожного кадру в консоль
         # half=True для FP16 інференсу
-        results = self.model(image, verbose=False, half=self.use_half)
+        # conf=0.45 відкидає слабкі передбачення, щоб уникнути хибних величезних масок
+        results = self.model(image, verbose=False, half=self.use_half, conf=0.45)
         result = results[0]
 
         height, width = image.shape[:2]
         static_mask = np.ones((height, width), dtype=np.uint8) * 255
+        
+        total_pixels = height * width
+        MAX_MASK_RATIO = 0.40  # Якщо один об'єкт займає більше 40% кадру, це ймовірно хибне спрацьовування, ігноруємо його
 
         detections = []
 
@@ -56,6 +60,12 @@ class YOLOWrapper:
                 combined_dynamic = np.zeros((height, width), dtype=np.float32)
                 for idx in dynamic_mask_indices:
                     mask_resized = cv2.resize(masks[idx], (width, height), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Перевіряємо, чи маска не є аномально великою (наприклад, помилково розпізнане поле як гігантська "вантажівка" чи "потяг")
+                    mask_area = np.sum(mask_resized > 0.5)
+                    if mask_area / total_pixels > MAX_MASK_RATIO:
+                        continue  # Ігноруємо цю величезну маску
+                        
                     combined_dynamic = np.maximum(combined_dynamic, mask_resized)
                 static_mask[combined_dynamic > 0.5] = 0
 

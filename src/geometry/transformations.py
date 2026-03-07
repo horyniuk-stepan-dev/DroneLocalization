@@ -31,6 +31,13 @@ class GeometryTransforms:
                 # Normalize by M[2,2] if possible
                 if abs(M[2, 2]) < 1e-9: return False
                 M = M / M[2, 2]
+                
+                # Check perspective components (should be very small for top-down drone imagery)
+                # If these are large, the corners will fly off to infinity
+                if abs(M[2, 0]) > 0.005 or abs(M[2, 1]) > 0.005:
+                    logger.debug(f"Matrix invalid: Extreme perspective warp ({M[2,0]:.5f}, {M[2,1]:.5f})")
+                    return False
+                    
                 A = M[:2, :2]
                 det = np.linalg.det(A)
             else:
@@ -38,10 +45,11 @@ class GeometryTransforms:
                 A = M[:2, :2]
                 det = np.linalg.det(A)
 
-            # 1. Determinant must be positive (no mirroring)
-            if det <= 0:
-                logger.debug("Matrix invalid: Negative or zero determinant (mirroring/degenerate)")
+            # 1. Determinant must be non-zero (prevent degenerate matrices)
+            if abs(det) < 1e-9:
+                logger.debug(f"Matrix invalid: Degenerate matrix with determinant near zero ({det})")
                 return False
+            # Allow negative determinant since mapping Image Y (down) to Map Y (up) requires reflection!
 
             # 2. Extract scale and shear from basis vectors
             u = A[:, 0]
@@ -87,10 +95,10 @@ class GeometryTransforms:
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
-        # USAC_MAGSAC (MAGSAC++) - State of the art robust estimator
+        # Use standard RANSAC instead of USAC_MAGSAC for stability in OpenCV
         H, mask = cv2.findHomography(
             src_pts_cv, dst_pts_cv,
-            method=cv2.USAC_MAGSAC,
+            method=cv2.RANSAC,
             ransacReprojThreshold=ransac_threshold,
             maxIters=max_iters,
             confidence=confidence
@@ -124,7 +132,7 @@ class GeometryTransforms:
 
         M, mask = cv2.estimateAffine2D(
             src_pts_cv, dst_pts_cv,
-            method=cv2.USAC_MAGSAC,
+            method=cv2.RANSAC,
             ransacReprojThreshold=ransac_threshold
         )
         

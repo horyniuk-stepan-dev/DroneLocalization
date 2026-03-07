@@ -189,8 +189,7 @@ class CalibrationPropagationWorker(QThread):
                     final_metric_corners = metric_right
 
                 if final_metric_corners is not None:
-                    # ВИПРАВЛЕНО: Жорстка фіксація форми без віддзеркалень та деформацій
-                    M, _ = cv2.estimateAffinePartial2D(self.corners, final_metric_corners)
+                    M, _ = cv2.estimateAffine2D(self.corners, final_metric_corners)
                     if M is not None:
                         frame_affine[frame_id] = M
                         frame_valid[frame_id] = True
@@ -211,8 +210,8 @@ class CalibrationPropagationWorker(QThread):
             if H_to_anchor is not None:
                 metric_corners = self._project_to_metric(H_to_anchor, anchor)
                 if metric_corners is not None:
-                    # ВИПРАВЛЕНО: Жорстка фіксація форми без віддзеркалень та деформацій
-                    M, _ = cv2.estimateAffinePartial2D(self.corners, metric_corners)
+                    # Повертаємо класичний estimateAffine2D, оскільки Image Y і Map Y йдуть у різні сторони (потрібне віддзеркалення осі)
+                    M, _ = cv2.estimateAffine2D(self.corners, metric_corners)
                     if M is not None:
                         frame_affine[frame_id] = M
                         frame_valid[frame_id] = True

@@ -131,7 +131,7 @@ class Localizer:
             rotated_frame = np.rot90(query_frame, k=k).copy()
             rotated_mask = np.rot90(static_mask, k=k).copy() if static_mask is not None else None
             
-            fb_inliers, fb_candidate_id, fb_mkpts_q, fb_mkpts_r, fb_rot, fb_total = self._try_lightglue_fallback(
+            fb_inliers, fb_candidate_id, fb_H_to_ref, fb_mkpts_q, fb_mkpts_r, fb_rot, fb_total = self._try_lightglue_fallback(
                 rotated_frame, rotated_mask, best_global_candidates, height, width
             )
             
@@ -189,6 +189,11 @@ class Localizer:
 
         lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
 
+        # Обчислюємо зсув (offset) між сирими координатами (метрикою) і згладженим Калманом маркером
+        # Це дозволить прямокутнику (FOV) ідеально центруватися навколо координати дрона на карті!
+        dx = filtered_pt[0] - metric_pt[0]
+        dy = filtered_pt[1] - metric_pt[1]
+
         # 7. Розрахунок поля зору (FOV) для ПОВЕРНУТОГО кадру
         corners = np.array([[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]], dtype=np.float32)
         ref_corners = GeometryTransforms.apply_homography(corners, H_query_to_ref)
@@ -199,7 +204,8 @@ class Localizer:
             if metric_corners is not None:
                 for cx, cy in metric_corners:
                     try:
-                        clat, clon = CoordinateConverter.metric_to_gps(cx, cy)
+                        # Додаємо зсув фільтра Калмана, щоб прямокутник на карті не стрибав окремо від маркера
+                        clat, clon = CoordinateConverter.metric_to_gps(cx + dx, cy + dy)
                         gps_corners.append((clat, clon))
                     except Exception:
                         pass
@@ -226,6 +232,7 @@ class Localizer:
         """Fallback: SuperPoint+LightGlue для складних сцен де XFeat не справився"""
         best_inliers = 0
         best_candidate_id = -1
+        best_H_to_ref = None
         best_mkpts_q_inliers = None
         best_mkpts_r_inliers = None
         best_rot_angle = 0
@@ -237,7 +244,7 @@ class Localizer:
             device = self.model_manager.device
         except Exception as e:
             logger.warning(f"Cannot load SuperPoint/LightGlue for fallback: {e}")
-            return best_inliers, best_candidate_id, best_mkpts_q_inliers, best_mkpts_r_inliers, best_rot_angle, best_total_matches
+            return best_inliers, best_candidate_id, best_H_to_ref, best_mkpts_q_inliers, best_mkpts_r_inliers, best_rot_angle, best_total_matches
 
         # Підготовка запиту для SuperPoint
         from lightglue.utils import numpy_image_to_torch
@@ -300,6 +307,7 @@ class Localizer:
                         if inliers > best_inliers and inliers >= self.min_matches:
                             best_inliers = inliers
                             best_candidate_id = candidate_id
+                            best_H_to_ref = H_eval
                             best_mkpts_q_inliers = mkpts_q[inlier_mask]
                             best_mkpts_r_inliers = mkpts_r[inlier_mask]
                             best_rot_angle = 0
@@ -309,4 +317,4 @@ class Localizer:
                 logger.debug(f"LightGlue fallback failed for frame {candidate_id}: {e}")
                 continue
 
-        return best_inliers, best_candidate_id, best_mkpts_q_inliers, best_mkpts_r_inliers, best_rot_angle, best_total_matches
+        return best_inliers, best_candidate_id, best_H_to_ref, best_mkpts_q_inliers, best_mkpts_r_inliers, best_rot_angle, best_total_matches

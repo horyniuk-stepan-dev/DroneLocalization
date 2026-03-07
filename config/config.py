@@ -89,7 +89,7 @@ APP_CONFIG = {
 
         # Поріг Z-score для відкидання стрибків координат
         # Читає: Localizer → OutlierDetector(threshold_std=...)
-        'outlier_threshold_std': 3.0,
+        'outlier_threshold_std': 300.0,
 
         # Максимальна фізично можлива швидкість дрона (м/с). Все вище — аномалія.
         # 1000 м/с = фактично вимкнено перевірку швидкості
