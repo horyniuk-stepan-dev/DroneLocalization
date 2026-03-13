@@ -13,7 +13,7 @@ def test_image_preprocessor_init():
     config = {
         'preprocessing': {
             'clahe_clip_limit': 4.0,
-            'clahe_tile_size': 4
+            'clahe_tile_grid': [4, 4]
         }
     }
     preprocessor2 = ImagePreprocessor(config)

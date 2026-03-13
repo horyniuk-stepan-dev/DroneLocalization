@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 import gc
 import time
 from contextlib import contextmanager
@@ -107,8 +107,8 @@ class ModelManager:
             try:
                 from lightglue import SuperPoint
                 sp_config = {
-                    'nms_radius': self.config.get('superpoint', {}).get('nms_radius', 4),
-                    'max_num_keypoints': self.config.get('superpoint', {}).get('max_keypoints', 4096),
+                    'nms_radius': cfg.get('nms_radius', 4),
+                    'max_num_keypoints': cfg.get('max_keypoints', 4096),
                 }
                 model = SuperPoint(**sp_config).eval().to(self.device)
                 self.models[name] = model

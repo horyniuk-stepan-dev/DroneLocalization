@@ -1,4 +1,4 @@
-﻿import cv2
+import cv2
 import numpy as np
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FastRetrieval
@@ -174,6 +174,15 @@ class Localizer:
 
         # 6. Переводимо в метрику і перевіряємо на аномалії (через affine)
         metric_pt = GeometryTransforms.apply_affine(pt_in_ref, affine_ref)[0]
+
+        # Діагностика: логуємо проміжні значення для аналізу точності
+        logger.debug(
+            f"DIAG | frame={best_candidate_id} | center_query=({center_pt[0,0]:.1f}, {center_pt[0,1]:.1f}) "
+            f"| pt_in_ref=({pt_in_ref[0,0]:.1f}, {pt_in_ref[0,1]:.1f}) "
+            f"| raw_metric=({metric_pt[0]:.2f}, {metric_pt[1]:.2f}) "
+            f"| affine_scale=({np.linalg.norm(affine_ref[0,:2]):.6f}, {np.linalg.norm(affine_ref[1,:2]):.6f}) "
+            f"| inliers={best_inliers}/{best_total_matches}"
+        )
 
         # Перевіряємо чи нова точка — аномалія (стрибок координат)
         if self.outlier_detector.is_outlier(metric_pt, dt):

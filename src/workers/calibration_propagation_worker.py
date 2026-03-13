@@ -247,7 +247,8 @@ class CalibrationPropagationWorker(QThread):
                 try:
                     pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
                     # H(frame→anchor) = inv(pose_anchor) @ pose_frame
-                    H = (inv_pose_anchor @ pose_frame).astype(np.float32)
+                    # Зберігаємо float64 для точності — truncation до float32 втрачає ~0.06м на UTM координатах
+                    H = inv_pose_anchor @ pose_frame
                     result[frame_id] = H
                 except (IndexError, np.linalg.LinAlgError):
                     continue

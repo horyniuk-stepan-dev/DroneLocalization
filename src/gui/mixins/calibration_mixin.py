@@ -42,8 +42,8 @@ class CalibrationMixin:
             points_gps = anchor_data.get('points_gps')
             frame_id = anchor_data.get('calib_frame_id')
 
-            if not points_2d or not points_gps or len(points_2d) < 3:
-                QMessageBox.warning(self, "Помилка", "Потрібно мінімум 3 точки для якоря!")
+            if not points_2d or not points_gps or len(points_2d) < 4:
+                QMessageBox.warning(self, "Помилка", "Потрібно мінімум 4 точки для якоря!")
                 return
 
             if not getattr(self.calibration, 'reference_gps', None):
@@ -53,7 +53,12 @@ class CalibrationMixin:
             pts_metric = [CoordinateConverter.gps_to_metric(lat, lon) for lat, lon in points_gps]
             pts_metric_np = np.array(pts_metric, dtype=np.float32)
 
-            M, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
+            # Для малої к-ті точок (<5) використовуємо partial affine (4 DoF: rotation+scale+translation)
+            # — стабільніше ніж повна 6-DoF affine з мінімальною вибіркою
+            if len(pts_2d_np) < 5:
+                M, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+            else:
+                M, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
             if M is None:
                 QMessageBox.critical(self, "Помилка",
                                      "Не вдалося обчислити матрицю. Спробуйте розставити точки ширше!")

@@ -44,7 +44,7 @@ def merge_files(source_dir: str, output_file: str) -> None:
 
 if __name__ == "__main__":
     # Змінюйте ці шляхи за потреби
-    SOURCE = "E:/Dip/budyak/DroneLocalization/src"
+    SOURCE = "E:/Dip/gsdfg/New/DroneLocalization/src"
     OUTPUT = "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFiles/all_merged.py"
     
     merge_files(SOURCE, OUTPUT)

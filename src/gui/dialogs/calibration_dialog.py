@@ -1,4 +1,4 @@
-﻿import cv2
+import cv2
 import numpy as np
 import re
 from PyQt6.QtWidgets import (
@@ -476,8 +476,11 @@ class CalibrationDialog(QDialog):
     # ── Add anchor ───────────────────────────────────────────────────────────
 
     def add_anchor(self):
-        if len(self.points_2d) < 3:
-            QMessageBox.warning(self, "Увага", "Потрібно мінімум 3 точки для якоря!")
+        if len(self.points_2d) < 4:
+            QMessageBox.warning(self, "Увага",
+                                "Потрібно мінімум 4 точки для якоря!\n\n"
+                                "💡 Рекомендовано: 5-6 точок, розставлених широко\n"
+                                "по всьому кадру для найкращої точності.")
             return
 
         frame_id = self.spinbox_frame_id.value()

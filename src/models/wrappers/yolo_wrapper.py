@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 import numpy as np
 import cv2
 
@@ -9,8 +9,8 @@ class YOLOWrapper:
     def __init__(self, model, device='cuda'):
         self.model = model
         self.device = device
-        # Класи COCO: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 6=train, 7=truck
-        self.dynamic_classes = {0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 33, 36, 37}
+        # Класи COCO: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
+        self.dynamic_classes = {0, 1, 2, 3, 5, 7}
 
         # FP16 для YOLO — прискорює інференс на ~40%
         # Ultralytics керує FP16 через параметр half=True при виклику
@@ -27,15 +27,16 @@ class YOLOWrapper:
         """
         # verbose=False вимикає зайве логування кожного кадру в консоль
         # half=True для FP16 інференсу
-        # conf=0.45 відкидає слабкі передбачення, щоб уникнути хибних величезних масок
-        results = self.model(image, verbose=False, half=self.use_half, conf=0.45)
+        # conf=0.50 відкидає слабкі передбачення, щоб уникнути хибних величезних масок
+        results = self.model(image, verbose=False, half=self.use_half, conf=0.50)
         result = results[0]
 
         height, width = image.shape[:2]
         static_mask = np.ones((height, width), dtype=np.uint8) * 255
         
         total_pixels = height * width
-        MAX_MASK_RATIO = 0.40  # Якщо один об'єкт займає більше 40% кадру, це ймовірно хибне спрацьовування, ігноруємо його
+        MAX_SINGLE_MASK_RATIO = 0.40  # Якщо один об'єкт займає більше 40% кадру — ігноруємо
+        MAX_COMBINED_MASK_RATIO = 0.70 # Якщо ВСІ маски разом займають > 70% — ймовірно помилка сегментації
 
         detections = []
 
@@ -63,10 +64,17 @@ class YOLOWrapper:
                     
                     # Перевіряємо, чи маска не є аномально великою (наприклад, помилково розпізнане поле як гігантська "вантажівка" чи "потяг")
                     mask_area = np.sum(mask_resized > 0.5)
-                    if mask_area / total_pixels > MAX_MASK_RATIO:
+                    if mask_area / total_pixels > MAX_SINGLE_MASK_RATIO:
                         continue  # Ігноруємо цю величезну маску
                         
                     combined_dynamic = np.maximum(combined_dynamic, mask_resized)
-                static_mask[combined_dynamic > 0.5] = 0
+                # Перевірка сумарної площі масок
+                combined_area = np.sum(combined_dynamic > 0.5)
+                if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
+                    static_mask[combined_dynamic > 0.5] = 0
+                else:
+                    from src.utils.logging_utils import get_logger
+                    logger = get_logger(__name__)
+                    logger.warning(f"YOLO OVER-MASKING DETECTED ({combined_area/total_pixels:.2%}). Frame preserved.")
 
         return static_mask, detections

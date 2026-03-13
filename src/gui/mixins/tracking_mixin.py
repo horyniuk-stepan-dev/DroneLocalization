@@ -86,6 +86,7 @@ class TrackingMixin:
         self.tracking_worker.status_update.connect(self.control_panel.update_status)
         self.tracking_worker.fov_found.connect(self.map_widget.update_fov)
         self.map_widget.clear_trajectory()
+        self._tracking_results = []  # Ініціалізуємо список результатів
         self.tracking_worker.start()
         self.status_bar.showMessage("Відстеження розпочато")
 
@@ -188,6 +189,11 @@ class TrackingMixin:
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
         self.map_widget.update_marker(lat, lon)
         self.map_widget.add_trajectory_point(lat, lon)
+        
+        # Зберігаємо результат для експорту
+        if not hasattr(self, '_tracking_results'): self._tracking_results = []
+        self._tracking_results.append({'lat': lat, 'lon': lon, 'confidence': confidence, 'inliers': inliers, 'timestamp': str(np.datetime64('now'))})
+        if len(self._tracking_results) == 1: self.control_panel.btn_export.setEnabled(True)
         self.status_bar.showMessage(
             f"Локалізація: {lat:.6f}, {lon:.6f} | "
             f"Впевненість: {confidence:.2f} | Точок: {inliers}"

@@ -1,4 +1,4 @@
-﻿import h5py
+import h5py
 import numpy as np
 import cv2
 from pathlib import Path
@@ -169,13 +169,13 @@ class DatabaseBuilder:
                 # Step 5: Оновлюємо накопичену позу H(frame_i → frame_0)
                 # Матчимо поточний кадр з попереднім і множимо гомографії
                 if i == 0 or prev_features is None:
-                    current_pose = np.eye(3, dtype=np.float32)
+                    current_pose = np.eye(3, dtype=np.float64)
                 else:
                     H_step = self._compute_inter_frame_H(prev_features, features)
                     if H_step is not None:
                         # current_pose = H(prev→frame_0) @ H(curr→prev) = H(curr→frame_0)
-                        current_pose = (current_pose.astype(np.float64)
-                                        @ H_step.astype(np.float64)).astype(np.float32)
+                        # Зберігаємо в float64 для мінімізації дрейфу в довгих ланцюгах
+                        current_pose = current_pose @ H_step.astype(np.float64)
                     else:
                         # Якщо матч не вдався — залишаємо попередню позу як апроксимацію
                         logger.warning(f"Frame {i}: inter-frame match failed, reusing previous pose")
@@ -327,7 +327,7 @@ class DatabaseBuilder:
             g1.create_dataset('descriptors', shape=(num_frames, self.descriptor_dim),
                               dtype='float32', compression='gzip')
             g1.create_dataset('frame_poses', shape=(num_frames, 3, 3),
-                              dtype='float32', compression='gzip')
+                              dtype='float64', compression='gzip')
             logger.debug("Created global_descriptors group")
 
             # Group 2: Local features (lazy loading)

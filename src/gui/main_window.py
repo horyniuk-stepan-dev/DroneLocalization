@@ -1,4 +1,4 @@
-﻿from PyQt6.QtWidgets import QMainWindow, QDockWidget, QStatusBar
+from PyQt6.QtWidgets import QMainWindow, QDockWidget, QStatusBar
 from PyQt6.QtCore import Qt
 
 from src.gui.widgets.video_widget import VideoWidget
@@ -70,6 +70,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         calib_menu.addAction('Зберегти калібрування...', self.on_save_calibration)
         calib_menu.addSeparator()
         calib_menu.addAction('Запустити пропагацію вручну', self.on_run_propagation)
+        calib_menu.addAction('Перевірити пропагацію на карті', self.on_verify_propagation)
 
         view_menu = menubar.addMenu('Вигляд')
         view_menu.addAction(self.control_dock.toggleViewAction())
@@ -86,3 +87,6 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.generate_panorama_clicked.connect(self.on_generate_panorama)
         cp.show_panorama_clicked.connect(self.on_show_panorama)
         cp.localize_image_clicked.connect(self.on_localize_image)
+        cp.verify_propagation_clicked.connect(self.on_verify_propagation)
+        cp.clear_map_clicked.connect(self.map_widget.clear_trajectory)
+        cp.export_results_clicked.connect(self.on_export_results)

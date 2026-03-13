@@ -1,4 +1,4 @@
-﻿import cv2
+import cv2
 import numpy as np
 from src.utils.logging_utils import get_logger
 
@@ -9,8 +9,8 @@ class GeometryTransforms:
 
     @staticmethod
     def is_matrix_valid(M: np.ndarray, is_homography: bool = False,
-                        min_scale: float = 0.1, max_scale: float = 10.0,
-                        max_shear: float = 0.5) -> bool:
+                        min_scale: float = 0.001, max_scale: float = 100.0,
+                        max_shear: float = 0.8) -> bool:
         """
         Check if the transformation matrix is physically realistic for drone imagery.
         
@@ -71,7 +71,7 @@ class GeometryTransforms:
             # 4. Check Shear (cos of angle between basis vectors)
             shear = abs(np.dot(u, v) / (scale_u * scale_v + 1e-9))
             if shear > max_shear:
-                logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f})")
+                logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
                 return False
 
             return True

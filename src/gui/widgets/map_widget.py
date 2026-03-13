@@ -1,4 +1,4 @@
-﻿import json
+import json
 from pathlib import Path
 
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -31,6 +31,10 @@ class MapBridge(QObject):
 
     # data_url (base64 JPEG) + 8 corner coords
     setPanoramaSignal     = pyqtSignal(str, float, float, float, float, float, float, float, float)
+
+    # Verification markers (JSON string of points)
+    showVerificationMarkersSignal = pyqtSignal(str)
+    clearVerificationMarkersSignal = pyqtSignal()
 
 
 class MapWidget(QWebEngineView):
@@ -114,3 +118,14 @@ class MapWidget(QWebEngineView):
             lat_br, lon_br,
             lat_bl, lon_bl,
         )
+
+    @pyqtSlot(list)
+    def show_verification_markers(self, points: list):
+        """
+        Accepts points as list of dicts [{'lat': float, 'lon': float, 'label': str}]
+        """
+        self.bridge.showVerificationMarkersSignal.emit(json.dumps(points))
+
+    @pyqtSlot()
+    def clear_verification_markers(self):
+        self.bridge.clearVerificationMarkersSignal.emit()

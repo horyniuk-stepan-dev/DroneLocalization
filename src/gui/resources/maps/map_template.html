@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html>
 <head>
     <title>Drone Tracker Map</title>
@@ -119,6 +119,7 @@
         var trajectoryLine   = L.polyline([], { color: 'red',    weight: 3 }).addTo(map);
         var fovPolygon       = L.polygon([], { color: '#00ff00', weight: 2, fillOpacity: 0.15 }).addTo(map);
         var panoramaOverlay  = null;
+        var verificationMarkers = L.layerGroup().addTo(map);
 
         // ── Bridge functions ──────────────────────────────────────────────────
         function updateMarker(lat, lon) {
@@ -152,6 +153,9 @@
             if (panoramaOverlay !== null) {
                 map.removeLayer(panoramaOverlay);
                 panoramaOverlay = null;
+            }
+            if (verificationMarkers) {
+                verificationMarkers.clearLayers();
             }
         }
 
@@ -188,6 +192,35 @@
             }
         }
 
+        function showVerificationMarkers(pointsJson) {
+            verificationMarkers.clearLayers();
+            var points = JSON.parse(pointsJson);
+            points.forEach(p => {
+                var m = L.circleMarker([p.lat, p.lon], {
+                    radius: 5,
+                    color: '#ffffff',
+                    weight: 1,
+                    fillColor: '#007bff',
+                    fillOpacity: 0.8
+                });
+                // Постійний тултіп з номером кадру
+                m.bindTooltip(p.label.toString(), {
+                    permanent: true,
+                    direction: 'top',
+                    className: 'marker-label'
+                });
+                verificationMarkers.addLayer(m);
+            });
+            if (points.length > 0) {
+                var bounds = L.latLngBounds(points.map(p => [p.lat, p.lon]));
+                map.fitBounds(bounds);
+            }
+        }
+
+        function clearVerificationMarkers() {
+            verificationMarkers.clearLayers();
+        }
+
         // ── QWebChannel init with retry ───────────────────────────────────────
         // DOMContentLoaded fires before Qt injects `qt.webChannelTransport`
         // → poll with retries instead of a one-shot check
@@ -200,6 +233,8 @@
                     bridge.clearTrajectorySignal.connect(clearTrajectory);
                     bridge.updateFOVSignal.connect(updateFOV);
                     bridge.setPanoramaSignal.connect(setPanoramaOverlay);
+                    bridge.showVerificationMarkersSignal.connect(showVerificationMarkers);
+                    bridge.clearVerificationMarkersSignal.connect(clearVerificationMarkers);
                     console.log("QWebChannel bridge connected");
                 });
             } else if (retriesLeft > 0) {
