@@ -8,18 +8,35 @@ logger = get_logger(__name__)
 
 
 class AnchorCalibration:
-    """Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та метриками якості."""
+    """
+    Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та повними QA-метриками.
+    """
 
     def __init__(self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict = None):
         self.frame_id = frame_id
         self.affine_matrix = affine_matrix
+        
         # QA fields
         self.qa_data = qa_data or {}
-        self.rmse_m = self.qa_data.get('rmse_m', 0.0)
-        self.max_err_m = self.qa_data.get('max_err_m', 0.0)
-        self.num_points = self.qa_data.get('num_points', 0)
+        
+        # Основні метрики якості
+        self.rmse_m = float(self.qa_data.get('rmse_m', 0.0))
+        self.median_err_m = float(self.qa_data.get('median_err_m', 0.0))
+        self.max_err_m = float(self.qa_data.get('max_err_m', 0.0))
+        self.inliers_count = int(self.qa_data.get('inliers_count', 0))
+        
+        # Дані точок
+        self.points_2d = self.qa_data.get('points_2d', [])      # [[x,y], ...]
+        self.points_gps = self.qa_data.get('points_gps', [])     # [[lat,lon], ...]
+        self.points_metric = self.qa_data.get('points_metric', [])  # [[mx,my], ...]
+        
+        # Метадані та UX
         self.transform_type = self.qa_data.get('transform_type', 'unknown')
+        self.projection_mode = self.qa_data.get('projection_mode', 'WEB_MERCATOR')
         self.created_at = self.qa_data.get('created_at', '')
+        self.updated_at = self.qa_data.get('updated_at', self.created_at)
+        self.notes = self.qa_data.get('notes', '')
+        self.quality_flag = self.qa_data.get('quality_flag', 'normal') # 'normal', 'warning', 'bad'
 
     def pixel_to_metric(self, x: float, y: float) -> tuple:
         pt = np.array([[x, y]], dtype=np.float32)
@@ -31,34 +48,51 @@ class AnchorCalibration:
             "frame_id": self.frame_id,
             "affine_matrix": self.affine_matrix.tolist(),
             "qa_data": {
-                "rmse_m": float(self.rmse_m),
-                "max_err_m": float(self.max_err_m),
-                "num_points": int(self.num_points),
+                "rmse_m": self.rmse_m,
+                "median_err_m": self.median_err_m,
+                "max_err_m": self.max_err_m,
+                "inliers_count": self.inliers_count,
+                "points_2d": self.points_2d,
+                "points_gps": self.points_gps,
+                "points_metric": self.points_metric,
                 "transform_type": self.transform_type,
+                "projection_mode": self.projection_mode,
                 "created_at": self.created_at,
-                "points_2d": self.qa_data.get('points_2d', []),
-                "points_gps": self.qa_data.get('points_gps', [])
+                "updated_at": self.updated_at,
+                "notes": self.notes,
+                "quality_flag": self.quality_flag
             }
         }
 
     @staticmethod
     def from_dict(data: dict) -> "AnchorCalibration":
+        # Підтримка зовсім старих форматів без qa_data
+        qa = data.get("qa_data", {})
+        
+        # Якщо це старий формат v1.0/v2.0, де деякі поля були плоскими
+        if not qa and "rmse_m" in data:
+            qa = {
+                "rmse_m": data.get("rmse_m"),
+                "max_err_m": data.get("max_err_m"),
+                "num_points": data.get("num_points"),
+                "transform_type": data.get("transform_type"),
+                "created_at": data.get("created_at")
+            }
+
         return AnchorCalibration(
             frame_id=int(data["frame_id"]),
             affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
-            qa_data=data.get("qa_data", {})
+            qa_data=qa
         )
 
 
 class MultiAnchorCalibration:
-    """Менеджер декількох якорів калібрування з підтримкою версіонування"""
+    """Менеджер декількох якорів калібрування з підтримкою версіонування та проєкцій"""
 
-    VERSION = "2.0"
+    VERSION = "2.2"
 
     def __init__(self):
         self.anchors = []
-        # Додано референсну точку для ініціалізації UTM
-        self.reference_gps = None
 
     @property
     def is_calibrated(self) -> bool:
@@ -69,14 +103,31 @@ class MultiAnchorCalibration:
         if existing:
             existing.affine_matrix = affine_matrix
             if qa_data:
-                existing.qa_data = qa_data
-                existing.rmse_m = qa_data.get('rmse_m', 0.0)
-                existing.max_err_m = qa_data.get('max_err_m', 0.0)
+                # Оновлюємо QA дані
+                new_anchor = AnchorCalibration(frame_id, affine_matrix, qa_data)
+                existing.qa_data = new_anchor.qa_data
+                existing.rmse_m = new_anchor.rmse_m
+                existing.max_err_m = new_anchor.max_err_m
+                existing.inliers_count = new_anchor.inliers_count
+                existing.points_2d = new_anchor.points_2d
+                existing.points_gps = new_anchor.points_gps
+                existing.updated_at = new_anchor.updated_at
             logger.info(f"Updated anchor for frame {frame_id}")
         else:
             self.anchors.append(AnchorCalibration(frame_id, affine_matrix, qa_data))
             self.anchors.sort(key=lambda a: a.frame_id)
             logger.info(f"Added new anchor for frame {frame_id}. Total anchors: {len(self.anchors)}")
+
+    def get_anchor(self, frame_id: int) -> AnchorCalibration | None:
+        return next((a for a in self.anchors if a.frame_id == frame_id), None)
+
+    def remove_anchor(self, frame_id: int) -> bool:
+        initial_len = len(self.anchors)
+        self.anchors = [a for a in self.anchors if a.frame_id != frame_id]
+        success = len(self.anchors) < initial_len
+        if success:
+            logger.info(f"Removed anchor for frame {frame_id}")
+        return success
 
     def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple | None:
         if not self.is_calibrated:
@@ -85,6 +136,7 @@ class MultiAnchorCalibration:
         if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
 
+        # Знаходимо два найближчі якорі для інтерполяції
         anchor_1 = self.anchors[0]
         anchor_2 = self.anchors[-1]
 
@@ -121,43 +173,50 @@ class MultiAnchorCalibration:
         if not self.is_calibrated:
             raise RuntimeError("Немає даних для збереження")
 
+        # Зберігаємо також метадані проєкції
         data = {
             "version": self.VERSION,
-            "reference_gps": self.reference_gps,
+            "projection": CoordinateConverter.export_projection_metadata(),
             "anchors": [a.to_dict() for a in self.anchors]
         }
 
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
         logger.success(f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)")
 
     def load(self, path: str):
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
         self.anchors.clear()
         version = data.get("version", "1.0")
 
-        # Ініціалізація UTM конвертера
-        if "reference_gps" in data and data["reference_gps"] is not None:
-            self.reference_gps = data["reference_gps"]
-            CoordinateConverter.gps_to_metric(self.reference_gps[0], self.reference_gps[1])
-            logger.info(f"UTM Projection initialized from loaded reference GPS: {self.reference_gps}")
+        # 1. Відновлення проєкції
+        if "projection" in data:
+            CoordinateConverter.load_projection_metadata(data["projection"])
+        elif "reference_gps" in data and data["reference_gps"] is not None:
+            # Fallback для v2.0
+            CoordinateConverter.configure_projection('UTM', data["reference_gps"])
         else:
-            logger.warning("No reference GPS found in calibration file. UTM converter is not initialized.")
+            # Fallback для v1.0 або відсутніх даних
+            logger.warning("No projection metadata found in calibration file. Defaulting to WEB_MERCATOR fallback.")
+            CoordinateConverter.configure_projection('WEB_MERCATOR')
 
-        # Підтримка старого формату файлів (v1.0)
+        # 2. Завантаження якорів
         if version == "1.0" and "affine_matrix" in data and "calib_frame_id" in data:
+            # Старий формат (один якір)
             anchor = AnchorCalibration(
                 frame_id=int(data.get("calib_frame_id", 0)),
                 affine_matrix=np.array(data["affine_matrix"], dtype=np.float32)
             )
             self.anchors.append(anchor)
-        # Новий формат (v2.0) або список якорів з v1.x
         elif "anchors" in data:
+            # Новій формат (список якорів)
             for item in data["anchors"]:
                 self.anchors.append(AnchorCalibration.from_dict(item))
 
         self.anchors.sort(key=lambda a: a.frame_id)
-        logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")
+        logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")
+
+

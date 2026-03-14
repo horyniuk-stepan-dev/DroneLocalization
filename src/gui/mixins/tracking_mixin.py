@@ -10,6 +10,11 @@ from src.workers.tracking_worker import RealtimeTrackingWorker
 from src.utils.image_utils import opencv_to_qpixmap
 
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
 class TrackingMixin:
 
     def _build_localizer(self) -> Localizer:
@@ -85,17 +90,29 @@ class TrackingMixin:
         self.tracking_worker.location_found.connect(self.on_location_found)
         self.tracking_worker.status_update.connect(self.control_panel.update_status)
         self.tracking_worker.fov_found.connect(self.map_widget.update_fov)
+        self.tracking_worker.finished.connect(self._on_tracking_finished)
+
         self.map_widget.clear_trajectory()
         self._tracking_results = []  # Ініціалізуємо список результатів
+        
+        self.control_panel.set_tracking_enabled(False)
         self.tracking_worker.start()
         self.status_bar.showMessage("Відстеження розпочато")
 
     @pyqtSlot()
     def on_stop_tracking(self):
-        if self.tracking_worker and self.tracking_worker.isRunning():
+        if hasattr(self, 'tracking_worker') and self.tracking_worker and self.tracking_worker.isRunning():
+            self.control_panel.update_status("Зупинка...")
             self.tracking_worker.stop()
-            self.status_bar.showMessage("Відстеження зупинено")
-            self.control_panel.update_status("Очікування")
+            # НЕ чекаємо тут — finished сигнал прийде сам
+
+    @pyqtSlot()
+    def _on_tracking_finished(self):
+        """Викликається коли воркер завершує роботу (сам або через зупинку)."""
+        logger.info("Tracking worker finished.")
+        self.control_panel.set_tracking_enabled(True)
+        self.status_bar.showMessage("Відстеження зупинено")
+        self.control_panel.update_status("Очікування")
 
     @pyqtSlot()
     def on_localize_image(self):
@@ -141,20 +158,26 @@ class TrackingMixin:
                 anchor = result.get("matched_frame", "?")  # ВИПРАВЛЕНО КЛЮЧ
 
                 self.map_widget.update_marker(lat, lon)
-                if "fov_polygon" in result:
+                is_fallback = result.get("fallback_mode") == "retrieval_only"
+                status_prefix = "ПРИБЛИЗНА Локалізація" if is_fallback else "Локалізація"
+                
+                if "fov_polygon" in result and result["fov_polygon"] is not None:
                     self.map_widget.update_fov(result["fov_polygon"])
 
                 self.status_bar.showMessage(
-                    f"Локалізація: {lat:.6f}, {lon:.6f} | "
+                    f"{status_prefix}: {lat:.6f}, {lon:.6f} | "
                     f"Впевненість: {conf:.2f} | Точок: {inliers} | Якір: {anchor}"
                 )
-                self.control_panel.update_status("Фото локалізовано")
+                self.control_panel.update_status("Фото локалізовано (приблизно)" if is_fallback else "Фото локалізовано")
                 msg_box = QMessageBox(self)
-                msg_box.setWindowTitle("Успіх")
-                msg_box.setText(f"Координати знайдено!\n\n"
-                                f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
-                                f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
-                                f"Якір: кадр {anchor}")
+                msg_title = "⚓ Приблизна локалізація" if is_fallback else "⚓ Успіх"
+                msg_text = (f"Знайдено ПРИБЛИЗНІ координати (retrieval-only)!\n\n" if is_fallback else f"Координати знайдено!\n\n")
+                msg_text += (f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
+                                 f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
+                                 f"Якір: кадр {anchor}")
+                
+                msg_box.setWindowTitle(msg_title)
+                msg_box.setText(msg_text)
                 msg_box.setIcon(QMessageBox.Icon.Information)
                 
                 # Default OK button
@@ -176,7 +199,7 @@ class TrackingMixin:
                 QMessageBox.warning(self, "Помилка", f"Не вдалося знайти координати:\n{err}")
 
         except Exception as e:
-            self.logger.error(f"Image localization error: {e}", exc_info=True)
+            logger.error(f"Image localization error: {e}", exc_info=True)
             QMessageBox.critical(self, "Критична помилка", str(e))
             self.status_bar.showMessage("Помилка обробки")
 

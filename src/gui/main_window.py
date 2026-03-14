@@ -13,13 +13,15 @@ from src.gui.mixins import CalibrationMixin, DatabaseMixin, TrackingMixin, Panor
 from config.config import APP_CONFIG
 
 
+logger = get_logger(__name__)
+
+
 class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Drone Topometric Localizer")
         self.setGeometry(100, 100, 1600, 900)
-        self.logger = get_logger('MainWindow')
 
         self.config                = APP_CONFIG
         self.model_manager         = ModelManager(config=APP_CONFIG)

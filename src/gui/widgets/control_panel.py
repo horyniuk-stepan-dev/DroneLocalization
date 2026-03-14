@@ -25,6 +25,7 @@ class ControlPanel(QWidget):
     export_results_clicked   = pyqtSignal()
     verify_propagation_clicked = pyqtSignal()
     clear_map_clicked        = pyqtSignal()
+    stop_db_generation_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -55,8 +56,15 @@ class ControlPanel(QWidget):
         self.btn_gen_pano.clicked.connect(self.generate_panorama_clicked)
         self.btn_show_pano.clicked.connect(self.show_panorama_clicked)
 
+        self.btn_stop_db = QPushButton("⏹  Зупинити генерацію БД")
+        self.btn_stop_db.setStyleSheet(
+            "background:#c62828; color:white; font-weight:bold; padding:7px;"
+        )
+        self.btn_stop_db.setVisible(False)
+        self.btn_stop_db.clicked.connect(self.stop_db_generation_clicked)
+
         for btn in [self.btn_new_mission, self.btn_load_db, self.btn_rebuild_db,
-                    self.btn_gen_pano, self.btn_show_pano]:
+                    self.btn_gen_pano, self.btn_show_pano, self.btn_stop_db]:
             db_layout.addWidget(btn)
 
         # Calibration group
@@ -115,7 +123,7 @@ class ControlPanel(QWidget):
         info_layout = QVBoxLayout(self.info_group)
         self.lbl_project_info = QLabel("Проєкт не завантажено")
         self.lbl_project_info.setWordWrap(True)
-        self.lbl_project_info.setStyleSheet("font-size: 11px; color: #888;")
+        self.lbl_project_info.setStyleSheet("font-size: 11px; color: #333;")
         info_layout.addWidget(self.lbl_project_info)
 
         # Status group
@@ -124,7 +132,7 @@ class ControlPanel(QWidget):
 
         self.lbl_status = QLabel("Очікування команди...")
         self.lbl_status.setWordWrap(True)
-        self.lbl_status.setStyleSheet("font-style:italic; color:#a0a0a0; margin-bottom:6px;")
+        self.lbl_status.setStyleSheet("font-style:italic; color:#333; margin-bottom:6px;")
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -145,6 +153,13 @@ class ControlPanel(QWidget):
 
     def update_progress(self, value: int):
         self.progress_bar.setValue(value)
+
+    def set_db_generation_running(self, is_running: bool):
+        """is_running=True: показати кнопку Stop, заблокувати решту кнопок проєкту."""
+        self.btn_stop_db.setVisible(is_running)
+        self.btn_new_mission.setEnabled(not is_running)
+        self.btn_load_db.setEnabled(not is_running)
+        self.btn_rebuild_db.setEnabled(not is_running)
 
     def set_tracking_enabled(self, enabled: bool):
         """
@@ -167,7 +182,7 @@ class ControlPanel(QWidget):
         """Оновити інформаційну панель проєкту."""
         if project_name is None:
             self.lbl_project_info.setText("Проєкт не завантажено")
-            self.lbl_project_info.setStyleSheet("font-size: 11px; color: #888;")
+            self.lbl_project_info.setStyleSheet("font-size: 11px; color: #222;")
             self.btn_rebuild_db.setEnabled(False)
             return
 
@@ -186,5 +201,5 @@ class ControlPanel(QWidget):
             lines.append(f"📍 GPS: {num_propagated}/{num_frames} кадрів")
 
         self.lbl_project_info.setText("<br>".join(lines))
-        self.lbl_project_info.setStyleSheet("font-size: 11px; color: #ddd;")
+        self.lbl_project_info.setStyleSheet("font-size: 11px; color: #000;")
         self.btn_rebuild_db.setEnabled(True)

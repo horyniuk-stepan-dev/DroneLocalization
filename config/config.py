@@ -21,13 +21,13 @@ APP_CONFIG = {
     # Локалізація — Localizer + CalibrationPropagationWorker
     # ══════════════════════════════════════════════════════════════════════════
     'localization': {
-        'min_matches': 8,
-        'min_inliers_accept': 8,
-        'ratio_threshold': 0.95,
-        'ransac_threshold': 5.0,
-        'retrieval_top_k': 8,
-        'early_stop_inliers': 20,
-        'confidence_max_inliers': 50,
+        'min_matches': 12,
+        'min_inliers_accept': 10,
+        'ratio_threshold': 0.85, # Більш строгий ratio test для XFeat
+        'ransac_threshold': 3.0,
+        'retrieval_top_k': 12,
+        'early_stop_inliers': 40,
+        'retrieval_only_min_score': 0.90,
 
         # Перебір 0 / 90 / 180 / 270
         'auto_rotation': True,
@@ -46,8 +46,8 @@ APP_CONFIG = {
         # Історія для OutlierDetector
         'outlier_window': 10,
 
-        'outlier_threshold_std': 5.0,
-        'max_speed_mps': 50.0,
+        'outlier_threshold_std': 25.0,
+        'max_speed_mps': 200.0,
         'process_fps': 1.0,
     },
 
@@ -109,5 +109,16 @@ APP_CONFIG = {
             'max_vram_ratio': 0.8,
             'default_required_mb': 2000.0,
         },
+    },
+    'projection': {
+        'default_mode': 'WEB_MERCATOR',
+        'strict_projection': True,
+        'fallback_to_webmercator': True,
+        'anchor_rmse_threshold_m': 3.0,
+        'anchor_max_error_m': 5.0,
+        'propagation_disagreement_threshold_m': 2.0,
+        'localizer_sample_points': 9,  # 3x3 grid
+        'localizer_expected_spread_m': 150.0, # Очікуваний розмах для дрона на 100-150м
+        'confidence_max_inliers': 80,
     },
 }

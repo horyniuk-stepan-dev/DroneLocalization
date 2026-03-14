@@ -17,6 +17,11 @@ _CROP_SIZE_MAX  = 800
 _JPEG_QUALITY   = 80
 
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
 class PanoramaMixin:
 
     @pyqtSlot()
@@ -106,7 +111,7 @@ class PanoramaMixin:
             self.status_bar.showMessage("Панораму накладено на карту!")
 
         except Exception as e:
-            self.logger.error(f"Panorama overlay failed: {e}", exc_info=True)
+            logger.error(f"Panorama overlay failed: {e}", exc_info=True)
             QMessageBox.critical(self, "Помилка", f"Не вдалося накласти панораму:\n{e}")
 
     def _localize_panorama_corners(self, img: np.ndarray):

@@ -92,3 +92,4 @@ scripts/data/models/depth_anything_vitl14.pth
 .ruff_cache
 ./scripts/allFiles/*
 all_merged.py
+scripts/allFiles/all_merged_old.py

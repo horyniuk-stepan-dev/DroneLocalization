@@ -23,6 +23,7 @@ class DatabaseLoader:
         self.calib_frame_id = None  # int
         self.frame_rmse = None      # (N,)      — RMSE кожного кадру
         self.frame_disagreement = None # (N,)   — Розбіжність між гілками
+        self.frame_matches = None   # (N,)      — Кількість точок (inliers)
 
         logger.info(f"Initializing DatabaseLoader with path: {db_path}")
         self._load_hot_data()
@@ -61,33 +62,49 @@ class DatabaseLoader:
             return
         try:
             grp = self.db_file['calibration']
+            
+            # 1. Відновлення проєкції (пріоритет)
+            import json
+            from src.geometry.coordinates import CoordinateConverter
+            
+            if 'projection_json' in grp.attrs:
+                try:
+                    meta = json.loads(grp.attrs['projection_json'])
+                    CoordinateConverter.load_projection_metadata(meta)
+                    logger.success(f"Projection restored from HDF5: {meta['mode']}")
+                except Exception as e:
+                    logger.warning(f"Could not load projection metadata: {e}")
+            elif 'reference_gps' in grp.attrs:
+                # Fallback для v2.0 (UTM)
+                try:
+                    ref_gps = json.loads(grp.attrs['reference_gps'])
+                    CoordinateConverter.configure_projection('UTM', ref_gps)
+                    logger.success(f"UTM auto-initialized from legacy reference GPS: {ref_gps}")
+                except Exception as e:
+                    logger.warning(f"Could not init UTM from legacy attr: {e}")
+            else:
+                # Fallback для v1.0 (WebMercator)
+                logger.info("No projection metadata found. Defaulting to WEB_MERCATOR fallback.")
+                CoordinateConverter.configure_projection('WEB_MERCATOR')
+
+            # 2. Завантаження датасетів
             if 'frame_affine' in grp:
                 self.frame_affine = grp['frame_affine'][:]
                 self.frame_valid = grp['frame_valid'][:].astype(bool)
                 
-                # Load QA metrics if present
+                # Метрики якості (QA)
                 self.frame_rmse = grp['frame_rmse'][:] if 'frame_rmse' in grp else None
                 self.frame_disagreement = grp['frame_disagreement'][:] if 'frame_disagreement' in grp else None
+                self.frame_matches = grp['frame_matches'][:] if 'frame_matches' in grp else None
                 
                 valid_count = int(np.sum(self.frame_valid))
                 logger.success(f"Propagation data loaded: {valid_count} frames valid")
-
-                # Автоматична ініціалізація UTM з reference_gps у HDF5
-                if 'reference_gps' in grp.attrs:
-                    import json
-                    from src.geometry.coordinates import CoordinateConverter
-                    try:
-                        ref_gps = json.loads(grp.attrs['reference_gps'])
-                        CoordinateConverter.gps_to_metric(ref_gps[0], ref_gps[1])
-                        logger.success(f"UTM auto-initialized from HDF5 reference GPS: {ref_gps}")
-                    except Exception as e:
-                        logger.warning(f"Could not auto-initialize UTM from HDF5: {e}")
             else:
-                logger.warning("Found old calibration format. Please run propagation again.")
+                logger.warning("Found calibration group but no frame_affine dataset.")
                 self.frame_affine = None
                 self.frame_valid = None
         except Exception as e:
-            logger.warning(f"Failed to load propagation data: {e}")
+            logger.error(f"Failed to load propagation data: {e}")
             self.frame_affine = None
             self.frame_valid = None
 
@@ -119,6 +136,20 @@ class DatabaseLoader:
         щоб localizer йшов основним шляхом через get_frame_affine().
         """
         return None
+
+    @lru_cache(maxsize=100)
+    def get_frame_size(self, frame_id: int) -> tuple[int, int]:
+        """Повертає (height, width) для вказаного кадру"""
+        group_name = f'local_features/frame_{frame_id}'
+        if group_name in self.db_file:
+            g = self.db_file[group_name]
+            if 'height' in g.attrs and 'width' in g.attrs:
+                return int(g.attrs['height']), int(g.attrs['width'])
+        
+        # Fallback до загальних метаданих або стандартних значень
+        h = self.metadata.get('frame_height') or self.metadata.get('height') or 1080
+        w = self.metadata.get('frame_width') or self.metadata.get('width') or 1920
+        return int(h), int(w)
 
     @lru_cache(maxsize=100)
     def get_local_features(self, frame_id: int) -> dict:

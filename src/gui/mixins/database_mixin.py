@@ -11,6 +11,11 @@ from src.core.project_registry import ProjectRegistry
 from src.core.export_results import ResultExporter
 
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
 class DatabaseMixin:
 
     # ── Реєстр проєктів (ініціалізується один раз) ───────────────────────────
@@ -56,6 +61,16 @@ class DatabaseMixin:
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
         self.control_panel.update_progress(0)
+        self.control_panel.set_db_generation_running(True)
+
+        # CRITICAL: Close and release the database file handle before overwriting/truncating it
+        if hasattr(self, 'database') and self.database:
+            try:
+                self.database.close()
+                logger.info("Current database closed before starting new generation.")
+            except Exception as e:
+                logger.warning(f"Could not close database: {e}")
+        self.database = None
 
         self.db_worker = DatabaseGenerationWorker(
             video_path=video_path,
@@ -66,7 +81,18 @@ class DatabaseMixin:
         self.db_worker.progress.connect(self.on_db_progress)
         self.db_worker.completed.connect(self.on_db_completed)
         self.db_worker.error.connect(self.on_db_error)
+        self.db_worker.cancelled.connect(self.on_db_cancelled)
+        
+        # Connect stop button
+        self.control_panel.stop_db_generation_clicked.connect(self.on_stop_db_generation)
+        
         self.db_worker.start()
+
+    @pyqtSlot()
+    def on_stop_db_generation(self):
+        if hasattr(self, 'db_worker') and self.db_worker and self.db_worker.isRunning():
+            self.control_panel.update_status("Зупинка... (чекаємо завершення кадру)")
+            self.db_worker.stop()
 
     @pyqtSlot(int, str)
     def on_db_progress(self, percent: int, message: str):
@@ -75,6 +101,7 @@ class DatabaseMixin:
 
     @pyqtSlot(str)
     def on_db_completed(self, db_path: str):
+        self.control_panel.set_db_generation_running(False)
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.current_database_path = db_path
@@ -95,11 +122,18 @@ class DatabaseMixin:
 
     @pyqtSlot(str)
     def on_db_error(self, error_msg: str):
+        self.control_panel.set_db_generation_running(False)
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.control_panel.update_progress(0)
         self.control_panel.update_status("Помилка генерації")
         QMessageBox.critical(self, "Помилка", f"Помилка генерації:\n{error_msg}")
+
+    @pyqtSlot()
+    def on_db_cancelled(self):
+        self.control_panel.set_db_generation_running(False)
+        self.control_panel.update_status("Генерацію скасовано користувачем")
+        self.control_panel.update_progress(0)
 
     # ── Відкриття проєкту ─────────────────────────────────────────────────────
 
@@ -259,7 +293,7 @@ class DatabaseMixin:
             calib_path = self.project_manager.calibration_path
             if calib_path:
                 self.calibration.save(calib_path)
-                self.logger.info(f"Calibration saved before rebuild: {calib_path}")
+                logger.info(f"Calibration saved before rebuild: {calib_path}")
 
         self._start_database_generation(video_path, self.project_manager.database_path)
 

@@ -1,4 +1,4 @@
-﻿import cv2
+import cv2
 import time
 import threading
 import numpy as np
@@ -108,12 +108,17 @@ class RealtimeTrackingWorker(QThread):
                         loc_result["lat"], loc_result["lon"],
                         loc_result["confidence"], loc_result["inliers"]
                     )
-                    if "fov_polygon" in loc_result:
+                    if "fov_polygon" in loc_result and loc_result["fov_polygon"] is not None:
                         self.fov_found.emit(loc_result["fov_polygon"])
 
-                    self.status_update.emit(
-                        f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})"
-                    )
+                    if loc_result.get("fallback_mode") == "retrieval_only":
+                         self.status_update.emit(
+                            f"Приблизно (Схожість: {loc_result.get('global_score', 0):.2f}, Кадр: {loc_result['matched_frame']})"
+                        )
+                    else:
+                        self.status_update.emit(
+                            f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})"
+                        )
                 else:
                     self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 

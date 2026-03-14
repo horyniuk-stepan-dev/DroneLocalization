@@ -1,4 +1,4 @@
-﻿from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal
 from src.database.database_builder import DatabaseBuilder
 from src.utils.logging_utils import get_logger
 
@@ -12,6 +12,7 @@ class DatabaseGenerationWorker(QThread):
     frame_processed = pyqtSignal(int)
     completed = pyqtSignal(str)
     error = pyqtSignal(str)
+    cancelled = pyqtSignal()
 
     def __init__(self, video_path: str, output_path: str, model_manager, config=None):
         super().__init__()
@@ -21,7 +22,7 @@ class DatabaseGenerationWorker(QThread):
         self.config = config or {}
         self._is_running = True
 
-        logger.info(f"DatabaseGenerationWorker initialized")
+        logger.info("DatabaseGenerationWorker initialized")
         logger.info(f"Video: {video_path}")
         logger.info(f"Output: {output_path}")
 
@@ -54,7 +55,7 @@ class DatabaseGenerationWorker(QThread):
 
         except InterruptedError as e:
             logger.warning(f"Database generation interrupted: {e}")
-            self.error.emit(str(e))
+            self.cancelled.emit()
         except Exception as e:
             logger.error(f"Database generation failed: {e}", exc_info=True)
             self.error.emit(f"Критична помилка: {str(e)}")
