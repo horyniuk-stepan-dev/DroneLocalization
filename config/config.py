@@ -46,8 +46,8 @@ APP_CONFIG = {
         # Історія для OutlierDetector
         'outlier_window': 10,
 
-        'outlier_threshold_std': 300.0,
-        'max_speed_mps': 1000.0,
+        'outlier_threshold_std': 5.0,
+        'max_speed_mps': 50.0,
         'process_fps': 1.0,
     },
 

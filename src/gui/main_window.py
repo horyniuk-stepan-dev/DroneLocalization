@@ -80,6 +80,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp = self.control_panel
         cp.new_mission_clicked.connect(self.on_new_mission)
         cp.load_database_clicked.connect(self.on_load_database)
+        cp.rebuild_database_clicked.connect(self.on_rebuild_database)
         cp.start_tracking_clicked.connect(self.on_start_tracking)
         cp.stop_tracking_clicked.connect(self.on_stop_tracking)
         cp.calibrate_clicked.connect(self.on_calibrate)

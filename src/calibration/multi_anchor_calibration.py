@@ -8,11 +8,18 @@ logger = get_logger(__name__)
 
 
 class AnchorCalibration:
-    """Одна точка прив'язки GPS — конкретний кадр з affine матрицею"""
+    """Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та метриками якості."""
 
-    def __init__(self, frame_id: int, affine_matrix: np.ndarray):
+    def __init__(self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict = None):
         self.frame_id = frame_id
         self.affine_matrix = affine_matrix
+        # QA fields
+        self.qa_data = qa_data or {}
+        self.rmse_m = self.qa_data.get('rmse_m', 0.0)
+        self.max_err_m = self.qa_data.get('max_err_m', 0.0)
+        self.num_points = self.qa_data.get('num_points', 0)
+        self.transform_type = self.qa_data.get('transform_type', 'unknown')
+        self.created_at = self.qa_data.get('created_at', '')
 
     def pixel_to_metric(self, x: float, y: float) -> tuple:
         pt = np.array([[x, y]], dtype=np.float32)
@@ -22,19 +29,31 @@ class AnchorCalibration:
     def to_dict(self) -> dict:
         return {
             "frame_id": self.frame_id,
-            "affine_matrix": self.affine_matrix.tolist()
+            "affine_matrix": self.affine_matrix.tolist(),
+            "qa_data": {
+                "rmse_m": float(self.rmse_m),
+                "max_err_m": float(self.max_err_m),
+                "num_points": int(self.num_points),
+                "transform_type": self.transform_type,
+                "created_at": self.created_at,
+                "points_2d": self.qa_data.get('points_2d', []),
+                "points_gps": self.qa_data.get('points_gps', [])
+            }
         }
 
     @staticmethod
     def from_dict(data: dict) -> "AnchorCalibration":
         return AnchorCalibration(
             frame_id=int(data["frame_id"]),
-            affine_matrix=np.array(data["affine_matrix"], dtype=np.float32)
+            affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
+            qa_data=data.get("qa_data", {})
         )
 
 
 class MultiAnchorCalibration:
-    """Менеджер декількох якорів калібрування"""
+    """Менеджер декількох якорів калібрування з підтримкою версіонування"""
+
+    VERSION = "2.0"
 
     def __init__(self):
         self.anchors = []
@@ -45,13 +64,17 @@ class MultiAnchorCalibration:
     def is_calibrated(self) -> bool:
         return len(self.anchors) > 0
 
-    def add_anchor(self, frame_id: int, affine_matrix: np.ndarray):
+    def add_anchor(self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict = None):
         existing = next((a for a in self.anchors if a.frame_id == frame_id), None)
         if existing:
             existing.affine_matrix = affine_matrix
+            if qa_data:
+                existing.qa_data = qa_data
+                existing.rmse_m = qa_data.get('rmse_m', 0.0)
+                existing.max_err_m = qa_data.get('max_err_m', 0.0)
             logger.info(f"Updated anchor for frame {frame_id}")
         else:
-            self.anchors.append(AnchorCalibration(frame_id, affine_matrix))
+            self.anchors.append(AnchorCalibration(frame_id, affine_matrix, qa_data))
             self.anchors.sort(key=lambda a: a.frame_id)
             logger.info(f"Added new anchor for frame {frame_id}. Total anchors: {len(self.anchors)}")
 
@@ -99,13 +122,14 @@ class MultiAnchorCalibration:
             raise RuntimeError("Немає даних для збереження")
 
         data = {
-            "reference_gps": self.reference_gps,  # Зберігаємо базову координату
+            "version": self.VERSION,
+            "reference_gps": self.reference_gps,
             "anchors": [a.to_dict() for a in self.anchors]
         }
 
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
-        logger.success(f"MultiAnchorCalibration saved: {path} ({len(self.anchors)} anchors)")
+        logger.success(f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)")
 
     def load(self, path: str):
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
@@ -113,8 +137,9 @@ class MultiAnchorCalibration:
             data = json.load(f)
 
         self.anchors.clear()
+        version = data.get("version", "1.0")
 
-        # Ініціалізація UTM конвертера, якщо у файлі збережено референсну GPS точку
+        # Ініціалізація UTM конвертера
         if "reference_gps" in data and data["reference_gps"] is not None:
             self.reference_gps = data["reference_gps"]
             CoordinateConverter.gps_to_metric(self.reference_gps[0], self.reference_gps[1])
@@ -122,17 +147,17 @@ class MultiAnchorCalibration:
         else:
             logger.warning("No reference GPS found in calibration file. UTM converter is not initialized.")
 
-        # Підтримка старого формату файлів
-        if "affine_matrix" in data and "calib_frame_id" in data:
+        # Підтримка старого формату файлів (v1.0)
+        if version == "1.0" and "affine_matrix" in data and "calib_frame_id" in data:
             anchor = AnchorCalibration(
                 frame_id=int(data.get("calib_frame_id", 0)),
                 affine_matrix=np.array(data["affine_matrix"], dtype=np.float32)
             )
             self.anchors.append(anchor)
-        # Новий формат файлів
+        # Новий формат (v2.0) або список якорів з v1.x
         elif "anchors" in data:
             for item in data["anchors"]:
                 self.anchors.append(AnchorCalibration.from_dict(item))
 
         self.anchors.sort(key=lambda a: a.frame_id)
-        logger.success(f"Loaded {len(self.anchors)} anchors")
+        logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")

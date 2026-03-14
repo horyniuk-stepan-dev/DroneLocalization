@@ -1,4 +1,4 @@
-﻿import h5py
+import h5py
 import numpy as np
 from functools import lru_cache
 from src.utils.logging_utils import get_logger
@@ -21,6 +21,8 @@ class DatabaseLoader:
         self.frame_gps = None       # (N, 2)    — (lat, lon) центру кожного кадру
         self.frame_valid = None     # (N,)      — True якщо кадр має GPS
         self.calib_frame_id = None  # int
+        self.frame_rmse = None      # (N,)      — RMSE кожного кадру
+        self.frame_disagreement = None # (N,)   — Розбіжність між гілками
 
         logger.info(f"Initializing DatabaseLoader with path: {db_path}")
         self._load_hot_data()
@@ -62,6 +64,11 @@ class DatabaseLoader:
             if 'frame_affine' in grp:
                 self.frame_affine = grp['frame_affine'][:]
                 self.frame_valid = grp['frame_valid'][:].astype(bool)
+                
+                # Load QA metrics if present
+                self.frame_rmse = grp['frame_rmse'][:] if 'frame_rmse' in grp else None
+                self.frame_disagreement = grp['frame_disagreement'][:] if 'frame_disagreement' in grp else None
+                
                 valid_count = int(np.sum(self.frame_valid))
                 logger.success(f"Propagation data loaded: {valid_count} frames valid")
 
@@ -83,6 +90,7 @@ class DatabaseLoader:
             logger.warning(f"Failed to load propagation data: {e}")
             self.frame_affine = None
             self.frame_valid = None
+
 
     @property
     def is_propagated(self) -> bool:

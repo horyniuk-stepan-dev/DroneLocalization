@@ -159,51 +159,61 @@ class Localizer:
         else:
             rot_height, rot_width = height, width
             
-        center_pt = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float32)
+        # 4. Багатоточкова локалізація (Multi-point sampling)
+        # Замість однієї точки в центрі, беремо сітку 3x3 для робастності
+        pts_query = np.array([
+            [rot_width / 2.0, rot_height / 2.0],  # Center
+            [rot_width / 4.0, rot_height / 4.0], [3 * rot_width / 4.0, rot_height / 4.0],
+            [rot_width / 4.0, 3 * rot_height / 4.0], [3 * rot_width / 4.0, 3 * rot_height / 4.0],
+            [rot_width / 2.0, rot_height / 4.0], [rot_width / 2.0, 3 * rot_height / 4.0],
+            [rot_width / 4.0, rot_height / 2.0], [3 * rot_width / 4.0, rot_height / 2.0]
+        ], dtype=np.float32)
 
         # Використовуємо гомографію з найкращого збігу
         H_query_to_ref = best_H_query_to_ref
-        
         if H_query_to_ref is None:
             return {"success": False, "error": "Failed to compute homography"}
 
-        # 5. Трансформуємо центр у систему знайденого кадру
-        pt_in_ref = GeometryTransforms.apply_homography(center_pt, H_query_to_ref)
-        if pt_in_ref is None or len(pt_in_ref) == 0:
+        # 5. Трансформуємо точки: Query -> Reference -> Metric
+        pts_in_ref = GeometryTransforms.apply_homography(pts_query, H_query_to_ref)
+        if pts_in_ref is None or len(pts_in_ref) == 0:
             return {"success": False, "error": "Помилка трансформації координат через гомографію"}
 
-        # 6. Переводимо в метрику і перевіряємо на аномалії (через affine)
-        metric_pt = GeometryTransforms.apply_affine(pt_in_ref, affine_ref)[0]
+        pts_metric = GeometryTransforms.apply_affine(pts_in_ref, affine_ref)
+        
+        # Робастне обчислення фінальної позиції (медіана)
+        mx = float(np.median(pts_metric[:, 0]))
+        my = float(np.median(pts_metric[:, 1]))
+        metric_pt = np.array([mx, my], dtype=np.float32)
 
-        # Діагностика: логуємо проміжні значення для аналізу точності
+        # Оцінка геометричної стабільності (розкид точок)
+        # Якщо гомографія "вивернута", розкид буде аномально великим
+        sample_spread_m = float(np.mean(np.linalg.norm(pts_metric - metric_pt, axis=1)))
+        
+        # Діагностика
         logger.debug(
-            f"DIAG | frame={best_candidate_id} | center_query=({center_pt[0,0]:.1f}, {center_pt[0,1]:.1f}) "
-            f"| pt_in_ref=({pt_in_ref[0,0]:.1f}, {pt_in_ref[0,1]:.1f}) "
-            f"| raw_metric=({metric_pt[0]:.2f}, {metric_pt[1]:.2f}) "
-            f"| affine_scale=({np.linalg.norm(affine_ref[0,:2]):.6f}, {np.linalg.norm(affine_ref[1,:2]):.6f}) "
-            f"| inliers={best_inliers}/{best_total_matches}"
+            f"DIAG | frame={best_candidate_id} | mx={mx:.1f}, my={my:.1f} "
+            f"| spread={sample_spread_m:.1f}m | inliers={best_inliers}/{best_total_matches}"
         )
 
-        # Перевіряємо чи нова точка — аномалія (стрибок координат)
+        # 6. Перевіряємо чи нова точка — аномалія (стрибок координат)
         if self.outlier_detector.is_outlier(metric_pt, dt):
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
-        # Оновлення Калмана з dt
+        # Оновлення Калмана
         if hasattr(self.trajectory_filter, 'update_with_dt'):
             filtered_pt = self.trajectory_filter.update_with_dt(metric_pt, dt)
         else:
             filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
 
         self.outlier_detector.add_position(filtered_pt)
-
         lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
 
-        # Обчислюємо зсув (offset) між сирими координатами (метрикою) і згладженим Калманом маркером
-        # Це дозволить прямокутнику (FOV) ідеально центруватися навколо координати дрона на карті!
+        # Зсув для FOV
         dx = filtered_pt[0] - metric_pt[0]
         dy = filtered_pt[1] - metric_pt[1]
 
-        # 7. Розрахунок поля зору (FOV) для ПОВЕРНУТОГО кадру
+        # 7. Розрахунок поля зору (FOV)
         corners = np.array([[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]], dtype=np.float32)
         ref_corners = GeometryTransforms.apply_homography(corners, H_query_to_ref)
 
@@ -213,29 +223,34 @@ class Localizer:
             if metric_corners is not None:
                 for cx, cy in metric_corners:
                     try:
-                        # Додаємо зсув фільтра Калмана, щоб прямокутник на карті не стрибав окремо від маркера
                         clat, clon = CoordinateConverter.metric_to_gps(cx + dx, cy + dy)
                         gps_corners.append((clat, clon))
                     except Exception:
                         pass
 
-
-        # Покращена формула confidence: враховує inlier ratio + кількість
+        # 8. Покращена формула confidence
         max_inliers = self.config.get('localization', {}).get('confidence_max_inliers', 50)
         inlier_ratio = best_inliers / max(best_total_matches, 1)
         count_score = min(1.0, best_inliers / max_inliers)
-        # Зважена комбінація: 60% від кількості inliers, 40% від їх частки
-        confidence = min(1.0, 0.6 * count_score + 0.4 * inlier_ratio)
+        
+        # Геометричний штраф: якщо розкид > 500м (ознака нестабільності H)
+        stability_penalty = 1.0
+        if sample_spread_m > 500.0: stability_penalty = 0.3
+        elif sample_spread_m > 300.0: stability_penalty = 0.6
+        
+        confidence = min(1.0, (0.6 * count_score + 0.4 * inlier_ratio) * stability_penalty)
 
         logger.success(
-            f"Localization: ({lat:.6f}, {lon:.6f}), matched frame={best_candidate_id}, "
-            f"rot={best_global_angle}°, confidence={confidence:.2f}")
+            f"Localization: ({lat:.6f}, {lon:.6f}), frame={best_candidate_id}, "
+            f"spread={sample_spread_m:.1f}m, confidence={confidence:.2f}")
 
         return {
             "success": True, "lat": lat, "lon": lon,
             "confidence": confidence, "matched_frame": best_candidate_id,
-            "inliers": best_inliers, "fov_polygon": gps_corners
+            "inliers": best_inliers, "fov_polygon": gps_corners,
+            "sample_spread_m": sample_spread_m
         }
+
 
     def _try_lightglue_fallback(self, query_frame, static_mask, candidates, height, width):
         """Fallback: SuperPoint+LightGlue для складних сцен де XFeat не справився"""

@@ -124,6 +124,23 @@ class DatabaseMixin:
 
         try:
             db_path = self.project_manager.database_path
+            
+            # НОВЕ: Перевірка наявності бази даних
+            if not Path(db_path).exists():
+                video_path = self.project_manager.settings.video_path
+                reply = QMessageBox.question(
+                    self, "База даних відсутня",
+                    f"Проєкт '{self.project_manager.project_name}' не має згенерованої бази даних.\n\n"
+                    f"Згенерувати базу зараз з відео:\n{Path(video_path).name}?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+                    self._start_database_generation(video_path, db_path)
+                    return
+                else:
+                    self.status_bar.showMessage("Завантаження скасовано: відсутня база даних")
+                    return
 
             if self.database:
                 self.database.close()
