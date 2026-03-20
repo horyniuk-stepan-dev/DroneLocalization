@@ -9,14 +9,15 @@ logger = get_logger(__name__)
 
 
 class FeatureExtractor:
-    """Combined feature extraction (XFeat + DINOv2)"""
+    """Combined feature extraction (XFeat + DINOv2 [+ CESP])"""
 
-    def __init__(self, local_model, global_model, device='cuda', config=None):
+    def __init__(self, local_model, global_model, device='cuda', config=None, cesp_module=None):
         self.local_model = local_model  # Тепер тут очікується XFeat
         self.global_model = global_model  # DINOv2
         self.device = device
         self.config = config or {}
         self.preprocessor = ImagePreprocessor(config)
+        self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
 
         # Трансформації для DINOv2 (ImageNet стандарти)
         # 336×336 замість 224×224 — кратне 14 (patch size DINOv2), дає ~15% краще retrieval
@@ -33,7 +34,8 @@ class FeatureExtractor:
         if self.use_fp16:
             logger.info("FP16 mixed precision ENABLED for inference")
 
-        logger.info(f"FeatureExtractor initialized with XFeat and DINOv2 on {device}")
+        cesp_status = "with CESP" if cesp_module is not None else "without CESP"
+        logger.info(f"FeatureExtractor initialized with XFeat and DINOv2 ({cesp_status}) on {device}")
 
     @torch.no_grad()
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
@@ -42,13 +44,27 @@ class FeatureExtractor:
         dino_tensor = dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
         dino_input = self.dinov2_transform(dino_tensor)
 
-        # DINOv2 повертає тензор форми (1, 384) — FP16 для прискорення
-        if self.use_fp16:
-            with torch.cuda.amp.autocast():
-                global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
+        if self.cesp_module is not None:
+            # CESP mode: отримуємо patch tokens замість CLS
+            if self.use_fp16:
+                with torch.cuda.amp.autocast():
+                    features = self.global_model.forward_features(dino_input)
+                    patch_tokens = features['x_norm_patchtokens'].float()  # (1, N, 1024)
+            else:
+                features = self.global_model.forward_features(dino_input)
+                patch_tokens = features['x_norm_patchtokens']
+
+            h_patches = self.dino_size // 14  # 336/14 = 24
+            w_patches = self.dino_size // 14
+            global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
-            global_desc = self.global_model(dino_input)[0].cpu().numpy()
-            
+            # Стандартний mode: CLS token
+            if self.use_fp16:
+                with torch.cuda.amp.autocast():
+                    global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
+            else:
+                global_desc = self.global_model(dino_input)[0].cpu().numpy()
+
         return global_desc
 
     @torch.no_grad()

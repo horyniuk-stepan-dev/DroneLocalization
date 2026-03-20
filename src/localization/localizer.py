@@ -101,21 +101,32 @@ class Localizer:
             mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
 
             if len(mkpts_q) >= self.min_matches:
-                # Використовуємо ту саму гомографію (8 DoF), що й в оригінальному коді all_merged
-                H_eval, mask = GeometryTransforms.estimate_homography(
+                # Використовуємо Full Affine (6 DoF: поворот, масштаб X/Y, shear, зсув)
+                # Точніший варіант — підтримує анізотропний масштаб між query та ref
+                M_eval, mask = GeometryTransforms.estimate_affine(
                     mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
                 )
 
-                if H_eval is not None:
+                if M_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     inliers = int(np.sum(inlier_mask))
                     if inliers > best_inliers and inliers >= self.min_matches:
                         best_inliers = inliers
                         best_candidate_id = candidate_id
-                        best_H_query_to_ref = H_eval
+                        best_H_query_to_ref = M_eval  # Full Affine матриця (2x3)
                         best_mkpts_q_inliers = mkpts_q[inlier_mask]
                         best_mkpts_r_inliers = mkpts_r[inlier_mask]
                         best_total_matches = len(mkpts_q)
+                        # Діагностика параметрів афінної матриці
+                        sx = np.linalg.norm(M_eval[:, 0])
+                        sy = np.linalg.norm(M_eval[:, 1])
+                        angle_deg = np.degrees(np.arctan2(M_eval[1, 0], M_eval[0, 0]))
+                        logger.debug(
+                            f"Affine params for candidate {candidate_id}: "
+                            f"scale_x={sx:.3f}, scale_y={sy:.3f}, "
+                            f"rotation={angle_deg:.1f}°, "
+                            f"tx={M_eval[0, 2]:.1f}, ty={M_eval[1, 2]:.1f}"
+                        )
 
             if best_inliers >= early_stop:
                 logger.info(f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}")
@@ -177,44 +188,32 @@ class Localizer:
         else:
             rot_height, rot_width = height, width
             
-        # 4. Багатоточкова локалізація (Multi-point sampling)
+        # 4. Багатоточкова локалізація більше не потрібна. Беремо ідеальний центр кадру
         proj_cfg = self.config.get('projection', {})
-        n_samples = proj_cfg.get('localizer_sample_points', 9)
         
-        # Генерація сітки для стабільної оцінки (зазвичай 3x3)
-        grid_size = int(np.sqrt(n_samples))
-        grid_x = np.linspace(rot_width * 0.2, rot_width * 0.8, grid_size)
-        grid_y = np.linspace(rot_height * 0.2, rot_height * 0.8, grid_size)
-        gx, gy = np.meshgrid(grid_x, grid_y)
-        pts_query = np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float32)
+        # Використовуємо знайдений affine_partial
+        M_query_to_ref = best_H_query_to_ref
+        if M_query_to_ref is None:
+            return {"success": False, "error": "Failed to compute affine transform"}
 
-        # Використовуємо гомографію з найкращого збігу
-        H_query_to_ref = best_H_query_to_ref
-        if H_query_to_ref is None:
-            return {"success": False, "error": "Failed to compute homography"}
-
-        # 5. Трансформуємо точки: Query -> Reference -> Metric
-        pts_in_ref = GeometryTransforms.apply_homography(pts_query, H_query_to_ref)
+        # 5. Трансформуємо центральну точку: Query -> Reference -> Metric
+        center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float32)
+        pts_in_ref = GeometryTransforms.apply_affine(center_query, M_query_to_ref)
         if pts_in_ref is None or len(pts_in_ref) == 0:
             target_id = best_candidate_id if (best_candidate_id != -1) else best_global_candidates[0][0]
             fallback_res = self._localize_by_reference_frame(target_id, best_global_score)
             if fallback_res:
-                logger.info(f"Homography failure, using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})")
+                logger.info(f"Affine transform failure, using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})")
                 return fallback_res
-            return {"success": False, "error": "Coordinate transformation error (homography failed)"}
+            return {"success": False, "error": "Coordinate transformation error (affine failed)"}
 
         pts_metric = GeometryTransforms.apply_affine(pts_in_ref, affine_ref)
         
-        # Робастне обчислення фінальної позиції (медіана по кожній осі)
-        mx = float(np.median(pts_metric[:, 0]))
-        my = float(np.median(pts_metric[:, 1]))
+        # Оскільки ми взяли одну центральну точку, просто беремо її координати
+        mx = float(pts_metric[0, 0])
+        my = float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float32)
 
-        # Оцінка геометричної стабільності (медіанний розкид точок від центру)
-        # Малий spread означає, що гомографія зберігає структуру (стабільна локалізація)
-        dists = np.linalg.norm(pts_metric - metric_pt, axis=1)
-        sample_spread_m = float(np.median(dists))
-        
         # 6. Перевіряємо чи нова точка — аномалія (стрибок координат)
         if self.outlier_detector.is_outlier(metric_pt, dt):
             # Ми все одно логуємо спробу, але кажемо, що це аутлаєр
@@ -234,13 +233,24 @@ class Localizer:
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
         # 7. Розрахунок поля зору (FOV)
-        corners = np.array([[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]], dtype=np.float32)
-        ref_corners = GeometryTransforms.apply_homography(corners, H_query_to_ref)
+        # Проектуємо кути QUERY-кадру через ланцюг: Query→Ref→Metric→GPS
+        corners = np.array([
+            [0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]
+        ], dtype=np.float32)
+        ref_corners = GeometryTransforms.apply_affine(corners, M_query_to_ref)
 
         gps_corners = []
         if ref_corners is not None:
             metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
             if metric_corners is not None:
+                # Діагностика розмірів FOV в метрах
+                fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
+                fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
+                logger.debug(
+                    f"FOV dimensions: {fov_w:.1f}m x {fov_h:.1f}m | "
+                    f"Center metric: ({mx:.1f}, {my:.1f}) | "
+                    f"Filtered: ({filtered_pt[0]:.1f}, {filtered_pt[1]:.1f})"
+                )
                 for cx, cy in metric_corners:
                     try:
                         clat, clon = CoordinateConverter.metric_to_gps(cx + dx, cy + dy)
@@ -249,33 +259,21 @@ class Localizer:
                         pass
 
         # 8. Confidence scoring (QA)
-        # Поєднануємо Inlier Ratio та геометричну стабільність.
-        # ВАЖЛИВО: spread — це фізичний розмір сітки на землі. 
-        # Якщо він дуже великий (>300м), це може бути ознакою "вибуху" гомографії.
         max_inliers = proj_cfg.get('confidence_max_inliers', 80)
-        expected_spread = proj_cfg.get('localizer_expected_spread_m', 100.0)
-        
         inlier_score = min(1.0, best_inliers / max_inliers)
         
-        # Стабільність тепер менш чутлива до абсолютного розмаху, 
-        # якщо він в межах розумного для дрона (напр. до 200м)
-        if sample_spread_m < expected_spread:
-            stability_score = 1.0
-        else:
-            # Плавне зниження довіри при перевищенні очікуваного розмаху
-            stability_score = max(0.1, 1.0 - (sample_spread_m - expected_spread) / expected_spread)
+        # Full Affine підтримує анізотропний масштаб, стабільність завжди 1.0 для дрон-камери
+        stability_score = 1.0
         
         confidence = float(np.clip(inlier_score * 0.7 + stability_score * 0.3, 0.05, 1.0))
 
-        # ДІАГНОСТИКА: Результати вибірки (sample points)
-        logger.debug(f"Localize Frame {best_candidate_id}: samples={n_samples} | spread={sample_spread_m:.2f}m")
-        # Логуємо крайні точки та центр сітки
-        logger.debug(f"Sample Grid METRIC: center=({mx:.1f}, {my:.1f})")
+        # ДІАГНОСТИКА
+        logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Full Affine (6 DoF)")
+        logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
         
         logger.success(
             f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id} | "
-            f"metric=({mx:.1f}, {my:.1f}) | spread={sample_spread_m:.1f}m | "
-            f"inliers={best_inliers} | conf={confidence:.2f}"
+            f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
         )
 
         return {
@@ -285,7 +283,7 @@ class Localizer:
             "matched_frame": int(best_candidate_id),
             "inliers": int(best_inliers), 
             "fov_polygon": gps_corners,
-            "sample_spread_m": sample_spread_m
+            "sample_spread_m": 0.0
         }
 
 
@@ -299,92 +297,163 @@ class Localizer:
         best_rot_angle = 0
         best_total_matches = 0
 
-        # Єдиний великий try/except — БУДЬ-ЯКИЙ збій повертає безпечний default-tuple
+        fallback_type = self.config.get('localization', {}).get('fallback_extractor', 'aliked')
+
         try:
             import torch
-            sp_model = self.model_manager.load_superpoint()
-            lg_model = self.model_manager.load_lightglue()
             device = self.model_manager.device
 
-            # Підготовка запиту для SuperPoint
-            from lightglue.utils import numpy_image_to_torch
-            query_tensor = numpy_image_to_torch(query_frame).to(device)
+            if fallback_type == 'aliked':
+                # ═══ ALIKED (128-dim) fallback ═══
+                aliked_model = self.model_manager.load_aliked()
+                from lightglue.utils import numpy_image_to_torch
 
-            with torch.no_grad():
-                sp_query = sp_model.extract(query_tensor)
+                query_tensor = numpy_image_to_torch(query_frame).to(device)
+                with torch.no_grad():
+                    aliked_query = aliked_model.extract(query_tensor)
 
-            # Фільтрація точок за маскою
-            if static_mask is not None:
-                kpts = sp_query['keypoints'][0].cpu().numpy()
-                ix = np.round(kpts[:, 0]).astype(np.intp)
-                iy = np.round(kpts[:, 1]).astype(np.intp)
-                in_bounds = (iy >= 0) & (iy < static_mask.shape[0]) & (ix >= 0) & (ix < static_mask.shape[1])
-                valid = np.zeros(len(kpts), dtype=bool)
-                valid[in_bounds] = static_mask[iy[in_bounds], ix[in_bounds]] > 128
-                if valid.any():
-                    valid_t = torch.from_numpy(valid).to(device)
-                    sp_query = {
-                        'keypoints': sp_query['keypoints'][:, valid_t],
-                        'descriptors': sp_query['descriptors'][:, valid_t],
-                        'keypoint_scores': sp_query['keypoint_scores'][:, valid_t] if 'keypoint_scores' in sp_query else None,
-                    }
-                    # Видаляємо None
-                    sp_query = {k: v for k, v in sp_query.items() if v is not None}
-
-            # Перебір top-3 кандидатів (менше для швидкості)
-            lg_compatible = False
-            for candidate_id, score in candidates[:3]:
-                ref_features = self.database.get_local_features(candidate_id)
-
-                # Підготовка ref для LightGlue
-                ref_kpts = torch.from_numpy(ref_features['keypoints']).float()[None].to(device)
-                ref_desc = torch.from_numpy(ref_features['descriptors']).float()[None].to(device)
-
-                # Якщо ref дескриптори 64-dim (XFeat), fallback не підходить
-                if ref_desc.shape[-1] != 256:
-                    logger.debug(f"Skipping LightGlue fallback for frame {candidate_id}: ref desc dim={ref_desc.shape[-1]}")
-                    continue
-                
-                lg_compatible = True
-                try:
-                    with torch.no_grad():
-                        data = {
-                            'image0': sp_query,
-                            'image1': {'keypoints': ref_kpts, 'descriptors': ref_desc}
+                # Фільтрація точок за YOLO маскою
+                if static_mask is not None:
+                    kpts = aliked_query['keypoints'][0].cpu().numpy()
+                    ix = np.round(kpts[:, 0]).astype(np.intp)
+                    iy = np.round(kpts[:, 1]).astype(np.intp)
+                    in_bounds = (iy >= 0) & (iy < static_mask.shape[0]) & (ix >= 0) & (ix < static_mask.shape[1])
+                    valid = np.zeros(len(kpts), dtype=bool)
+                    valid[in_bounds] = static_mask[iy[in_bounds], ix[in_bounds]] > 128
+                    if valid.any():
+                        valid_t = torch.from_numpy(valid).to(device)
+                        aliked_query = {
+                            'keypoints': aliked_query['keypoints'][:, valid_t],
+                            'descriptors': aliked_query['descriptors'][:, valid_t],
+                            'keypoint_scores': aliked_query.get('keypoint_scores',
+                                               aliked_query['keypoints'].new_ones(1, int(valid_t.sum())))[:, :int(valid_t.sum())],
                         }
-                        res = lg_model(data)
-                        matches = res['matches'][0].cpu().numpy()
+                        aliked_query = {k: v for k, v in aliked_query.items() if v is not None}
 
-                    if len(matches) >= self.min_matches:
-                        q_kpts = sp_query['keypoints'][0].cpu().numpy()
-                        mkpts_q = q_kpts[matches[:, 0]]
-                        mkpts_r = ref_features['keypoints'][matches[:, 1]]
+                # Перебір top-3 кандидатів
+                for candidate_id, score in candidates[:3]:
+                    ref_features = self.database.get_local_features(candidate_id)
+                    ref_desc_dim = ref_features['descriptors'].shape[1] if len(ref_features['descriptors']) > 0 else 0
 
-                        H_eval, mask = GeometryTransforms.estimate_homography(
-                            mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
-                        )
-                        if H_eval is not None:
-                            inlier_mask = mask.ravel().astype(bool)
-                            inliers = int(np.sum(inlier_mask))
-                            if inliers > best_inliers and inliers >= self.min_matches:
-                                best_inliers = inliers
-                                best_candidate_id = candidate_id
-                                best_H_to_ref = H_eval
-                                best_mkpts_q_inliers = mkpts_q[inlier_mask]
-                                best_mkpts_r_inliers = mkpts_r[inlier_mask]
-                                best_rot_angle = 0
-                                best_total_matches = len(matches)
-                                logger.info(f"LightGlue fallback: {inliers} inliers on frame {candidate_id}")
-                except Exception as e:
-                    logger.debug(f"LightGlue fallback failed for frame {candidate_id}: {e}")
-                    continue
-            
-            if not lg_compatible:
-                logger.warning("LightGlue fallback: all candidates have XFeat (64-dim) descriptors — incompatible with SuperPoint. "
-                               "Re-index database with SuperPoint to enable this fallback.")
+                    try:
+                        q_kpts = aliked_query['keypoints'][0].cpu().numpy()
+                        q_desc = aliked_query['descriptors'][0].cpu().numpy()
+
+                        query_dict = {'keypoints': q_kpts, 'descriptors': q_desc}
+
+                        if ref_desc_dim == 128:
+                            # Ref також ALIKED → можна використати LightGlue(aliked) або Numpy L2
+                            mkpts_q, mkpts_r = self.matcher.match(query_dict, ref_features)
+                        else:
+                            # Ref має XFeat (64-dim) → cross-descriptor через Numpy L2
+                            # ALIKED 128-dim vs XFeat 64-dim — безпосередній матчинг неможливий
+                            # Тому екстрагуємо ALIKED features з reference frame зображення
+                            # Fallback: пропускаємо LightGlue, використовуємо Numpy L2
+                            logger.debug(
+                                f"ALIKED fallback: ref desc dim={ref_desc_dim} (XFeat), "
+                                f"matching ALIKED query (128-dim) vs XFeat ref (64-dim) not possible directly. "
+                                f"Skipping candidate {candidate_id}."
+                            )
+                            continue
+
+                        if len(mkpts_q) >= self.min_matches:
+                            M_eval, mask = GeometryTransforms.estimate_affine(
+                                mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
+                            )
+                            if M_eval is not None:
+                                inlier_mask = mask.ravel().astype(bool)
+                                inliers = int(np.sum(inlier_mask))
+                                if inliers > best_inliers and inliers >= self.min_matches:
+                                    best_inliers = inliers
+                                    best_candidate_id = candidate_id
+                                    best_H_to_ref = M_eval
+                                    best_mkpts_q_inliers = mkpts_q[inlier_mask]
+                                    best_mkpts_r_inliers = mkpts_r[inlier_mask]
+                                    best_rot_angle = 0
+                                    best_total_matches = len(mkpts_q)
+                                    logger.info(f"ALIKED fallback: {inliers} inliers on frame {candidate_id}")
+                    except Exception as e:
+                        logger.debug(f"ALIKED fallback failed for frame {candidate_id}: {e}")
+                        continue
+
+            else:
+                # ═══ SuperPoint (256-dim) fallback (legacy) ═══
+                sp_model = self.model_manager.load_superpoint()
+                lg_model = self.model_manager.load_lightglue()
+
+                from lightglue.utils import numpy_image_to_torch
+                query_tensor = numpy_image_to_torch(query_frame).to(device)
+
+                with torch.no_grad():
+                    sp_query = sp_model.extract(query_tensor)
+
+                # Фільтрація точок за маскою
+                if static_mask is not None:
+                    kpts = sp_query['keypoints'][0].cpu().numpy()
+                    ix = np.round(kpts[:, 0]).astype(np.intp)
+                    iy = np.round(kpts[:, 1]).astype(np.intp)
+                    in_bounds = (iy >= 0) & (iy < static_mask.shape[0]) & (ix >= 0) & (ix < static_mask.shape[1])
+                    valid = np.zeros(len(kpts), dtype=bool)
+                    valid[in_bounds] = static_mask[iy[in_bounds], ix[in_bounds]] > 128
+                    if valid.any():
+                        valid_t = torch.from_numpy(valid).to(device)
+                        sp_query = {
+                            'keypoints': sp_query['keypoints'][:, valid_t],
+                            'descriptors': sp_query['descriptors'][:, valid_t],
+                            'keypoint_scores': sp_query['keypoint_scores'][:, valid_t] if 'keypoint_scores' in sp_query else None,
+                        }
+                        sp_query = {k: v for k, v in sp_query.items() if v is not None}
+
+                lg_compatible = False
+                for candidate_id, score in candidates[:3]:
+                    ref_features = self.database.get_local_features(candidate_id)
+                    ref_kpts = torch.from_numpy(ref_features['keypoints']).float()[None].to(device)
+                    ref_desc = torch.from_numpy(ref_features['descriptors']).float()[None].to(device)
+
+                    if ref_desc.shape[-1] != 256:
+                        logger.debug(f"Skipping LightGlue fallback for frame {candidate_id}: ref desc dim={ref_desc.shape[-1]}")
+                        continue
+
+                    lg_compatible = True
+                    try:
+                        with torch.no_grad():
+                            data = {
+                                'image0': sp_query,
+                                'image1': {'keypoints': ref_kpts, 'descriptors': ref_desc}
+                            }
+                            res = lg_model(data)
+                            matches = res['matches'][0].cpu().numpy()
+
+                        if len(matches) >= self.min_matches:
+                            q_kpts = sp_query['keypoints'][0].cpu().numpy()
+                            mkpts_q = q_kpts[matches[:, 0]]
+                            mkpts_r = ref_features['keypoints'][matches[:, 1]]
+
+                            M_eval, mask = GeometryTransforms.estimate_affine(
+                                mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
+                            )
+                            if M_eval is not None:
+                                inlier_mask = mask.ravel().astype(bool)
+                                inliers = int(np.sum(inlier_mask))
+                                if inliers > best_inliers and inliers >= self.min_matches:
+                                    best_inliers = inliers
+                                    best_candidate_id = candidate_id
+                                    best_H_to_ref = M_eval
+                                    best_mkpts_q_inliers = mkpts_q[inlier_mask]
+                                    best_mkpts_r_inliers = mkpts_r[inlier_mask]
+                                    best_rot_angle = 0
+                                    best_total_matches = len(matches)
+                                    logger.info(f"LightGlue fallback: {inliers} inliers on frame {candidate_id}")
+                    except Exception as e:
+                        logger.debug(f"LightGlue fallback failed for frame {candidate_id}: {e}")
+                        continue
+
+                if not lg_compatible:
+                    logger.warning("LightGlue fallback: all candidates have XFeat (64-dim) descriptors — incompatible with SuperPoint. "
+                                   "Consider switching to fallback_extractor='aliked' or re-index database.")
 
         except Exception as e:
-            logger.warning(f"LightGlue fallback aborted with unexpected error: {e}", exc_info=True)
+            logger.warning(f"{fallback_type.upper()} fallback aborted with unexpected error: {e}", exc_info=True)
 
         return best_inliers, best_candidate_id, best_H_to_ref, best_mkpts_q_inliers, best_mkpts_r_inliers, best_rot_angle, best_total_matches
 

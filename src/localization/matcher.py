@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 import torch
 
 from src.utils.logging_utils import get_logger
@@ -54,7 +54,7 @@ class FeatureMatcher:
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         """
         Dynamically routes to LightGlue (for 256-dim SuperPoint)
-        or Fast L2 Matcher (for 64-dim XFeat).
+        or Fast L2 Matcher (for 64-dim XFeat / 128-dim ALIKED).
         """
         desc_dim = query_features['descriptors'].shape[1] if len(query_features['descriptors']) > 0 else 0
 
@@ -62,7 +62,11 @@ class FeatureMatcher:
         if self.lightglue is not None and desc_dim == 256:
             return self._lightglue_match(query_features, ref_features)
 
-        # Для XFeat (64) або якщо LightGlue не завантажено
+        # ALIKED (128-dim) — Numpy L2 з суворішим ratio test
+        if desc_dim == 128:
+            return self._fast_numpy_match(query_features, ref_features, ratio_threshold=0.80)
+
+        # Для XFeat (64) або іншого — Numpy L2 з конфігурованим ratio
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def _fast_numpy_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80) -> tuple:

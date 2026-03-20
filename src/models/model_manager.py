@@ -163,6 +163,79 @@ class ModelManager:
         self._register_model_usage(name)
         return self.models[name]
 
+    def load_aliked(self):
+        """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
+        name = 'aliked'
+        if name not in self.models:
+            cfg = self.config.get('models', {}).get(name, {})
+            vram_req = cfg.get('vram_required_mb', 400.0)
+            max_keypoints = cfg.get('max_keypoints', 4096)
+
+            logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
+            self._ensure_vram_available(vram_req)
+            try:
+                from lightglue import ALIKED
+                model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
+                self.models[name] = model
+                logger.success(f"ALIKED loaded successfully on {self.device}")
+            except Exception as e:
+                logger.error(f"Failed to load ALIKED: {e}", exc_info=True)
+                raise
+        self._register_model_usage(name)
+        return self.models[name]
+
+    def load_lightglue_aliked(self):
+        """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
+        name = 'lightglue_aliked'
+        if name not in self.models:
+            cfg = self.config.get('models', {}).get('lightglue', {})
+            vram_req = cfg.get('vram_required_mb', 1000.0)
+
+            logger.info("Loading LightGlue (ALIKED weights)...")
+            self._ensure_vram_available(vram_req)
+            try:
+                from lightglue import LightGlue
+                model = LightGlue(
+                    features='aliked',
+                    depth_confidence=cfg.get('depth_confidence', -1),
+                    width_confidence=cfg.get('width_confidence', -1),
+                ).eval().to(self.device)
+                self.models[name] = model
+                logger.success("LightGlue (ALIKED) loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load LightGlue (ALIKED): {e}", exc_info=True)
+                raise
+        self._register_model_usage(name)
+        return self.models[name]
+
+    def load_cesp(self):
+        """Завантажує CESP модуль для покращення DINOv2 global descriptors"""
+        name = 'cesp'
+        if name not in self.models:
+            logger.info("Loading CESP module...")
+            try:
+                from src.models.wrappers.cesp_module import CESP
+                cesp_cfg = self.config.get('models', {}).get('cesp', {})
+                scales = cesp_cfg.get('scales', [1, 2, 4])
+                cesp = CESP(dim=1024, scales=tuple(scales))
+
+                # Завантаження pretrained ваг (якщо є)
+                weights_path = cesp_cfg.get('weights_path', None)
+                if weights_path:
+                    cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
+                    logger.success(f"CESP pretrained weights loaded from {weights_path}")
+                else:
+                    logger.warning("CESP initialized WITHOUT pretrained weights (random init)")
+
+                cesp = cesp.eval().to(self.device)
+                self.models[name] = cesp
+                logger.success("CESP module loaded")
+            except Exception as e:
+                logger.error(f"Failed to load CESP: {e}", exc_info=True)
+                raise
+        self._register_model_usage(name)
+        return self.models[name]
+
     def unload_model(self, model_name: str):
         if model_name in self.models:
             logger.info(f"Unloading model: {model_name}")

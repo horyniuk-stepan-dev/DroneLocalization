@@ -32,8 +32,9 @@ APP_CONFIG = {
         # Перебір 0 / 90 / 180 / 270
         'auto_rotation': True,
 
-        # Fallback на SuperPoint + LightGlue при слабкому XFeat
+        # Fallback при слабкому XFeat: 'aliked' (рекомендовано) або 'superpoint' (legacy)
         'enable_lightglue_fallback': True,
+        'fallback_extractor': 'aliked',  # 'aliked' | 'superpoint'
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -87,6 +88,12 @@ APP_CONFIG = {
             'vram_required_mb': 300.0,
         },
 
+        'aliked': {
+            'max_keypoints': 4096,
+            'detection_threshold': 0.2,
+            'vram_required_mb': 400.0,
+        },
+
         'superpoint': {
             'nms_radius': 4,
             'max_keypoints': 4096,
@@ -103,6 +110,12 @@ APP_CONFIG = {
             'hub_repo': 'facebookresearch/dinov2',
             'hub_model': 'dinov2_vitl14',
             'vram_required_mb': 1600.0,
+        },
+
+        'cesp': {
+            'enabled': False,        # Вмикається після навчання ваг
+            'weights_path': None,    # Шлях до .pt файлу з натренованими вагами
+            'scales': [1, 2, 4],     # Масштаби піраміди
         },
 
         'vram_management': {

@@ -23,7 +23,15 @@ class TrackingMixin:
         xf = self.model_manager.load_xfeat()
         nv = self.model_manager.load_dinov2()
 
-        fe = FeatureExtractor(xf, nv, self.model_manager.device, config=self.config)
+        # Опціональне завантаження CESP для покращення DINOv2 global descriptors
+        cesp = None
+        if self.config.get('models', {}).get('cesp', {}).get('enabled', False):
+            try:
+                cesp = self.model_manager.load_cesp()
+            except Exception as e:
+                logger.warning(f"CESP loading failed, continuing without it: {e}")
+
+        fe = FeatureExtractor(xf, nv, self.model_manager.device, config=self.config, cesp_module=cesp)
 
         # ОНОВЛЕНО: Матчер сам вирішить (Numpy для XFeat або LightGlue для SuperPoint)
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)

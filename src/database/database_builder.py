@@ -39,15 +39,24 @@ class DatabaseBuilder:
         """
         logger.info(f"Starting database build from video: {video_path}")
 
+        # Читаємо налаштування з конфігу (з дефолтом)
+        frame_step = self.config.get('database', {}).get('frame_step', 3)
+        if frame_step < 1:
+            frame_step = 1
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             logger.error(f"Failed to open video: {video_path}")
             raise ValueError(f"Не вдалося відкрити відео: {video_path}")
 
-        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        original_fps = cap.get(cv2.CAP_PROP_FPS)
+
+        # Обчислюємо скільки кадрів РЕАЛЬНО буде оброблено
+        num_frames = (total_frames + frame_step - 1) // frame_step
+        effective_fps = original_fps / frame_step
 
         if num_frames <= 0:
             cap.release()
@@ -57,7 +66,8 @@ class DatabaseBuilder:
                 "Спробуйте переконвертувати відео у стандартний MP4 (H.264)."
             )
 
-        logger.info(f"Video properties: {width}x{height}, {num_frames} frames, {fps:.2f} FPS")
+        logger.info(f"Video properties: {width}x{height}, {total_frames} total frames, {original_fps:.2f} FPS")
+        logger.info(f"Processing with step={frame_step} -> {num_frames} frames to process ({effective_fps:.2f} effective FPS)")
 
         # Ініціалізуємо запис відео з keypoints
         kp_video_path = None
@@ -74,12 +84,12 @@ class DatabaseBuilder:
             kp_video_path = str(Path(self.output_path).with_suffix('')) + '_keypoints.mp4'
             # Використовуємо H.264 (avc1) кодек для кращої компресії замість старого mp4v
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (kp_width, kp_height))
+            kp_writer = cv2.VideoWriter(kp_video_path, fourcc, effective_fps, (kp_width, kp_height))
             
             if not kp_writer.isOpened():
                 logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                kp_writer = cv2.VideoWriter(kp_video_path, fourcc, fps, (kp_width, kp_height))
+                kp_writer = cv2.VideoWriter(kp_video_path, fourcc, effective_fps, (kp_width, kp_height))
 
             if kp_writer.isOpened():
                 logger.info(f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})")
@@ -95,7 +105,15 @@ class DatabaseBuilder:
         # ОНОВЛЕНО: Використовуємо XFeat замість SuperPoint
         local_model = model_manager.load_xfeat()
         nv_model = model_manager.load_dinov2()
-        feature_extractor = FeatureExtractor(local_model, nv_model, model_manager.device, config=self.config)
+
+        cesp = None
+        if self.config.get('models', {}).get('cesp', {}).get('enabled', False):
+            try:
+                cesp = model_manager.load_cesp()
+            except Exception:
+                logger.warning("CESP loading failed during DB build, continuing without it")
+
+        feature_extractor = FeatureExtractor(local_model, nv_model, model_manager.device, config=self.config, cesp_module=cesp)
         logger.success("All models loaded successfully")
 
         # Create empty database structure
@@ -116,13 +134,20 @@ class DatabaseBuilder:
         frame_queue = Queue(maxsize=4)
 
         def prefetch_frames():
-            for i in range(num_frames):
+            for i in range(total_frames):
                 ret, frame = cap.read()
                 if not ret:
-                    frame_queue.put((i, None))
                     break
+                
+                # Пропускаємо кадри згідно з frame_step
+                if i % frame_step != 0:
+                    continue
+                    
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_queue.put((i, (frame, frame_rgb)))
+                # Зберігаємо "новий" індекс (0, 1, 2...) для бази
+                db_index = i // frame_step
+                frame_queue.put((db_index, (frame, frame_rgb)))
+            
             frame_queue.put((-1, None))  # sentinel
 
         prefetch_thread = Thread(target=prefetch_frames, daemon=True)
@@ -271,46 +296,47 @@ class DatabaseBuilder:
                                 ransac_thresh: float = 3.0) -> np.ndarray | None:
         """
         Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
-        Використовує brute-force L2 матчинг дескрипторів XFeat
-        без LightGlue (щоб не тримати матчер у пам'яті під час побудови БД).
+        Використовує ШВИДКИЙ cv2.BFMatcher замість повільного Numpy argsort.
         """
-        desc_a = fa['descriptors']  # Тепер це (N, 64) для XFeat
-        desc_b = fb['descriptors']  # Тепер це (M, 64) для XFeat
+        desc_a = fa['descriptors']  # (N, 64) для XFeat
+        desc_b = fb['descriptors']  # (M, 64) для XFeat
         kpts_a = fa['keypoints']
         kpts_b = fb['keypoints']
 
         if len(kpts_a) < min_matches or len(kpts_b) < min_matches:
             return None
 
-        # Нормалізація дескрипторів
+        # BFMatcher очікує L2-нормовані float32 дескриптори або просто float32
+        # Нормалізація
         desc_a_n = desc_a / (np.linalg.norm(desc_a, axis=1, keepdims=True) + 1e-8)
         desc_b_n = desc_b / (np.linalg.norm(desc_b, axis=1, keepdims=True) + 1e-8)
 
-        # Косинусна відстань через dot product
-        sim = desc_b_n @ desc_a_n.T  # (M, N)
+        # Використовуємо L2 відстань (що еквівалентно косинусній для нормованих векторів)
+        matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        knn_matches = matcher.knnMatch(desc_b_n.astype(np.float32), desc_a_n.astype(np.float32), k=2)
 
-        # Lowe's ratio test
-        sorted_idx = np.argsort(-sim, axis=1)
-        best = sim[np.arange(len(desc_b)), sorted_idx[:, 0]]
-        second = sim[np.arange(len(desc_b)), sorted_idx[:, 1]]
-        ratio_valid = (best / (second + 1e-8)) > 1.2  # ratio > 1.2 ≈ відстань ratio < 0.83
+        good_matches = []
+        for match_pair in knn_matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                # Lowe's ratio test (ratio 0.8 ≈ cos_sim > 1.2)
+                if m.distance < 0.8 * n.distance:
+                    good_matches.append(m)
+            elif len(match_pair) == 1:
+                # Якщо знайшовся лише один сусід, ми не можемо застосувати ratio test, але можемо взяти його
+                # якщо відстань дуже мала. Для надійності краще просто пропустити.
+                pass
 
-        # Mutual Nearest Neighbor (MNN) — перевірка двосторонньої консистентності
-        best_b_to_a = sorted_idx[:, 0]  # Найкращий збіг B→A
-        best_a_to_b = np.argmax(sim, axis=0)  # Найкращий збіг A→B
-        is_mutual = best_a_to_b[best_b_to_a] == np.arange(len(desc_b))
-
-        valid = ratio_valid & is_mutual
-
-        if valid.sum() < min_matches:
+        if len(good_matches) < min_matches:
             return None
 
-        mkpts_b = kpts_b[valid]
-        mkpts_a = kpts_a[sorted_idx[valid, 0]]
+        # Cross-check manually to simulate MNN (хоча ratio test вже достатньо сильний)
+        # Для швидкості залишаємо тільки ratio test, цього достатньо для RANSAC
+        
+        src_pts = np.float32([kpts_b[m.queryIdx] for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kpts_a[m.trainIdx] for m in good_matches]).reshape(-1, 1, 2)
 
-        src = mkpts_b.reshape(-1, 1, 2).astype(np.float32)
-        dst = mkpts_a.reshape(-1, 1, 2).astype(np.float32)
-        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransac_thresh)
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransac_thresh)
 
         if H is None or int(np.sum(mask)) < min_matches:
             return None

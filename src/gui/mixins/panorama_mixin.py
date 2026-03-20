@@ -179,9 +179,14 @@ class PanoramaMixin:
         xf = self.model_manager.load_xfeat()
         nv = self.model_manager.load_dinov2()
 
-        # Вилучено штучне переведення на CPU:
-        # Моделі залишаються там, де вони були ініціалізовані (device з config).
-        fe = FeatureExtractor(xf, nv, device=device, config=self.config)
+        cesp = None
+        if self.config.get('models', {}).get('cesp', {}).get('enabled', False):
+            try:
+                cesp = self.model_manager.load_cesp()
+            except Exception:
+                pass
+
+        fe = FeatureExtractor(xf, nv, device=device, config=self.config, cesp_module=cesp)
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
         localizer = Localizer(self.database, fe, matcher, self.calibration,
                               {**self.config, '_model_manager': self.model_manager})
