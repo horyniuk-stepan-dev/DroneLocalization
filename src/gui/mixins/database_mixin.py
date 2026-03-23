@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QMessageBox, QFileDialog
+from PyQt6.QtCore import pyqtSlot, Qt
+from PyQt6.QtWidgets import QMessageBox, QFileDialog, QApplication
 
 from src.database.database_loader import DatabaseLoader
 from src.workers.database_worker import DatabaseGenerationWorker
@@ -58,6 +58,9 @@ class DatabaseMixin:
     # ── Генерація бази ────────────────────────────────────────────────────────
 
     def _start_database_generation(self, video_path: str, save_path: str):
+        from src.geometry.coordinates import CoordinateConverter
+        CoordinateConverter.reset()
+        
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
         self.control_panel.update_progress(0)
@@ -108,7 +111,11 @@ class DatabaseMixin:
 
         if self.database:
             self.database.close()
-        self.database = DatabaseLoader(db_path)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.database = DatabaseLoader(db_path)
+        finally:
+            QApplication.restoreOverrideCursor()
         self.control_panel.update_progress(100)
         self.control_panel.update_status("Базу успішно створено")
         self.status_bar.showMessage(f"Проєкт: {self.project_manager.project_name} | База: {db_path}")
@@ -156,6 +163,9 @@ class DatabaseMixin:
             QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
             return
 
+        from src.geometry.coordinates import CoordinateConverter
+        CoordinateConverter.reset()
+
         try:
             db_path = self.project_manager.database_path
             
@@ -179,7 +189,11 @@ class DatabaseMixin:
             if self.database:
                 self.database.close()
 
-            self.database = DatabaseLoader(db_path)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.database = DatabaseLoader(db_path)
+            finally:
+                QApplication.restoreOverrideCursor()
             self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
 
             # Оновити реєстр (завжди викликаємо register для збереження нових проєктів)

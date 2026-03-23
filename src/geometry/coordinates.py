@@ -17,6 +17,16 @@ class CoordinateConverter:
     _reference_gps = None
 
     @classmethod
+    def reset(cls):
+        """Скидає проєкцію при зміні проєкту/відеобази."""
+        with cls._lock:
+            cls._initialized = False
+            cls._reference_gps = None
+            cls._transformer_to_metric = None
+            cls._transformer_to_gps = None
+            logger.info("CoordinateConverter reset")
+
+    @classmethod
     def configure_projection(cls, mode: str, reference_gps: tuple = None):
         """
         Явне налаштування проєкції для проєкту.

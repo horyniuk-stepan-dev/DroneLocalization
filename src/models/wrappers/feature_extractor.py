@@ -9,10 +9,10 @@ logger = get_logger(__name__)
 
 
 class FeatureExtractor:
-    """Combined feature extraction (XFeat + DINOv2 [+ CESP])"""
+    """Combined feature extraction (ALIKED + DINOv2 [+ CESP])"""
 
     def __init__(self, local_model, global_model, device='cuda', config=None, cesp_module=None):
-        self.local_model = local_model  # Тепер тут очікується XFeat
+        self.local_model = local_model  # ALIKED
         self.global_model = global_model  # DINOv2
         self.device = device
         self.config = config or {}
@@ -20,7 +20,6 @@ class FeatureExtractor:
         self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
 
         # Трансформації для DINOv2 (ImageNet стандарти)
-        # 336×336 замість 224×224 — кратне 14 (patch size DINOv2), дає ~15% краще retrieval
         dino_size = self.config.get('dinov2', {}).get('input_size', 336)
         self.dino_size = dino_size
         self.dinov2_transform = T.Compose([
@@ -28,14 +27,14 @@ class FeatureExtractor:
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-        # FP16 mixed precision для прискорення GPU інференсу (~1.5-2x на GTX 1650)
+        # FP16 mixed precision для прискорення GPU інференсу
         self.use_fp16 = (device == 'cuda' and torch.cuda.is_available()
                          and self.config.get('performance', {}).get('fp16', True))
         if self.use_fp16:
             logger.info("FP16 mixed precision ENABLED for inference")
 
         cesp_status = "with CESP" if cesp_module is not None else "without CESP"
-        logger.info(f"FeatureExtractor initialized with XFeat and DINOv2 ({cesp_status}) on {device}")
+        logger.info(f"FeatureExtractor initialized with ALIKED and DINOv2 ({cesp_status}) on {device}")
 
     @torch.no_grad()
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
@@ -49,12 +48,12 @@ class FeatureExtractor:
             if self.use_fp16:
                 with torch.cuda.amp.autocast():
                     features = self.global_model.forward_features(dino_input)
-                    patch_tokens = features['x_norm_patchtokens'].float()  # (1, N, 1024)
+                    patch_tokens = features['x_norm_patchtokens'].float()
             else:
                 features = self.global_model.forward_features(dino_input)
                 patch_tokens = features['x_norm_patchtokens']
 
-            h_patches = self.dino_size // 14  # 336/14 = 24
+            h_patches = self.dino_size // 14
             w_patches = self.dino_size // 14
             global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
@@ -69,53 +68,28 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def extract_local_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
-        logger.debug(f"Extracting local features (XFeat) from image: {image.shape}")
+        logger.debug(f"Extracting local features (ALIKED) from image: {image.shape}")
 
         enhanced_image = self.preprocessor.preprocess(image)
 
-        # Підготовка зображення для XFeat
+        # Підготовка зображення для ALIKED (LightGlue format)
         rgb_tensor = torch.from_numpy(enhanced_image).float().div_(255.0)
         rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
 
-        # 1. Витягування локальних ознак через XFeat
-        base_top_k = self.config.get('localization', {}).get('xfeat_top_k', 2048)
-        img_area = image.shape[0] * image.shape[1]
-        adaptive_top_k = max(1024, min(3000, int(base_top_k * (img_area / (640 * 480)))))
+        # ALIKED очікує словник зі списком/тензором 'image'
+        input_dict = {'image': rgb_tensor}
 
-        # FP16 для XFeat (якщо увімкнено)
         if self.use_fp16:
             with torch.cuda.amp.autocast():
-                xfeat_out = self.local_model.detectAndCompute(rgb_tensor, top_k=adaptive_top_k)[0]
+                aliked_out = self.local_model(input_dict)
         else:
-            xfeat_out = self.local_model.detectAndCompute(rgb_tensor, top_k=adaptive_top_k)[0]
+            aliked_out = self.local_model(input_dict)
 
-        keypoints = xfeat_out['keypoints'].cpu().numpy()
-        descriptors = xfeat_out['descriptors'].cpu().numpy()
+        # LightGlue ALIKED wrapper повертає батч: (1, N, 2) та (1, N, 128)
+        keypoints = aliked_out['keypoints'][0].cpu().numpy()
+        descriptors = aliked_out['descriptors'][0].cpu().numpy()
 
-        # Bugfix (XFeat 0 points on portrait images): якщо XFeat повернув 0 точок для H > W,
-        # спробуємо отримати ознаки з паддінгом до квадрата.
-        if len(keypoints) == 0 and image.shape[0] > image.shape[1]:
-            logger.warning("XFeat returned 0 points for a portrait image, retrying with square padding...")
-            pad_w = image.shape[0] - image.shape[1]
-            padded_img = cv2.copyMakeBorder(enhanced_image, 0, 0, 0, pad_w, cv2.BORDER_REFLECT)
-            rgb_tensor_padded = torch.from_numpy(padded_img).float().div_(255.0).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            with torch.cuda.amp.autocast() if self.use_fp16 else torch.enable_grad(): # Use context conditional properly
-                pass
-            if self.use_fp16:
-                with torch.cuda.amp.autocast():
-                    xfeat_out_pad = self.local_model.detectAndCompute(rgb_tensor_padded, top_k=adaptive_top_k)[0]
-            else:
-                xfeat_out_pad = self.local_model.detectAndCompute(rgb_tensor_padded, top_k=adaptive_top_k)[0]
-            
-            # Фільтруємо точки, які потрапили на паддінг
-            kpts_pad = xfeat_out_pad['keypoints'].cpu().numpy()
-            desc_pad = xfeat_out_pad['descriptors'].cpu().numpy()
-            if len(kpts_pad) > 0:
-                valid_mask = kpts_pad[:, 0] < image.shape[1]
-                keypoints = kpts_pad[valid_mask]
-                descriptors = desc_pad[valid_mask]
-
-        # 2. Фільтрація точок за маскою динамічних об'єктів (YOLO)
+        # Фільтрація точок за маскою динамічних об'єктів (YOLO)
         if static_mask is not None and len(keypoints) > 0:
             # Vectorized YOLO mask filtering
             ix = np.round(keypoints[:, 0]).astype(np.intp)
@@ -142,5 +116,5 @@ class FeatureExtractor:
         global_desc = self.extract_global_descriptor(image)
         local_feats['global_desc'] = global_desc
         
-        logger.success(f"Extracted {len(local_feats['keypoints'])} XFeat keypoints, global DINOv2 desc dim {len(global_desc)}")
+        logger.success(f"Extracted {len(local_feats['keypoints'])} ALIKED keypoints, global DINOv2 desc dim {len(global_desc)}")
         return local_feats

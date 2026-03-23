@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import faiss
 
 from src.utils.logging_utils import get_logger
 
@@ -7,31 +8,43 @@ logger = get_logger(__name__)
 
 
 class FastRetrieval:
-    """Fast candidate search using DINOv2 global descriptors"""
+    """Fast candidate search using DINOv2 global descriptors (optimized with FAISS)"""
 
     def __init__(self, global_descriptors: np.ndarray):
-        logger.info(f"Initializing FastRetrieval with {len(global_descriptors)} descriptors")
-        self.global_descriptors = self.normalize_vectors(global_descriptors)
-        logger.success("FastRetrieval initialized and descriptors normalized")
+        logger.info(f"Initializing FastRetrieval with {len(global_descriptors)} descriptors using FAISS")
+        self.dim = global_descriptors.shape[1]
+        
+        # Inner Product index (для косинусної схожості нормалізованих векторів)
+        self.index = faiss.IndexFlatIP(self.dim)
+        
+        # Нормалізуємо і додаємо в індекс
+        normed = self.normalize_vectors(global_descriptors)
+        self.index.add(normed.astype(np.float32))
+        
+        logger.success(f"FAISS index built with {self.index.ntotal} vectors")
 
     @staticmethod
     def normalize_vectors(vectors: np.ndarray) -> np.ndarray:
-        logger.debug(f"Normalizing {len(vectors)} vectors")
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        normalized = vectors / (norms + 1e-8)
-        logger.debug("Vector normalization complete")
-        return normalized
+        return vectors / (norms + 1e-8)
 
     def find_similar_frames(self, query_desc: np.ndarray, top_k: int = 5) -> list:
-        logger.debug(f"Finding top-{top_k} similar frames...")
-
-        query_norm = query_desc / (np.linalg.norm(query_desc) + 1e-8)
-
-        # Матричне множення для швидкого пошуку косинусної схожості
-        similarities = np.dot(self.global_descriptors, query_norm.T).flatten()
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-
-        results = [(int(idx), float(similarities[idx])) for idx in top_indices]
+        # Підготовка запиту
+        q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
+        q = q.astype(np.float32)
+        
+        if q.ndim == 1:
+            q = q[None]
+            
+        # Пошук у FAISS
+        scores, ids = self.index.search(q, top_k)
+        
+        # Повертаємо список (id, score)
+        results = [
+            (int(idx), float(score)) 
+            for idx, score in zip(ids[0], scores[0]) 
+            if idx != -1
+        ]
         return results
 
 
@@ -43,13 +56,16 @@ class FeatureMatcher:
         self.model_manager = model_manager
         self.ratio_threshold = self.config.get('localization', {}).get('ratio_threshold', 0.95)
 
-        # Намагаємося завантажити LightGlue, якщо він потрібен
+        # Завантажуємо LightGlue (ALIKED) через ModelManager
         self.lightglue = None
-        if self.model_manager and 'lightglue' in self.model_manager.models:
-            self.lightglue = self.model_manager.models['lightglue']
-            logger.info("FeatureMatcher configured to use LightGlue (if descriptor dims match)")
+        if self.model_manager:
+            try:
+                self.lightglue = self.model_manager.load_lightglue_aliked()
+                logger.info("FeatureMatcher configured to use LightGlue (ALIKED)")
+            except Exception as e:
+                logger.warning(f"Failed to load LightGlue ALIKED: {e}. Falling back to Numpy L2.")
         else:
-            logger.info("FeatureMatcher configured to use fast Numpy L2 matching (ideal for XFeat)")
+            logger.info("FeatureMatcher configured to use fast Numpy L2 matching")
 
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         """
@@ -58,15 +74,11 @@ class FeatureMatcher:
         """
         desc_dim = query_features['descriptors'].shape[1] if len(query_features['descriptors']) > 0 else 0
 
-        # Якщо є LightGlue і розмірність дескриптора 256 (SuperPoint)
-        if self.lightglue is not None and desc_dim == 256:
+        # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED)
+        if self.lightglue is not None and desc_dim == 128:
             return self._lightglue_match(query_features, ref_features)
 
-        # ALIKED (128-dim) — Numpy L2 з суворішим ratio test
-        if desc_dim == 128:
-            return self._fast_numpy_match(query_features, ref_features, ratio_threshold=0.80)
-
-        # Для XFeat (64) або іншого — Numpy L2 з конфігурованим ratio
+        # Fallback (якщо немає LightGlue або інші ознаки)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def _fast_numpy_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80) -> tuple:

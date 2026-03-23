@@ -3,6 +3,20 @@
 # Єдиний конфіг для всього застосунку.
 # Залишені ключі, які реально використовуються поточним кодом.
 
+
+def get_cfg(config: dict, path: str, default=None):
+    """Централізований доступ до конфігу з dot-path.
+
+    Приклад: get_cfg(config, 'tracking.outlier_threshold_std', 25.0)
+    """
+    keys = path.split('.')
+    current = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
 APP_CONFIG = {
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -10,11 +24,19 @@ APP_CONFIG = {
     # Читають: DatabaseBuilder, FeatureExtractor, ModelManager
     # ══════════════════════════════════════════════════════════════════════════
     'dinov2': {
-        # Має збігатися з моделлю у models.dinov2.hub_model
         'descriptor_dim': 1024,
-
-        # FeatureExtractor resize перед DINOv2
         'input_size': 336,
+    },
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # База даних — DatabaseBuilder
+    # ══════════════════════════════════════════════════════════════════════════
+    'database': {
+        'frame_step': 3,
+        'prefetch_queue_size': 32,
+        'keypoint_video_scale': 0.5,
+        'inter_frame_min_matches': 15,
+        'inter_frame_ransac_thresh': 3.0,
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -23,18 +45,23 @@ APP_CONFIG = {
     'localization': {
         'min_matches': 12,
         'min_inliers_accept': 10,
-        'ratio_threshold': 0.85, # Більш строгий ratio test для XFeat
+        'ratio_threshold': 0.85,
         'ransac_threshold': 3.0,
         'retrieval_top_k': 12,
         'early_stop_inliers': 40,
         'retrieval_only_min_score': 0.90,
-
-        # Перебір 0 / 90 / 180 / 270
         'auto_rotation': True,
-
-        # Fallback при слабкому XFeat: 'aliked' (рекомендовано) або 'superpoint' (legacy)
         'enable_lightglue_fallback': True,
-        'fallback_extractor': 'aliked',  # 'aliked' | 'superpoint'
+        'fallback_extractor': 'aliked',
+
+        # Налаштування впевненості (Fix 8)
+        'confidence': {
+            'inlier_weight': 0.7,
+            'stability_weight': 0.3,
+            'rmse_norm_m': 10.0,
+            'disagreement_norm_m': 5.0,
+            'confidence_max_inliers': 80,
+        }
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -48,7 +75,7 @@ APP_CONFIG = {
         'outlier_window': 10,
 
         'outlier_threshold_std': 25.0,
-        'max_speed_mps': 200.0,
+        'max_speed_mps': 40.0,
         'process_fps': 1.0,
     },
 
@@ -112,15 +139,24 @@ APP_CONFIG = {
             'vram_required_mb': 1600.0,
         },
 
+        # EXPERIMENTAL: CESP (Cross-Enhancement Spatial Pyramid) для DINOv2.
+        # Потребує навчених ваг (weights_path) для production use.
+        # Без ваг використовує random projection — не впливає на якість.
+        # load_cesp() реалізовано в ModelManager, інтеграція — у FeatureExtractor.
         'cesp': {
-            'enabled': False,        # Вмикається після навчання ваг
-            'weights_path': None,    # Шлях до .pt файлу з натренованими вагами
-            'scales': [1, 2, 4],     # Масштаби піраміди
+            'enabled': False,
+            'weights_path': None,
+            'scales': [1, 2, 4],
         },
 
         'vram_management': {
             'max_vram_ratio': 0.8,
             'default_required_mb': 2000.0,
+        },
+
+        'performance': {
+            'propagation_max_workers': 4,
+            'fp16_enabled': True,
         },
     },
     'projection': {
@@ -132,6 +168,6 @@ APP_CONFIG = {
         'propagation_disagreement_threshold_m': 2.0,
         'localizer_sample_points': 9,  # 3x3 grid
         'localizer_expected_spread_m': 150.0, # Очікуваний розмах для дрона на 100-150м
-        'confidence_max_inliers': 80,
+        # confidence_max_inliers — єдине визначення в localization.confidence
     },
 }

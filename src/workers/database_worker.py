@@ -33,7 +33,11 @@ class DatabaseGenerationWorker(QThread):
             self.progress.emit(0, "Ініціалізація бази даних (XFeat + DINOv2)...")
             logger.info("Initializing database builder...")
 
-            builder = DatabaseBuilder(self.output_path, self.config)
+            builder = DatabaseBuilder(
+                output_path=self.output_path,
+                matcher=None,  # Will be initialized inside builder if needed
+                config=self.config
+            )
 
             def update_progress(percent: int):
                 if not self._is_running:

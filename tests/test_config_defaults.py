@@ -4,8 +4,8 @@ from config.config import APP_CONFIG
 def test_config_structure():
     """Verify that the APP_CONFIG dictionary has all required main sections."""
     required_sections = [
-        'dinov2', 'lightglue', 'localization', 
-        'tracking', 'preprocessing', 'gui'
+        'dinov2', 'models', 'localization', 
+        'tracking', 'preprocessing', 'gui', 'projection'
     ]
     for section in required_sections:
         assert section in APP_CONFIG, f"Missing section: {section}"

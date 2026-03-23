@@ -34,6 +34,10 @@ class RealtimeTrackingWorker(QThread):
         self.process_fps = self.config.get('tracking', {}).get('process_fps', 1.0)
 
     def run(self):
+        # Fix 6: Pre-warm fallback моделей при старті трекінгу
+        import threading
+        threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
+
         logger.info(f"Starting tracking from source: {self.video_source}")
 
         yolo_wrapper = None
@@ -140,6 +144,26 @@ class RealtimeTrackingWorker(QThread):
 
         cap.release()
         logger.info("Tracking worker thread finished cleanly.")
+
+    def _prewarm_fallback_models(self):
+        """Завантажує важкі моделі фоллбеку заздалегідь."""
+        try:
+            if not self.model_manager:
+                return
+            
+            fallback = self.config.get('localization', {}).get('fallback_extractor', 'aliked')
+            logger.info(f"Pre-warming fallback models ({fallback})...")
+            
+            if fallback == 'aliked':
+                self.model_manager.load_aliked()
+                self.model_manager.load_lightglue_aliked()
+            else:
+                self.model_manager.load_superpoint()
+                self.model_manager.load_lightglue()
+            
+            logger.success("Fallback models pre-warmed successfully")
+        except Exception as e:
+            logger.warning(f"Fallback pre-warm failed: {e}")
 
     def stop(self):
         logger.info("Stopping tracking worker...")

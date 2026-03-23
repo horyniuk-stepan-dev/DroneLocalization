@@ -93,3 +93,7 @@ scripts/data/models/depth_anything_vitl14.pth
 ./scripts/allFiles/*
 all_merged.py
 scripts/allFiles/all_merged_old.py
+diff_utf8.txt
+diff.txt
+map_diff_utf8.txt
+map_diff.txt

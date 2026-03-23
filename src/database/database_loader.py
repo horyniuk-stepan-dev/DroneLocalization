@@ -1,6 +1,5 @@
 import h5py
 import numpy as np
-from functools import lru_cache
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -24,6 +23,11 @@ class DatabaseLoader:
         self.frame_rmse = None      # (N,)      — RMSE кожного кадру
         self.frame_disagreement = None # (N,)   — Розбіжність між гілками
         self.frame_matches = None   # (N,)      — Кількість точок (inliers)
+        
+        # Кешування
+        self._feature_cache: dict[int, dict] = {}
+        self._size_cache: dict[int, tuple[int, int]] = {}
+        self._cache_max_size = 200
 
         logger.info(f"Initializing DatabaseLoader with path: {db_path}")
         self._load_hot_data()
@@ -137,32 +141,49 @@ class DatabaseLoader:
         """
         return None
 
-    @lru_cache(maxsize=100)
     def get_frame_size(self, frame_id: int) -> tuple[int, int]:
         """Повертає (height, width) для вказаного кадру"""
+        if frame_id in self._size_cache:
+            return self._size_cache[frame_id]
+
         group_name = f'local_features/frame_{frame_id}'
+        h, w = 1080, 1920
         if group_name in self.db_file:
             g = self.db_file[group_name]
             if 'height' in g.attrs and 'width' in g.attrs:
-                return int(g.attrs['height']), int(g.attrs['width'])
+                h, w = int(g.attrs['height']), int(g.attrs['width'])
+            else:
+                # Fallback до загальних метаданих або стандартних значень
+                h = self.metadata.get('frame_height') or self.metadata.get('height') or 1080
+                w = self.metadata.get('frame_width') or self.metadata.get('width') or 1920
         
-        # Fallback до загальних метаданих або стандартних значень
-        h = self.metadata.get('frame_height') or self.metadata.get('height') or 1080
-        w = self.metadata.get('frame_width') or self.metadata.get('width') or 1920
+        if len(self._size_cache) >= self._cache_max_size:
+            self._size_cache.pop(next(iter(self._size_cache)))
+        self._size_cache[frame_id] = (int(h), int(w))
         return int(h), int(w)
 
-    @lru_cache(maxsize=100)
     def get_local_features(self, frame_id: int) -> dict:
         """Повертає локальні ознаки XFeat для вказаного кадру"""
+        if frame_id in self._feature_cache:
+            return self._feature_cache[frame_id]
+
         group_name = f'local_features/frame_{frame_id}'
         if group_name not in self.db_file:
             raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
         g = self.db_file[group_name]
-        return {
+        
+        result = {
             'keypoints': g['keypoints'][:],
             'descriptors': g['descriptors'][:],
             'coords_2d': g['coords_2d'][:]
         }
+
+        if len(self._feature_cache) >= self._cache_max_size:
+            # Видаляємо найстаріший запис (FIFO)
+            self._feature_cache.pop(next(iter(self._feature_cache)))
+        
+        self._feature_cache[frame_id] = result
+        return result
 
     def get_num_frames(self) -> int:
         return int(self.metadata.get('num_frames', 0))

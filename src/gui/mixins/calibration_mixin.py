@@ -325,11 +325,24 @@ class CalibrationMixin:
             valid_mask = getattr(self.database, 'frame_valid', None)
             
             points_to_show = []
+            _diag_done = False
             for i in range(0, num_frames, step):
                 affine = self.database.get_frame_affine(i)
                 if affine is not None:
                     w = self.database.metadata.get('frame_width', 1920)
                     h = self.database.metadata.get('frame_height', 1080)
+
+                    # ДІАГНОСТИКА: лише для першого кадру
+                    if not _diag_done:
+                        _diag_done = True
+                        logger.warning(f"=== VERIFY DIAG frame={i} ===")
+                        logger.warning(f"  frame_width={w}, frame_height={h}")
+                        logger.warning(f"  affine=\n{affine}")
+                        for lbl, px, py in [("corner0", 0, 0), ("center", w/2, h/2), ("corner2", w, h)]:
+                            mx_d = affine[0,0]*px + affine[0,1]*py + affine[0,2]
+                            my_d = affine[1,0]*px + affine[1,1]*py + affine[1,2]
+                            lat_d, lon_d = CoordinateConverter.metric_to_gps(mx_d, my_d)
+                            logger.warning(f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})")
                     
                     # 1. Центр кадру
                     mx, my = affine[0, 0]*(w/2) + affine[0, 1]*(h/2) + affine[0, 2], affine[1, 0]*(w/2) + affine[1, 1]*(h/2) + affine[1, 2]
@@ -353,7 +366,16 @@ class CalibrationMixin:
                     elif rmse > 2.0 or dis > 3.0: color = "orange"
                     
                     # 3. Крайні точки (для візуалізації перекосу/масштабу)
-                    pts_px = [(0, 0), (w, 0), (w, h), (0, h)]
+                    # МАЛЮЄМО НЕ ВЕСЬ КАДР (1920x1080 - це величезна площа на карті!),
+                    # а лише центральні 20% екрану, щоб прямокутник на карті не здавався гіпер-великим.
+                    cx_px, cy_px = w / 2, h / 2
+                    dw, dh = w * 0.1, h * 0.1 # 10% в кожну сторону від центру
+                    pts_px = [
+                        (cx_px - dw, cy_px - dh), 
+                        (cx_px + dw, cy_px - dh), 
+                        (cx_px + dw, cy_px + dh), 
+                        (cx_px - dw, cy_px + dh)
+                    ]
                     for idx_p, (px, py) in enumerate(pts_px):
                         mx_p, my_p = affine[0, 0]*px + affine[0, 1]*py + affine[0, 2], affine[1, 0]*px + affine[1, 1]*py + affine[1, 2]
                         lat_p, lon_p = CoordinateConverter.metric_to_gps(mx_p, my_p)

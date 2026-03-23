@@ -99,20 +99,35 @@ class CalibrationPropagationWorker(QThread):
         segments = self._build_segments(anchors, num_frames)
         total_segments = len(segments)
 
-        for seg_idx, segment in enumerate(segments):
-            if not self._is_running:
-                return
+        # Fix 7: Паралельна propagation по незалежних сегментах
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        between_segments = [s for s in segments if s['type'] == 'between']
+        tail_segments = [s for s in segments if s['type'] == 'tail']
+
+        logger.info(f"Parallel processing of {len(between_segments)} segments...")
+        max_workers = self.config.get('models', {}).get('performance', {}).get('propagation_max_workers', 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._process_segment, seg, anchor_features, frame_affine, frame_valid,
+                    frame_rmse, frame_disagreement, frame_matches, i, total_segments, num_frames
+                ): seg for i, seg in enumerate(between_segments)
+            }
+            for future in as_completed(futures):
+                if not self._is_running: break
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Segment processing failed: {e}")
+
+        # Хвости зазвичай дешевші і можуть бути послідовними або теж паралельними
+        for i, seg in enumerate(tail_segments):
+            if not self._is_running: break
             self._process_segment(
-                segment=segment,
-                anchor_features=anchor_features,
-                frame_affine=frame_affine,
-                frame_valid=frame_valid,
-                frame_rmse=frame_rmse,
-                frame_disagreement=frame_disagreement,
-                frame_matches=frame_matches,
-                seg_idx=seg_idx,
-                total_segments=total_segments,
-                num_frames=num_frames
+                seg, anchor_features, frame_affine, frame_valid,
+                frame_rmse, frame_disagreement, frame_matches, 
+                len(between_segments) + i, total_segments, num_frames
             )
 
         valid_count = int(np.sum(frame_valid))
@@ -147,6 +162,18 @@ class CalibrationPropagationWorker(QThread):
                 'frames': list(range(anchors[-1].frame_id + 1, num_frames)),
                 'anchor': anchors[-1]
             })
+
+        # Валідація: сегменти НЕ повинні перетинатися — це гарантує
+        # thread-safety при паралельному записі в numpy-масиви через ThreadPoolExecutor
+        all_frame_ids = set()
+        for seg in segments:
+            seg_frames = set(seg['frames'])
+            overlap = all_frame_ids & seg_frames
+            assert not overlap, (
+                f"CRITICAL: Segment overlap detected on frames {overlap}! "
+                f"This would cause race conditions in ThreadPoolExecutor."
+            )
+            all_frame_ids |= seg_frames
 
         return segments
 
@@ -250,57 +277,58 @@ class CalibrationPropagationWorker(QThread):
                         frame_matches[frame_id] = info['matches']
 
     def _build_homography_chain(self, frames, anchor, anchor_feat):
-        result = {}
+        """
+        Fix 4: Використання збережених frame_poses для миттєвої пропагації.
+        O(1) замість O(N) GPU-викликів матчингу.
+        """
+        result = {anchor.frame_id: {'H': np.eye(3, dtype=np.float32), 'matches': 100}}
         anchor_id = anchor.frame_id
         
-        # Спроба отримати початкову інверсну позу
-        inv_pose_anchor = None
         try:
             pose_anchor = self.database.frame_poses[anchor_id].astype(np.float64)
             if np.abs(np.linalg.det(pose_anchor)) > 1e-9:
                 inv_pose_anchor = np.linalg.inv(pose_anchor)
-        except (IndexError, np.linalg.LinAlgError, AttributeError):
-            pass
+                
+                for frame_id in frames:
+                    if not self._is_running: break
+                    try:
+                        pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
+                        # H від frame до anchor через збережені pose-ланцюги
+                        H = (inv_pose_anchor @ pose_frame).astype(np.float32)
+                        result[frame_id] = {'H': H, 'matches': 50}  # 50 = estimated
+                    except Exception:
+                        continue
+                return result
+        except Exception as e:
+            logger.warning(f"Failed to use saved poses for anchor {anchor_id}, falling back to visual: {e}")
 
-        if inv_pose_anchor is not None:
-            # Використання попередньо обчислених поз з бази
-            for frame_id in frames:
-                if not self._is_running: break
-                try:
-                    pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
-                    H = inv_pose_anchor @ pose_frame
-                    # При використанні готових поз ми не знаємо кількість матчів, ставимо константу
-                    result[frame_id] = {'H': H.astype(np.float32), 'matches': 100}
-                except (IndexError, np.linalg.LinAlgError):
-                    continue
-        else:
-            # Візуальна пропагація (якщо поз немає)
-            h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
-            matches_cache = {anchor_id: 100}
-            prev_features = anchor_feat
-            prev_frame_id = anchor_id
+        # Fallback до візуальної пропагації (тільки якщо поз немає)
+        h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
+        matches_cache = {anchor_id: 100}
+        prev_features = anchor_feat
+        prev_frame_id = anchor_id
 
-            for frame_id in frames:
-                if not self._is_running: break
-                try:
-                    curr_features = self._all_features.get(frame_id)
-                    if curr_features is None: continue
-                    
-                    res = self._match_pair_with_count(curr_features, prev_features)
-                    if res is None: continue
-                    H_curr_to_prev, n_matches = res
+        for frame_id in frames:
+            if not self._is_running: break
+            try:
+                curr_features = self._all_features.get(frame_id)
+                if curr_features is None: continue
+                
+                res = self._match_pair_with_count(curr_features, prev_features)
+                if res is None: continue
+                H_curr_to_prev, n_matches = res
 
-                    H_prev_to_anchor = h_cache[prev_frame_id]
-                    H_curr_to_anchor = (H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)).astype(np.float32)
+                H_prev_to_anchor = h_cache[prev_frame_id]
+                H_curr_to_anchor = (H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)).astype(np.float32)
 
-                    h_cache[frame_id] = H_curr_to_anchor
-                    matches_cache[frame_id] = n_matches
-                    result[frame_id] = {'H': H_curr_to_anchor, 'matches': n_matches}
+                h_cache[frame_id] = H_curr_to_anchor
+                matches_cache[frame_id] = n_matches
+                result[frame_id] = {'H': H_curr_to_anchor, 'matches': n_matches}
 
-                    prev_features = curr_features
-                    prev_frame_id = frame_id
-                except Exception:
-                    continue
+                prev_features = curr_features
+                prev_frame_id = frame_id
+            except Exception:
+                continue
         return result
 
     def _match_pair_with_count(self, features_a: dict, features_b: dict) -> tuple | None:
@@ -351,4 +379,4 @@ class CalibrationPropagationWorker(QThread):
             logger.success(f"Successful propagation saved to HDF5 (rev 2.1, {len(anchors)} anchors)")
         finally:
             self.database._load_hot_data()
-
+
