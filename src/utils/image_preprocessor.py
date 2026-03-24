@@ -1,16 +1,18 @@
 import cv2
 import numpy as np
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
 
 class ImagePreprocessor:
     def __init__(self, config=None):
         self.config = config or {}
         # Ініціалізуємо алгоритм локального контрасту CLAHE
         # clipLimit=3.0 дає сильне витягування тіней, tileGridSize=(8,8) - розмір блоку
-        clip = self.config.get('preprocessing', {}).get('clahe_clip_limit', 3.0)
-        tile_cfg = self.config.get('preprocessing', {}).get('clahe_tile_grid', [8, 8])
+        clip = self.config.get("preprocessing", {}).get("clahe_clip_limit", 3.0)
+        tile_cfg = self.config.get("preprocessing", {}).get("clahe_tile_grid", [8, 8])
         # Підтримуємо і список [8, 8] і число 8
         tile = tuple(tile_cfg) if isinstance(tile_cfg, list) else (tile_cfg, tile_cfg)
         self.clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tile)

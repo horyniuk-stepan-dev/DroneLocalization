@@ -1,4 +1,5 @@
-﻿"""Tests for GUI components"""
+"""Tests for GUI components"""
+
 
 def test_main_window_creation():
     """Test main window can be created"""

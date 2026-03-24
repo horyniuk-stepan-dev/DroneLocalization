@@ -1,10 +1,11 @@
-import cv2
 import sys
 from pathlib import Path
 
+import cv2
+
 # Додаємо шлях до нашого проекту
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from src.utils.logging_utils import setup_logging, get_logger
+from src.utils.logging_utils import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("PanoramaBuilder")
@@ -55,11 +56,13 @@ def create_panorama_from_video(video_path, output_path, frame_step=30):
         errors = {
             cv2.Stitcher_ERR_NEED_MORE_IMGS: "Потрібно більше зображень (або більше перекриття між ними).",
             cv2.Stitcher_ERR_HOMOGRAPHY_EST_FAIL: "Не вдалося розрахувати гомографію (замало спільних точок).",
-            cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL: "Не вдалося налаштувати параметри камери."
+            cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL: "Не вдалося налаштувати параметри камери.",
         }
         err_msg = errors.get(status, f"Невідома помилка (код {status})")
         logger.error(f"Помилка зшивання: {err_msg}")
-        logger.warning("Спробуйте змінити параметр frame_step (наприклад, зробити його меншим: 15 або 20).")
+        logger.warning(
+            "Спробуйте змінити параметр frame_step (наприклад, зробити його меншим: 15 або 20)."
+        )
 
 
 if __name__ == "__main__":

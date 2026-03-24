@@ -1,14 +1,21 @@
-import os
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
-from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QListWidget, QListWidgetItem, QFileDialog, QLineEdit,
-    QMessageBox, QGroupBox,
-)
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from src.core.project_registry import ProjectRegistry
 from src.utils.logging_utils import get_logger
@@ -100,13 +107,13 @@ class OpenProjectDialog(QDialog):
         projects = self.registry.get_recent(limit=50)
 
         for proj in projects:
-            name = proj.get('name', 'Без назви')
+            name = proj.get("name", "Без назви")
             if filter_text and filter_text.lower() not in name.lower():
                 continue
 
             # Статус-іконки
-            has_db = proj.get('has_database', False)
-            has_cal = proj.get('has_calibration', False)
+            has_db = proj.get("has_database", False)
+            has_cal = proj.get("has_calibration", False)
             status = ""
             if has_db and has_cal:
                 status = "✅"
@@ -116,7 +123,7 @@ class OpenProjectDialog(QDialog):
                 status = "❌ без бази"
 
             # Формат дати
-            last = proj.get('last_opened', '')
+            last = proj.get("last_opened", "")
             try:
                 dt = datetime.fromisoformat(last)
                 date_str = dt.strftime("%d.%m.%Y %H:%M")
@@ -128,7 +135,7 @@ class OpenProjectDialog(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, proj)
 
             # Позначаємо недоступні проєкти
-            if not Path(proj['path']).is_dir():
+            if not Path(proj["path"]).is_dir():
                 item.setForeground(QColor("#aaa"))
                 item.setToolTip("⚠ Папка проєкту не знайдена")
 
@@ -160,9 +167,9 @@ class OpenProjectDialog(QDialog):
         self.btn_remove.setEnabled(True)
 
         # Preview
-        path = proj.get('path', '')
-        video = proj.get('video_path', '—')
-        created = proj.get('created_at', '—')
+        path = proj.get("path", "")
+        video = proj.get("video_path", "—")
+        created = proj.get("created_at", "—")
         try:
             created = datetime.fromisoformat(created).strftime("%d.%m.%Y %H:%M")
         except (ValueError, TypeError):
@@ -185,8 +192,8 @@ class OpenProjectDialog(QDialog):
 
     def _on_double_click(self, item: QListWidgetItem):
         proj = item.data(Qt.ItemDataRole.UserRole)
-        if proj and Path(proj['path']).is_dir():
-            self.selected_path = proj['path']
+        if proj and Path(proj["path"]).is_dir():
+            self.selected_path = proj["path"]
             self.accept()
 
     def _on_open(self):
@@ -194,10 +201,12 @@ class OpenProjectDialog(QDialog):
         if current:
             proj = current.data(Qt.ItemDataRole.UserRole)
             if proj:
-                if not Path(proj['path']).is_dir():
-                    QMessageBox.warning(self, "Помилка", f"Папка проєкту не знайдена:\n{proj['path']}")
+                if not Path(proj["path"]).is_dir():
+                    QMessageBox.warning(
+                        self, "Помилка", f"Папка проєкту не знайдена:\n{proj['path']}"
+                    )
                     return
-                self.selected_path = proj['path']
+                self.selected_path = proj["path"]
                 self.accept()
 
     def _on_browse(self):
@@ -215,13 +224,13 @@ class OpenProjectDialog(QDialog):
             return
 
         reply = QMessageBox.question(
-            self, "Підтвердження",
-            f"Видалити «{proj['name']}» зі списку?\n\n"
-            f"Файли проєкту НЕ будуть видалені.",
+            self,
+            "Підтвердження",
+            f"Видалити «{proj['name']}» зі списку?\n\nФайли проєкту НЕ будуть видалені.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.registry.unregister(proj['path'])
+            self.registry.unregister(proj["path"])
             self._populate_list(self.search_input.text())
 
     def get_selected_path(self) -> str | None:

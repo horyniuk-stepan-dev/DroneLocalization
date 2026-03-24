@@ -1,6 +1,6 @@
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap, QPen, QColor, QBrush, QPainter
+from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
+from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
 from src.utils.logging_utils import get_logger
 
@@ -10,7 +10,7 @@ logger = get_logger(__name__)
 class VideoWidget(QGraphicsView):
     """Displays video frames with optional overlay annotations (calibration points)."""
 
-    frame_clicked = pyqtSignal(int, int)   # pixel coords in image space
+    frame_clicked = pyqtSignal(int, int)  # pixel coords in image space
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -23,7 +23,7 @@ class VideoWidget(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor(0, 0, 0)))
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        self._video_item    = QGraphicsPixmapItem()
+        self._video_item = QGraphicsPixmapItem()
         self._overlay_items: list = []
         self._scene.addItem(self._video_item)
 
@@ -48,8 +48,8 @@ class VideoWidget(QGraphicsView):
         dpr = self._dpr()
         lx, ly = x / dpr, y / dpr
 
-        pen    = QPen(color, 2)
-        brush  = QBrush(color)
+        pen = QPen(color, 2)
+        brush = QBrush(color)
         radius = 8
 
         ellipse = self._scene.addEllipse(
@@ -73,7 +73,7 @@ class VideoWidget(QGraphicsView):
     def clear_overlays(self):
         for item in self._overlay_items:
             self._scene.removeItem(item)
-            item.setParentItem(None)   # break Qt ownership before Python GC
+            item.setParentItem(None)  # break Qt ownership before Python GC
         self._overlay_items.clear()
 
     # ── Events ───────────────────────────────────────────────────────────────

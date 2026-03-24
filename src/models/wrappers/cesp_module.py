@@ -5,13 +5,13 @@ import torch.nn.functional as F
 
 class CESP(nn.Module):
     """Cross-Enhancement Spatial Pyramid для DINOv2 patch tokens.
-    
+
     IEEE RA-L 2025: "DINOv2-based UAV Visual Self-localization"
     Покращує multi-scale сприйняття для aerial imagery.
-    
+
     Вхід: patch_tokens (B, N, D) з DINOv2
     Вихід: enhanced_descriptor (B, D) — L2-нормалізований
-    
+
     Примітка: потребує навчання на парах UAV↔satellite зображень.
     Без навчених ваг повертає усереднення multi-scale features (random projection).
     """
@@ -22,9 +22,7 @@ class CESP(nn.Module):
         self.scales = scales
 
         # Проекційні шари для кожного масштабу піраміди
-        self.projectors = nn.ModuleList([
-            nn.Linear(dim, dim) for _ in scales
-        ])
+        self.projectors = nn.ModuleList([nn.Linear(dim, dim) for _ in scales])
 
         # Фінальне злиття (N_scales * dim → dim)
         self.fusion = nn.Sequential(
@@ -55,12 +53,12 @@ class CESP(nn.Module):
             else:
                 # Spatial Pyramid: розбити на scale×scale регіонів → усереднити
                 pooled = F.adaptive_avg_pool2d(x, scale)  # (B, D, scale, scale)
-                pooled = pooled.flatten(2).mean(dim=2)     # (B, D)
+                pooled = pooled.flatten(2).mean(dim=2)  # (B, D)
             scale_features.append(proj(pooled))
 
         # Cross-Enhancement: конкатенація + fusion
         multi_scale = torch.cat(scale_features, dim=1)  # (B, N_scales*D)
-        enhanced = self.fusion(multi_scale)              # (B, D)
-        enhanced = F.normalize(enhanced, p=2, dim=1)     # L2 нормалізація
+        enhanced = self.fusion(multi_scale)  # (B, D)
+        enhanced = F.normalize(enhanced, p=2, dim=1)  # L2 нормалізація
 
         return enhanced

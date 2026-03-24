@@ -1,4 +1,5 @@
-﻿"""Tests for model wrappers"""
+"""Tests for model wrappers"""
+
 
 def test_yolo_wrapper():
     """Test YOLO wrapper"""

@@ -1,6 +1,6 @@
-﻿import numpy as np
-from filterpy.kalman import KalmanFilter
+import numpy as np
 from filterpy.common import Q_discrete_white_noise
+from filterpy.kalman import KalmanFilter
 
 from src.utils.logging_utils import get_logger
 
@@ -20,26 +20,19 @@ class TrajectoryFilter:
         self.is_initialized = False
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
-        logger.info(f"Parameters: process_noise={process_noise}, measurement_noise={measurement_noise}, dt={dt}")
+        logger.info(
+            f"Parameters: process_noise={process_noise}, measurement_noise={measurement_noise}, dt={dt}"
+        )
 
         self.kf.P *= 1000.0
 
-        self.kf.F = np.array([
-            [1.0, 0.0, dt, 0.0],
-            [0.0, 1.0, 0.0, dt],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0]
-        ])
+        self.kf.F = np.array(
+            [[1.0, 0.0, dt, 0.0], [0.0, 1.0, 0.0, dt], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        )
 
-        self.kf.H = np.array([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0]
-        ])
+        self.kf.H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
 
-        self.kf.R = np.array([
-            [measurement_noise, 0.0],
-            [0.0, measurement_noise]
-        ])
+        self.kf.R = np.array([[measurement_noise, 0.0], [0.0, measurement_noise]])
 
         self._update_matrices_for_dt(dt)
 

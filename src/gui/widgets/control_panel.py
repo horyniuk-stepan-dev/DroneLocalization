@@ -1,8 +1,12 @@
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QPushButton, QLabel,
-    QProgressBar, QGroupBox,
+    QGroupBox,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import pyqtSignal, Qt
 
 from src.utils.logging_utils import get_logger
 
@@ -12,25 +16,25 @@ logger = get_logger(__name__)
 class ControlPanel(QWidget):
     """Mission control sidebar — emits signals, holds no business logic."""
 
-    new_mission_clicked      = pyqtSignal()
-    load_database_clicked    = pyqtSignal()
+    new_mission_clicked = pyqtSignal()
+    load_database_clicked = pyqtSignal()
     rebuild_database_clicked = pyqtSignal()
-    start_tracking_clicked   = pyqtSignal()
-    stop_tracking_clicked    = pyqtSignal()
-    calibrate_clicked        = pyqtSignal()
+    start_tracking_clicked = pyqtSignal()
+    stop_tracking_clicked = pyqtSignal()
+    calibrate_clicked = pyqtSignal()
     load_calibration_clicked = pyqtSignal()
-    localize_image_clicked   = pyqtSignal()
+    localize_image_clicked = pyqtSignal()
     generate_panorama_clicked = pyqtSignal()
-    show_panorama_clicked    = pyqtSignal()
-    export_results_clicked   = pyqtSignal()
+    show_panorama_clicked = pyqtSignal()
+    export_results_clicked = pyqtSignal()
     verify_propagation_clicked = pyqtSignal()
-    clear_map_clicked        = pyqtSignal()
+    clear_map_clicked = pyqtSignal()
     stop_db_generation_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._init_ui()
-        self.set_tracking_enabled(True)   # correct initial state on startup
+        self.set_tracking_enabled(True)  # correct initial state on startup
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
@@ -39,16 +43,16 @@ class ControlPanel(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         # Project group
-        db_group  = QGroupBox("Управління проєктом")
+        db_group = QGroupBox("Управління проєктом")
         db_layout = QVBoxLayout(db_group)
 
         self.btn_new_mission = QPushButton("Створити новий проєкт")
-        self.btn_load_db     = QPushButton("Відкрити проєкт")
-        self.btn_rebuild_db  = QPushButton("🔄 Перегенерувати базу")
+        self.btn_load_db = QPushButton("Відкрити проєкт")
+        self.btn_rebuild_db = QPushButton("🔄 Перегенерувати базу")
         self.btn_rebuild_db.setToolTip("Перебудовує базу даних з оригінального відео проєкту")
         self.btn_rebuild_db.setEnabled(False)
-        self.btn_gen_pano    = QPushButton("Згенерувати панораму з відео")
-        self.btn_show_pano   = QPushButton("Накласти панораму на карту")
+        self.btn_gen_pano = QPushButton("Згенерувати панораму з відео")
+        self.btn_show_pano = QPushButton("Накласти панораму на карту")
 
         self.btn_new_mission.clicked.connect(self.new_mission_clicked)
         self.btn_load_db.clicked.connect(self.load_database_clicked)
@@ -63,18 +67,26 @@ class ControlPanel(QWidget):
         self.btn_stop_db.setVisible(False)
         self.btn_stop_db.clicked.connect(self.stop_db_generation_clicked)
 
-        for btn in [self.btn_new_mission, self.btn_load_db, self.btn_rebuild_db,
-                    self.btn_gen_pano, self.btn_show_pano, self.btn_stop_db]:
+        for btn in [
+            self.btn_new_mission,
+            self.btn_load_db,
+            self.btn_rebuild_db,
+            self.btn_gen_pano,
+            self.btn_show_pano,
+            self.btn_stop_db,
+        ]:
             db_layout.addWidget(btn)
 
         # Calibration group
-        calib_group  = QGroupBox("Калібрування GPS")
+        calib_group = QGroupBox("Калібрування GPS")
         calib_layout = QVBoxLayout(calib_group)
 
-        self.btn_calibrate       = QPushButton("Виконати калібрування (Video → Map)")
-        self.btn_load_calibrate  = QPushButton("Завантажити калібрування (JSON)")
+        self.btn_calibrate = QPushButton("Виконати калібрування (Video → Map)")
+        self.btn_load_calibrate = QPushButton("Завантажити калібрування (JSON)")
         self.btn_verify_propagation = QPushButton("🔍 Перевірити пропагацію на карті")
-        self.btn_verify_propagation.setToolTip("Відображає центри всіх кадрів з обчисленими координатами на карті")
+        self.btn_verify_propagation.setToolTip(
+            "Відображає центри всіх кадрів з обчисленими координатами на карті"
+        )
         self.btn_clear_map = QPushButton("🗑 Очистити карту")
         self.btn_clear_map.setToolTip("Видалити траєкторію, панораму та маркери з карти")
 
@@ -89,7 +101,7 @@ class ControlPanel(QWidget):
         calib_layout.addWidget(self.btn_clear_map)
 
         # Localization group
-        track_group  = QGroupBox("Локалізація")
+        track_group = QGroupBox("Локалізація")
         track_layout = QVBoxLayout(track_group)
 
         self.btn_start_tracking = QPushButton("▶  Почати відстеження")
@@ -127,7 +139,7 @@ class ControlPanel(QWidget):
         info_layout.addWidget(self.lbl_project_info)
 
         # Status group
-        status_group  = QGroupBox("Статус системи")
+        status_group = QGroupBox("Статус системи")
         status_layout = QVBoxLayout(status_group)
 
         self.lbl_status = QLabel("Очікування команди...")
@@ -142,7 +154,14 @@ class ControlPanel(QWidget):
         status_layout.addWidget(self.lbl_status)
         status_layout.addWidget(self.progress_bar)
 
-        for group in [db_group, calib_group, track_group, export_group, self.info_group, status_group]:
+        for group in [
+            db_group,
+            calib_group,
+            track_group,
+            export_group,
+            self.info_group,
+            status_group,
+        ]:
             layout.addWidget(group)
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -170,15 +189,29 @@ class ControlPanel(QWidget):
         self.btn_stop_tracking.setEnabled(not enabled)
 
         # Disable DB/calibration ops during tracking to prevent GPU OOM
-        for btn in [self.btn_new_mission, self.btn_load_db, self.btn_rebuild_db,
-                    self.btn_calibrate, self.btn_load_calibrate, self.btn_verify_propagation,
-                    self.btn_clear_map,
-                    self.btn_localize_image, self.btn_gen_pano, self.btn_export]:
+        for btn in [
+            self.btn_new_mission,
+            self.btn_load_db,
+            self.btn_rebuild_db,
+            self.btn_calibrate,
+            self.btn_load_calibrate,
+            self.btn_verify_propagation,
+            self.btn_clear_map,
+            self.btn_localize_image,
+            self.btn_gen_pano,
+            self.btn_export,
+        ]:
             btn.setEnabled(enabled)
 
-    def update_project_info(self, project_name: str = None, video_path: str = None,
-                             num_frames: int = None, num_anchors: int = None,
-                             num_propagated: int = None, db_size_mb: float = None):
+    def update_project_info(
+        self,
+        project_name: str = None,
+        video_path: str = None,
+        num_frames: int = None,
+        num_anchors: int = None,
+        num_propagated: int = None,
+        db_size_mb: float = None,
+    ):
         """Оновити інформаційну панель проєкту."""
         if project_name is None:
             self.lbl_project_info.setText("Проєкт не завантажено")
@@ -187,6 +220,7 @@ class ControlPanel(QWidget):
             return
 
         from pathlib import Path
+
         lines = [f"▶ <b>{project_name}</b>"]
         if video_path:
             lines.append(f"🎥 {Path(video_path).name}")

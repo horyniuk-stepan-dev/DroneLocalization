@@ -1,7 +1,8 @@
 import os
-import sys
 import subprocess
+import sys
 from pathlib import Path
+
 
 def main():
     """
@@ -12,10 +13,10 @@ def main():
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
 
-    print(f"==================================================")
-    print(f"🚀 Running DroneLocalization Test Suite")
+    print("==================================================")
+    print("🚀 Running DroneLocalization Test Suite")
     print(f"📂 Project Root: {project_root}")
-    print(f"==================================================\n")
+    print("==================================================\n")
 
     # Set the working directory to the project root
     os.chdir(project_root)
@@ -25,22 +26,14 @@ def main():
     python_exec = str(venv_python) if venv_python.exists() else sys.executable
 
     # Define the pytest command with coverage
-    cmd = [
-        python_exec,
-        "-m",
-        "pytest",
-        "tests",
-        "--cov=src",
-        "--cov-report=term-missing",
-        "-v"
-    ]
+    cmd = [python_exec, "-m", "pytest", "tests", "--cov=src", "--cov-report=term-missing", "-v"]
 
     print(f"Executing command: {' '.join(cmd)}\n")
 
     try:
         # Run pytest
         result = subprocess.run(cmd, check=False)
-        
+
         print("\n==================================================")
         if result.returncode == 0:
             print("✅ All tests passed successfully!")
@@ -48,13 +41,14 @@ def main():
         else:
             print(f"❌ Tests failed with exit code: {result.returncode}")
             sys.exit(result.returncode)
-            
+
     except KeyboardInterrupt:
         print("\n⚠️ Test execution interrupted by user.")
         sys.exit(130)
     except Exception as e:
         print(f"\n❌ Failed to run tests: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

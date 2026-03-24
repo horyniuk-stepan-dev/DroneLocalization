@@ -1,7 +1,8 @@
-import cv2
-import numpy as np
 import base64
+
+import cv2
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -41,16 +42,20 @@ class PanoramaOverlayWorker(QThread):
                 scale = 4000.0 / w
                 img = cv2.resize(img, (int(w * scale), int(h * scale)))
 
-            _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            b64_string = base64.b64encode(buffer).decode('utf-8')
+            _, buffer = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            b64_string = base64.b64encode(buffer).decode("utf-8")
             data_url = f"data:image/jpeg;base64,{b64_string}"
 
             self.success.emit(
                 data_url,
-                fov[0][0], fov[0][1],
-                fov[1][0], fov[1][1],
-                fov[2][0], fov[2][1],
-                fov[3][0], fov[3][1]
+                fov[0][0],
+                fov[0][1],
+                fov[1][0],
+                fov[1][1],
+                fov[2][0],
+                fov[2][1],
+                fov[3][0],
+                fov[3][1],
             )
 
             logger.success("Panorama successfully processed in background")

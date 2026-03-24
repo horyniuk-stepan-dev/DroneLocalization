@@ -1,27 +1,24 @@
 from pathlib import Path
 
-from PyQt6.QtCore import pyqtSlot, Qt
-from PyQt6.QtWidgets import QMessageBox, QFileDialog, QApplication
+from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from src.core.export_results import ResultExporter
+from src.core.project_registry import ProjectRegistry
 from src.database.database_loader import DatabaseLoader
-from src.workers.database_worker import DatabaseGenerationWorker
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
-from src.core.project_registry import ProjectRegistry
-from src.core.export_results import ResultExporter
-
-
 from src.utils.logging_utils import get_logger
+from src.workers.database_worker import DatabaseGenerationWorker
 
 logger = get_logger(__name__)
 
 
 class DatabaseMixin:
-
     # ── Реєстр проєктів (ініціалізується один раз) ───────────────────────────
 
     def _get_registry(self) -> ProjectRegistry:
-        if not hasattr(self, '_project_registry'):
+        if not hasattr(self, "_project_registry"):
             self._project_registry = ProjectRegistry()
         return self._project_registry
 
@@ -34,8 +31,8 @@ class DatabaseMixin:
             return
 
         mission_data = dialog.get_mission_data()
-        workspace_dir = mission_data.get('workspace_dir')
-        video_path = mission_data.get('video_path')
+        workspace_dir = mission_data.get("workspace_dir")
+        video_path = mission_data.get("video_path")
 
         if not workspace_dir or not video_path:
             return
@@ -59,15 +56,16 @@ class DatabaseMixin:
 
     def _start_database_generation(self, video_path: str, save_path: str):
         from src.geometry.coordinates import CoordinateConverter
+
         CoordinateConverter.reset()
-        
+
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
         self.control_panel.update_progress(0)
         self.control_panel.set_db_generation_running(True)
 
         # CRITICAL: Close and release the database file handle before overwriting/truncating it
-        if hasattr(self, 'database') and self.database:
+        if hasattr(self, "database") and self.database:
             try:
                 self.database.close()
                 logger.info("Current database closed before starting new generation.")
@@ -85,15 +83,15 @@ class DatabaseMixin:
         self.db_worker.completed.connect(self.on_db_completed)
         self.db_worker.error.connect(self.on_db_error)
         self.db_worker.cancelled.connect(self.on_db_cancelled)
-        
+
         # Connect stop button
         self.control_panel.stop_db_generation_clicked.connect(self.on_stop_db_generation)
-        
+
         self.db_worker.start()
 
     @pyqtSlot()
     def on_stop_db_generation(self):
-        if hasattr(self, 'db_worker') and self.db_worker and self.db_worker.isRunning():
+        if hasattr(self, "db_worker") and self.db_worker and self.db_worker.isRunning():
             self.control_panel.update_status("Зупинка... (чекаємо завершення кадру)")
             self.db_worker.stop()
 
@@ -118,7 +116,9 @@ class DatabaseMixin:
             QApplication.restoreOverrideCursor()
         self.control_panel.update_progress(100)
         self.control_panel.update_status("Базу успішно створено")
-        self.status_bar.showMessage(f"Проєкт: {self.project_manager.project_name} | База: {db_path}")
+        self.status_bar.showMessage(
+            f"Проєкт: {self.project_manager.project_name} | База: {db_path}"
+        )
 
         # Оновити реєстр та інфо-панель
         if self.project_manager.is_loaded:
@@ -164,22 +164,26 @@ class DatabaseMixin:
             return
 
         from src.geometry.coordinates import CoordinateConverter
+
         CoordinateConverter.reset()
 
         try:
             db_path = self.project_manager.database_path
-            
+
             # НОВЕ: Перевірка наявності бази даних
             if not Path(db_path).exists():
                 video_path = self.project_manager.settings.video_path
                 reply = QMessageBox.question(
-                    self, "База даних відсутня",
+                    self,
+                    "База даних відсутня",
                     f"Проєкт '{self.project_manager.project_name}' не має згенерованої бази даних.\n\n"
                     f"Згенерувати базу зараз з відео:\n{Path(video_path).name}?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.Yes:
-                    self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+                    self.setWindowTitle(
+                        f"Drone Topometric Localizer - {self.project_manager.project_name}"
+                    )
                     self._start_database_generation(video_path, db_path)
                     return
                 else:
@@ -201,7 +205,9 @@ class DatabaseMixin:
             registry.register(
                 project_dir=str(self.project_manager.project_dir),
                 name=self.project_manager.project_name,
-                video_path=self.project_manager.settings.video_path if self.project_manager.settings else ""
+                video_path=self.project_manager.settings.video_path
+                if self.project_manager.settings
+                else "",
             )
 
             # Завантажити калібрацію якщо є
@@ -230,28 +236,31 @@ class DatabaseMixin:
     @pyqtSlot()
     def on_verify_propagation(self):
         if not self.database or not self.database.is_propagated:
-            QMessageBox.warning(self, "Увага", "Дані пропагації відсутні або проєкт не завантажено!")
+            QMessageBox.warning(
+                self, "Увага", "Дані пропагації відсутні або проєкт не завантажено!"
+            )
             return
 
-        from src.geometry.coordinates import CoordinateConverter
         import numpy as np
+
+        from src.geometry.coordinates import CoordinateConverter
 
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid
         frame_affine = self.database.frame_affine
-        
+
         # Отримуємо розміри кадру з метаданих
-        width = self.database.metadata.get('frame_width', 1920)
-        height = self.database.metadata.get('frame_height', 1080)
-        
+        width = self.database.metadata.get("frame_width", 1920)
+        height = self.database.metadata.get("frame_height", 1080)
+
         # Центр кадру в пікселях
         center_px = np.array([[width / 2, height / 2]], dtype=np.float32)
-        
+
         points_to_show = []
-        
+
         # Збираємо тільки валідні кадри (з кроком 5 для продуктивності на карті)
-        step = max(1, num_frames // 200) # Максимум ~200 точок щоб не гальмував біндер
-        
+        step = max(1, num_frames // 200)  # Максимум ~200 точок щоб не гальмував біндер
+
         for i in range(0, num_frames, step):
             if frame_valid[i]:
                 # Приміняємо афінну матрицю (2x3)
@@ -259,16 +268,14 @@ class DatabaseMixin:
                 # Metric = M * [x, y, 1]^T
                 metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
                 metric_y = M[1, 0] * center_px[0, 0] + M[1, 1] * center_px[0, 1] + M[1, 2]
-                
+
                 lat, lon = CoordinateConverter.metric_to_gps(metric_x, metric_y)
-                points_to_show.append({
-                    'lat': float(lat),
-                    'lon': float(lon),
-                    'label': str(i)
-                })
+                points_to_show.append({"lat": float(lat), "lon": float(lon), "label": str(i)})
 
         if not points_to_show:
-            QMessageBox.information(self, "Інформація", "Не знайдено жодного кадру з валідними координатами.")
+            QMessageBox.information(
+                self, "Інформація", "Не знайдено жодного кадру з валідними координатами."
+            )
             return
 
         self.map_widget.show_verification_markers(points_to_show)
@@ -285,14 +292,16 @@ class DatabaseMixin:
         video_path = self.project_manager.settings.video_path
         if not video_path or not Path(video_path).exists():
             QMessageBox.warning(
-                self, "Увага",
+                self,
+                "Увага",
                 f"Відео проєкту не знайдено:\n{video_path}\n\n"
-                "Перевірте шлях до відео у налаштуваннях проєкту."
+                "Перевірте шлях до відео у налаштуваннях проєкту.",
             )
             return
 
         reply = QMessageBox.question(
-            self, "Перегенерація бази",
+            self,
+            "Перегенерація бази",
             f"Базу даних буде перезаписано!\n\n"
             f"Відео: {Path(video_path).name}\n"
             f"Калібрація буде збережена.\n\n"
@@ -315,36 +324,44 @@ class DatabaseMixin:
 
     @pyqtSlot()
     def on_export_results(self):
-        if not hasattr(self, '_tracking_results') or not self._tracking_results:
-            QMessageBox.warning(self, "Увага", "Немає результатів для експорту!\n\n"
-                                "Спочатку виконайте відстеження.")
+        if not hasattr(self, "_tracking_results") or not self._tracking_results:
+            QMessageBox.warning(
+                self, "Увага", "Немає результатів для експорту!\n\nСпочатку виконайте відстеження."
+            )
             return
 
         path, selected_filter = QFileDialog.getSaveFileName(
-            self, "Експорт результатів", "tracking_results",
+            self,
+            "Експорт результатів",
+            "tracking_results",
             "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
         )
         if not path:
             return
 
         try:
-            if path.endswith('.csv') or 'CSV' in selected_filter:
-                if not path.endswith('.csv'):
-                    path += '.csv'
+            if path.endswith(".csv") or "CSV" in selected_filter:
+                if not path.endswith(".csv"):
+                    path += ".csv"
                 ResultExporter.export_csv(self._tracking_results, path)
-            elif path.endswith('.geojson') or 'GeoJSON' in selected_filter:
-                if not path.endswith('.geojson'):
-                    path += '.geojson'
+            elif path.endswith(".geojson") or "GeoJSON" in selected_filter:
+                if not path.endswith(".geojson"):
+                    path += ".geojson"
                 ResultExporter.export_geojson(self._tracking_results, path)
-            elif path.endswith('.kml') or 'KML' in selected_filter:
-                if not path.endswith('.kml'):
-                    path += '.kml'
-                name = self.project_manager.project_name if self.project_manager.is_loaded else "Drone Track"
+            elif path.endswith(".kml") or "KML" in selected_filter:
+                if not path.endswith(".kml"):
+                    path += ".kml"
+                name = (
+                    self.project_manager.project_name
+                    if self.project_manager.is_loaded
+                    else "Drone Track"
+                )
                 ResultExporter.export_kml(self._tracking_results, path, name=name)
 
             self.status_bar.showMessage(f"Результати експортовано: {path}")
-            QMessageBox.information(self, "Успіх",
-                                    f"Експортовано {len(self._tracking_results)} точок\n\n{path}")
+            QMessageBox.information(
+                self, "Успіх", f"Експортовано {len(self._tracking_results)} точок\n\n{path}"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Помилка експорту:\n{e}")
 
@@ -370,7 +387,9 @@ class DatabaseMixin:
 
         self.control_panel.update_project_info(
             project_name=self.project_manager.project_name,
-            video_path=self.project_manager.settings.video_path if self.project_manager.settings else None,
+            video_path=self.project_manager.settings.video_path
+            if self.project_manager.settings
+            else None,
             num_frames=num_frames,
             num_anchors=num_anchors,
             num_propagated=num_propagated,

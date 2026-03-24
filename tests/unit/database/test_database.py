@@ -1,4 +1,5 @@
-﻿"""Tests for database operations"""
+"""Tests for database operations"""
+
 
 def test_database_creation():
     """Test database creation"""

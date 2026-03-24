@@ -1,31 +1,34 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Drone Topometric Localization System — application entry point."""
+
 import sys
 import warnings
-import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Suppress only known noisy third-party warnings, not everything
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
-warnings.filterwarnings("ignore", category=UserWarning,        module="torchvision")
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 
-from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
+
 from src.gui.main_window import MainWindow
-from src.utils.logging_utils import setup_logging, get_logger
+from src.utils.logging_utils import get_logger, setup_logging
 
 
 def _build_exception_hook(log):
     """Return sys.excepthook that logs unhandled exceptions before exit."""
+
     def hook(exctype, value, tb):
         log.critical(
             "Unhandled exception caught — application will exit",
             exc_info=(exctype, value, tb),
         )
         sys.exit(1)
+
     return hook
 
 

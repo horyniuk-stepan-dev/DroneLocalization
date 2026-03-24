@@ -1,22 +1,18 @@
 import numpy as np
-from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QMessageBox, QFileDialog, QProgressDialog
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
-from src.localization.matcher import FeatureMatcher
-from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
-
-
+from src.localization.matcher import FeatureMatcher
 from src.utils.logging_utils import get_logger
+from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
 
 logger = get_logger(__name__)
 
 
 class CalibrationMixin:
-
     # ── Calibration dialog ───────────────────────────────────────────────────
 
     @pyqtSlot()
@@ -34,7 +30,7 @@ class CalibrationMixin:
             parent=self,
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
-        self._calib_dialog.anchor_removed.connect(self.on_anchor_removed) # Новий сигнал
+        self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)  # Новий сигнал
         self._calib_dialog.calibration_complete.connect(self.on_run_propagation)
         self._calib_dialog.exec()
 
@@ -44,9 +40,9 @@ class CalibrationMixin:
     @pyqtSlot(object)
     def on_anchor_added(self, anchor_data: dict):
         try:
-            points_2d = anchor_data.get('points_2d')
-            points_gps = anchor_data.get('points_gps')
-            frame_id = anchor_data.get('calib_frame_id')
+            points_2d = anchor_data.get("points_2d")
+            points_gps = anchor_data.get("points_gps")
+            frame_id = anchor_data.get("calib_frame_id")
 
             if not points_2d or not points_gps or len(points_2d) < 4:
                 QMessageBox.warning(self, "Помилка", "Потрібно мінімум 4 точки для якоря!")
@@ -56,9 +52,11 @@ class CalibrationMixin:
             proj_meta = CoordinateConverter.export_projection_metadata()
             if not CoordinateConverter._initialized:
                 # Використовуємо налаштування з конфігу або за замовчуванням
-                proj_cfg = self.config.get('projection', {})
-                mode = proj_cfg.get('default_mode', 'WEB_MERCATOR')
-                CoordinateConverter.configure_projection(mode, points_gps[0] if mode == 'UTM' else None)
+                proj_cfg = self.config.get("projection", {})
+                mode = proj_cfg.get("default_mode", "WEB_MERCATOR")
+                CoordinateConverter.configure_projection(
+                    mode, points_gps[0] if mode == "UTM" else None
+                )
 
             pts_2d_np = np.array(points_2d, dtype=np.float32)
             pts_metric = [CoordinateConverter.gps_to_metric(lat, lon) for lat, lon in points_gps]
@@ -66,17 +64,22 @@ class CalibrationMixin:
 
             # 1. Спроба обчислити різні типи трансформацій
             M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
-            
+
             best_M = M_partial
-            best_type = "affine_partial" # 4-DoF (Scale, Rotate, Translate)
-            
+            best_type = "affine_partial"  # 4-DoF (Scale, Rotate, Translate)
+
             def calc_metrics(M, src, dst):
                 proj = GeometryTransforms.apply_affine(src, M)
                 errs = np.linalg.norm(proj - dst, axis=1)
-                return float(np.sqrt(np.mean(errs**2))), float(np.median(errs)), float(np.max(errs)), proj.tolist()
+                return (
+                    float(np.sqrt(np.mean(errs**2))),
+                    float(np.median(errs)),
+                    float(np.max(errs)),
+                    proj.tolist(),
+                )
 
             rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
-            
+
             # Якщо точок >= 5, пробуємо повний Affine (6 DoF)
             if len(pts_2d_np) >= 5:
                 M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
@@ -87,23 +90,31 @@ class CalibrationMixin:
                         best_M = M_full
                         best_type = "affine_full"
                         rmse_p, median_p, max_p, proj_p = rmse_f, median_f, max_f, proj_f
-                        logger.info(f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)")
+                        logger.info(
+                            f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)"
+                        )
 
             if best_M is None:
-                QMessageBox.critical(self, "Помилка", "Не вдалося обчислити матрицю. Спробуйте іншу комбінацію точок.")
+                QMessageBox.critical(
+                    self,
+                    "Помилка",
+                    "Не вдалося обчислити матрицю. Спробуйте іншу комбінацію точок.",
+                )
                 return
 
             # 2. Перевірка порогів якості з конфігу
-            proj_cfg = self.config.get('projection', {})
-            rmse_threshold = proj_cfg.get('anchor_rmse_threshold_m', 3.0)
-            max_err_threshold = proj_cfg.get('anchor_max_error_m', 5.0)
+            proj_cfg = self.config.get("projection", {})
+            rmse_threshold = proj_cfg.get("anchor_rmse_threshold_m", 3.0)
+            max_err_threshold = proj_cfg.get("anchor_max_error_m", 5.0)
 
             # 3. QA Діалог підтвердження
             from datetime import datetime
-            
+
             severity_color = "green"
-            if rmse_p > rmse_threshold: severity_color = "red"
-            elif rmse_p > rmse_threshold * 0.7: severity_color = "orange"
+            if rmse_p > rmse_threshold:
+                severity_color = "red"
+            elif rmse_p > rmse_threshold * 0.7:
+                severity_color = "orange"
 
             qa_summary = (
                 f"<b>Метрики якості для якоря (кадр {frame_id}):</b><br><br>"
@@ -113,13 +124,14 @@ class CalibrationMixin:
                 f"Медіанна похибка: <b>{median_p:.2f} м</b><br>"
                 f"Макс. похибка: <b>{max_p:.2f} м</b> (поріг: {max_err_threshold}м)<br>"
             )
-            
+
             if rmse_p > rmse_threshold or max_p > max_err_threshold:
-                qa_summary += f"<br><span style='color:red'>⚠ Увага: Якість прив'язки нижча за рекомендовану!</span>"
+                qa_summary += "<br><span style='color:red'>⚠ Увага: Якість прив'язки нижча за рекомендовану!</span>"
                 reply = QMessageBox.warning(
-                    self, "Якість калібрування",
+                    self,
+                    "Якість калібрування",
                     qa_summary + "<br><br>Зберегти цей якір попри високу похибку?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.No:
                     return
@@ -137,7 +149,7 @@ class CalibrationMixin:
                 "created_at": datetime.now().isoformat(),
                 "points_2d": points_2d,
                 "points_gps": points_gps,
-                "points_metric": pts_metric
+                "points_metric": pts_metric,
             }
 
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=best_M, qa_data=qa_data)
@@ -153,13 +165,15 @@ class CalibrationMixin:
                 if best_M is not None:
                     trans = GeometryTransforms.apply_affine(p2d.reshape(1, 2), best_M)[0]
                     err = np.linalg.norm(trans - pm)
-                    
+
                     # Перевіряємо зворотну конвертацію для візуалізації зсуву в градусах
                     lat_c, lon_c = CoordinateConverter.metric_to_gps(trans[0], trans[1])
                     lat_t, lon_t = points_gps[j][0], points_gps[j][1]
-                    
-                    dist_err = CoordinateConverter.haversine_distance((lat_c, lon_c), (lat_t, lon_t))
-                    
+
+                    dist_err = CoordinateConverter.haversine_distance(
+                        (lat_c, lon_c), (lat_t, lon_t)
+                    )
+
                     logger.info(
                         f"  Pt {j}: px={p2d} -> err={err:.3f}м ({dist_err:.3f}м по Хаверсину)"
                     )
@@ -174,7 +188,7 @@ class CalibrationMixin:
 
             self.status_bar.showMessage(f"Додано якір (кадр {frame_id}, RMSE: {rmse_p:.2f}м)")
 
-            if hasattr(self, '_calib_dialog') and self._calib_dialog is not None:
+            if hasattr(self, "_calib_dialog") and self._calib_dialog is not None:
                 self._calib_dialog.on_anchor_confirmed(frame_id)
 
         except Exception as e:
@@ -188,9 +202,11 @@ class CalibrationMixin:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
                     self.calibration.save(self.project_manager.calibration_path)
-                
+
                 logger.info(f"Anchor {frame_id} removed from project")
-                self.status_bar.showMessage(f"Якір {frame_id} видалено. Потрібно оновити пропагацію.", 5000)
+                self.status_bar.showMessage(
+                    f"Якір {frame_id} видалено. Потрібно оновити пропагацію.", 5000
+                )
         except Exception as e:
             logger.error(f"Failed to remove anchor: {e}", exc_info=True)
             QMessageBox.critical(self, "Помилка", f"Не вдалося видалити якір:\n{e}")
@@ -220,7 +236,10 @@ class CalibrationMixin:
 
         self._propagation_dialog = QProgressDialog(
             f"Пропагація GPS від {len(anchor_ids)} якорів на {n_frames} кадрів...",
-            "Скасувати", 0, 100, self,
+            "Скасувати",
+            0,
+            100,
+            self,
         )
         self._propagation_dialog.setWindowTitle("Розповсюдження GPS координат")
         self._propagation_dialog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -260,49 +279,51 @@ class CalibrationMixin:
         num_frames = self.database.get_num_frames()
         valid_mask = self.database.frame_valid
         valid_count = int(np.sum(valid_mask)) if valid_mask is not None else 0
-        
+
         avg_rmse = 0.0
         max_rmse = 0.0
         avg_dis = 0.0
         avg_matches = 0.0
-        
+
         if valid_count > 0:
-            rmse_data = getattr(self.database, 'frame_rmse', None)
+            rmse_data = getattr(self.database, "frame_rmse", None)
             if rmse_data is not None:
                 valid_rmse = rmse_data[valid_mask]
                 avg_rmse = float(np.mean(valid_rmse))
                 max_rmse = float(np.max(valid_rmse))
-            
-            dis_data = getattr(self.database, 'frame_disagreement', None)
+
+            dis_data = getattr(self.database, "frame_disagreement", None)
             if dis_data is not None:
                 dis_valid = dis_data[valid_mask]
                 if np.any(dis_valid > 0):
                     avg_dis = float(np.mean(dis_valid[dis_valid > 0]))
 
-            matches_data = getattr(self.database, 'frame_matches', None)
+            matches_data = getattr(self.database, "frame_matches", None)
             if matches_data is not None:
                 avg_matches = float(np.mean(matches_data[valid_mask]))
-        
-        proj_cfg = self.config.get('projection', {})
-        rmse_thresh = proj_cfg.get('anchor_rmse_threshold_m', 3.0)
+
+        proj_cfg = self.config.get("projection", {})
+        rmse_thresh = proj_cfg.get("anchor_rmse_threshold_m", 3.0)
 
         report = (
             f"<b>Пропагація завершена!</b><br><br>"
-            f"Валідних кадрів: <b>{valid_count} / {num_frames}</b> ({valid_count/num_frames*100:.1f}%)<br>"
-            f"Середній RMSE (grid): <b style='color:{'green' if avg_rmse < rmse_thresh*0.5 else 'orange'}'>{avg_rmse:.3f} м</b><br>"
+            f"Валідних кадрів: <b>{valid_count} / {num_frames}</b> ({valid_count / num_frames * 100:.1f}%)<br>"
+            f"Середній RMSE (grid): <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} м</b><br>"
             f"Середній матчинг: <b>{avg_matches:.1f} точок</b><br>"
         )
         if avg_dis > 0:
             report += f"Середня розбіжність (drift): <b style='color:{'red' if avg_dis > 5.0 else 'green'}'>{avg_dis:.3f} м</b><br>"
-            
+
         if avg_rmse > rmse_thresh or avg_dis > 5.0:
             report += "<br><span style='color:red'>⚠ Увага: Якість у деяких сегментах може бути нестабільною.</span>"
         else:
             report += "<br><span style='color:green'>✅ Результати стабільні. Можна починати локалізацію.</span>"
 
         QMessageBox.information(self, "Пропагація", report)
-        self.status_bar.showMessage(f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}м, Mat: {avg_matches:.0f}")
-        
+        self.status_bar.showMessage(
+            f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}м, Mat: {avg_matches:.0f}"
+        )
+
         if self.map_widget:
             self.on_verify_propagation()
 
@@ -319,18 +340,18 @@ class CalibrationMixin:
             step = max(1, num_frames // 30)
 
             # Отримуємо дані один раз
-            rmse_data = getattr(self.database, 'frame_rmse', None)
-            dis_data = getattr(self.database, 'frame_disagreement', None)
-            matches_data = getattr(self.database, 'frame_matches', None)
-            valid_mask = getattr(self.database, 'frame_valid', None)
-            
+            rmse_data = getattr(self.database, "frame_rmse", None)
+            dis_data = getattr(self.database, "frame_disagreement", None)
+            matches_data = getattr(self.database, "frame_matches", None)
+            valid_mask = getattr(self.database, "frame_valid", None)
+
             points_to_show = []
             _diag_done = False
             for i in range(0, num_frames, step):
                 affine = self.database.get_frame_affine(i)
                 if affine is not None:
-                    w = self.database.metadata.get('frame_width', 1920)
-                    h = self.database.metadata.get('frame_height', 1080)
+                    w = self.database.metadata.get("frame_width", 1920)
+                    h = self.database.metadata.get("frame_height", 1080)
 
                     # ДІАГНОСТИКА: лише для першого кадру
                     if not _diag_done:
@@ -338,78 +359,111 @@ class CalibrationMixin:
                         logger.warning(f"=== VERIFY DIAG frame={i} ===")
                         logger.warning(f"  frame_width={w}, frame_height={h}")
                         logger.warning(f"  affine=\n{affine}")
-                        for lbl, px, py in [("corner0", 0, 0), ("center", w/2, h/2), ("corner2", w, h)]:
-                            mx_d = affine[0,0]*px + affine[0,1]*py + affine[0,2]
-                            my_d = affine[1,0]*px + affine[1,1]*py + affine[1,2]
+                        for lbl, px, py in [
+                            ("corner0", 0, 0),
+                            ("center", w / 2, h / 2),
+                            ("corner2", w, h),
+                        ]:
+                            mx_d = affine[0, 0] * px + affine[0, 1] * py + affine[0, 2]
+                            my_d = affine[1, 0] * px + affine[1, 1] * py + affine[1, 2]
                             lat_d, lon_d = CoordinateConverter.metric_to_gps(mx_d, my_d)
-                            logger.warning(f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})")
-                    
+                            logger.warning(
+                                f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
+                            )
+
                     # 1. Центр кадру
-                    mx, my = affine[0, 0]*(w/2) + affine[0, 1]*(h/2) + affine[0, 2], affine[1, 0]*(w/2) + affine[1, 1]*(h/2) + affine[1, 2]
+                    mx, my = (
+                        affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
+                        affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
+                    )
                     lat_c, lon_c = CoordinateConverter.metric_to_gps(mx, my)
-                    
+
                     # 2. Низ центру (часто там дорога)
-                    mx_b, my_b = affine[0, 0]*(w/2) + affine[0, 1]*(h*0.75) + affine[0, 2], affine[1, 0]*(w/2) + affine[1, 1]*(h*0.75) + affine[1, 2]
+                    mx_b, my_b = (
+                        affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
+                        affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
+                    )
                     lat_b, lon_b = CoordinateConverter.metric_to_gps(mx_b, my_b)
-                    
-                    rmse = float(rmse_data[i]) if rmse_data is not None and i < len(rmse_data) else 0.0
+
+                    rmse = (
+                        float(rmse_data[i]) if rmse_data is not None and i < len(rmse_data) else 0.0
+                    )
                     dis = float(dis_data[i]) if dis_data is not None and i < len(dis_data) else 0.0
-                    matches = int(matches_data[i]) if matches_data is not None and i < len(matches_data) else 0
-                    
+                    matches = (
+                        int(matches_data[i])
+                        if matches_data is not None and i < len(matches_data)
+                        else 0
+                    )
+
                     # Лог для вибраного кадру (кожен 3-й з тих що показуємо)
                     if (i // step) % 3 == 0:
-                        logger.debug(f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | BOTTOM={lat_b:.6f},{lon_b:.6f} | RMSE={rmse:.2f}m")
+                        logger.debug(
+                            f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | BOTTOM={lat_b:.6f},{lon_b:.6f} | RMSE={rmse:.2f}m"
+                        )
 
                     # Колір базується на комбінації факторів
                     color = "green"
-                    if rmse > 5.0 or dis > 10.0: color = "red"
-                    elif rmse > 2.0 or dis > 3.0: color = "orange"
-                    
+                    if rmse > 5.0 or dis > 10.0:
+                        color = "red"
+                    elif rmse > 2.0 or dis > 3.0:
+                        color = "orange"
+
                     # 3. Крайні точки (для візуалізації перекосу/масштабу)
                     # МАЛЮЄМО НЕ ВЕСЬ КАДР (1920x1080 - це величезна площа на карті!),
                     # а лише центральні 20% екрану, щоб прямокутник на карті не здавався гіпер-великим.
                     cx_px, cy_px = w / 2, h / 2
-                    dw, dh = w * 0.1, h * 0.1 # 10% в кожну сторону від центру
+                    dw, dh = w * 0.1, h * 0.1  # 10% в кожну сторону від центру
                     pts_px = [
-                        (cx_px - dw, cy_px - dh), 
-                        (cx_px + dw, cy_px - dh), 
-                        (cx_px + dw, cy_px + dh), 
-                        (cx_px - dw, cy_px + dh)
+                        (cx_px - dw, cy_px - dh),
+                        (cx_px + dw, cy_px - dh),
+                        (cx_px + dw, cy_px + dh),
+                        (cx_px - dw, cy_px + dh),
                     ]
                     for idx_p, (px, py) in enumerate(pts_px):
-                        mx_p, my_p = affine[0, 0]*px + affine[0, 1]*py + affine[0, 2], affine[1, 0]*px + affine[1, 1]*py + affine[1, 2]
+                        mx_p, my_p = (
+                            affine[0, 0] * px + affine[0, 1] * py + affine[0, 2],
+                            affine[1, 0] * px + affine[1, 1] * py + affine[1, 2],
+                        )
                         lat_p, lon_p = CoordinateConverter.metric_to_gps(mx_p, my_p)
-                        points_to_show.append({
-                            'lat': float(lat_p), 'lon': float(lon_p),
-                            'label': f"Кадр {i} Корнер {idx_p}",
-                            'color': 'gray'
-                        })
+                        points_to_show.append(
+                            {
+                                "lat": float(lat_p),
+                                "lon": float(lon_p),
+                                "label": f"Кадр {i} Корнер {idx_p}",
+                                "color": "gray",
+                            }
+                        )
 
                     # Додаємо дві основні точки
-                    points_to_show.append({
-                        'lat': float(lat_c), 'lon': float(lon_c),
-                        'label': f"Кадр {i} (Центр) | RMSE:{rmse:.1f}м | Mat:{matches}",
-                        'color': color
-                    })
-                    points_to_show.append({
-                        'lat': float(lat_b), 'lon': float(lon_b),
-                        'label': f"Кадр {i} (Низ) | RMSE:{rmse:.1f}м",
-                        'color': "blue" 
-                    })
+                    points_to_show.append(
+                        {
+                            "lat": float(lat_c),
+                            "lon": float(lon_c),
+                            "label": f"Кадр {i} (Центр) | RMSE:{rmse:.1f}м | Mat:{matches}",
+                            "color": color,
+                        }
+                    )
+                    points_to_show.append(
+                        {
+                            "lat": float(lat_b),
+                            "lon": float(lon_b),
+                            "label": f"Кадр {i} (Низ) | RMSE:{rmse:.1f}м",
+                            "color": "blue",
+                        }
+                    )
 
             if points_to_show:
                 self.map_widget.show_verification_markers(points_to_show)
-            
+
             if valid_mask is not None and rmse_data is not None:
                 valid_rmse = rmse_data[valid_mask]
                 if len(valid_rmse) > 0:
                     avg_rmse = float(np.mean(valid_rmse))
                     self.status_bar.showMessage(f"Пропагація: Середній RMSE = {avg_rmse:.3f} м")
-        
+
         except Exception as e:
             logger.error(f"Error in on_verify_propagation: {e}", exc_info=True)
             self.status_bar.showMessage("Помилка візуалізації якості")
-
 
     @pyqtSlot(str)
     def on_propagation_error(self, error_msg: str):
@@ -426,11 +480,11 @@ class CalibrationMixin:
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
-            
+
         default_path = "calibration.json"
         if self.project_manager and self.project_manager.is_loaded:
             default_path = str(self.project_manager.project_dir / default_path)
-            
+
         path, _ = QFileDialog.getSaveFileName(
             self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
         )
@@ -440,8 +494,9 @@ class CalibrationMixin:
             self.calibration.save(path)
             n = len(self.calibration.anchors)
             self.status_bar.showMessage(f"Калібрування збережено: {path} ({n} якорів)")
-            QMessageBox.information(self, "Збережено",
-                f"Калібрування збережено!\nЯкорів: {n}\nФайл: {path}")
+            QMessageBox.information(
+                self, "Збережено", f"Калібрування збережено!\nЯкорів: {n}\nФайл: {path}"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося зберегти:\n{e}")
 
@@ -450,7 +505,7 @@ class CalibrationMixin:
         default_dir = ""
         if self.project_manager and self.project_manager.is_loaded:
             default_dir = str(self.project_manager.project_dir)
-            
+
         path, _ = QFileDialog.getOpenFileName(
             self, "Завантажити калібрування", default_dir, "JSON Files (*.json);;All Files (*)"
         )
@@ -462,8 +517,11 @@ class CalibrationMixin:
             propagated = self.database and self.database.is_propagated
             self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
             self.control_panel.update_status("Калібрування завантажено")
-            QMessageBox.information(self, "Успіх",
+            QMessageBox.information(
+                self,
+                "Успіх",
                 f"Завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
-                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}")
+                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}",
+            )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")

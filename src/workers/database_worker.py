@@ -1,4 +1,5 @@
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from src.database.database_builder import DatabaseBuilder
 from src.utils.logging_utils import get_logger
 
@@ -36,7 +37,7 @@ class DatabaseGenerationWorker(QThread):
             builder = DatabaseBuilder(
                 output_path=self.output_path,
                 matcher=None,  # Will be initialized inside builder if needed
-                config=self.config
+                config=self.config,
             )
 
             def update_progress(percent: int):
@@ -49,7 +50,7 @@ class DatabaseGenerationWorker(QThread):
             builder.build_from_video(
                 video_path=self.video_path,
                 model_manager=self.model_manager,
-                progress_callback=update_progress
+                progress_callback=update_progress,
             )
 
             if self._is_running:

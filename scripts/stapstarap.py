@@ -1,4 +1,3 @@
-
 import shutil
 from pathlib import Path
 
@@ -29,4 +28,6 @@ def collect_files(source_dir: str, output_dir: str) -> None:
 
 
 if __name__ == "__main__":
-    collect_files("E:/Dip/budyak/DroneLocalization/src", "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFiles")
+    collect_files(
+        "E:/Dip/budyak/DroneLocalization/src", "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFiles"
+    )

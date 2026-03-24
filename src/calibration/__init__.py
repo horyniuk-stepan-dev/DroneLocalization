@@ -1,1 +1,1 @@
-﻿"""Calibration module"""
+"""Calibration module"""

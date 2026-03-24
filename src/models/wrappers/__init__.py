@@ -1,1 +1,1 @@
-﻿"""Model wrappers module"""
+"""Model wrappers module"""

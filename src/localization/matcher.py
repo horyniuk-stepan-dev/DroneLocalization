@@ -1,6 +1,6 @@
+import faiss
 import numpy as np
 import torch
-import faiss
 
 from src.utils.logging_utils import get_logger
 
@@ -11,16 +11,18 @@ class FastRetrieval:
     """Fast candidate search using DINOv2 global descriptors (optimized with FAISS)"""
 
     def __init__(self, global_descriptors: np.ndarray):
-        logger.info(f"Initializing FastRetrieval with {len(global_descriptors)} descriptors using FAISS")
+        logger.info(
+            f"Initializing FastRetrieval with {len(global_descriptors)} descriptors using FAISS"
+        )
         self.dim = global_descriptors.shape[1]
-        
+
         # Inner Product index (для косинусної схожості нормалізованих векторів)
         self.index = faiss.IndexFlatIP(self.dim)
-        
+
         # Нормалізуємо і додаємо в індекс
         normed = self.normalize_vectors(global_descriptors)
         self.index.add(normed.astype(np.float32))
-        
+
         logger.success(f"FAISS index built with {self.index.ntotal} vectors")
 
     @staticmethod
@@ -32,19 +34,15 @@ class FastRetrieval:
         # Підготовка запиту
         q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
         q = q.astype(np.float32)
-        
+
         if q.ndim == 1:
             q = q[None]
-            
+
         # Пошук у FAISS
         scores, ids = self.index.search(q, top_k)
-        
+
         # Повертаємо список (id, score)
-        results = [
-            (int(idx), float(score)) 
-            for idx, score in zip(ids[0], scores[0]) 
-            if idx != -1
-        ]
+        results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
 
 
@@ -54,7 +52,7 @@ class FeatureMatcher:
     def __init__(self, model_manager=None, config=None):
         self.config = config or {}
         self.model_manager = model_manager
-        self.ratio_threshold = self.config.get('localization', {}).get('ratio_threshold', 0.95)
+        self.ratio_threshold = self.config.get("localization", {}).get("ratio_threshold", 0.95)
 
         # Завантажуємо LightGlue (ALIKED) через ModelManager
         self.lightglue = None
@@ -72,7 +70,9 @@ class FeatureMatcher:
         Dynamically routes to LightGlue (for 256-dim SuperPoint)
         or Fast L2 Matcher (for 64-dim XFeat / 128-dim ALIKED).
         """
-        desc_dim = query_features['descriptors'].shape[1] if len(query_features['descriptors']) > 0 else 0
+        desc_dim = (
+            query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
+        )
 
         # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED)
         if self.lightglue is not None and desc_dim == 128:
@@ -81,14 +81,16 @@ class FeatureMatcher:
         # Fallback (якщо немає LightGlue або інші ознаки)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
-    def _fast_numpy_match(self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80) -> tuple:
+    def _fast_numpy_match(
+        self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80
+    ) -> tuple:
         """
         Highly optimized L2 matching using dot product and Mutual Nearest Neighbor (MNN).
         """
-        desc_q = query_features['descriptors']
-        desc_r = ref_features['descriptors']
-        kpts_q = query_features['keypoints']
-        kpts_r = ref_features['keypoints']
+        desc_q = query_features["descriptors"]
+        desc_r = ref_features["descriptors"]
+        kpts_q = query_features["keypoints"]
+        kpts_r = ref_features["keypoints"]
 
         if len(desc_q) < 2 or len(desc_r) < 2:
             return np.empty((0, 2)), np.empty((0, 2))
@@ -137,20 +139,28 @@ class FeatureMatcher:
 
             # Підготовка тензорів для LightGlue
             data = {
-                'image0': {
-                    'keypoints': torch.from_numpy(query_features['keypoints']).float()[None].to(device),
-                    'descriptors': torch.from_numpy(query_features['descriptors']).float()[None].to(device)
+                "image0": {
+                    "keypoints": torch.from_numpy(query_features["keypoints"])
+                    .float()[None]
+                    .to(device),
+                    "descriptors": torch.from_numpy(query_features["descriptors"])
+                    .float()[None]
+                    .to(device),
                 },
-                'image1': {
-                    'keypoints': torch.from_numpy(ref_features['keypoints']).float()[None].to(device),
-                    'descriptors': torch.from_numpy(ref_features['descriptors']).float()[None].to(device)
-                }
+                "image1": {
+                    "keypoints": torch.from_numpy(ref_features["keypoints"])
+                    .float()[None]
+                    .to(device),
+                    "descriptors": torch.from_numpy(ref_features["descriptors"])
+                    .float()[None]
+                    .to(device),
+                },
             }
 
             with torch.no_grad():
                 res = self.lightglue(data)
 
-            matches = res['matches'][0].cpu().numpy()
+            matches = res["matches"][0].cpu().numpy()
 
             if len(matches) == 0:
                 return np.empty((0, 2)), np.empty((0, 2))
@@ -158,8 +168,8 @@ class FeatureMatcher:
             m_q = matches[:, 0]
             m_r = matches[:, 1]
 
-            mkpts_q = query_features['keypoints'][m_q]
-            mkpts_r = ref_features['keypoints'][m_r]
+            mkpts_q = query_features["keypoints"][m_q]
+            mkpts_r = ref_features["keypoints"][m_r]
 
             return mkpts_q, mkpts_r
 

@@ -1,15 +1,16 @@
+from datetime import datetime
+from pathlib import Path
+from queue import Queue
+from threading import Thread
+
+import cv2
 import h5py
 import numpy as np
-import cv2
-from pathlib import Path
-from threading import Thread
-from queue import Queue
+import torch
 
-from datetime import datetime
-from src.utils.logging_utils import get_logger
-
-from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.models.wrappers.feature_extractor import FeatureExtractor
+from src.models.wrappers.yolo_wrapper import YOLOWrapper
+from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -21,10 +22,10 @@ class DatabaseBuilder:
         self.output_path = output_path
         self.config = config or {}
         self.matcher = matcher
-        db_cfg = self.config.get('database', {})
-        self.descriptor_dim = self.config.get('dinov2', {}).get('descriptor_dim', 384)
-        self.prefetch_size = db_cfg.get('prefetch_queue_size', 32)
-        self.kp_scale_cfg = db_cfg.get('keypoint_video_scale', 0.5)
+        db_cfg = self.config.get("database", {})
+        self.descriptor_dim = self.config.get("dinov2", {}).get("descriptor_dim", 384)
+        self.prefetch_size = db_cfg.get("prefetch_queue_size", 32)
+        self.kp_scale_cfg = db_cfg.get("keypoint_video_scale", 0.5)
         self.db_file = None
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
@@ -32,15 +33,20 @@ class DatabaseBuilder:
             logger.info("Using provided FeatureMatcher for inter-frame poses")
         logger.info(f"DINOv2 descriptor dimension: {self.descriptor_dim}")
 
-    def build_from_video(self, video_path: str, model_manager, progress_callback=None,
-                         save_keypoint_video: bool = True):
+    def build_from_video(
+        self,
+        video_path: str,
+        model_manager,
+        progress_callback=None,
+        save_keypoint_video: bool = True,
+    ):
         """
         Process video and build database.
         """
         logger.info(f"Starting database build from video: {video_path}")
 
         # Читаємо налаштування з конфігу (з дефолтом)
-        frame_step = self.config.get('database', {}).get('frame_step', 3)
+        frame_step = self.config.get("database", {}).get("frame_step", 3)
         if frame_step < 1:
             frame_step = 1
 
@@ -60,39 +66,53 @@ class DatabaseBuilder:
 
         if num_frames <= 0:
             cap.release()
-            logger.error(f"Invalid frame count ({num_frames}). Video might be corrupted or uses unsupported codec.")
+            logger.error(
+                f"Invalid frame count ({num_frames}). Video might be corrupted or uses unsupported codec."
+            )
             raise ValueError(
                 "OpenCV не зміг розпізнати відео. Файл пошкоджений або використовує непідтримуваний кодек. "
                 "Спробуйте переконвертувати відео у стандартний MP4 (H.264)."
             )
 
-        logger.info(f"Video properties: {width}x{height}, {total_frames} total frames, {original_fps:.2f} FPS")
-        logger.info(f"Processing with step={frame_step} -> {num_frames} frames to process ({effective_fps:.2f} effective FPS)")
+        logger.info(
+            f"Video properties: {width}x{height}, {total_frames} total frames, {original_fps:.2f} FPS"
+        )
+        logger.info(
+            f"Processing with step={frame_step} -> {num_frames} frames to process ({effective_fps:.2f} effective FPS)"
+        )
 
         # Ініціалізуємо запис відео з keypoints
         kp_video_path = None
         kp_writer = None
-        kp_scale = 1.0 # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
+        kp_scale = 1.0  # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
         if save_keypoint_video:
             try:
                 kp_width = int(width * kp_scale)
                 kp_height = int(height * kp_scale)
-                
-                kp_video_path = str(Path(self.output_path).with_suffix('')) + '_keypoints.mp4'
-                
+
+                kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
+
                 # Attempt H.264 (avc1)
-                fourcc = cv2.VideoWriter_fourcc(*'avc1')
-                kp_writer = cv2.VideoWriter(kp_video_path, fourcc, effective_fps, (kp_width, kp_height))
-                
+                fourcc = cv2.VideoWriter_fourcc(*"avc1")
+                kp_writer = cv2.VideoWriter(
+                    kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                )
+
                 if not kp_writer or not kp_writer.isOpened():
                     logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    kp_writer = cv2.VideoWriter(kp_video_path, fourcc, effective_fps, (kp_width, kp_height))
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    kp_writer = cv2.VideoWriter(
+                        kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                    )
 
                 if kp_writer and kp_writer.isOpened():
-                    logger.info(f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})")
+                    logger.info(
+                        f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})"
+                    )
                 else:
-                    logger.warning("Failed to initialize any compatible video codec, keypoint video disabled")
+                    logger.warning(
+                        "Failed to initialize any compatible video codec, keypoint video disabled"
+                    )
                     kp_writer = None
             except Exception as e:
                 logger.warning(f"VideoWriter initialization crashed: {e}")
@@ -107,13 +127,15 @@ class DatabaseBuilder:
         nv_model = model_manager.load_dinov2()
 
         cesp = None
-        if self.config.get('models', {}).get('cesp', {}).get('enabled', False):
+        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
             try:
                 cesp = model_manager.load_cesp()
             except Exception:
                 logger.warning("CESP loading failed during DB build, continuing without it")
 
-        feature_extractor = FeatureExtractor(local_model, nv_model, model_manager.device, config=self.config, cesp_module=cesp)
+        feature_extractor = FeatureExtractor(
+            local_model, nv_model, model_manager.device, config=self.config, cesp_module=cesp
+        )
         logger.success("All models loaded successfully")
 
         # Fix 10: Dynamic descriptor dimension detection to avoid broadcast errors
@@ -121,32 +143,34 @@ class DatabaseBuilder:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 import gc
+
                 gc.collect()
                 free_mb, total_mb = torch.cuda.mem_get_info()
-                logger.info(f"VRAM before dimension detection: {free_mb/(1024**2):.1f}MB free")
+                logger.info(f"VRAM before dimension detection: {free_mb / (1024**2):.1f}MB free")
 
             logger.info("Detecting descriptor dimension...")
-            if hasattr(nv_model, 'embed_dim'):
+            if hasattr(nv_model, "embed_dim"):
                 self.descriptor_dim = int(nv_model.embed_dim)
             else:
                 # Use a small dummy tensor directly to save VRAM
                 with torch.no_grad():
-                    dino_size = self.config.get('dinov2', {}).get('input_size', 336)
+                    dino_size = self.config.get("dinov2", {}).get("input_size", 336)
                     dummy_input = torch.zeros((1, 3, dino_size, dino_size)).to(model_manager.device)
                     # Use the same logic as FeatureExtractor
                     if cesp is not None:
                         features = nv_model.forward_features(dummy_input)
-                        patch_tokens = features['x_norm_patchtokens']
+                        patch_tokens = features["x_norm_patchtokens"]
                         h_patches, w_patches = dino_size // 14, dino_size // 14
                         dummy_out = cesp(patch_tokens, h_patches, w_patches)[0]
                         self.descriptor_dim = int(dummy_out.shape[0])
                     else:
                         dummy_out = nv_model(dummy_input)[0]
                         self.descriptor_dim = int(dummy_out.shape[0])
-            
+
             logger.info(f"Detected global descriptor dimension: {self.descriptor_dim}")
         except Exception as e:
             import traceback
+
             logger.warning(f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}")
             logger.warning(f"Using default dimension: {self.descriptor_dim}")
 
@@ -158,10 +182,10 @@ class DatabaseBuilder:
         prev_features = None
 
         # cuDNN benchmark conditionally (Fix 5)
-        import torch
+
         if torch.cuda.is_available():
-            model_type = self.config.get('models', {}).get('local_extractor', 'xfeat')
-            if model_type in ('xfeat', 'aliked'): # CNN-based types
+            model_type = self.config.get("models", {}).get("local_extractor", "xfeat")
+            if model_type in ("xfeat", "aliked"):  # CNN-based types
                 torch.backends.cudnn.benchmark = True
                 logger.info(f"cuDNN benchmark ENABLED for {model_type}")
 
@@ -173,21 +197,21 @@ class DatabaseBuilder:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
+
                 if i % frame_step != 0:
                     continue
-                    
+
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 db_index = i // frame_step
                 frame_queue.put((db_index, (frame, frame_rgb)))
-            
+
             frame_queue.put((-1, None))
 
         prefetch_thread = Thread(target=prefetch_frames, daemon=True)
         prefetch_thread.start()
 
         try:
-            self.db_file = h5py.File(self.output_path, 'a')
+            self.db_file = h5py.File(self.output_path, "a")
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
             while True:
@@ -200,16 +224,18 @@ class DatabaseBuilder:
 
                 static_mask, detections = yolo_wrapper.detect_and_mask(frame_rgb)
                 features = feature_extractor.extract_features(frame_rgb, static_mask)
-                features['coords_2d'] = features['keypoints']
+                features["coords_2d"] = features["keypoints"]
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
-                        frame, features['keypoints'], static_mask, i, num_frames
+                        frame, features["keypoints"], static_mask, i, num_frames
                     )
                     if kp_scale != 1.0:
                         kp_width = int(width * kp_scale)
                         kp_height = int(height * kp_scale)
-                        kp_frame = cv2.resize(kp_frame, (kp_width, kp_height), interpolation=cv2.INTER_AREA)
+                        kp_frame = cv2.resize(
+                            kp_frame, (kp_width, kp_height), interpolation=cv2.INTER_AREA
+                        )
                     kp_writer.write(kp_frame)
 
                 if i == 0 or prev_features is None:
@@ -219,7 +245,9 @@ class DatabaseBuilder:
                     if H_step is not None:
                         current_pose = current_pose @ H_step.astype(np.float64)
                     else:
-                        logger.warning(f"Frame {i}: inter-frame match failed, reusing previous pose")
+                        logger.warning(
+                            f"Frame {i}: inter-frame match failed, reusing previous pose"
+                        )
 
                 prev_features = features
                 self.save_frame_data(i, features, current_pose)
@@ -244,13 +272,18 @@ class DatabaseBuilder:
 
         logger.success(f"Database build completed successfully: {self.output_path}")
 
-    def _draw_keypoints_frame(self, frame_bgr: np.ndarray, keypoints: np.ndarray,
-                                static_mask: np.ndarray, frame_id: int,
-                                total_frames: int) -> np.ndarray:
+    def _draw_keypoints_frame(
+        self,
+        frame_bgr: np.ndarray,
+        keypoints: np.ndarray,
+        static_mask: np.ndarray,
+        frame_id: int,
+        total_frames: int,
+    ) -> np.ndarray:
         vis = frame_bgr.copy()
 
         if static_mask is not None:
-            dynamic_zone = (static_mask == 0)
+            dynamic_zone = static_mask == 0
             if dynamic_zone.any():
                 overlay = vis.copy()
                 overlay[dynamic_zone] = (0, 0, 200)
@@ -272,19 +305,39 @@ class DatabaseBuilder:
 
         for idx, line in enumerate(info_lines):
             cv2.putText(
-                vis, line,
+                vis,
+                line,
                 (8, 22 + idx * 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                (0, 255, 0), 1, cv2.LINE_AA
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
             )
 
         legend_y = vis.shape[0] - 10
         cv2.circle(vis, (12, legend_y - 4), 5, (0, 255, 0), -1)
-        cv2.putText(vis, "XFeat keypoint", (22, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(
+            vis,
+            "XFeat keypoint",
+            (22, legend_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
         cv2.rectangle(vis, (200, legend_y - 10), (218, legend_y + 2), (0, 0, 200), -1)
-        cv2.putText(vis, "YOLO dynamic zone", (224, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1, cv2.LINE_AA)
+        cv2.putText(
+            vis,
+            "YOLO dynamic zone",
+            (224, legend_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 200),
+            1,
+            cv2.LINE_AA,
+        )
 
         return vis
 
@@ -292,12 +345,13 @@ class DatabaseBuilder:
         """
         Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
         """
-        db_cfg = self.config.get('database', {})
-        min_matches = db_cfg.get('inter_frame_min_matches', 15)
-        ransac_thresh = db_cfg.get('inter_frame_ransac_thresh', 3.0)
+        db_cfg = self.config.get("database", {})
+        min_matches = db_cfg.get("inter_frame_min_matches", 15)
+        ransac_thresh = db_cfg.get("inter_frame_ransac_thresh", 3.0)
 
         if self.matcher is None:
             from src.localization.matcher import FeatureMatcher
+
             self.matcher = FeatureMatcher(config=self.config)
 
         mkpts_a, mkpts_b = self.matcher.match(fa, fb)
@@ -306,7 +360,10 @@ class DatabaseBuilder:
             return None
 
         from src.geometry.transformations import GeometryTransforms
-        H, mask = GeometryTransforms.estimate_homography(mkpts_a, mkpts_b, ransac_threshold=ransac_thresh)
+
+        H, mask = GeometryTransforms.estimate_homography(
+            mkpts_a, mkpts_b, ransac_threshold=ransac_thresh
+        )
 
         if H is None or int(np.sum(mask)) < min_matches:
             return None
@@ -317,33 +374,41 @@ class DatabaseBuilder:
         """Create optimal HDF5 hierarchy with compression"""
         logger.info(f"Creating HDF5 structure for {num_frames} frames")
 
-        with h5py.File(self.output_path, 'w') as f:
-            g1 = f.create_group('global_descriptors')
-            g1.create_dataset('descriptors', shape=(num_frames, self.descriptor_dim),
-                               dtype='float32', compression='gzip')
-            g1.create_dataset('frame_poses', shape=(num_frames, 3, 3),
-                               dtype='float64', compression='gzip')
+        with h5py.File(self.output_path, "w") as f:
+            g1 = f.create_group("global_descriptors")
+            g1.create_dataset(
+                "descriptors",
+                shape=(num_frames, self.descriptor_dim),
+                dtype="float32",
+                compression="gzip",
+            )
+            g1.create_dataset(
+                "frame_poses", shape=(num_frames, 3, 3), dtype="float64", compression="gzip"
+            )
 
-            f.create_group('local_features')
+            f.create_group("local_features")
 
-            g3 = f.create_group('metadata')
-            g3.attrs['num_frames'] = num_frames
-            g3.attrs['creation_date'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            g3.attrs['frame_width'] = width
-            g3.attrs['frame_height'] = height
-            g3.attrs['descriptor_dim'] = self.descriptor_dim
+            g3 = f.create_group("metadata")
+            g3.attrs["num_frames"] = num_frames
+            g3.attrs["creation_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            g3.attrs["frame_width"] = width
+            g3.attrs["frame_height"] = height
+            g3.attrs["descriptor_dim"] = self.descriptor_dim
 
         logger.success("HDF5 structure created successfully")
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
         """Save extracted data for a single frame"""
-        self.db_file['global_descriptors']['descriptors'][frame_id] = features['global_desc']
-        self.db_file['global_descriptors']['frame_poses'][frame_id] = pose_2d
+        self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+        self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
-        frame_group = self.db_file['local_features'].create_group(f'frame_{frame_id}')
-        frame_group.create_dataset('keypoints', data=features['keypoints'],
-                                   dtype='float32', compression='gzip')
-        frame_group.create_dataset('descriptors', data=features['descriptors'],
-                                   dtype='float32', compression='gzip')
-        frame_group.create_dataset('coords_2d', data=features['coords_2d'],
-                                   dtype='float32', compression='gzip')
+        frame_group = self.db_file["local_features"].create_group(f"frame_{frame_id}")
+        frame_group.create_dataset(
+            "keypoints", data=features["keypoints"], dtype="float32", compression="gzip"
+        )
+        frame_group.create_dataset(
+            "descriptors", data=features["descriptors"], dtype="float32", compression="gzip"
+        )
+        frame_group.create_dataset(
+            "coords_2d", data=features["coords_2d"], dtype="float32", compression="gzip"
+        )

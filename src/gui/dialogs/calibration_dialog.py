@@ -1,18 +1,30 @@
+import re
+
 import cv2
 import numpy as np
-import re
-from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QFileDialog, QLineEdit, QListWidget, QMessageBox, QSlider,
-    QSpinBox, QGroupBox, QListWidgetItem, QFrame,
-)
-from PyQt6.QtCore import pyqtSignal, Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QVBoxLayout,
+)
 
 from src.gui.widgets.video_widget import VideoWidget
 from src.utils.image_utils import opencv_to_qpixmap
 
-_UNKNOWN_FRAME_COUNT = 99999   # fallback when codec doesn't report frame count
+_UNKNOWN_FRAME_COUNT = 99999  # fallback when codec doesn't report frame count
 
 
 class CalibrationDialog(QDialog):
@@ -28,24 +40,24 @@ class CalibrationDialog(QDialog):
       6. "Done" — triggers full-database propagation
     """
 
-    anchor_added         = pyqtSignal(object)  # dict: {points_2d, points_gps, calib_frame_id}
-    anchor_removed       = pyqtSignal(int)     # frame_id
-    anchor_confirmed     = pyqtSignal(int)     # frame_id actually saved (from MainWindow)
+    anchor_added = pyqtSignal(object)  # dict: {points_2d, points_gps, calib_frame_id}
+    anchor_removed = pyqtSignal(int)  # frame_id
+    anchor_confirmed = pyqtSignal(int)  # frame_id actually saved (from MainWindow)
     calibration_complete = pyqtSignal()
 
     def __init__(self, database_path: str, existing_anchors=None, parent=None):
         super().__init__(parent)
-        self.database_path   = database_path
+        self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
 
-        self.points_2d        = []
-        self.points_gps       = []
+        self.points_2d = []
+        self.points_gps = []
         self.current_2d_point = None
-        self.cap              = None
+        self.cap = None
         self.last_slider_value = 0
-        self._is_video        = False
+        self._is_video = False
 
-        self.timer     = QTimer(self)
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.play_next_frame)
         self.is_playing = False
 
@@ -58,7 +70,7 @@ class CalibrationDialog(QDialog):
 
     def _init_ui(self):
         main_layout = QHBoxLayout(self)
-        self.setAcceptDrops(True) # На майбутнє, якщо знадобиться
+        self.setAcceptDrops(True)  # На майбутнє, якщо знадобиться
 
         # Left panel — video
         left = QVBoxLayout()
@@ -76,8 +88,8 @@ class CalibrationDialog(QDialog):
 
         player_row = QHBoxLayout()
         self.btn_step_back = QPushButton("◀◀")
-        self.btn_play      = QPushButton("▶")
-        self.btn_step      = QPushButton("▶▶")
+        self.btn_play = QPushButton("▶")
+        self.btn_step = QPushButton("▶▶")
         self.lbl_frame_info = QLabel("Кадр: 0 / 0")
         self.lbl_frame_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_frame_info.setStyleSheet("color: #555; font-size: 12px;")
@@ -105,10 +117,10 @@ class CalibrationDialog(QDialog):
         anchors_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         ag = QVBoxLayout(anchors_group)
         self.anchors_list = QListWidget()
-        self.anchors_list.setMaximumHeight(130) # Трохи збільшимо
+        self.anchors_list.setMaximumHeight(130)  # Трохи збільшимо
         self.anchors_list.setStyleSheet("font-size: 11px;")
         self.anchors_list.itemClicked.connect(self.on_anchor_selected)
-        
+
         btn_row = QHBoxLayout()
         self.btn_delete_anchor = QPushButton("🗑 Видалити якір")
         self.btn_delete_anchor.setStyleSheet("color: #b71c1c;")
@@ -226,7 +238,7 @@ class CalibrationDialog(QDialog):
     # ── Parsing GPS ──────────────────────────────────────────────────────────
 
     def parse_combined_gps(self, text: str):
-        matches = re.findall(r'-?\d+\.\d+', text)
+        matches = re.findall(r"-?\d+\.\d+", text)
         if len(matches) >= 2:
             self.input_lat.setText(matches[0])
             self.input_lon.setText(matches[1])
@@ -241,16 +253,16 @@ class CalibrationDialog(QDialog):
             self.anchors_list.addItem(item)
         else:
             # Сортуємо за frame_id
-            sorted_anchors = sorted(self.existing_anchors, key=lambda a: a.get('frame_id', 0))
+            sorted_anchors = sorted(self.existing_anchors, key=lambda a: a.get("frame_id", 0))
             for i, anchor in enumerate(sorted_anchors):
-                fid = anchor.get('frame_id', 0)
-                n_pts = len(anchor.get('qa_data', {}).get('points_2d', []))
-                rmse = anchor.get('qa_data', {}).get('rmse_m', 0.0)
-                
+                fid = anchor.get("frame_id", 0)
+                n_pts = len(anchor.get("qa_data", {}).get("points_2d", []))
+                rmse = anchor.get("qa_data", {}).get("rmse_m", 0.0)
+
                 label = f"⚓ Кадр {fid} | {n_pts} точок"
                 if n_pts > 0:
                     label += f" | RMSE: {rmse:.2f}м"
-                
+
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, fid)
                 item.setForeground(QColor("#1565C0"))
@@ -258,7 +270,7 @@ class CalibrationDialog(QDialog):
 
         has = bool(self.existing_anchors)
         self.btn_done.setEnabled(has)
-        self.btn_delete_anchor.setEnabled(False) # Очищуємо вибір
+        self.btn_delete_anchor.setEnabled(False)  # Очищуємо вибір
 
         if has:
             self.lbl_status.setText(
@@ -277,38 +289,39 @@ class CalibrationDialog(QDialog):
 
         if self.points_2d or self.current_2d_point:
             reply = QMessageBox.question(
-                self, "Увага",
+                self,
+                "Увага",
                 "У вас є незбережені точки. Перейти до іншого кадру?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.No:
                 return
 
-        anchor = next((a for a in self.existing_anchors if a.get('frame_id') == frame_id), None)
+        anchor = next((a for a in self.existing_anchors if a.get("frame_id") == frame_id), None)
         if not anchor:
             return
 
         self.btn_delete_anchor.setEnabled(True)
-        
+
         # Перехід на кадр
         if self._is_video:
             self.slider.blockSignals(True)
             self.slider.setValue(frame_id)
             self.slider.blockSignals(False)
             self._jump_to_frame(frame_id)
-        
+
         # Завантаження точок
         self.clear_current_points()
-        qa = anchor.get('qa_data', {})
-        pts_2d = qa.get('points_2d', [])
-        pts_gps = qa.get('points_gps', [])
-        
+        qa = anchor.get("qa_data", {})
+        pts_2d = qa.get("points_2d", [])
+        pts_gps = qa.get("points_gps", [])
+
         if pts_2d and pts_gps:
             self.points_2d = [tuple(p) for p in pts_2d]
             self.points_gps = [tuple(p) for p in pts_gps]
             for i, (p2d, pgps) in enumerate(zip(self.points_2d, self.points_gps)):
                 self.points_list.addItem(
-                    f"  {i+1}. ({p2d[0]}, {p2d[1]}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
+                    f"  {i + 1}. ({p2d[0]}, {p2d[1]}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
                 )
             self._redraw_points()
         else:
@@ -317,13 +330,16 @@ class CalibrationDialog(QDialog):
 
     def delete_selected_anchor(self):
         curr = self.anchors_list.currentItem()
-        if not curr: return
-        
+        if not curr:
+            return
+
         frame_id = curr.data(Qt.ItemDataRole.UserRole)
-        if frame_id is None: return
+        if frame_id is None:
+            return
 
         reply = QMessageBox.question(
-            self, "Видалення",
+            self,
+            "Видалення",
             f"Видалити якір для кадру {frame_id}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
@@ -331,15 +347,16 @@ class CalibrationDialog(QDialog):
             return
 
         # Видаляємо локально
-        self.existing_anchors = [a for a in self.existing_anchors if a.get('frame_id') != frame_id]
+        self.existing_anchors = [a for a in self.existing_anchors if a.get("frame_id") != frame_id]
         self._refresh_anchors_list()
         self.clear_current_points()
-        
+
         # Сигнал у MainWindow
         self.anchor_removed.emit(frame_id)
 
     def _jump_to_frame(self, frame_id: int):
-        if not self.cap: return
+        if not self.cap:
+            return
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
         ret, frame = self.cap.read()
         if ret and frame is not None:
@@ -352,36 +369,37 @@ class CalibrationDialog(QDialog):
         """Called by MainWindow after affine matrix is successfully computed."""
         # Отримуємо оновлені дані з MainWindow (опціонально, але MainWindow і так оновлює calibration в пам'яті)
         # У MIXIN ми вже додали якір в self.calibration. Тут ми просто хочемо оновити UI діалогу.
-        
+
         # Перевіримо, чи це оновлення існуючого
-        existing = next((a for a in self.existing_anchors if a.get('frame_id') == frame_id), None)
-        
-        # Оскільки діалог не має прямого доступу до об'єкта calibration з MainWindow, 
+        existing = next((a for a in self.existing_anchors if a.get("frame_id") == frame_id), None)
+
+        # Оскільки діалог не має прямого доступу до об'єкта calibration з MainWindow,
         # нам треба або передати сюди новий dict, абоMainWindow сам оновить список при наступному відкритті.
         # Але ми хочемо оновити список ЗАРАЗ.
-        
+
         # ХАК: оскільки ми щойно додали/оновили якір, але діалог не знає НОВІ точки (він знає лише ті, що в self.points_2d),
         # ми можемо "імітувати" оновлення об'єкта в списку діалогу.
         new_data = {
-            'frame_id': frame_id,
-            'qa_data': {
-                'points_2d': list(self.points_2d),
-                'points_gps': list(self.points_gps),
-                'rmse_m': 0.0 # Буде оновлено при наступному відкритті або якщо MainWindow надішле повний об'єкт
-            }
+            "frame_id": frame_id,
+            "qa_data": {
+                "points_2d": list(self.points_2d),
+                "points_gps": list(self.points_gps),
+                "rmse_m": 0.0,  # Буде оновлено при наступному відкритті або якщо MainWindow надішле повний об'єкт
+            },
         }
-        
+
         if existing:
             idx = self.existing_anchors.index(existing)
             self.existing_anchors[idx] = new_data
         else:
             self.existing_anchors.append(new_data)
-        
+
         self._refresh_anchors_list()
-        self.clear_current_points() # ОЧИЩАЄМО після збереження за запитом користувача
-        
+        self.clear_current_points()  # ОЧИЩАЄМО після збереження за запитом користувача
+
         QMessageBox.information(
-            self, "⚓ Якір додано",
+            self,
+            "⚓ Якір додано",
             f"Якір для кадру {frame_id} успішно збережено!",
         )
 
@@ -389,7 +407,9 @@ class CalibrationDialog(QDialog):
 
     def load_frame(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Відео або зображення", "",
+            self,
+            "Відео або зображення",
+            "",
             "Media (*.png *.jpg *.jpeg *.mp4 *.avi *.mkv *.mov);;"
             "Images (*.png *.jpg *.jpeg);;Videos (*.mp4 *.avi *.mkv *.mov)",
         )
@@ -398,7 +418,7 @@ class CalibrationDialog(QDialog):
 
         self.clear_current_points()
 
-        if path.lower().endswith(('.mp4', '.avi', '.mkv', '.mov')):
+        if path.lower().endswith((".mp4", ".avi", ".mkv", ".mov")):
             self._load_video(path)
         else:
             self._load_image(path)
@@ -419,7 +439,7 @@ class CalibrationDialog(QDialog):
         self.cap = cap
         total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total <= 0:
-            total = _UNKNOWN_FRAME_COUNT   # unknown length codec
+            total = _UNKNOWN_FRAME_COUNT  # unknown length codec
 
         self.slider.blockSignals(True)
         self.slider.setEnabled(True)
@@ -520,7 +540,8 @@ class CalibrationDialog(QDialog):
             self.slider.blockSignals(False)
 
             reply = QMessageBox.question(
-                self, "Увага",
+                self,
+                "Увага",
                 "Зміна кадру очистить незбережені точки. Продовжити?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
@@ -602,28 +623,34 @@ class CalibrationDialog(QDialog):
 
     def add_anchor(self):
         if len(self.points_2d) < 4:
-            QMessageBox.warning(self, "Увага",
-                                "Потрібно мінімум 4 точки для якоря!\n\n"
-                                "💡 Рекомендовано: 5-6 точок, розставлених широко\n"
-                                "по всьому кадру для найкращої точності.")
+            QMessageBox.warning(
+                self,
+                "Увага",
+                "Потрібно мінімум 4 точки для якоря!\n\n"
+                "💡 Рекомендовано: 5-6 точок, розставлених широко\n"
+                "по всьому кадру для найкращої точності.",
+            )
             return
 
         frame_id = self.spinbox_frame_id.value()
 
         if frame_id in self.existing_anchors:
             reply = QMessageBox.question(
-                self, "Якір існує",
+                self,
+                "Якір існує",
                 f"Якір для кадру {frame_id} вже є. Замінити?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.No:
                 return
 
-        self.anchor_added.emit({
-            'points_2d':      list(self.points_2d),
-            'points_gps':     list(self.points_gps),
-            'calib_frame_id': frame_id,
-        })
+        self.anchor_added.emit(
+            {
+                "points_2d": list(self.points_2d),
+                "points_gps": list(self.points_gps),
+                "calib_frame_id": frame_id,
+            }
+        )
 
     # ── Finish ───────────────────────────────────────────────────────────────
 
@@ -634,13 +661,14 @@ class CalibrationDialog(QDialog):
 
         if self.points_2d:
             reply = QMessageBox.question(
-                self, "Незбережені точки",
+                self,
+                "Незбережені точки",
                 f"У вас {len(self.points_2d)} незбережених точок для кадру "
                 f"{self.spinbox_frame_id.value()}.\n"
                 f"Додати їх як якір перед завершенням?",
-                QMessageBox.StandardButton.Yes |
-                QMessageBox.StandardButton.No |
-                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.add_anchor()

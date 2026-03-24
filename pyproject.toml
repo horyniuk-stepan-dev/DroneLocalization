@@ -68,6 +68,15 @@ select = [
 ]
 ignore = [
     "E501",  # line too long (formatter handles this)
+    "N802",  # Function name should be lowercase (PyQt events)
+    "N803",  # Argument name should be lowercase (Math symbols M, H)
+    "N806",  # Variable in function should be lowercase (Math symbols M, H)
+    "N812",  # Lowercase imported as non-lowercase
+    "N815",  # Variable in class scope should not be mixedCase (PyQt signals)
+    "B007",  # Loop control variable not used
+    "B905",  # zip() without strict
+    "E402",  # Module level import not at top of file
+    "F841",  # Local variable is assigned to but never used
 ]
 
 [tool.ty]

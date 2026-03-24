@@ -1,1 +1,1 @@
-﻿"""Custom Qt widgets"""
+"""Custom Qt widgets"""

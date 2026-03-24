@@ -1,6 +1,7 @@
-import cv2
-import time
 import threading
+import time
+
+import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -31,11 +32,10 @@ class RealtimeTrackingWorker(QThread):
         # Скільки кадрів розпізнавати за одну секунду ВІДЕО.
         # 1.0 = 1 кадр в секунду; 2.0 = кожні 0.5 секунд; 0.5 = кожні 2 секунди відео.
         # Ти можеш змінити це число прямо тут для тестів:
-        self.process_fps = self.config.get('tracking', {}).get('process_fps', 1.0)
+        self.process_fps = self.config.get("tracking", {}).get("process_fps", 1.0)
 
     def run(self):
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
-        import threading
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
 
         logger.info(f"Starting tracking from source: {self.video_source}")
@@ -102,21 +102,25 @@ class RealtimeTrackingWorker(QThread):
 
                 # БЛОК TRY-EXCEPT для запобігання "зависанню на першому кадрі"
                 try:
-                    loc_result = self.localizer.localize_frame(frame_rgb, static_mask=static_mask, dt=calculated_dt)
+                    loc_result = self.localizer.localize_frame(
+                        frame_rgb, static_mask=static_mask, dt=calculated_dt
+                    )
                 except Exception as e:
                     logger.error(f"Localization exception: {e}", exc_info=True)
                     loc_result = {"success": False, "error": str(e)}
 
                 if loc_result.get("success"):
                     self.location_found.emit(
-                        loc_result["lat"], loc_result["lon"],
-                        loc_result["confidence"], loc_result["inliers"]
+                        loc_result["lat"],
+                        loc_result["lon"],
+                        loc_result["confidence"],
+                        loc_result["inliers"],
                     )
                     if "fov_polygon" in loc_result and loc_result["fov_polygon"] is not None:
                         self.fov_found.emit(loc_result["fov_polygon"])
 
                     if loc_result.get("fallback_mode") == "retrieval_only":
-                         self.status_update.emit(
+                        self.status_update.emit(
                             f"Приблизно (Схожість: {loc_result.get('global_score', 0):.2f}, Кадр: {loc_result['matched_frame']})"
                         )
                     else:
@@ -124,7 +128,9 @@ class RealtimeTrackingWorker(QThread):
                             f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})"
                         )
                 else:
-                    self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
+                    self.status_update.emit(
+                        f"Втрата: {loc_result.get('error', 'Невідома помилка')}"
+                    )
 
                 # Оновлюємо завжди — інакше dt накопичується і Kalman робить стрибок
                 last_localization_real_time = current_real_time
@@ -150,17 +156,17 @@ class RealtimeTrackingWorker(QThread):
         try:
             if not self.model_manager:
                 return
-            
-            fallback = self.config.get('localization', {}).get('fallback_extractor', 'aliked')
+
+            fallback = self.config.get("localization", {}).get("fallback_extractor", "aliked")
             logger.info(f"Pre-warming fallback models ({fallback})...")
-            
-            if fallback == 'aliked':
+
+            if fallback == "aliked":
                 self.model_manager.load_aliked()
                 self.model_manager.load_lightglue_aliked()
             else:
                 self.model_manager.load_superpoint()
                 self.model_manager.load_lightglue()
-            
+
             logger.success("Fallback models pre-warmed successfully")
         except Exception as e:
             logger.warning(f"Fallback pre-warm failed: {e}")

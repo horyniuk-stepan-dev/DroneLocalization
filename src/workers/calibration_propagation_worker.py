@@ -1,11 +1,12 @@
-import cv2
-import numpy as np
-import h5py
 import json
+
+import cv2
+import h5py
+import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from src.geometry.transformations import GeometryTransforms
 from src.geometry.coordinates import CoordinateConverter
+from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -29,11 +30,11 @@ class CalibrationPropagationWorker(QThread):
         self.config = config or {}
         self._is_running = True
 
-        self.min_matches = self.config.get('localization', {}).get('min_matches', 15)
-        self.ransac_thresh = self.config.get('localization', {}).get('ransac_threshold', 3.0)
+        self.min_matches = self.config.get("localization", {}).get("min_matches", 15)
+        self.ransac_thresh = self.config.get("localization", {}).get("ransac_threshold", 3.0)
 
-        self.frame_w = self.database.metadata.get('frame_width', 1920)
-        self.frame_h = self.database.metadata.get('frame_height', 1080)
+        self.frame_w = self.database.metadata.get("frame_width", 1920)
+        self.frame_h = self.database.metadata.get("frame_height", 1080)
 
         # Базова сітка точок для точної апроксимації афінної матриці (4x4)
         grid_x = np.linspace(0, self.frame_w, 4)
@@ -60,11 +61,13 @@ class CalibrationPropagationWorker(QThread):
             self.error.emit("Немає якорів калібрування")
             return
 
-        logger.info(f"Starting visual wave propagation for {num_frames} frames using {len(anchors)} anchors")
+        logger.info(
+            f"Starting visual wave propagation for {num_frames} frames using {len(anchors)} anchors"
+        )
 
         frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float32)
         frame_valid = np.zeros(num_frames, dtype=bool)
-        
+
         # QA metrics
         frame_rmse = np.zeros(num_frames, dtype=np.float32)
         frame_disagreement = np.zeros(num_frames, dtype=np.float32)
@@ -90,8 +93,8 @@ class CalibrationPropagationWorker(QThread):
                 anchor_features[anchor.frame_id] = self._all_features[anchor.frame_id]
                 frame_affine[anchor.frame_id] = anchor.affine_matrix
                 frame_valid[anchor.frame_id] = True
-                frame_rmse[anchor.frame_id] = getattr(anchor, 'rmse_m', 0.0)
-                frame_matches[anchor.frame_id] = getattr(anchor, 'inliers_count', 0)
+                frame_rmse[anchor.frame_id] = getattr(anchor, "rmse_m", 0.0)
+                frame_matches[anchor.frame_id] = getattr(anchor, "inliers_count", 0)
             except Exception as e:
                 self.error.emit(f"Не вдалося завантажити якір {anchor.frame_id}: {e}")
                 return
@@ -101,21 +104,34 @@ class CalibrationPropagationWorker(QThread):
 
         # Fix 7: Паралельна propagation по незалежних сегментах
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        between_segments = [s for s in segments if s['type'] == 'between']
-        tail_segments = [s for s in segments if s['type'] == 'tail']
+
+        between_segments = [s for s in segments if s["type"] == "between"]
+        tail_segments = [s for s in segments if s["type"] == "tail"]
 
         logger.info(f"Parallel processing of {len(between_segments)} segments...")
-        max_workers = self.config.get('models', {}).get('performance', {}).get('propagation_max_workers', 4)
+        max_workers = (
+            self.config.get("models", {}).get("performance", {}).get("propagation_max_workers", 4)
+        )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
-                    self._process_segment, seg, anchor_features, frame_affine, frame_valid,
-                    frame_rmse, frame_disagreement, frame_matches, i, total_segments, num_frames
-                ): seg for i, seg in enumerate(between_segments)
+                    self._process_segment,
+                    seg,
+                    anchor_features,
+                    frame_affine,
+                    frame_valid,
+                    frame_rmse,
+                    frame_disagreement,
+                    frame_matches,
+                    i,
+                    total_segments,
+                    num_frames,
+                ): seg
+                for i, seg in enumerate(between_segments)
             }
             for future in as_completed(futures):
-                if not self._is_running: break
+                if not self._is_running:
+                    break
                 try:
                     future.result()
                 except Exception as e:
@@ -123,16 +139,26 @@ class CalibrationPropagationWorker(QThread):
 
         # Хвости зазвичай дешевші і можуть бути послідовними або теж паралельними
         for i, seg in enumerate(tail_segments):
-            if not self._is_running: break
+            if not self._is_running:
+                break
             self._process_segment(
-                seg, anchor_features, frame_affine, frame_valid,
-                frame_rmse, frame_disagreement, frame_matches, 
-                len(between_segments) + i, total_segments, num_frames
+                seg,
+                anchor_features,
+                frame_affine,
+                frame_valid,
+                frame_rmse,
+                frame_disagreement,
+                frame_matches,
+                len(between_segments) + i,
+                total_segments,
+                num_frames,
             )
 
         valid_count = int(np.sum(frame_valid))
         self.progress.emit(90, "Збереження результатів у HDF5...")
-        self._save_to_hdf5(frame_affine, frame_valid, frame_rmse, frame_disagreement, frame_matches, anchors)
+        self._save_to_hdf5(
+            frame_affine, frame_valid, frame_rmse, frame_disagreement, frame_matches, anchors
+        )
 
         self.progress.emit(100, f"Готово! {valid_count}/{num_frames} кадрів отримали координати.")
         self.completed.emit()
@@ -140,34 +166,40 @@ class CalibrationPropagationWorker(QThread):
     def _build_segments(self, anchors: list, num_frames: int) -> list:
         segments = []
         if anchors[0].frame_id > 0:
-            segments.append({
-                'type': 'tail',
-                'frames': list(range(anchors[0].frame_id - 1, -1, -1)),
-                'anchor': anchors[0]
-            })
+            segments.append(
+                {
+                    "type": "tail",
+                    "frames": list(range(anchors[0].frame_id - 1, -1, -1)),
+                    "anchor": anchors[0],
+                }
+            )
 
         for i in range(len(anchors) - 1):
             left_anchor = anchors[i]
             right_anchor = anchors[i + 1]
-            segments.append({
-                'type': 'between',
-                'left_anchor': left_anchor,
-                'right_anchor': right_anchor,
-                'frames': list(range(left_anchor.frame_id + 1, right_anchor.frame_id))
-            })
+            segments.append(
+                {
+                    "type": "between",
+                    "left_anchor": left_anchor,
+                    "right_anchor": right_anchor,
+                    "frames": list(range(left_anchor.frame_id + 1, right_anchor.frame_id)),
+                }
+            )
 
         if anchors[-1].frame_id < num_frames - 1:
-            segments.append({
-                'type': 'tail',
-                'frames': list(range(anchors[-1].frame_id + 1, num_frames)),
-                'anchor': anchors[-1]
-            })
+            segments.append(
+                {
+                    "type": "tail",
+                    "frames": list(range(anchors[-1].frame_id + 1, num_frames)),
+                    "anchor": anchors[-1],
+                }
+            )
 
         # Валідація: сегменти НЕ повинні перетинатися — це гарантує
         # thread-safety при паралельному записі в numpy-масиви через ThreadPoolExecutor
         all_frame_ids = set()
         for seg in segments:
-            seg_frames = set(seg['frames'])
+            seg_frames = set(seg["frames"])
             overlap = all_frame_ids & seg_frames
             assert not overlap, (
                 f"CRITICAL: Segment overlap detected on frames {overlap}! "
@@ -177,34 +209,60 @@ class CalibrationPropagationWorker(QThread):
 
         return segments
 
-    def _process_segment(self, segment, anchor_features, frame_affine, frame_valid, 
-                         frame_rmse, frame_disagreement, frame_matches, seg_idx, total_segments,
-                         num_frames):
-        if segment['type'] == 'tail':
-            anchor = segment['anchor']
-            frames = segment['frames']
+    def _process_segment(
+        self,
+        segment,
+        anchor_features,
+        frame_affine,
+        frame_valid,
+        frame_rmse,
+        frame_disagreement,
+        frame_matches,
+        seg_idx,
+        total_segments,
+        num_frames,
+    ):
+        if segment["type"] == "tail":
+            anchor = segment["anchor"]
+            frames = segment["frames"]
             self._wave_from_anchor(
-                frames=frames, anchor=anchor, anchor_feat=anchor_features[anchor.frame_id],
-                frame_affine=frame_affine, frame_valid=frame_valid, frame_rmse=frame_rmse,
+                frames=frames,
+                anchor=anchor,
+                anchor_feat=anchor_features[anchor.frame_id],
+                frame_affine=frame_affine,
+                frame_valid=frame_valid,
+                frame_rmse=frame_rmse,
                 frame_matches=frame_matches,
-                seg_idx=seg_idx, total_segments=total_segments, num_frames=num_frames
+                seg_idx=seg_idx,
+                total_segments=total_segments,
+                num_frames=num_frames,
             )
-        elif segment['type'] == 'between':
-            left_anchor = segment['left_anchor']
-            right_anchor = segment['right_anchor']
-            frames = segment['frames']
+        elif segment["type"] == "between":
+            left_anchor = segment["left_anchor"]
+            right_anchor = segment["right_anchor"]
+            frames = segment["frames"]
 
-            h_left_res = self._build_homography_chain(frames, left_anchor, anchor_features[left_anchor.frame_id])
+            h_left_res = self._build_homography_chain(
+                frames, left_anchor, anchor_features[left_anchor.frame_id]
+            )
             frames_reversed = list(reversed(frames))
-            h_right_res = self._build_homography_chain(frames_reversed, right_anchor,
-                                                          anchor_features[right_anchor.frame_id])
+            h_right_res = self._build_homography_chain(
+                frames_reversed, right_anchor, anchor_features[right_anchor.frame_id]
+            )
 
             total_frames_in_seg = len(frames)
             for local_idx, frame_id in enumerate(frames):
-                if not self._is_running: return
+                if not self._is_running:
+                    return
 
                 if local_idx % 10 == 0:
-                    prog = int((seg_idx / total_segments + local_idx / (total_frames_in_seg * total_segments)) * 90)
+                    prog = int(
+                        (
+                            seg_idx / total_segments
+                            + local_idx / (total_frames_in_seg * total_segments)
+                        )
+                        * 90
+                    )
                     self.progress.emit(prog, f"Блендінг: кадр {frame_id}/{num_frames}...")
 
                 H_to_left_info = h_left_res.get(frame_id)
@@ -213,26 +271,30 @@ class CalibrationPropagationWorker(QThread):
                 metric_pts_left = None
                 n_left = 0
                 if H_to_left_info:
-                    metric_pts_left = self._project_to_metric(H_to_left_info['H'], left_anchor)
-                    n_left = H_to_left_info['matches']
+                    metric_pts_left = self._project_to_metric(H_to_left_info["H"], left_anchor)
+                    n_left = H_to_left_info["matches"]
 
                 metric_pts_right = None
                 n_right = 0
                 if H_to_right_info:
-                    metric_pts_right = self._project_to_metric(H_to_right_info['H'], right_anchor)
-                    n_right = H_to_right_info['matches']
+                    metric_pts_right = self._project_to_metric(H_to_right_info["H"], right_anchor)
+                    n_right = H_to_right_info["matches"]
 
                 final_metric_pts = None
                 disagreement = 0.0
 
                 if metric_pts_left is not None and metric_pts_right is not None:
-                    disagreement = np.mean(np.linalg.norm(metric_pts_left - metric_pts_right, axis=1))
-                    
+                    disagreement = np.mean(
+                        np.linalg.norm(metric_pts_left - metric_pts_right, axis=1)
+                    )
+
                     dist_to_left = abs(frame_id - left_anchor.frame_id)
                     dist_to_right = abs(frame_id - right_anchor.frame_id)
                     weight_left = dist_to_right / (dist_to_left + dist_to_right)
                     weight_right = 1.0 - weight_left
-                    final_metric_pts = metric_pts_left * weight_left + metric_pts_right * weight_right
+                    final_metric_pts = (
+                        metric_pts_left * weight_left + metric_pts_right * weight_right
+                    )
                     frame_matches[frame_id] = int((n_left + n_right) / 2)
                 elif metric_pts_left is not None:
                     final_metric_pts = metric_pts_left
@@ -247,60 +309,82 @@ class CalibrationPropagationWorker(QThread):
                         frame_affine[frame_id] = M
                         frame_valid[frame_id] = True
                         proj = GeometryTransforms.apply_affine(self.grid_points, M)
-                        rmse = np.sqrt(np.mean(np.linalg.norm(proj - final_metric_pts, axis=1)**2))
+                        rmse = np.sqrt(
+                            np.mean(np.linalg.norm(proj - final_metric_pts, axis=1) ** 2)
+                        )
                         frame_rmse[frame_id] = rmse
                         frame_disagreement[frame_id] = disagreement
 
-    def _wave_from_anchor(self, frames, anchor, anchor_feat, frame_affine, frame_valid, frame_rmse, frame_matches,
-                          seg_idx, total_segments, num_frames):
+    def _wave_from_anchor(
+        self,
+        frames,
+        anchor,
+        anchor_feat,
+        frame_affine,
+        frame_valid,
+        frame_rmse,
+        frame_matches,
+        seg_idx,
+        total_segments,
+        num_frames,
+    ):
         h_chain = self._build_homography_chain(frames, anchor, anchor_feat)
         total_frames_in_seg = len(frames)
 
         for local_idx, frame_id in enumerate(frames):
-            if not self._is_running: return
+            if not self._is_running:
+                return
 
             if local_idx % 20 == 0:
-                prog = int((seg_idx / total_segments + local_idx / (total_frames_in_seg * total_segments)) * 90)
-                self.progress.emit(prog, f"Хвиля від {anchor.frame_id}: кадр {frame_id}/{num_frames}...")
+                prog = int(
+                    (seg_idx / total_segments + local_idx / (total_frames_in_seg * total_segments))
+                    * 90
+                )
+                self.progress.emit(
+                    prog, f"Хвиля від {anchor.frame_id}: кадр {frame_id}/{num_frames}..."
+                )
 
             info = h_chain.get(frame_id)
             if info:
-                metric_pts = self._project_to_metric(info['H'], anchor)
+                metric_pts = self._project_to_metric(info["H"], anchor)
                 if metric_pts is not None:
                     M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts)
                     if M is not None:
                         frame_affine[frame_id] = M
                         frame_valid[frame_id] = True
                         proj = GeometryTransforms.apply_affine(self.grid_points, M)
-                        rmse = np.sqrt(np.mean(np.linalg.norm(proj - metric_pts, axis=1)**2))
+                        rmse = np.sqrt(np.mean(np.linalg.norm(proj - metric_pts, axis=1) ** 2))
                         frame_rmse[frame_id] = rmse
-                        frame_matches[frame_id] = info['matches']
+                        frame_matches[frame_id] = info["matches"]
 
     def _build_homography_chain(self, frames, anchor, anchor_feat):
         """
         Fix 4: Використання збережених frame_poses для миттєвої пропагації.
         O(1) замість O(N) GPU-викликів матчингу.
         """
-        result = {anchor.frame_id: {'H': np.eye(3, dtype=np.float32), 'matches': 100}}
+        result = {anchor.frame_id: {"H": np.eye(3, dtype=np.float32), "matches": 100}}
         anchor_id = anchor.frame_id
-        
+
         try:
             pose_anchor = self.database.frame_poses[anchor_id].astype(np.float64)
             if np.abs(np.linalg.det(pose_anchor)) > 1e-9:
                 inv_pose_anchor = np.linalg.inv(pose_anchor)
-                
+
                 for frame_id in frames:
-                    if not self._is_running: break
+                    if not self._is_running:
+                        break
                     try:
                         pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
                         # H від frame до anchor через збережені pose-ланцюги
                         H = (inv_pose_anchor @ pose_frame).astype(np.float32)
-                        result[frame_id] = {'H': H, 'matches': 50}  # 50 = estimated
+                        result[frame_id] = {"H": H, "matches": 50}  # 50 = estimated
                     except Exception:
                         continue
                 return result
         except Exception as e:
-            logger.warning(f"Failed to use saved poses for anchor {anchor_id}, falling back to visual: {e}")
+            logger.warning(
+                f"Failed to use saved poses for anchor {anchor_id}, falling back to visual: {e}"
+            )
 
         # Fallback до візуальної пропагації (тільки якщо поз немає)
         h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
@@ -309,21 +393,26 @@ class CalibrationPropagationWorker(QThread):
         prev_frame_id = anchor_id
 
         for frame_id in frames:
-            if not self._is_running: break
+            if not self._is_running:
+                break
             try:
                 curr_features = self._all_features.get(frame_id)
-                if curr_features is None: continue
-                
+                if curr_features is None:
+                    continue
+
                 res = self._match_pair_with_count(curr_features, prev_features)
-                if res is None: continue
+                if res is None:
+                    continue
                 H_curr_to_prev, n_matches = res
 
                 H_prev_to_anchor = h_cache[prev_frame_id]
-                H_curr_to_anchor = (H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)).astype(np.float32)
+                H_curr_to_anchor = (
+                    H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)
+                ).astype(np.float32)
 
                 h_cache[frame_id] = H_curr_to_anchor
                 matches_cache[frame_id] = n_matches
-                result[frame_id] = {'H': H_curr_to_anchor, 'matches': n_matches}
+                result[frame_id] = {"H": H_curr_to_anchor, "matches": n_matches}
 
                 prev_features = curr_features
                 prev_frame_id = frame_id
@@ -339,7 +428,8 @@ class CalibrationPropagationWorker(QThread):
             H, mask = GeometryTransforms.estimate_homography(
                 mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
             )
-            if H is None: return None
+            if H is None:
+                return None
             inliers = int(np.sum(mask))
             if inliers < self.min_matches:
                 return None
@@ -354,29 +444,40 @@ class CalibrationPropagationWorker(QThread):
         metric_pts = GeometryTransforms.apply_affine(pts_in_anchor, anchor.affine_matrix)
         return metric_pts
 
-    def _save_to_hdf5(self, frame_affine, frame_valid, frame_rmse, frame_disagreement, frame_matches, anchors):
+    def _save_to_hdf5(
+        self, frame_affine, frame_valid, frame_rmse, frame_disagreement, frame_matches, anchors
+    ):
         db_path = self.database.db_path
         self.database.close()
         try:
-            with h5py.File(db_path, 'a') as f:
-                if 'calibration' in f:
-                    del f['calibration']
-                grp = f.create_group('calibration')
-                
+            with h5py.File(db_path, "a") as f:
+                if "calibration" in f:
+                    del f["calibration"]
+                grp = f.create_group("calibration")
+
                 # Дані та метадані версії 2.1
-                grp.attrs['version'] = '2.1'
-                grp.attrs['num_anchors'] = len(anchors)
-                grp.attrs['anchors_json'] = json.dumps([a.to_dict() for a in anchors], ensure_ascii=False)
-                grp.attrs['projection_json'] = json.dumps(CoordinateConverter.export_projection_metadata())
-                
+                grp.attrs["version"] = "2.1"
+                grp.attrs["num_anchors"] = len(anchors)
+                grp.attrs["anchors_json"] = json.dumps(
+                    [a.to_dict() for a in anchors], ensure_ascii=False
+                )
+                grp.attrs["projection_json"] = json.dumps(
+                    CoordinateConverter.export_projection_metadata()
+                )
+
                 # Датасети
-                grp.create_dataset('frame_affine', data=frame_affine, compression='gzip')
-                grp.create_dataset('frame_valid', data=frame_valid.astype(np.uint8), compression='gzip')
-                grp.create_dataset('frame_rmse', data=frame_rmse, compression='gzip')
-                grp.create_dataset('frame_disagreement', data=frame_disagreement, compression='gzip')
-                grp.create_dataset('frame_matches', data=frame_matches, compression='gzip')
-                
-            logger.success(f"Successful propagation saved to HDF5 (rev 2.1, {len(anchors)} anchors)")
+                grp.create_dataset("frame_affine", data=frame_affine, compression="gzip")
+                grp.create_dataset(
+                    "frame_valid", data=frame_valid.astype(np.uint8), compression="gzip"
+                )
+                grp.create_dataset("frame_rmse", data=frame_rmse, compression="gzip")
+                grp.create_dataset(
+                    "frame_disagreement", data=frame_disagreement, compression="gzip"
+                )
+                grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
+
+            logger.success(
+                f"Successful propagation saved to HDF5 (rev 2.1, {len(anchors)} anchors)"
+            )
         finally:
             self.database._load_hot_data()
-

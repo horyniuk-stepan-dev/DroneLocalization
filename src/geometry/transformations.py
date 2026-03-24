@@ -1,19 +1,25 @@
 import cv2
 import numpy as np
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
 
 class GeometryTransforms:
     """Geometric transformations for localization with robust estimation (MAGSAC++)"""
 
     @staticmethod
-    def is_matrix_valid(M: np.ndarray, is_homography: bool = False,
-                        min_scale: float = 0.001, max_scale: float = 100.0,
-                        max_shear: float = 0.8) -> bool:
+    def is_matrix_valid(
+        M: np.ndarray,
+        is_homography: bool = False,
+        min_scale: float = 0.001,
+        max_scale: float = 100.0,
+        max_shear: float = 0.8,
+    ) -> bool:
         """
         Check if the transformation matrix is physically realistic for drone imagery.
-        
+
         Args:
             M: Transformation matrix (2x3 for Affine or 3x3 for Homography)
             is_homography: True if M is a 3x3 Homography matrix
@@ -27,27 +33,34 @@ class GeometryTransforms:
         try:
             if is_homography:
                 # For Homography, we care about the affine part for stability checks
-                if M.shape != (3, 3): return False
+                if M.shape != (3, 3):
+                    return False
                 # Normalize by M[2,2] if possible
-                if abs(M[2, 2]) < 1e-9: return False
+                if abs(M[2, 2]) < 1e-9:
+                    return False
                 M = M / M[2, 2]
-                
+
                 # Check perspective components (should be very small for top-down drone imagery)
                 # If these are large, the corners will fly off to infinity
                 if abs(M[2, 0]) > 0.005 or abs(M[2, 1]) > 0.005:
-                    logger.debug(f"Matrix invalid: Extreme perspective warp ({M[2,0]:.5f}, {M[2,1]:.5f})")
+                    logger.debug(
+                        f"Matrix invalid: Extreme perspective warp ({M[2, 0]:.5f}, {M[2, 1]:.5f})"
+                    )
                     return False
-                    
+
                 A = M[:2, :2]
                 det = np.linalg.det(A)
             else:
-                if M.shape != (2, 3): return False
+                if M.shape != (2, 3):
+                    return False
                 A = M[:2, :2]
                 det = np.linalg.det(A)
 
             # 1. Determinant must be non-zero (prevent degenerate matrices)
             if abs(det) < 1e-9:
-                logger.debug(f"Matrix invalid: Degenerate matrix with determinant near zero ({det})")
+                logger.debug(
+                    f"Matrix invalid: Degenerate matrix with determinant near zero ({det})"
+                )
                 return False
             # Allow negative determinant since mapping Image Y (down) to Map Y (up) requires reflection!
 
@@ -65,7 +78,9 @@ class GeometryTransforms:
             # 3. Check Aspect Ratio (should be close to 1.0 for drone imagery)
             aspect_ratio = scale_u / (scale_v + 1e-9)
             if not (0.5 < aspect_ratio < 2.0):
-                logger.debug(f"Matrix invalid: Extreme aspect ratio distortion ({aspect_ratio:.2f})")
+                logger.debug(
+                    f"Matrix invalid: Extreme aspect ratio distortion ({aspect_ratio:.2f})"
+                )
                 return False
 
             # 4. Check Shear (cos of angle between basis vectors)
@@ -81,11 +96,14 @@ class GeometryTransforms:
             return False
 
     @staticmethod
-    def estimate_homography(src_pts: np.ndarray, dst_pts: np.ndarray,
-                             ransac_threshold: float = 3.0,
-                             max_iters: int = 2000,
-                             confidence: float = 0.99,
-                             fallback_to_affine: bool = True):
+    def estimate_homography(
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        ransac_threshold: float = 3.0,
+        max_iters: int = 2000,
+        confidence: float = 0.99,
+        fallback_to_affine: bool = True,
+    ):
         """
         Estimate Homography using MAGSAC++ with validation and optional fallback.
         """
@@ -97,18 +115,21 @@ class GeometryTransforms:
 
         # Use standard RANSAC instead of USAC_MAGSAC for stability in OpenCV
         H, mask = cv2.findHomography(
-            src_pts_cv, dst_pts_cv,
+            src_pts_cv,
+            dst_pts_cv,
             method=cv2.RANSAC,
             ransacReprojThreshold=ransac_threshold,
             maxIters=max_iters,
-            confidence=confidence
+            confidence=confidence,
         )
 
         # Validate Homography
         if not GeometryTransforms.is_matrix_valid(H, is_homography=True):
             if fallback_to_affine:
                 logger.warning("Homography invalid/degenerate, falling back to Partial Affine")
-                return GeometryTransforms.estimate_affine_partial(src_pts, dst_pts, ransac_threshold)
+                return GeometryTransforms.estimate_affine_partial(
+                    src_pts, dst_pts, ransac_threshold
+                )
             return None, None
 
         return H, mask
@@ -131,34 +152,32 @@ class GeometryTransforms:
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
         M, mask = cv2.estimateAffine2D(
-            src_pts_cv, dst_pts_cv,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
         )
-        
+
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
             return None, None
-            
+
         return M, mask
 
     @staticmethod
-    def estimate_affine_partial(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
+    def estimate_affine_partial(
+        src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0
+    ):
         """Compute STRICT Affine transformation (4 DoF: R+T+S only) using MAGSAC++"""
-        if len(src_pts) < 2: # Partial needs only 2 points minimum
+        if len(src_pts) < 2:  # Partial needs only 2 points minimum
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
         M, mask = cv2.estimateAffinePartial2D(
-            src_pts_cv, dst_pts_cv,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
         )
-        
+
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
             return None, None
-            
+
         return M, mask
 
     @staticmethod

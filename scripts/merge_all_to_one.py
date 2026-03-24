@@ -1,5 +1,5 @@
-import sys
 from pathlib import Path
+
 
 def merge_files(source_dir: str, output_file: str) -> None:
     """
@@ -8,10 +8,10 @@ def merge_files(source_dir: str, output_file: str) -> None:
     """
     source = Path(source_dir).resolve()
     output = Path(output_file).resolve()
-    
+
     # Створюємо директорію для вихідного файлу, якщо її немає
     output.parent.mkdir(parents=True, exist_ok=True)
-    
+
     merged_content = []
     copied = 0
 
@@ -23,12 +23,12 @@ def merge_files(source_dir: str, output_file: str) -> None:
             continue
 
         relative = file_path.relative_to(source)
-        
+
         # Додаємо красивий заголовок з назвою файлу
-        merged_content.append(f"\n\n# {'='*80}\n# File: {relative}\n# {'='*80}\n")
-        
+        merged_content.append(f"\n\n# {'=' * 80}\n# File: {relative}\n# {'=' * 80}\n")
+
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, encoding="utf-8") as f:
                 merged_content.append(f.read())
             print(f"[MERGED] {file_path.name} -> {output.name}")
             copied += 1
@@ -36,7 +36,7 @@ def merge_files(source_dir: str, output_file: str) -> None:
             print(f"[ERROR] Не вдалося прочитати файл {file_path}: {e}")
 
     # Записуємо всі зібрані дані в один файл
-    with open(output, 'w', encoding='utf-8') as out_f:
+    with open(output, "w", encoding="utf-8") as out_f:
         out_f.write("".join(merged_content))
 
     print(f"\nГотово! {copied} файлів об'єднано в {output}.")
@@ -44,7 +44,7 @@ def merge_files(source_dir: str, output_file: str) -> None:
 
 if __name__ == "__main__":
     # Змінюйте ці шляхи за потреби
-    SOURCE = "E:/Dip/budyak/DroneLocalization/src"
+    SOURCE = "E:/Dip/gsdfg/New/DroneLocalization/src"
     OUTPUT = "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFiles/all_merged_old.py"
-    
+
     merge_files(SOURCE, OUTPUT)

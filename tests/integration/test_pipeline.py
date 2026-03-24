@@ -1,4 +1,5 @@
-﻿"""Integration tests"""
+"""Integration tests"""
+
 
 def test_full_pipeline():
     """Test complete localization pipeline"""

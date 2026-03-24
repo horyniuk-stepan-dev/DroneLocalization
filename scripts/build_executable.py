@@ -1,6 +1,7 @@
-﻿import PyInstaller.__main__
 import os
 from pathlib import Path
+
+import PyInstaller.__main__
 
 
 def build_app():
@@ -19,46 +20,39 @@ def build_app():
 
     args = [
         main_script,
-        '--name=DroneLocalization',
-        '--noconfirm',
-
+        "--name=DroneLocalization",
+        "--noconfirm",
         # Режим папки (швидкий запуск, ідеально для AI додатків)
-        '--onedir',
-
+        "--onedir",
         # Вимикаємо консоль (змініть на --console для дебагу)
-        '--windowed',
-
+        "--windowed",
         # Абсолютний шлях до джерела ресурсів
-        f'--add-data={resources_dir};src/gui/resources',
-
+        f"--add-data={resources_dir};src/gui/resources",
         # Примусово вказуємо PyInstaller запакувати ці бібліотеки
-        '--hidden-import=PyQt6.QtWebEngineWidgets',
-        '--hidden-import=PyQt6.QtWebEngineCore',
-        '--hidden-import=torch',
-        '--hidden-import=torchvision',
-        '--hidden-import=ultralytics',
-        '--hidden-import=lightglue',
-        '--hidden-import=h5py',
-        '--hidden-import=cv2',
-        '--hidden-import=filterpy',
-        '--hidden-import=pyproj',
-
+        "--hidden-import=PyQt6.QtWebEngineWidgets",
+        "--hidden-import=PyQt6.QtWebEngineCore",
+        "--hidden-import=torch",
+        "--hidden-import=torchvision",
+        "--hidden-import=ultralytics",
+        "--hidden-import=lightglue",
+        "--hidden-import=h5py",
+        "--hidden-import=cv2",
+        "--hidden-import=filterpy",
+        "--hidden-import=pyproj",
         # --- ФІКС ПОМИЛКИ JARACO ---
-        '--hidden-import=pkg_resources',
-        '--hidden-import=jaraco.text',
-        '--hidden-import=jaraco.functools',
-        '--hidden-import=jaraco.context',
-        '--hidden-import=pkg_resources._vendor.jaraco.text',
-        '--hidden-import=pkg_resources._vendor.jaraco.functools',
-        '--hidden-import=pkg_resources._vendor.jaraco.context',
+        "--hidden-import=pkg_resources",
+        "--hidden-import=jaraco.text",
+        "--hidden-import=jaraco.functools",
+        "--hidden-import=jaraco.context",
+        "--hidden-import=pkg_resources._vendor.jaraco.text",
+        "--hidden-import=pkg_resources._vendor.jaraco.functools",
+        "--hidden-import=pkg_resources._vendor.jaraco.context",
         # ---------------------------
-
         # Очищуємо кеш попередніх збірок
-        '--clean',
-
+        "--clean",
         # Явно вказуємо, куди класти готові файли (в корінь проєкту)
-        f'--distpath={str(root_dir / "dist")}',
-        f'--workpath={str(root_dir / "build")}'
+        f"--distpath={str(root_dir / 'dist')}",
+        f"--workpath={str(root_dir / 'build')}",
     ]
 
     # Запускаємо процес збірки

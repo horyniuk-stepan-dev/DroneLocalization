@@ -1,20 +1,21 @@
 import base64
+
 import cv2
 import numpy as np
 import torch
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QMessageBox, QFileDialog
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
-from src.models.wrappers.feature_extractor import FeatureExtractor
-from src.localization.matcher import FeatureMatcher
 from src.localization.localizer import Localizer
+from src.localization.matcher import FeatureMatcher
+from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.workers.panorama_worker import PanoramaWorker
 
 _MAX_DISPLAY_PX = 2048
-_CROP_SIZE_MAX  = 800
-_JPEG_QUALITY   = 80
+_CROP_SIZE_MAX = 800
+_JPEG_QUALITY = 80
 
 
 from src.utils.logging_utils import get_logger
@@ -23,12 +24,11 @@ logger = get_logger(__name__)
 
 
 class PanoramaMixin:
-
     @pyqtSlot()
     def on_generate_panorama(self):
         default_video = ""
         default_save = "panorama.jpg"
-        
+
         if self.project_manager and self.project_manager.is_loaded:
             default_video = self.project_manager.settings.video_path
             default_save = str(self.project_manager.project_dir / "panoramas" / "panorama.jpg")
@@ -38,7 +38,7 @@ class PanoramaMixin:
         )
         if not video_path:
             return
-            
+
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Зберегти панораму", default_save, "Images (*.jpg *.png)"
         )
@@ -64,7 +64,7 @@ class PanoramaMixin:
 
     @pyqtSlot()
     def on_show_panorama(self):
-        if not (self.calibration.is_calibrated or getattr(self.database, 'is_propagated', False)):
+        if not (self.calibration.is_calibrated or getattr(self.database, "is_propagated", False)):
             QMessageBox.warning(self, "Увага", "Спочатку виконайте калібрування!")
             return
 
@@ -96,17 +96,23 @@ class PanoramaMixin:
                 scale = _MAX_DISPLAY_PX / max(W, H)
                 img = cv2.resize(img, (int(W * scale), int(H * scale)))
 
-            ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
             if not ok:
                 raise RuntimeError("Не вдалося закодувати зображення")
 
-            data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
+            data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
             (lat_tl, lon_tl), (lat_tr, lon_tr), (lat_br, lon_br), (lat_bl, lon_bl) = corners_gps
 
             self.map_widget.set_panorama_overlay(
                 data_url,
-                lat_tl, lon_tl, lat_tr, lon_tr,
-                lat_br, lon_br, lat_bl, lon_bl,
+                lat_tl,
+                lon_tl,
+                lat_tr,
+                lon_tr,
+                lat_br,
+                lon_br,
+                lat_bl,
+                lon_bl,
             )
             self.status_bar.showMessage("Панораму накладено на карту!")
 
@@ -132,31 +138,33 @@ class PanoramaMixin:
 
         # Обчислюємо відстань від кожного пікселя до чорного фону
         # Це допоможе нам вибрати центри, які знаходяться глибоко всередині зображення
-        dist = cv2.distanceTransform(cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)[1], cv2.DIST_L2, 5)
-        
+        dist = cv2.distanceTransform(
+            cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)[1], cv2.DIST_L2, 5
+        )
+
         # Визначаємо "безпечну зону", де можна брати центр кропу, щоб він (майже) не захоплював чорні краї
         # Якщо панорама тонка, беремо хоча б 80% від її максимальної товщини
         safe_dist = min(crop_size // 2, dist.max() * 0.8)
         safe_mask = dist >= safe_dist
-        
+
         safe_y, safe_x = np.where(safe_mask > 0)
-        
+
         if len(safe_x) == 0:
             QMessageBox.warning(self, "Помилка", "Панорама занадто тонка для аналізу.")
             return None
 
         # Цільові ідеальні 4 кути рамки
         target_corners = [
-            (x, y),                 # Top-Left
-            (x + w, y),             # Top-Right
-            (x, y + h),             # Bottom-Left
-            (x + w, y + h)          # Bottom-Right
+            (x, y),  # Top-Left
+            (x + w, y),  # Top-Right
+            (x, y + h),  # Bottom-Left
+            (x + w, y + h),  # Bottom-Right
         ]
-        
+
         # Формуємо 4 центри, знаходячи найближчу "безпечну" точку до кожного ідеального кута
         centers = []
         for tx, ty in target_corners:
-            dists_sq = (safe_x - tx)**2 + (safe_y - ty)**2
+            dists_sq = (safe_x - tx) ** 2 + (safe_y - ty) ** 2
             best_idx = np.argmin(dists_sq)
             centers.append((safe_x[best_idx], safe_y[best_idx]))
 
@@ -165,22 +173,22 @@ class PanoramaMixin:
             # Зміщуємо так, щоб центр crop співпадав з cx, cy (або якомога ближче, враховуючи межі)
             x1 = max(0, cx - crop_size // 2)
             y1 = max(0, cy - crop_size // 2)
-            
+
             # Коригуємо межі, щоб не вилізти за межі зображення
             x1 = min(x1, W - crop_size)
             y1 = min(y1, H - crop_size)
-            
+
             # Якщо розмір менший за crop_size (наприклад зображення мале)
             x1, y1 = max(0, x1), max(0, y1)
 
-            crops.append((img[y1:y1 + crop_size, x1:x1 + crop_size], x1, y1))
+            crops.append((img[y1 : y1 + crop_size, x1 : x1 + crop_size], x1, y1))
 
         device = self.model_manager.device
         xf = self.model_manager.load_aliked()
         nv = self.model_manager.load_dinov2()
 
         cesp = None
-        if self.config.get('models', {}).get('cesp', {}).get('enabled', False):
+        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
             try:
                 cesp = self.model_manager.load_cesp()
             except Exception:
@@ -188,8 +196,13 @@ class PanoramaMixin:
 
         fe = FeatureExtractor(xf, nv, device=device, config=self.config, cesp_module=cesp)
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
-        localizer = Localizer(self.database, fe, matcher, self.calibration,
-                              {**self.config, '_model_manager': self.model_manager})
+        localizer = Localizer(
+            self.database,
+            fe,
+            matcher,
+            self.calibration,
+            {**self.config, "_model_manager": self.model_manager},
+        )
 
         pts_pano, pts_metric = [], []
         try:
@@ -198,13 +211,12 @@ class PanoramaMixin:
                 self.repaint()
 
                 res = localizer.localize_frame(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                if not res.get('success') or 'fov_polygon' in res is False:
+                if not res.get("success") or "fov_polygon" in res is False:
                     continue
 
                 ch, cw = crop.shape[:2]
                 for (px, py), (lat, lon) in zip(
-                        [(0, 0), (cw, 0), (cw, ch), (0, ch)],
-                        res['fov_polygon']
+                    [(0, 0), (cw, 0), (cw, ch), (0, ch)], res["fov_polygon"]
                 ):
                     pts_pano.append((px + off_x, py + off_y))
                     pts_metric.append(CoordinateConverter.gps_to_metric(lat, lon))
@@ -213,8 +225,7 @@ class PanoramaMixin:
                 torch.cuda.empty_cache()
 
         if len(pts_pano) < 3:
-            QMessageBox.warning(self, "Помилка",
-                                "Замало точок для прив'язки панорами.")
+            QMessageBox.warning(self, "Помилка", "Замало точок для прив'язки панорами.")
             return None
 
         M, _ = cv2.estimateAffine2D(
