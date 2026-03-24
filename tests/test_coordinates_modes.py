@@ -1,25 +1,19 @@
 import sys
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-import sys
-from pathlib import Path
-
-from src.geometry.coordinates import CoordinateConverter
-
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 import pytest
+
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.geometry.coordinates import CoordinateConverter
 
 
 def test_conversions():
-    # Reset initialization to clean state
-    CoordinateConverter.set_projection_mode("UTM")
-
     lat, lon = 50.4501, 30.5234  # Kyiv
+
+    # Reset initialization to clean state
+    CoordinateConverter.reset()
+    CoordinateConverter.configure_projection("UTM", reference_gps=(lat, lon))
 
     # Test automatic UTM projection
     x_utm, y_utm = CoordinateConverter.gps_to_metric(lat, lon)
@@ -32,7 +26,8 @@ def test_conversions():
     assert abs(lon - lon_utm) < 1e-7
 
     # Test Web Mercator
-    CoordinateConverter.set_projection_mode("WEB_MERCATOR")
+    CoordinateConverter.reset()
+    CoordinateConverter.configure_projection("WEB_MERCATOR")
     x_wm, y_wm = CoordinateConverter.gps_to_metric(lat, lon)
 
     assert CoordinateConverter._initialized is True
@@ -58,6 +53,7 @@ def test_haversine_distance():
 
 def test_uninitialized_error():
     # Reset initialization strictly for testing error
-    CoordinateConverter._initialized = False
-    with pytest.raises(ValueError, match="CoordinateConverter is not initialized."):
+    CoordinateConverter.reset()
+    CoordinateConverter._projection_mode = "UTM"
+    with pytest.raises(RuntimeError, match="CoordinateConverter is not initialized."):
         CoordinateConverter.metric_to_gps(100.0, 100.0)
