@@ -55,6 +55,9 @@ qt_api = "pyqt6"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = [
+    "scripts/allFiles",
+]
 
 [tool.ruff.lint]
 select = [
