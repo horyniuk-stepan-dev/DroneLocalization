@@ -4,6 +4,7 @@ from contextlib import contextmanager
 
 import torch
 
+from config.config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -13,7 +14,7 @@ class ModelManager:
     def __init__(self, config=None, device="cuda"):
         self.config = config or {}
 
-        use_cuda = self.config.get("models", {}).get("use_cuda", True)
+        use_cuda = get_cfg(self.config, "models.use_cuda", True)
         if not use_cuda:
             logger.info("CUDA force disabled in configuration")
 
@@ -24,10 +25,10 @@ class ModelManager:
         self.model_usage = {}
 
         # Конфігурація VRAM
-        m_cfg = self.config.get("models", {})
-        vram_cfg = m_cfg.get("vram_management", {})
-        self.max_vram_ratio = vram_cfg.get("max_vram_ratio", 0.8)
-        self.default_vram_required = vram_cfg.get("default_required_mb", 2000.0)
+        self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
+        self.default_vram_required = get_cfg(
+            self.config, "models.vram_management.default_required_mb", 2000.0
+        )
 
         logger.info(f"ModelManager initialized with device: {self.device}")
         if self.device == "cuda":
@@ -60,9 +61,8 @@ class ModelManager:
     def load_yolo(self):
         name = "yolo"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            model_path = cfg.get("model_path", "yolo11x-seg.pt")
-            vram_req = cfg.get("vram_required_mb", 1200.0)
+            model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11x-seg.pt")
+            vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
 
             logger.info(f"Loading YOLO model: {model_path}...")
             self._ensure_vram_available(vram_req)
@@ -82,11 +82,10 @@ class ModelManager:
     def load_xfeat(self):
         name = "xfeat"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            repo = cfg.get("hub_repo", "verlab/accelerated_features")
-            model_name = cfg.get("hub_model", "XFeat")
-            top_k = cfg.get("top_k", 2048)
-            vram_req = cfg.get("vram_required_mb", 300.0)
+            repo = get_cfg(self.config, "models.xfeat.hub_repo", "verlab/accelerated_features")
+            model_name = get_cfg(self.config, "models.xfeat.hub_model", "XFeat")
+            top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
+            vram_req = get_cfg(self.config, "models.xfeat.vram_required_mb", 300.0)
 
             logger.info(f"Loading XFeat model ({repo}/{model_name})...")
             self._ensure_vram_available(vram_req)
@@ -107,8 +106,7 @@ class ModelManager:
     def load_superpoint(self):
         name = "superpoint"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            vram_req = cfg.get("vram_required_mb", 500.0)
+            vram_req = get_cfg(self.config, "models.superpoint.vram_required_mb", 500.0)
 
             logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
             self._ensure_vram_available(vram_req)
@@ -116,8 +114,10 @@ class ModelManager:
                 from lightglue import SuperPoint
 
                 sp_config = {
-                    "nms_radius": cfg.get("nms_radius", 4),
-                    "max_num_keypoints": cfg.get("max_keypoints", 4096),
+                    "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
+                    "max_num_keypoints": get_cfg(
+                        self.config, "models.superpoint.max_keypoints", 4096
+                    ),
                 }
                 model = SuperPoint(**sp_config).eval().to(self.device)
                 self.models[name] = model
@@ -131,8 +131,7 @@ class ModelManager:
     def load_lightglue(self):
         name = "lightglue"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            vram_req = cfg.get("vram_required_mb", 1000.0)
+            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
             logger.info("Loading LightGlue model...")
             self._ensure_vram_available(vram_req)
@@ -140,8 +139,12 @@ class ModelManager:
                 from lightglue import LightGlue
 
                 lg_config = {
-                    "depth_confidence": cfg.get("depth_confidence", -1),
-                    "width_confidence": cfg.get("width_confidence", -1),
+                    "depth_confidence": get_cfg(
+                        self.config, "models.lightglue.depth_confidence", -1
+                    ),
+                    "width_confidence": get_cfg(
+                        self.config, "models.lightglue.width_confidence", -1
+                    ),
                 }
                 model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
                 self.models[name] = model
@@ -155,10 +158,9 @@ class ModelManager:
     def load_dinov2(self):
         name = "dinov2"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            repo = cfg.get("hub_repo", "facebookresearch/dinov2")
-            model_name = cfg.get("hub_model", "dinov2_vitl14")
-            vram_req = cfg.get("vram_required_mb", 1600.0)
+            repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
+            model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
+            vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
 
             logger.info(f"Loading DINOv2 ({model_name}) model...")
             self._ensure_vram_available(vram_req)
@@ -177,9 +179,8 @@ class ModelManager:
         """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
         name = "aliked"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            vram_req = cfg.get("vram_required_mb", 400.0)
-            max_keypoints = cfg.get("max_keypoints", 4096)
+            vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
+            max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
 
             logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
             self._ensure_vram_available(vram_req)
@@ -199,8 +200,7 @@ class ModelManager:
         """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
         name = "lightglue_aliked"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get("lightglue", {})
-            vram_req = cfg.get("vram_required_mb", 1000.0)
+            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
             logger.info("Loading LightGlue (ALIKED weights)...")
             self._ensure_vram_available(vram_req)
@@ -210,8 +210,12 @@ class ModelManager:
                 model = (
                     LightGlue(
                         features="aliked",
-                        depth_confidence=cfg.get("depth_confidence", -1),
-                        width_confidence=cfg.get("width_confidence", -1),
+                        depth_confidence=get_cfg(
+                            self.config, "models.lightglue.depth_confidence", -1
+                        ),
+                        width_confidence=get_cfg(
+                            self.config, "models.lightglue.width_confidence", -1
+                        ),
                     )
                     .eval()
                     .to(self.device)
@@ -232,12 +236,11 @@ class ModelManager:
             try:
                 from src.models.wrappers.cesp_module import CESP
 
-                cesp_cfg = self.config.get("models", {}).get("cesp", {})
-                scales = cesp_cfg.get("scales", [1, 2, 4])
+                scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
                 cesp = CESP(dim=1024, scales=tuple(scales))
 
                 # Завантаження pretrained ваг (якщо є)
-                weights_path = cesp_cfg.get("weights_path", None)
+                weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
                 if weights_path:
                     cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
                     logger.success(f"CESP pretrained weights loaded from {weights_path}")

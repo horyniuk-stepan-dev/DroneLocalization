@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 
+from config.config import get_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
 
@@ -20,7 +21,7 @@ class FeatureExtractor:
         self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
 
         # Трансформації для DINOv2 (ImageNet стандарти)
-        dino_size = self.config.get("dinov2", {}).get("input_size", 336)
+        dino_size = get_cfg(self.config, "dinov2.input_size", 336)
         self.dino_size = dino_size
         self.dinov2_transform = T.Compose(
             [
@@ -29,11 +30,10 @@ class FeatureExtractor:
             ]
         )
 
-        # FP16 mixed precision для прискорення GPU інференсу
         self.use_fp16 = (
             device == "cuda"
             and torch.cuda.is_available()
-            and self.config.get("performance", {}).get("fp16", True)
+            and get_cfg(self.config, "models.performance.fp16_enabled", True)
         )
         if self.use_fp16:
             logger.info("FP16 mixed precision ENABLED for inference")

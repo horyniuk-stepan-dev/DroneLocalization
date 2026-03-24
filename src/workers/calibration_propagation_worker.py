@@ -5,7 +5,7 @@ import h5py
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from src.geometry.coordinates import CoordinateConverter
+from config.config import get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
 
@@ -30,8 +30,8 @@ class CalibrationPropagationWorker(QThread):
         self.config = config or {}
         self._is_running = True
 
-        self.min_matches = self.config.get("localization", {}).get("min_matches", 15)
-        self.ransac_thresh = self.config.get("localization", {}).get("ransac_threshold", 3.0)
+        self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
+        self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
 
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
@@ -109,9 +109,7 @@ class CalibrationPropagationWorker(QThread):
         tail_segments = [s for s in segments if s["type"] == "tail"]
 
         logger.info(f"Parallel processing of {len(between_segments)} segments...")
-        max_workers = (
-            self.config.get("models", {}).get("performance", {}).get("propagation_max_workers", 4)
-        )
+        max_workers = get_cfg(self.config, "models.performance.propagation_max_workers", 4)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -462,7 +460,7 @@ class CalibrationPropagationWorker(QThread):
                     [a.to_dict() for a in anchors], ensure_ascii=False
                 )
                 grp.attrs["projection_json"] = json.dumps(
-                    CoordinateConverter.export_projection_metadata()
+                    self.calibration.converter.export_metadata()
                 )
 
                 # Датасети

@@ -6,7 +6,7 @@ import torch
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
-from src.geometry.coordinates import CoordinateConverter
+from config.config import get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
@@ -188,7 +188,7 @@ class PanoramaMixin:
         nv = self.model_manager.load_dinov2()
 
         cesp = None
-        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
+        if get_cfg(self.config, "models.cesp.enabled", False):
             try:
                 cesp = self.model_manager.load_cesp()
             except Exception:
@@ -219,7 +219,7 @@ class PanoramaMixin:
                     [(0, 0), (cw, 0), (cw, ch), (0, ch)], res["fov_polygon"]
                 ):
                     pts_pano.append((px + off_x, py + off_y))
-                    pts_metric.append(CoordinateConverter.gps_to_metric(lat, lon))
+                    pts_metric.append(self.calibration.converter.gps_to_metric(lat, lon))
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -238,4 +238,6 @@ class PanoramaMixin:
 
         corners_px = np.array([[0, 0], [W, 0], [W, H], [0, H]], dtype=np.float32)
         corners_m = GeometryTransforms.apply_affine(corners_px, M)
-        return [CoordinateConverter.metric_to_gps(*pt) for pt in corners_m]
+        return [
+            self.calibration.converter.metric_to_gps(float(pt[0]), float(pt[1])) for pt in corners_m
+        ]

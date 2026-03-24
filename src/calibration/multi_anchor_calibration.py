@@ -1,4 +1,6 @@
 import json
+from datetime import datetime
+from typing import Any
 
 import numpy as np
 
@@ -14,12 +16,16 @@ class AnchorCalibration:
     Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та повними QA-метриками.
     """
 
-    def __init__(self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict = None):
+    def __init__(
+        self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict[str, Any] | None = None
+    ):
         self.frame_id = frame_id
         self.affine_matrix = affine_matrix
+        self.update_qa(qa_data or {})
 
-        # QA fields
-        self.qa_data = qa_data or {}
+    def update_qa(self, qa_data: dict[str, Any]) -> None:
+        """Оновлює QA метрики якоря без перестворення об'єкта."""
+        self.qa_data = qa_data
 
         # Основні метрики якості
         self.rmse_m = float(self.qa_data.get("rmse_m", 0.0))
@@ -35,17 +41,17 @@ class AnchorCalibration:
         # Метадані та UX
         self.transform_type = self.qa_data.get("transform_type", "unknown")
         self.projection_mode = self.qa_data.get("projection_mode", "WEB_MERCATOR")
-        self.created_at = self.qa_data.get("created_at", "")
+        self.created_at = self.qa_data.get("created_at", datetime.now().isoformat())
         self.updated_at = self.qa_data.get("updated_at", self.created_at)
         self.notes = self.qa_data.get("notes", "")
         self.quality_flag = self.qa_data.get("quality_flag", "normal")  # 'normal', 'warning', 'bad'
 
-    def pixel_to_metric(self, x: float, y: float) -> tuple:
+    def pixel_to_metric(self, x: float, y: float) -> tuple[float, float]:
         pt = np.array([[x, y]], dtype=np.float32)
         result = GeometryTransforms.apply_affine(pt, self.affine_matrix)[0]
         return float(result[0]), float(result[1])
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "frame_id": self.frame_id,
             "affine_matrix": self.affine_matrix.tolist(),
@@ -67,7 +73,7 @@ class AnchorCalibration:
         }
 
     @staticmethod
-    def from_dict(data: dict) -> "AnchorCalibration":
+    def from_dict(data: dict[str, Any]) -> "AnchorCalibration":
         # Підтримка зовсім старих форматів без qa_data
         qa = data.get("qa_data", {})
 
@@ -91,29 +97,25 @@ class AnchorCalibration:
 class MultiAnchorCalibration:
     """Менеджер декількох якорів калібрування з підтримкою версіонування та проєкцій"""
 
-    VERSION = "2.2"
+    VERSION: str = "2.2"
 
-    def __init__(self):
-        self.anchors = []
+    def __init__(self, converter: CoordinateConverter | None = None) -> None:
+        self.anchors: list[AnchorCalibration] = []
+        self.converter = converter or CoordinateConverter("WEB_MERCATOR")
 
     @property
     def is_calibrated(self) -> bool:
         return len(self.anchors) > 0
 
-    def add_anchor(self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict = None):
+    def add_anchor(
+        self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict[str, Any] | None = None
+    ) -> None:
         existing = next((a for a in self.anchors if a.frame_id == frame_id), None)
         if existing:
             existing.affine_matrix = affine_matrix
             if qa_data:
-                # Оновлюємо QA дані
-                new_anchor = AnchorCalibration(frame_id, affine_matrix, qa_data)
-                existing.qa_data = new_anchor.qa_data
-                existing.rmse_m = new_anchor.rmse_m
-                existing.max_err_m = new_anchor.max_err_m
-                existing.inliers_count = new_anchor.inliers_count
-                existing.points_2d = new_anchor.points_2d
-                existing.points_gps = new_anchor.points_gps
-                existing.updated_at = new_anchor.updated_at
+                existing.update_qa(qa_data)
+                existing.updated_at = datetime.now().isoformat()
             logger.info(f"Updated anchor for frame {frame_id}")
         else:
             self.anchors.append(AnchorCalibration(frame_id, affine_matrix, qa_data))
@@ -133,7 +135,7 @@ class MultiAnchorCalibration:
             logger.info(f"Removed anchor for frame {frame_id}")
         return success
 
-    def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple | None:
+    def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple[float, float] | None:
         if not self.is_calibrated:
             return None
         if len(self.anchors) == 1 or frame_id <= self.anchors[0].frame_id:
@@ -156,14 +158,14 @@ class MultiAnchorCalibration:
                 return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
         return None
 
-    def save(self, path: str):
+    def save(self, path: str) -> None:
         if not self.is_calibrated:
             raise RuntimeError("Немає даних для збереження")
 
         # Зберігаємо також метадані проєкції
         data = {
             "version": self.VERSION,
-            "projection": CoordinateConverter.export_projection_metadata(),
+            "projection": self.converter.export_metadata(),
             "anchors": [a.to_dict() for a in self.anchors],
         }
 
@@ -173,7 +175,7 @@ class MultiAnchorCalibration:
             f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)"
         )
 
-    def load(self, path: str):
+    def load(self, path: str) -> None:
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -183,16 +185,16 @@ class MultiAnchorCalibration:
 
         # 1. Відновлення проєкції
         if "projection" in data:
-            CoordinateConverter.load_projection_metadata(data["projection"])
+            self.converter = CoordinateConverter.from_metadata(data["projection"])
         elif "reference_gps" in data and data["reference_gps"] is not None:
             # Fallback для v2.0
-            CoordinateConverter.configure_projection("UTM", data["reference_gps"])
+            self.converter = CoordinateConverter("UTM", tuple(data["reference_gps"]))
         else:
             # Fallback для v1.0 або відсутніх даних
             logger.warning(
                 "No projection metadata found in calibration file. Defaulting to WEB_MERCATOR fallback."
             )
-            CoordinateConverter.configure_projection("WEB_MERCATOR")
+            self.converter = CoordinateConverter("WEB_MERCATOR")
 
         # 2. Завантаження якорів
         if version == "1.0" and "affine_matrix" in data and "calib_frame_id" in data:

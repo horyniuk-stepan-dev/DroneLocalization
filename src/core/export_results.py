@@ -1,6 +1,8 @@
 import csv
-import json
 from datetime import datetime
+from typing import Any
+
+import geojson
 
 from src.utils.logging_utils import get_logger
 
@@ -11,7 +13,7 @@ class ResultExporter:
     """Експорт результатів локалізації у різні формати."""
 
     @staticmethod
-    def export_csv(results: list[dict], output_path: str):
+    def export_csv(results: list[dict[str, Any]], output_path: str) -> None:
         """
         Експорт у CSV файл.
 
@@ -43,40 +45,59 @@ class ResultExporter:
         logger.success(f"Exported {len(results)} results to CSV: {output_path}")
 
     @staticmethod
-    def export_geojson(results: list[dict], output_path: str):
-        """Експорт у GeoJSON (для GIS-систем)."""
+    def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
+        """Експорт у GeoJSON (для GIS-систем). Додає точки та полігони FOV."""
         features = []
         for r in results:
             if "lat" not in r or "lon" not in r:
                 continue
-            feature = {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [r["lon"], r["lat"]]},
-                "properties": {
+
+            # 1. Point feature (trajectory)
+            point = geojson.Feature(
+                geometry=geojson.Point((r["lon"], r["lat"])),
+                properties={
+                    "type": "trajectory_point",
                     "frame_id": r.get("frame_id"),
                     "confidence": r.get("confidence"),
                     "timestamp": r.get("timestamp"),
                     "matched_frame": r.get("matched_frame"),
                 },
-            }
-            features.append(feature)
+            )
+            features.append(point)
 
-        geojson = {
-            "type": "FeatureCollection",
-            "features": features,
-            "properties": {
-                "exported_at": datetime.now().isoformat(),
-                "total_points": len(features),
-            },
-        }
+            # 2. Polygon feature (FOV) - якщо є дані
+            fov = r.get("fov_polygon")
+            if fov and len(fov) >= 3:
+                # GeoJSON Polygon coordinates must be a list of rings,
+                # each ring is a list of [lon, lat] points, first and last must be same.
+                coords = [[lon, lat] for lat, lon in fov]
+                # Close the polygon
+                if coords[0] != coords[-1]:
+                    coords.append(coords[0])
+
+                polygon = geojson.Feature(
+                    geometry=geojson.Polygon([coords]),
+                    properties={
+                        "type": "fov_polygon",
+                        "frame_id": r.get("frame_id"),
+                        "confidence": r.get("confidence"),
+                    },
+                )
+                features.append(polygon)
+
+        feature_collection = geojson.FeatureCollection(
+            features, properties={"exported_at": datetime.now().isoformat()}
+        )
 
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(geojson, f, indent=2, ensure_ascii=False)
+            geojson.dump(feature_collection, f, indent=2, ensure_ascii=False)
 
-        logger.success(f"Exported {len(features)} points to GeoJSON: {output_path}")
+        logger.success(f"Exported {len(features)} features to GeoJSON: {output_path}")
 
     @staticmethod
-    def export_kml(results: list[dict], output_path: str, name: str = "Drone Track"):
+    def export_kml(
+        results: list[dict[str, Any]], output_path: str, name: str = "Drone Track"
+    ) -> None:
         """Експорт у KML (для Google Earth)."""
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',

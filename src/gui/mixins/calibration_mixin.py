@@ -2,6 +2,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
+from config.config import get_cfg
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
@@ -49,17 +50,16 @@ class CalibrationMixin:
                 return
 
             # Налаштування проєкції, якщо вона ще не ініціалізована
-            proj_meta = CoordinateConverter.export_projection_metadata()
-            if not CoordinateConverter._initialized:
+            if not self.calibration.converter._initialized:
                 # Використовуємо налаштування з конфігу або за замовчуванням
-                proj_cfg = self.config.get("projection", {})
-                mode = proj_cfg.get("default_mode", "WEB_MERCATOR")
-                CoordinateConverter.configure_projection(
-                    mode, points_gps[0] if mode == "UTM" else None
-                )
+                mode = get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")
+                reference_gps = points_gps[0] if mode == "UTM" else None
+                self.calibration.converter = CoordinateConverter(mode, reference_gps)
 
             pts_2d_np = np.array(points_2d, dtype=np.float32)
-            pts_metric = [CoordinateConverter.gps_to_metric(lat, lon) for lat, lon in points_gps]
+            pts_metric = [
+                self.calibration.converter.gps_to_metric(lat, lon) for lat, lon in points_gps
+            ]
             pts_metric_np = np.array(pts_metric, dtype=np.float32)
 
             # 1. Спроба обчислити різні типи трансформацій
@@ -103,9 +103,8 @@ class CalibrationMixin:
                 return
 
             # 2. Перевірка порогів якості з конфігу
-            proj_cfg = self.config.get("projection", {})
-            rmse_threshold = proj_cfg.get("anchor_rmse_threshold_m", 3.0)
-            max_err_threshold = proj_cfg.get("anchor_max_error_m", 5.0)
+            rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
+            max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
 
             # 3. QA Діалог підтвердження
             from datetime import datetime
@@ -145,7 +144,7 @@ class CalibrationMixin:
                 "max_err_m": max_p,
                 "inliers_count": len(pts_2d_np),
                 "transform_type": best_type,
-                "projection_mode": CoordinateConverter._projection_mode,
+                "projection_mode": self.calibration.converter._mode,
                 "created_at": datetime.now().isoformat(),
                 "points_2d": points_2d,
                 "points_gps": points_gps,
@@ -167,7 +166,9 @@ class CalibrationMixin:
                     err = np.linalg.norm(trans - pm)
 
                     # Перевіряємо зворотну конвертацію для візуалізації зсуву в градусах
-                    lat_c, lon_c = CoordinateConverter.metric_to_gps(trans[0], trans[1])
+                    lat_c, lon_c = self.calibration.converter.metric_to_gps(
+                        float(trans[0]), float(trans[1])
+                    )
                     lat_t, lon_t = points_gps[j][0], points_gps[j][1]
 
                     dist_err = CoordinateConverter.haversine_distance(
@@ -302,8 +303,7 @@ class CalibrationMixin:
             if matches_data is not None:
                 avg_matches = float(np.mean(matches_data[valid_mask]))
 
-        proj_cfg = self.config.get("projection", {})
-        rmse_thresh = proj_cfg.get("anchor_rmse_threshold_m", 3.0)
+        rmse_thresh = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
 
         report = (
             f"<b>Пропагація завершена!</b><br><br>"
@@ -366,7 +366,9 @@ class CalibrationMixin:
                         ]:
                             mx_d = affine[0, 0] * px + affine[0, 1] * py + affine[0, 2]
                             my_d = affine[1, 0] * px + affine[1, 1] * py + affine[1, 2]
-                            lat_d, lon_d = CoordinateConverter.metric_to_gps(mx_d, my_d)
+                            lat_d, lon_d = self.calibration.converter.metric_to_gps(
+                                float(mx_d), float(my_d)
+                            )
                             logger.warning(
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
@@ -376,14 +378,16 @@ class CalibrationMixin:
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
-                    lat_c, lon_c = CoordinateConverter.metric_to_gps(mx, my)
+                    lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
                     # 2. Низ центру (часто там дорога)
                     mx_b, my_b = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
                     )
-                    lat_b, lon_b = CoordinateConverter.metric_to_gps(mx_b, my_b)
+                    lat_b, lon_b = self.calibration.converter.metric_to_gps(
+                        float(mx_b), float(my_b)
+                    )
 
                     rmse = (
                         float(rmse_data[i]) if rmse_data is not None and i < len(rmse_data) else 0.0
@@ -424,7 +428,9 @@ class CalibrationMixin:
                             affine[0, 0] * px + affine[0, 1] * py + affine[0, 2],
                             affine[1, 0] * px + affine[1, 1] * py + affine[1, 2],
                         )
-                        lat_p, lon_p = CoordinateConverter.metric_to_gps(mx_p, my_p)
+                        lat_p, lon_p = self.calibration.converter.metric_to_gps(
+                            float(mx_p), float(my_p)
+                        )
                         points_to_show.append(
                             {
                                 "lat": float(lat_p),

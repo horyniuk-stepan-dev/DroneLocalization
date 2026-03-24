@@ -2,6 +2,7 @@ import faiss
 import numpy as np
 import torch
 
+from config.config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -52,7 +53,7 @@ class FeatureMatcher:
     def __init__(self, model_manager=None, config=None):
         self.config = config or {}
         self.model_manager = model_manager
-        self.ratio_threshold = self.config.get("localization", {}).get("ratio_threshold", 0.95)
+        self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.95)
 
         # Завантажуємо LightGlue (ALIKED) через ModelManager
         self.lightglue = None

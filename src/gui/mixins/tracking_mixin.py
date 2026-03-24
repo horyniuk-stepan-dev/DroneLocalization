@@ -3,6 +3,7 @@ import numpy as np
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from config.config import get_cfg
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
@@ -22,7 +23,7 @@ class TrackingMixin:
 
         # Опціональне завантаження CESP для покращення DINOv2 global descriptors
         cesp = None
-        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
+        if get_cfg(self.config, "models.cesp.enabled", False):
             try:
                 cesp = self.model_manager.load_cesp()
             except Exception as e:
@@ -41,13 +42,12 @@ class TrackingMixin:
 
     def _ensure_utm_initialized(self) -> bool:
         """Перевіряє чи ініціалізована проєкція UTM, якщо ні - пробує ініціалізувати з калібрування."""
-        from src.geometry.coordinates import CoordinateConverter
 
-        if CoordinateConverter._initialized:
+        if self.calibration.converter._initialized:
             return True
 
         if self.calibration and self.calibration.reference_gps:
-            CoordinateConverter.gps_to_metric(
+            self.calibration.converter.gps_to_metric(
                 self.calibration.reference_gps[0], self.calibration.reference_gps[1]
             )
             return True

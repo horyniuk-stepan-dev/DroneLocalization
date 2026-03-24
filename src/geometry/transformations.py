@@ -89,6 +89,9 @@ class GeometryTransforms:
                 logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
                 return False
 
+            # 5. Check Rotation Stability (avoid 180-degree flips if not expected, though drones can rotate)
+            # For now, we allow any rotation as drones can turn, but we could cap it if we have IMU data.
+
             return True
 
         except Exception as e:
@@ -113,11 +116,11 @@ class GeometryTransforms:
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
-        # Use standard RANSAC instead of USAC_MAGSAC for stability in OpenCV
+        # Use USAC_MAGSAC for better outlier rejection and accuracy (OpenCV 4.5+)
         H, mask = cv2.findHomography(
             src_pts_cv,
             dst_pts_cv,
-            method=cv2.RANSAC,
+            method=cv2.USAC_MAGSAC,
             ransacReprojThreshold=ransac_threshold,
             maxIters=max_iters,
             confidence=confidence,
@@ -152,7 +155,7 @@ class GeometryTransforms:
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
         M, mask = cv2.estimateAffine2D(
-            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv, method=cv2.USAC_MAGSAC, ransacReprojThreshold=ransac_threshold
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
@@ -172,7 +175,7 @@ class GeometryTransforms:
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
         M, mask = cv2.estimateAffinePartial2D(
-            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv, method=cv2.USAC_MAGSAC, ransacReprojThreshold=ransac_threshold
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):

@@ -8,6 +8,7 @@ import h5py
 import numpy as np
 import torch
 
+from config.config import get_cfg
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
@@ -23,9 +24,9 @@ class DatabaseBuilder:
         self.config = config or {}
         self.matcher = matcher
         db_cfg = self.config.get("database", {})
-        self.descriptor_dim = self.config.get("dinov2", {}).get("descriptor_dim", 384)
-        self.prefetch_size = db_cfg.get("prefetch_queue_size", 32)
-        self.kp_scale_cfg = db_cfg.get("keypoint_video_scale", 0.5)
+        self.descriptor_dim = get_cfg(self.config, "dinov2.descriptor_dim", 384)
+        self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
+        self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
@@ -46,7 +47,7 @@ class DatabaseBuilder:
         logger.info(f"Starting database build from video: {video_path}")
 
         # Читаємо налаштування з конфігу (з дефолтом)
-        frame_step = self.config.get("database", {}).get("frame_step", 3)
+        frame_step = get_cfg(self.config, "database.frame_step", 3)
         if frame_step < 1:
             frame_step = 1
 
@@ -127,7 +128,7 @@ class DatabaseBuilder:
         nv_model = model_manager.load_dinov2()
 
         cesp = None
-        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
+        if get_cfg(self.config, "models.cesp.enabled", False):
             try:
                 cesp = model_manager.load_cesp()
             except Exception:
@@ -154,7 +155,7 @@ class DatabaseBuilder:
             else:
                 # Use a small dummy tensor directly to save VRAM
                 with torch.no_grad():
-                    dino_size = self.config.get("dinov2", {}).get("input_size", 336)
+                    dino_size = get_cfg(self.config, "dinov2.input_size", 336)
                     dummy_input = torch.zeros((1, 3, dino_size, dino_size)).to(model_manager.device)
                     # Use the same logic as FeatureExtractor
                     if cesp is not None:
@@ -184,7 +185,7 @@ class DatabaseBuilder:
         # cuDNN benchmark conditionally (Fix 5)
 
         if torch.cuda.is_available():
-            model_type = self.config.get("models", {}).get("local_extractor", "xfeat")
+            model_type = get_cfg(self.config, "localization.fallback_extractor", "aliked")
             if model_type in ("xfeat", "aliked"):  # CNN-based types
                 torch.backends.cudnn.benchmark = True
                 logger.info(f"cuDNN benchmark ENABLED for {model_type}")
@@ -345,9 +346,8 @@ class DatabaseBuilder:
         """
         Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
         """
-        db_cfg = self.config.get("database", {})
-        min_matches = db_cfg.get("inter_frame_min_matches", 15)
-        ransac_thresh = db_cfg.get("inter_frame_ransac_thresh", 3.0)
+        min_matches = get_cfg(self.config, "database.inter_frame_min_matches", 15)
+        ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
 
         if self.matcher is None:
             from src.localization.matcher import FeatureMatcher

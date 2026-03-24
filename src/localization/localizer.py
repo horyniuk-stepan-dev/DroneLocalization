@@ -1,7 +1,6 @@
 import numpy as np
 
 from config.config import get_cfg
-from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
@@ -32,7 +31,8 @@ class Localizer:
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
             threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 25.0),
-            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 200.0),
+            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 60.0),
+            max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
         # Створюємо FastRetrieval один раз — нормалізація дескрипторів відбувається лише тут
@@ -42,6 +42,8 @@ class Localizer:
         self.model_manager = self.config.get("_model_manager", None)
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
         self.min_inliers_for_accept = get_cfg(self.config, "localization.min_inliers_accept", 10)
+        self.retrieval_top_k = get_cfg(self.config, "localization.retrieval_top_k", 8)
+        self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
 
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
@@ -55,7 +57,7 @@ class Localizer:
         best_global_candidates = []
         best_query_features = None
 
-        top_k = self.config.get("localization", {}).get("retrieval_top_k", 8)
+        top_k = self.retrieval_top_k
 
         # 1. Екстракція ознак для всіх дозволених кутів обертання та вибір найкращого ракурсу
         for angle in angles_to_try:
@@ -102,8 +104,9 @@ class Localizer:
         best_mkpts_q_inliers = None
         best_mkpts_r_inliers = None
         best_total_matches = 0
+        best_rmse = 999.0
 
-        early_stop = self.config.get("localization", {}).get("early_stop_inliers", 30)
+        early_stop = self.early_stop_inliers
 
         # 2. Локальний пошук (XFeat) ТІЛЬКИ для найкращого знайденого ракурсу
         for candidate_id, score in best_global_candidates:
@@ -120,19 +123,25 @@ class Localizer:
                 if H_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     inliers = int(np.sum(inlier_mask))
+                    pts_q_in = mkpts_q[inlier_mask]
+                    pts_r_in = mkpts_r[inlier_mask]
+
+                    # Розрахунок RMSE для оцінки якості геометрії
+                    pts_q_transformed = GeometryTransforms.apply_homography(pts_q_in, H_eval)
+                    rmse = float(
+                        np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
+                    )
+
                     if inliers > best_inliers and inliers >= self.min_matches:
                         best_inliers = inliers
                         best_candidate_id = candidate_id
-                        best_H_query_to_ref = H_eval  # Homography матриця (3x3)
-
-                        pts_q_in = mkpts_q[inlier_mask]
-                        pts_r_in = mkpts_r[inlier_mask]
-
+                        best_H_query_to_ref = H_eval
                         best_mkpts_q_inliers = pts_q_in
                         best_mkpts_r_inliers = pts_r_in
                         best_total_matches = len(mkpts_q)
+                        best_rmse = rmse
                         logger.debug(
-                            f"Homography estimated for candidate {candidate_id} with {inliers} inliers"
+                            f"Homography for {candidate_id}: {inliers} inliers, RMSE: {rmse:.2f}"
                         )
 
             if best_inliers >= early_stop:
@@ -185,7 +194,6 @@ class Localizer:
             rot_height, rot_width = height, width
 
         # 4. Багатоточкова локалізація більше не потрібна. Беремо ідеальний центр кадру
-        proj_cfg = self.config.get("projection", {})
 
         # Використовуємо знайдену Homography
         M_query_to_ref = best_H_query_to_ref
@@ -229,7 +237,9 @@ class Localizer:
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
 
         self.outlier_detector.add_position(filtered_pt)
-        lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
+        lat, lon = self.calibration.converter.metric_to_gps(
+            float(filtered_pt[0]), float(filtered_pt[1])
+        )
 
         # Зсув для корекції FOV через фільтрацію
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
@@ -303,12 +313,16 @@ class Localizer:
                 )
                 for cx, cy in metric_corners:
                     try:
-                        clat, clon = CoordinateConverter.metric_to_gps(cx + dx, cy + dy)
+                        clat, clon = self.calibration.converter.metric_to_gps(
+                            float(cx + dx), float(cy + dy)
+                        )
                         gps_corners.append((clat, clon))
                     except Exception:
                         pass
 
-        confidence = self._compute_confidence(best_candidate_id, best_inliers)
+        confidence = self._compute_confidence(
+            best_candidate_id, best_inliers, best_total_matches, best_rmse
+        )
 
         # ДІАГНОСТИКА
         logger.debug(
@@ -332,15 +346,16 @@ class Localizer:
             "sample_spread_m": 0.0,
         }
 
-    def _compute_confidence(self, best_candidate_id: int, best_inliers: int) -> float:
+    def _compute_confidence(
+        self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
+    ) -> float:
         """Обчислює впевненість на основі QA бази даних (RMSE, Disagreement) та кількості інлаєрів."""
         # Налаштування з конфігу
-        conf_cfg = self.config.get("localization", {}).get("confidence", {})
-        max_inliers = conf_cfg.get("confidence_max_inliers", 80)
-        rmse_norm = conf_cfg.get("rmse_norm_m", 10.0)
-        diag_norm = conf_cfg.get("disagreement_norm_m", 5.0)
-        w_inlier = conf_cfg.get("inlier_weight", 0.7)
-        w_stability = conf_cfg.get("stability_weight", 0.3)
+        max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
+        rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
+        diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
+        w_inlier = get_cfg(self.config, "localization.confidence.inlier_weight", 0.7)
+        w_stability = get_cfg(self.config, "localization.confidence.stability_weight", 0.3)
 
         # 1. Показник інлаєрів (0-1)
         inlier_score = min(1.0, best_inliers / max_inliers)
@@ -362,15 +377,26 @@ class Localizer:
         )
         stability_score = float(np.clip(stability_score, 0.0, 1.0))
 
-        # 3. Комбінована оцінка
-        return float(np.clip(inlier_score * w_inlier + stability_score * w_stability, 0.05, 1.0))
+        # 3. Показник поточної відповідності (ПЕР-ФРЕЙМ)
+        # a) Inlier ratio
+        ratio_score = float(best_inliers / (total_matches + 1e-6))
+        # b) RMSE score (1.0 if RMSE=0, 0.5 if RMSE=thresh)
+        rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
+
+        match_score = ratio_score * 0.5 + rmse_score_val * 0.5
+
+        # 4. Комбінована оцінка
+        # (QA бази * 0.3) + (Кількість інлаєрів * 0.4) + (Якість відповідності * 0.3)
+        final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
+
+        return float(np.clip(final_conf, 0.05, 1.0))
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
         """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)"""
         if frame_id == -1:
             return None
 
-        threshold = self.config.get("localization", {}).get("retrieval_only_min_score", 0.90)
+        threshold = get_cfg(self.config, "localization.retrieval_only_min_score", 0.90)
         if score < threshold:
             return None
 
@@ -383,7 +409,7 @@ class Localizer:
         center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float32)
         metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
 
-        lat, lon = CoordinateConverter.metric_to_gps(float(metric_pt[0]), float(metric_pt[1]))
+        lat, lon = self.calibration.converter.metric_to_gps(metric_pt[0], metric_pt[1])
 
         return {
             "success": True,
@@ -391,8 +417,8 @@ class Localizer:
             "lon": lon,
             "confidence": 0.3,  # Низький confidence для retrieval-only
             "inliers": 0,
-            "matched_frame": int(frame_id),
+            "matched_frame": frame_id,
             "fallback_mode": "retrieval_only",
-            "global_score": float(score),
+            "global_score": score,
             "fov_polygon": None,
         }

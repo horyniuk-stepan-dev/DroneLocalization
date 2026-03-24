@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from config.config import get_cfg
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
@@ -32,7 +33,7 @@ class RealtimeTrackingWorker(QThread):
         # Скільки кадрів розпізнавати за одну секунду ВІДЕО.
         # 1.0 = 1 кадр в секунду; 2.0 = кожні 0.5 секунд; 0.5 = кожні 2 секунди відео.
         # Ти можеш змінити це число прямо тут для тестів:
-        self.process_fps = self.config.get("tracking", {}).get("process_fps", 1.0)
+        self.process_fps = get_cfg(self.config, "tracking.process_fps", 1.0)
 
     def run(self):
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
@@ -157,7 +158,7 @@ class RealtimeTrackingWorker(QThread):
             if not self.model_manager:
                 return
 
-            fallback = self.config.get("localization", {}).get("fallback_extractor", "aliked")
+            fallback = get_cfg(self.config, "localization.fallback_extractor", "aliked")
             logger.info(f"Pre-warming fallback models ({fallback})...")
 
             if fallback == "aliked":

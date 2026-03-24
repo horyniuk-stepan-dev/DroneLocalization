@@ -1,5 +1,5 @@
 import math
-import threading
+from typing import Any
 
 from pyproj import CRS, Transformer
 
@@ -9,84 +9,31 @@ logger = get_logger(__name__)
 
 
 class CoordinateConverter:
-    """Детермінована конвертація координат (WebMercator або UTM)"""
+    """Детермінована конвертація координат (WebMercator або UTM) на основі екземпляра."""
 
-    _lock = threading.Lock()
-    _transformer_to_metric = None
-    _transformer_to_gps = None
-    _initialized = False
-    _projection_mode = "WEB_MERCATOR"
-    _reference_gps = None
+    def __init__(
+        self, mode: str = "WEB_MERCATOR", reference_gps: tuple[float, float] | None = None
+    ):
+        self._mode = mode.upper()
+        self._reference_gps = reference_gps
+        self._transformer_to_metric: Transformer | None = None
+        self._transformer_to_gps: Transformer | None = None
+        self._initialized = False
 
-    @classmethod
-    def reset(cls):
-        """Скидає проєкцію при зміні проєкту/відеобази."""
-        with cls._lock:
-            cls._initialized = False
-            cls._reference_gps = None
-            cls._transformer_to_metric = None
-            cls._transformer_to_gps = None
-            logger.info("CoordinateConverter reset")
+        if self._mode == "WEB_MERCATOR":
+            self._initialize_projection(0.0, 0.0)
+        elif self._reference_gps:
+            self._initialize_projection(*self._reference_gps)
 
-    @classmethod
-    def configure_projection(cls, mode: str, reference_gps: tuple = None):
-        """
-        Явне налаштування проєкції для проєкту.
-        mode: 'WEB_MERCATOR' (EPSG:3857) або 'UTM'
-        reference_gps: (lat, lon) обов'язковий тільки для UTM
-        """
-        with cls._lock:
-            mode = mode.upper()
-            if mode not in ["UTM", "WEB_MERCATOR"]:
-                raise ValueError(f"Unsupported projection mode: {mode}")
-
-            cls._projection_mode = mode
-            if reference_gps:
-                cls._reference_gps = (float(reference_gps[0]), float(reference_gps[1]))
-            else:
-                cls._reference_gps = None
-
-            # WEB_MERCATOR не потребує reference point
-            if mode == "WEB_MERCATOR":
-                cls._initialize_projection(0, 0)
-            elif cls._reference_gps:
-                cls._initialize_projection(*cls._reference_gps)
-            else:
-                logger.warning(
-                    "UTM configuration called without reference_gps. Initialization deferred."
-                )
-                cls._initialized = False
-
-            logger.info(f"CoordinateConverter configured: {mode} (ref={cls._reference_gps})")
-
-    @classmethod
-    def export_projection_metadata(cls) -> dict:
-        """Експорт поточних налаштувань для серіалізації в JSON/HDF5"""
-        return {"mode": cls._projection_mode, "reference_gps": cls._reference_gps}
-
-    @classmethod
-    def load_projection_metadata(cls, meta: dict):
-        """Відновлення проєкції з метаданих"""
-        if not meta:
-            logger.warning("No projection metadata found, falling back to WEB_MERCATOR")
-            cls.configure_projection("WEB_MERCATOR")
-            return
-
-        mode = meta.get("mode", "WEB_MERCATOR")
-        ref = meta.get("reference_gps")
-        cls.configure_projection(mode, tuple(ref) if ref else None)
-
-    @classmethod
-    def _initialize_projection(cls, lat: float, lon: float):
+    def _initialize_projection(self, lat: float, lon: float) -> None:
         wgs84_crs = CRS("EPSG:4326")
 
-        if cls._projection_mode == "UTM":
-            # Якщо референс не заданий явно, ініціалізуємо UTM по першій точці
-            if cls._reference_gps is None:
-                cls._reference_gps = (lat, lon)
-                logger.warning(f"Auto-initializing UTM reference from point: {cls._reference_gps}")
+        if self._mode == "UTM":
+            if self._reference_gps is None:
+                self._reference_gps = (lat, lon)
+                logger.warning(f"Auto-initializing UTM reference from point: {self._reference_gps}")
 
-            ref_lat, ref_lon = cls._reference_gps
+            ref_lat, ref_lon = self._reference_gps
             zone_number = int((ref_lon + 180) / 6) + 1
             target_crs = CRS(proj="utm", zone=zone_number, ellps="WGS84")
             logger.info(
@@ -96,40 +43,54 @@ class CoordinateConverter:
             target_crs = CRS("EPSG:3857")
             logger.info("Initialized WEB_MERCATOR projection (EPSG:3857)")
 
-        cls._transformer_to_metric = Transformer.from_crs(wgs84_crs, target_crs, always_xy=True)
-        cls._transformer_to_gps = Transformer.from_crs(target_crs, wgs84_crs, always_xy=True)
-        cls._initialized = True
+        self._transformer_to_metric = Transformer.from_crs(wgs84_crs, target_crs, always_xy=True)
+        self._transformer_to_gps = Transformer.from_crs(target_crs, wgs84_crs, always_xy=True)
+        self._initialized = True
+
+    def gps_to_metric(self, lat: float, lon: float) -> tuple[float, float]:
+        if not self._initialized:
+            if self._mode == "WEB_MERCATOR":
+                self._initialize_projection(lat, lon)
+            else:
+                raise RuntimeError(
+                    "CoordinateConverter (UTM) must be initialized with reference_gps."
+                )
+
+        if self._transformer_to_metric is None:
+            raise RuntimeError("Transformer not initialized.")
+
+        x, y = self._transformer_to_metric.transform(lon, lat)
+        return float(x), float(y)
+
+    def metric_to_gps(self, x: float, y: float) -> tuple[float, float]:
+        if not self._initialized:
+            if self._mode == "WEB_MERCATOR":
+                self._initialize_projection(0.0, 0.0)
+            else:
+                raise RuntimeError("CoordinateConverter is not initialized.")
+
+        if self._transformer_to_gps is None:
+            raise RuntimeError("Transformer not initialized.")
+
+        lon, lat = self._transformer_to_gps.transform(x, y)
+        return float(lat), float(lon)
+
+    def export_metadata(self) -> dict[str, Any]:
+        """Експорт налаштувань для серіалізації."""
+        return {"mode": self._mode, "reference_gps": self._reference_gps}
+
+    @classmethod
+    def from_metadata(cls, meta: dict[str, Any]) -> "CoordinateConverter":
+        """Створення конвертера з метаданих."""
+        if not meta:
+            return cls("WEB_MERCATOR")
+        mode = meta.get("mode", "WEB_MERCATOR")
+        ref = meta.get("reference_gps")
+        return cls(mode, tuple(ref) if ref else None)
 
     @staticmethod
-    def gps_to_metric(lat: float, lon: float) -> tuple:
-        with CoordinateConverter._lock:
-            if not CoordinateConverter._initialized:
-                # Fallback для WebMercator, якщо не було конфігурації
-                if CoordinateConverter._projection_mode == "WEB_MERCATOR":
-                    CoordinateConverter._initialize_projection(lat, lon)
-                else:
-                    raise RuntimeError(
-                        "CoordinateConverter (UTM) must be configured with reference_gps before use."
-                    )
-
-            x, y = CoordinateConverter._transformer_to_metric.transform(lon, lat)
-            return x, y
-
-    @staticmethod
-    def metric_to_gps(x: float, y: float) -> tuple:
-        with CoordinateConverter._lock:
-            if not CoordinateConverter._initialized:
-                if CoordinateConverter._projection_mode == "WEB_MERCATOR":
-                    CoordinateConverter._initialize_projection(0, 0)
-                else:
-                    raise RuntimeError("CoordinateConverter is not initialized.")
-
-            lon, lat = CoordinateConverter._transformer_to_gps.transform(x, y)
-            return lat, lon
-
-    @staticmethod
-    def haversine_distance(coord1: tuple, coord2: tuple) -> float:
-        """Розрахунок фізичної відстані між двома GPS точками в метрах"""
+    def haversine_distance(coord1: tuple[float, float], coord2: tuple[float, float]) -> float:
+        """Розрахунок фізичної відстані між двома GPS точками в метрах."""
         lat1, lon1 = coord1
         lat2, lon2 = coord2
         R = 6371000  # Радіус Землі
@@ -143,3 +104,7 @@ class CoordinateConverter:
             + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
         )
         return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# Глобальний екземпляр для зворотної сумісності (тимчасово)
+DEFAULT_CONVERTER = CoordinateConverter("WEB_MERCATOR")

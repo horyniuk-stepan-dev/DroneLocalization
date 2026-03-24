@@ -57,7 +57,7 @@ class DatabaseMixin:
     def _start_database_generation(self, video_path: str, save_path: str):
         from src.geometry.coordinates import CoordinateConverter
 
-        CoordinateConverter.reset()
+        self.calibration.converter = CoordinateConverter("WEB_MERCATOR")
 
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
@@ -165,7 +165,7 @@ class DatabaseMixin:
 
         from src.geometry.coordinates import CoordinateConverter
 
-        CoordinateConverter.reset()
+        self.calibration.converter = CoordinateConverter("WEB_MERCATOR")
 
         try:
             db_path = self.project_manager.database_path
@@ -243,8 +243,6 @@ class DatabaseMixin:
 
         import numpy as np
 
-        from src.geometry.coordinates import CoordinateConverter
-
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid
         frame_affine = self.database.frame_affine
@@ -269,7 +267,9 @@ class DatabaseMixin:
                 metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
                 metric_y = M[1, 0] * center_px[0, 0] + M[1, 1] * center_px[0, 1] + M[1, 2]
 
-                lat, lon = CoordinateConverter.metric_to_gps(metric_x, metric_y)
+                lat, lon = self.calibration.converter.metric_to_gps(
+                    float(metric_x), float(metric_y)
+                )
                 points_to_show.append({"lat": float(lat), "lon": float(lon), "label": str(i)})
 
         if not points_to_show:
