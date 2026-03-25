@@ -1,8 +1,16 @@
-import json
+try:
+    import orjson as _json_lib
+
+    _USE_ORJSON = True
+except ImportError:
+    import json as _json_lib  # type: ignore[assignment]  # fallback якщо orjson не встановлено
+
+    _USE_ORJSON = False
 from datetime import datetime
 from typing import Any
 
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
@@ -102,6 +110,18 @@ class MultiAnchorCalibration:
     def __init__(self, converter: CoordinateConverter | None = None) -> None:
         self.anchors: list[AnchorCalibration] = []
         self.converter = converter or CoordinateConverter("WEB_MERCATOR")
+        self._interp: PchipInterpolator | None = None  # кешований інтерполятор
+
+    def _rebuild_interpolators(self) -> None:
+        """Перебудовує PCHIP-інтерполятор. Викликати після кожної зміни anchors."""
+        if len(self.anchors) < 2:
+            self._interp = None
+            return
+
+        ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
+        matrices = np.stack([a.affine_matrix.ravel() for a in self.anchors])  # (N, 6)
+        # PchipInterpolator обробляє multi-column масиви нативно
+        self._interp = PchipInterpolator(ids, matrices, extrapolate=False)
 
     @property
     def is_calibrated(self) -> bool:
@@ -123,6 +143,7 @@ class MultiAnchorCalibration:
             logger.info(
                 f"Added new anchor for frame {frame_id}. Total anchors: {len(self.anchors)}"
             )
+        self._rebuild_interpolators()
 
     def get_anchor(self, frame_id: int) -> AnchorCalibration | None:
         return next((a for a in self.anchors if a.frame_id == frame_id), None)
@@ -132,18 +153,30 @@ class MultiAnchorCalibration:
         self.anchors = [a for a in self.anchors if a.frame_id != frame_id]
         success = len(self.anchors) < initial_len
         if success:
+            self._rebuild_interpolators()
             logger.info(f"Removed anchor for frame {frame_id}")
         return success
 
     def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple[float, float] | None:
         if not self.is_calibrated:
             return None
+
+        # Граничні умови
         if len(self.anchors) == 1 or frame_id <= self.anchors[0].frame_id:
             return self.anchors[0].pixel_to_metric(x, y)
         if frame_id >= self.anchors[-1].frame_id:
             return self.anchors[-1].pixel_to_metric(x, y)
 
-        # Знаходимо сегмент — тепер логіка одна і читається зверху вниз
+        # PCHIP: інтерполяція матриці → застосування до точки
+        if self._interp is not None:
+            flat = self._interp(float(frame_id))  # (6,) float64
+            if flat is not None and not np.any(np.isnan(flat)):
+                M = flat.reshape(2, 3).astype(np.float32)
+                pt = np.array([[x, y]], dtype=np.float32)
+                result = GeometryTransforms.apply_affine(pt, M)[0]
+                return float(result[0]), float(result[1])
+
+        # Fallback — лінійна інтерполяція (якщо PCHIP недоступний або NaN)
         for i in range(len(self.anchors) - 1):
             a1, a2 = self.anchors[i], self.anchors[i + 1]
             if a1.frame_id <= frame_id <= a2.frame_id:
@@ -152,7 +185,7 @@ class MultiAnchorCalibration:
                 total = dist_1 + dist_2
                 if total == 0:
                     return a1.pixel_to_metric(x, y)
-                w2 = dist_1 / total  # ближчий до a2 → більше вагу a2
+                w2 = dist_1 / total
                 m1 = a1.pixel_to_metric(x, y)
                 m2 = a2.pixel_to_metric(x, y)
                 return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
@@ -169,16 +202,30 @@ class MultiAnchorCalibration:
             "anchors": [a.to_dict() for a in self.anchors],
         }
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        if _USE_ORJSON:
+            raw = _json_lib.dumps(
+                data,
+                option=_json_lib.OPT_INDENT_2 | _json_lib.OPT_NON_STR_KEYS,
+            )
+            with open(path, "wb") as f:
+                f.write(raw)
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                _json_lib.dump(data, f, indent=2, ensure_ascii=False)
         logger.success(
             f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)"
         )
 
     def load(self, path: str) -> None:
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            content = f.read()
+        if _USE_ORJSON:
+            data = _json_lib.loads(content)
+        else:
+            import json
+
+            data = json.loads(content)
 
         self.anchors.clear()
         version = data.get("version", "1.0")
@@ -210,4 +257,5 @@ class MultiAnchorCalibration:
                 self.anchors.append(AnchorCalibration.from_dict(item))
 
         self.anchors.sort(key=lambda a: a.frame_id)
+        self._rebuild_interpolators()
         logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")
