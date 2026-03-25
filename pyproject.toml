@@ -36,6 +36,7 @@ dependencies = [
     "geojson>=3.0.0",
     "faiss-cpu>=1.7.4",
     "orjson>=3.9.0",
+    "orjson>=3.9.0",
 ]
 
 [project.optional-dependencies]
