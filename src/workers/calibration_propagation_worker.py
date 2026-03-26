@@ -90,13 +90,18 @@ class CalibrationPropagationWorker(QThread):
         anchor_features = {}
         for anchor in anchors:
             try:
-                anchor_features[anchor.frame_id] = self._all_features[anchor.frame_id]
+                # Вкрай важливо: використовуємо .get(), бо якір може бути на кадрі,
+                # який не є keyframe і не має локальних ознак.
+                feat = self._all_features.get(anchor.frame_id)
+                if feat is not None:
+                    anchor_features[anchor.frame_id] = feat
+
                 frame_affine[anchor.frame_id] = anchor.affine_matrix
                 frame_valid[anchor.frame_id] = True
                 frame_rmse[anchor.frame_id] = getattr(anchor, "rmse_m", 0.0)
                 frame_matches[anchor.frame_id] = getattr(anchor, "inliers_count", 0)
             except Exception as e:
-                self.error.emit(f"Не вдалося завантажити якір {anchor.frame_id}: {e}")
+                self.error.emit(f"Не вдалося ініціалізувати якір {anchor.frame_id}: {e}")
                 return
 
         segments = self._build_segments(anchors, num_frames)
@@ -373,8 +378,33 @@ class CalibrationPropagationWorker(QThread):
                         break
                     try:
                         pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
+                        # Пропускаємо кадри з вироженою позою (не збережені / zeros)
+                        if np.abs(np.linalg.det(pose_frame)) < 1e-9:
+                            continue
                         # H від frame до anchor через збережені pose-ланцюги
                         H = (inv_pose_anchor @ pose_frame).astype(np.float32)
+
+                        # Fix: Якщо поза ідентична якірній (frozen pose), пробуємо екстраполяцію
+                        if np.allclose(H, np.eye(3), atol=1e-6) and frame_id != anchor_id:
+                            # Шукаємо тренд перед якорем (для хвоста в кінці) або після (для хвоста на початку)
+                            # Робимо лінійну екстраполяцію зсуву
+                            step = 1 if frame_id > anchor_id else -1
+                            prev_id = anchor_id - step
+                            if 0 <= prev_id < self.database.get_num_frames():
+                                try:
+                                    p_prev = self.database.frame_poses[prev_id].astype(np.float64)
+                                    # H_step = inv(anchor) @ p_prev  => рух за 1 кадр до якоря
+                                    H_step = inv_pose_anchor @ p_prev
+                                    # Екстраполюємо: H_extrap = H_step ^ (dist)
+                                    dist = abs(frame_id - anchor_id)
+                                    # Для простоти — лінійна екстраполяція трансляції (найважливіше)
+                                    H = np.eye(3, dtype=np.float32)
+                                    H[0, 2] = -H_step[0, 2] * dist
+                                    H[1, 2] = -H_step[1, 2] * dist
+                                    # logger.debug(f"Extrapolated H for frame {frame_id} from trend at {anchor_id}")
+                                except Exception:
+                                    pass
+
                         result[frame_id] = {"H": H, "matches": 50}  # 50 = estimated
                     except Exception:
                         continue
@@ -384,7 +414,13 @@ class CalibrationPropagationWorker(QThread):
                 f"Failed to use saved poses for anchor {anchor_id}, falling back to visual: {e}"
             )
 
-        # Fallback до візуальної пропагації (тільки якщо поз немає)
+        # Fallback до візуальної пропагації (тільки якщо поз немає АБО якщо pose-chain метод не спрацював)
+        if anchor_feat is None:
+            logger.warning(
+                f"No features for anchor {anchor_id}, visual fallback disabled for this segment."
+            )
+            return result
+
         h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
         matches_cache = {anchor_id: 100}
         prev_features = anchor_feat

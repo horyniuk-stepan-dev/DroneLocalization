@@ -347,7 +347,17 @@ class CalibrationMixin:
 
             points_to_show = []
             _diag_done = False
-            for i in range(0, num_frames, step):
+
+            # Режим відображення верифікації: "center" | "center_corners" | "full"
+            display_mode = get_cfg(self.config, "gui.verify_display_mode", "center_corners")
+            logger.info(f"Verification display mode: {display_mode}")
+
+            # Формуємо список кадрів для перевірки: рівномірна вибірка + останній кадр
+            frames_to_check = list(range(0, num_frames, step))
+            if num_frames > 0 and (num_frames - 1) not in frames_to_check:
+                frames_to_check.append(num_frames - 1)
+
+            for i in frames_to_check:
                 affine = self.database.get_frame_affine(i)
                 if affine is not None:
                     w = self.database.metadata.get("frame_width", 1920)
@@ -373,21 +383,12 @@ class CalibrationMixin:
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
 
-                    # 1. Центр кадру
+                    # 1. Центр кадру (показується завжди)
                     mx, my = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
-
-                    # 2. Низ центру (часто там дорога)
-                    mx_b, my_b = (
-                        affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
-                        affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
-                    )
-                    lat_b, lon_b = self.calibration.converter.metric_to_gps(
-                        float(mx_b), float(my_b)
-                    )
 
                     rmse = (
                         float(rmse_data[i]) if rmse_data is not None and i < len(rmse_data) else 0.0
@@ -402,7 +403,7 @@ class CalibrationMixin:
                     # Лог для вибраного кадру (кожен 3-й з тих що показуємо)
                     if (i // step) % 3 == 0:
                         logger.debug(
-                            f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | BOTTOM={lat_b:.6f},{lon_b:.6f} | RMSE={rmse:.2f}m"
+                            f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | RMSE={rmse:.2f}m"
                         )
 
                     # Колір базується на комбінації факторів
@@ -412,51 +413,74 @@ class CalibrationMixin:
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    # 3. Крайні точки (для візуалізації перекосу/масштабу)
-                    # МАЛЮЄМО НЕ ВЕСЬ КАДР (1920x1080 - це величезна площа на карті!),
-                    # а лише центральні 20% екрану, щоб прямокутник на карті не здавався гіпер-великим.
-                    cx_px, cy_px = w / 2, h / 2
-                    dw, dh = w * 0.1, h * 0.1  # 10% в кожну сторону від центру
-                    pts_px = [
-                        (cx_px - dw, cy_px - dh),
-                        (cx_px + dw, cy_px - dh),
-                        (cx_px + dw, cy_px + dh),
-                        (cx_px - dw, cy_px + dh),
-                    ]
-                    for idx_p, (px, py) in enumerate(pts_px):
-                        mx_p, my_p = (
-                            affine[0, 0] * px + affine[0, 1] * py + affine[0, 2],
-                            affine[1, 0] * px + affine[1, 1] * py + affine[1, 2],
-                        )
-                        lat_p, lon_p = self.calibration.converter.metric_to_gps(
-                            float(mx_p), float(my_p)
-                        )
-                        points_to_show.append(
-                            {
-                                "lat": float(lat_p),
-                                "lon": float(lon_p),
-                                "label": f"Кадр {i} Корнер {idx_p}",
-                                "color": "gray",
-                            }
-                        )
+                    # Формуємо label залежно від режиму
+                    label_mode = get_cfg(self.config, "gui.verify_label_mode", "number_rmse")
+                    if label_mode == "number":
+                        center_label = f"Кадр {i}"
+                    elif label_mode == "number_rmse":
+                        center_label = f"Кадр {i} | RMSE:{rmse:.1f}м"
+                    else:  # full
+                        center_label = f"Кадр {i} (Центр) | RMSE:{rmse:.1f}м | Mat:{matches}"
 
-                    # Додаємо дві основні точки
+                    # Центральна точка (завжди)
                     points_to_show.append(
                         {
                             "lat": float(lat_c),
                             "lon": float(lon_c),
-                            "label": f"Кадр {i} (Центр) | RMSE:{rmse:.1f}м | Mat:{matches}",
+                            "label": center_label,
                             "color": color,
                         }
                     )
-                    points_to_show.append(
-                        {
-                            "lat": float(lat_b),
-                            "lon": float(lon_b),
-                            "label": f"Кадр {i} (Низ) | RMSE:{rmse:.1f}м",
-                            "color": "blue",
-                        }
-                    )
+
+                    # 2. Низ центру — тільки у full режимі
+                    if display_mode == "full":
+                        mx_b, my_b = (
+                            affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
+                            affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
+                        )
+                        lat_b, lon_b = self.calibration.converter.metric_to_gps(
+                            float(mx_b), float(my_b)
+                        )
+                        bottom_label = (
+                            f"Кадр {i} (Низ)"
+                            if label_mode == "number"
+                            else f"Кадр {i} (Низ) | RMSE:{rmse:.1f}м"
+                        )
+                        points_to_show.append(
+                            {
+                                "lat": float(lat_b),
+                                "lon": float(lon_b),
+                                "label": bottom_label,
+                                "color": "blue",
+                            }
+                        )
+
+                    # 3. Кути — у center_corners та full режимах
+                    if display_mode in ("center_corners", "full"):
+                        cx_px, cy_px = w / 2, h / 2
+                        dw, dh = w * 0.1, h * 0.1  # 10% в кожну сторону від центру
+                        pts_px = [
+                            (cx_px - dw, cy_px - dh),
+                            (cx_px + dw, cy_px - dh),
+                            (cx_px + dw, cy_px + dh),
+                            (cx_px - dw, cy_px + dh),
+                        ]
+                        for idx_p, (px, py) in enumerate(pts_px):
+                            mx_p, my_p = (
+                                affine[0, 0] * px + affine[0, 1] * py + affine[0, 2],
+                                affine[1, 0] * px + affine[1, 1] * py + affine[1, 2],
+                            )
+                            lat_p, lon_p = self.calibration.converter.metric_to_gps(
+                                float(mx_p), float(my_p)
+                            )
+                            points_to_show.append(
+                                {
+                                    "lat": float(lat_p),
+                                    "lon": float(lon_p),
+                                    "label": f"Кадр {i} Корнер {idx_p}",
+                                    "color": "gray",
+                                }
+                            )
 
             if points_to_show:
                 self.map_widget.show_verification_markers(points_to_show)
