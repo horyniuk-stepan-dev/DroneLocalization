@@ -164,14 +164,40 @@ class ModelManager:
 
             logger.info(f"Loading DINOv2 ({model_name}) model...")
             self._ensure_vram_available(vram_req)
+
+            # Спроба завантажити TensorRT engine (якщо скомпільований)
+            trt_loaded = False
+            engine_dir = get_cfg(
+                self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
+            )
             try:
-                model = torch.hub.load(repo, model_name)
-                model = model.eval().to(self.device)
-                self.models[name] = model
-                logger.success(f"DINOv2 model {model_name} loaded successfully")
+                from src.models.wrappers.trt_dinov2_wrapper import (
+                    TensorRTDINOv2Wrapper,
+                    is_trt_available,
+                )
+
+                if is_trt_available():
+                    import os
+
+                    engine_path = os.path.join(engine_dir, "dinov2_vitl14_fp16.engine")
+                    if os.path.exists(engine_path):
+                        model = TensorRTDINOv2Wrapper(engine_path)
+                        self.models[name] = model
+                        trt_loaded = True
+                        logger.success(f"DINOv2 TensorRT FP16 engine loaded: {engine_path}")
             except Exception as e:
-                logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
-                raise
+                logger.debug(f"TensorRT DINOv2 not available, using PyTorch: {e}")
+
+            # Fallback: стандартний PyTorch hub
+            if not trt_loaded:
+                try:
+                    model = torch.hub.load(repo, model_name)
+                    model = model.eval().to(self.device)
+                    self.models[name] = model
+                    logger.success(f"DINOv2 model {model_name} loaded successfully (PyTorch)")
+                except Exception as e:
+                    logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
+                    raise
         self._register_model_usage(name)
         return self.models[name]
 

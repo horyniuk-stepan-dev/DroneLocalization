@@ -67,16 +67,19 @@ class PreprocessingConfig(BaseModel):
     clahe_tile_grid: list[int] = [8, 8]
     histogram_matching: bool = True
     reference_image_path: str = "config/reference_style.png"
+    masking_strategy: str = "yolo"  # "yolo" | "none" (підготовка до EfficientViT-SAM)
 
 
 class GuiConfig(BaseModel):
     video_fps: int = 30
+    verify_display_mode: str = "center"  # "center" | "center_corners" | "full"
+    verify_label_mode: str = "number"  # "number" | "number_rmse" | "full"
 
 
 class YoloConfig(BaseModel):
-    model_path: str = "yolo11x-seg.pt"
-    vram_required_mb: float = 1200.0
-    description: str = "YOLOv11x-seg (Extra Large) for dynamic object masking"
+    model_path: str = "yolo11n-seg.pt"
+    vram_required_mb: float = 200.0
+    description: str = "YOLOv11n-seg (Nano) for dynamic object masking"
 
 
 class ModelSettings(BaseModel):
@@ -101,6 +104,11 @@ class CespConfig(BaseModel):
 class VramManagementConfig(BaseModel):
     max_vram_ratio: float = 0.8
     default_required_mb: float = 2000.0
+
+
+class ModelsCacheConfig(BaseModel):
+    engine_cache_dir: str = "models/engines/"
+    auto_compile: bool = False
 
 
 class PerformanceConfig(BaseModel):
@@ -128,6 +136,7 @@ class ModelsConfig(BaseModel):
     cesp: CespConfig = CespConfig()
     vram_management: VramManagementConfig = VramManagementConfig()
     performance: PerformanceConfig = PerformanceConfig()
+    engines_cache: ModelsCacheConfig = ModelsCacheConfig()
 
 
 class ProjectionConfig(BaseModel):
@@ -141,6 +150,13 @@ class ProjectionConfig(BaseModel):
     localizer_expected_spread_m: float = 150.0
 
 
+class HomographyConfig(BaseModel):
+    backend: str = "opencv"  # "poselib" | "opencv"
+    ransac_threshold: float = 3.0
+    max_iters: int = 2000
+    confidence: float = 0.99
+
+
 class AppConfig(BaseModel):
     dinov2: Dinov2Config = Dinov2Config()
     database: DatabaseConfig = DatabaseConfig()
@@ -150,6 +166,7 @@ class AppConfig(BaseModel):
     gui: GuiConfig = GuiConfig()
     models: ModelsConfig = ModelsConfig()
     projection: ProjectionConfig = ProjectionConfig()
+    homography: HomographyConfig = HomographyConfig()
 
 
 def get_cfg(config: Any, path: str, default: Any = None) -> Any:

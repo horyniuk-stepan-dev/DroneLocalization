@@ -96,3 +96,46 @@ def test_estimate_affine_partial():
     M, mask = GeometryTransforms.estimate_affine_partial(src, dst)
     assert M is not None
     assert M.shape == (2, 3)
+
+
+# --- PoseLib backend tests ---
+
+
+def test_estimate_homography_poselib():
+    """PoseLib LO-RANSAC повинен успішно оцінити гомографію."""
+    src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=float)
+    dst = np.array([[10, 10], [110, 10], [110, 110], [10, 110]], dtype=float)
+
+    H, mask = GeometryTransforms.estimate_homography(src, dst, backend="poselib")
+    assert H is not None
+    assert H.shape == (3, 3)
+
+
+def test_estimate_homography_opencv_backend():
+    """Явний OpenCV backend повинен працювати як і раніше."""
+    src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=float)
+    dst = np.array([[10, 10], [110, 10], [110, 110], [10, 110]], dtype=float)
+
+    H, mask = GeometryTransforms.estimate_homography(src, dst, backend="opencv")
+    assert H is not None
+    assert H.shape == (3, 3)
+
+
+def test_poselib_vs_opencv_equivalent():
+    """PoseLib та OpenCV мають давати подібні результати на чистих даних."""
+    np.random.seed(42)
+    src = np.array([[0, 0], [100, 0], [100, 100], [0, 100], [50, 50], [25, 75]], dtype=float)
+    # Проста трансляція — обидва мають знайти правильну H
+    dst = src + np.array([15.0, 20.0])
+
+    H_poselib, mask_p = GeometryTransforms.estimate_homography(src, dst, backend="poselib")
+    H_opencv, mask_o = GeometryTransforms.estimate_homography(src, dst, backend="opencv")
+
+    assert H_poselib is not None
+    assert H_opencv is not None
+
+    # Обидва мають трансформувати центральну точку однаково (±1px)
+    test_pt = np.array([[50.0, 50.0]])
+    result_p = GeometryTransforms.apply_homography(test_pt, H_poselib)
+    result_o = GeometryTransforms.apply_homography(test_pt, H_opencv)
+    assert np.allclose(result_p, result_o, atol=1.0)
