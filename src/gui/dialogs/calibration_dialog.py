@@ -363,7 +363,8 @@ class CalibrationDialog(QDialog):
             self.last_slider_value = frame_id
             self.spinbox_frame_id.setValue(frame_id)
             self.video_widget.display_frame(opencv_to_qpixmap(frame))
-            self.lbl_frame_info.setText(f"Кадр: {frame_id} / {self.slider.maximum()}")
+            total = self.slider.maximum() + 1
+            self.lbl_frame_info.setText(f"Кадр: {frame_id + 1} / {total}")
 
     def on_anchor_confirmed(self, frame_id: int):
         """Called by MainWindow after affine matrix is successfully computed."""
@@ -501,14 +502,19 @@ class CalibrationDialog(QDialog):
         if not ret:
             self.toggle_playback()
             return
-        cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        self.last_slider_value = cur
+        # POS_FRAMES points to the NEXT frame after read()
+        cur_next = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+        cur_idx = cur_next - 1
+
+        self.last_slider_value = cur_idx
         self.slider.blockSignals(True)
-        self.slider.setValue(cur)
+        self.slider.setValue(cur_idx)
         self.slider.blockSignals(False)
-        self.spinbox_frame_id.setValue(cur)
+        self.spinbox_frame_id.setValue(cur_idx)
         self.video_widget.display_frame(opencv_to_qpixmap(frame))
-        self.lbl_frame_info.setText(f"Кадр: {cur} / {self.slider.maximum()}")
+
+        total = self.slider.maximum() + 1
+        self.lbl_frame_info.setText(f"Кадр: {cur_idx + 1} / {total}")
 
     def step_forward(self):
         if self.is_playing:
@@ -567,7 +573,8 @@ class CalibrationDialog(QDialog):
         if ret and frame is not None:
             self.spinbox_frame_id.setValue(value)
             self.video_widget.display_frame(opencv_to_qpixmap(frame))
-            self.lbl_frame_info.setText(f"Кадр: {value} / {self.slider.maximum()}")
+            total = self.slider.maximum() + 1
+            self.lbl_frame_info.setText(f"Кадр: {value + 1} / {total}")
 
     # ── Points ───────────────────────────────────────────────────────────────
 

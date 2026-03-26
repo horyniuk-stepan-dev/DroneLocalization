@@ -121,7 +121,7 @@ class MultiAnchorCalibration:
         ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
         matrices = np.stack([a.affine_matrix.ravel() for a in self.anchors])  # (N, 6)
         # PchipInterpolator обробляє multi-column масиви нативно
-        self._interp = PchipInterpolator(ids, matrices, extrapolate=False)
+        self._interp = PchipInterpolator(ids, matrices, extrapolate=True)
 
     @property
     def is_calibrated(self) -> bool:
@@ -161,13 +161,11 @@ class MultiAnchorCalibration:
         if not self.is_calibrated:
             return None
 
-        # Граничні умови
-        if len(self.anchors) == 1 or frame_id <= self.anchors[0].frame_id:
+        # Якщо якір один — екстраполяція неможлива, повертаємо його координати
+        if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
-        if frame_id >= self.anchors[-1].frame_id:
-            return self.anchors[-1].pixel_to_metric(x, y)
 
-        # PCHIP: інтерполяція матриці → застосування до точки
+        # PCHIP: інтерполяція/екстраполяція матриці → застосування до точки
         if self._interp is not None:
             flat = self._interp(float(frame_id))  # (6,) float64
             if flat is not None and not np.any(np.isnan(flat)):
@@ -192,8 +190,7 @@ class MultiAnchorCalibration:
         return None
 
     def save(self, path: str) -> None:
-        if not self.is_calibrated:
-            raise RuntimeError("Немає даних для збереження")
+        """Збереження якорів та метаданих проєкції у JSON."""
 
         # Зберігаємо також метадані проєкції
         data = {
