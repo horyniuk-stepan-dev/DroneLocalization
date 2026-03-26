@@ -235,6 +235,12 @@
                     bridge.setPanoramaSignal.connect(setPanoramaOverlay);
                     bridge.showVerificationMarkersSignal.connect(showVerificationMarkers);
                     bridge.clearVerificationMarkersSignal.connect(clearVerificationMarkers);
+
+                    // ── JS -> Python: Notify on map click ─────────────────────
+                    map.on('click', function(e) {
+                        bridge.mapClicked(e.latlng.lat, e.latlng.lng);
+                    });
+
                     console.log("QWebChannel bridge connected");
                 });
             } else if (retriesLeft > 0) {

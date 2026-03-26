@@ -34,9 +34,19 @@ class MapBridge(QObject):
     showVerificationMarkersSignal = pyqtSignal(str)
     clearVerificationMarkersSignal = pyqtSignal()
 
+    # JS -> Python: Map Click
+    mapClickedSignal = pyqtSignal(float, float)
+
+    @pyqtSlot(float, float)
+    def mapClicked(self, lat: float, lon: float):
+        """Called from JavaScript when the map is clicked."""
+        self.mapClickedSignal.emit(lat, lon)
+
 
 class MapWidget(QWebEngineView):
     """Interactive map widget backed by Leaflet via QWebChannel."""
+
+    mapClicked = pyqtSignal(float, float)  # Public signal
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,6 +56,8 @@ class MapWidget(QWebEngineView):
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
 
         self.bridge = MapBridge()
+        self.bridge.mapClickedSignal.connect(self.mapClicked)  # Re-emit for convenience
+
         self._channel = QWebChannel()
         self._channel.registerObject("mapBridge", self.bridge)
         self.page().setWebChannel(self._channel)

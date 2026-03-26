@@ -5,6 +5,16 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# PoseLib: LO-RANSAC з 4-точковим розв'язувачем (кращий за MAGSAC++ на малих datasets)
+try:
+    import poselib
+
+    _POSELIB_AVAILABLE = True
+    logger.info(f"PoseLib {poselib.__version__} available — LO-RANSAC enabled")
+except ImportError:
+    _POSELIB_AVAILABLE = False
+    logger.info("PoseLib not installed — using OpenCV MAGSAC++ for homography estimation")
+
 
 class GeometryTransforms:
     """Geometric transformations for localization with robust estimation (MAGSAC++)"""
@@ -106,17 +116,31 @@ class GeometryTransforms:
         max_iters: int = 2000,
         confidence: float = 0.99,
         fallback_to_affine: bool = True,
+        backend: str = "opencv",
     ):
         """
-        Estimate Homography using MAGSAC++ with validation and optional fallback.
+        Estimate Homography with configurable backend.
+
+        Args:
+            backend: "poselib" (LO-RANSAC) або "opencv" (MAGSAC++, default)
         """
         if len(src_pts) < 4:
             return None, None
 
+        # PoseLib backend (LO-RANSAC)
+        if backend == "poselib" and _POSELIB_AVAILABLE:
+            H, mask = GeometryTransforms._estimate_homography_poselib(
+                src_pts, dst_pts, ransac_threshold, max_iters, confidence
+            )
+            if GeometryTransforms.is_matrix_valid(H, is_homography=True):
+                return H, mask
+            # Якщо PoseLib дав невалідну матрицю — fallback
+            logger.debug("PoseLib homography invalid, falling back to OpenCV")
+
+        # OpenCV backend (USAC_MAGSAC)
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
-        # Use USAC_MAGSAC for better outlier rejection and accuracy (OpenCV 4.5+)
         H, mask = cv2.findHomography(
             src_pts_cv,
             dst_pts_cv,
@@ -136,6 +160,42 @@ class GeometryTransforms:
             return None, None
 
         return H, mask
+
+    @staticmethod
+    def _estimate_homography_poselib(
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        ransac_threshold: float = 3.0,
+        max_iters: int = 2000,
+        confidence: float = 0.99,
+    ):
+        """
+        Estimate Homography через PoseLib LO-RANSAC.
+        Повертає (H, mask) у форматі сумісному з OpenCV.
+        """
+        pts_src = src_pts.reshape(-1, 2).astype(np.float64)
+        pts_dst = dst_pts.reshape(-1, 2).astype(np.float64)
+
+        ransac_opt = {
+            "max_reproj_error": ransac_threshold,
+            "max_iterations": max_iters,
+            "confidence": confidence,
+        }
+
+        H, info = poselib.estimate_homography(pts_src, pts_dst, ransac_opt)
+
+        if H is None:
+            return None, None
+
+        # Конвертація inlier mask у формат (N, 1) uint8 — аналог OpenCV
+        inliers = info.get("inliers", [])
+        n_pts = len(pts_src)
+        mask = np.zeros((n_pts, 1), dtype=np.uint8)
+        for idx in inliers:
+            if 0 <= idx < n_pts:
+                mask[idx] = 1
+
+        return np.array(H, dtype=np.float64), mask
 
     @staticmethod
     def apply_homography(points: np.ndarray, H: np.ndarray) -> np.ndarray:

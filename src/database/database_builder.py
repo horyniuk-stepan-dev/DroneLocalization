@@ -10,7 +10,7 @@ import torch
 
 from config.config import get_cfg
 from src.models.wrappers.feature_extractor import FeatureExtractor
-from src.models.wrappers.yolo_wrapper import YOLOWrapper
+from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -119,10 +119,12 @@ class DatabaseBuilder:
                 logger.warning(f"VideoWriter initialization crashed: {e}")
                 kp_writer = None
 
-        # Initialize neural network wrappers
-        logger.info("Loading neural network models...")
-        yolo_model = model_manager.load_yolo()
-        yolo_wrapper = YOLOWrapper(yolo_model, model_manager.device)
+        # Ініціалізуємо стратегію маскування (YOLO / none / ...)
+        masking_strategy_name = get_cfg(self.config, "preprocessing.masking_strategy", "yolo")
+        logger.info(f"Loading masking strategy: {masking_strategy_name}")
+        masking_strategy = create_masking_strategy(
+            masking_strategy_name, model_manager, model_manager.device
+        )
 
         local_model = model_manager.load_aliked()
         nv_model = model_manager.load_dinov2()
@@ -234,11 +236,11 @@ class DatabaseBuilder:
                 logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
             pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
 
-            def _flush_yolo_batch(batch: list) -> list:
-                """Обробляє батч через YOLO, повертає (idx, frame, frame_rgb, static_mask)."""
+            def _flush_mask_batch(batch: list) -> list:
+                """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
                 images_rgb = [b[2] for b in batch]
-                masks_list = yolo_wrapper.detect_and_mask_batch(images_rgb)
-                return [(b[0], b[1], b[2], m[0]) for b, m in zip(batch, masks_list)]
+                masks_list = masking_strategy.get_mask_batch(images_rgb)
+                return [(b[0], b[1], b[2], m) for b, m in zip(batch, masks_list)]
 
             def _process_single_frame(
                 p_idx,
@@ -287,6 +289,12 @@ class DatabaseBuilder:
 
                 prev_features = features
 
+                # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
+                # навіть якщо кадр не є keyframe (пропущений через малий рух).
+                # Без цього frame_poses[frame_id] = zeros → пропагація ламається.
+                if self.db_file:
+                    self.db_file["global_descriptors"]["frame_poses"][p_idx] = current_pose
+
                 if save_this_frame:
                     frame_index_map.append(p_idx)
                     # Зберігаємо за ОРИГІНАЛЬНИМ індексом p_idx, а не послідовним
@@ -320,7 +328,7 @@ class DatabaseBuilder:
                 if not pending_frames:
                     break
 
-                processed = _flush_yolo_batch(pending_frames)
+                processed = _flush_mask_batch(pending_frames)
                 pending_frames = []
 
                 for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:

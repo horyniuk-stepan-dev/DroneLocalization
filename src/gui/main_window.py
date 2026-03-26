@@ -91,3 +91,10 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.verify_propagation_clicked.connect(self.on_verify_propagation)
         cp.clear_map_clicked.connect(self.map_widget.clear_trajectory)
         cp.export_results_clicked.connect(self.on_export_results)
+        self.map_widget.mapClicked.connect(self._on_map_clicked)
+
+    def _on_map_clicked(self, lat: float, lon: float):
+        """Handle map click by showing coordinates in the status bar."""
+        msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
+        self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
+        logger.info(f"Map click: {lat=}, {lon=}")
