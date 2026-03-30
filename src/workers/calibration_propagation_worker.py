@@ -237,27 +237,6 @@ class CalibrationPropagationWorker(QThread):
         """
         result = {}
 
-        # --- Спочатку пробуємо saved poses (O(1), без GPU) ---
-        try:
-            pose_anchor = self.database.frame_poses[anchor_id].astype(np.float64)
-            if np.abs(np.linalg.det(pose_anchor)) > 1e-9:
-                inv_pose_anchor = np.linalg.inv(pose_anchor)
-                for frame_id in frames:
-                    if not self._is_running:
-                        break
-                    try:
-                        pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
-                        if np.abs(np.linalg.det(pose_frame)) < 1e-9:
-                            continue
-                        H = (inv_pose_anchor @ pose_frame).astype(np.float32)
-                        result[frame_id] = {"H": H, "matches": 50}
-                    except Exception:
-                        continue
-                if result:
-                    return result
-        except Exception as e:
-            logger.debug(f"Saved poses unavailable for anchor {anchor_id}: {e}")
-
         # --- Fallback: візуальний ланцюжок з gap-bridging ---
         # h_cache: frame_id -> H (відносно anchor)
         h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
@@ -375,7 +354,7 @@ class CalibrationPropagationWorker(QThread):
                     dists.append(np.mean(np.linalg.norm(proj - final_metric_pts, axis=1)))
                 frame_disagreement[frame_id] = float(np.mean(dists))
 
-            M, _ = cv2.estimateAffine2D(self.grid_points, final_metric_pts)
+            M, _ = cv2.estimateAffine2D(self.grid_points, final_metric_pts, method=cv2.LMEDS)
             if M is not None:
                 frame_affine[frame_id] = M
                 frame_valid[frame_id] = True

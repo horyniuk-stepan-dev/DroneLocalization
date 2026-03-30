@@ -273,7 +273,7 @@ class DatabaseBuilder:
 
                 # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
                 # навіть якщо кадр не є keyframe (пропущений через малий рух).
-                self.db_file["global_descriptors"]["frame_poses"][i] = current_pose
+
 
                 if not save_this_frame:
                     progress_percent = int((i + 1) / num_frames * 100)

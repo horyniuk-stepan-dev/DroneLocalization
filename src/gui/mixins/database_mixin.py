@@ -163,9 +163,7 @@ class DatabaseMixin:
             QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
             return
 
-        from src.geometry.coordinates import CoordinateConverter
 
-        self.calibration.converter = CoordinateConverter("WEB_MERCATOR")
 
         try:
             db_path = self.project_manager.database_path
@@ -214,6 +212,12 @@ class DatabaseMixin:
             calib_path = self.project_manager.calibration_path
             if calib_path and Path(calib_path).exists():
                 self.calibration.load(calib_path)
+
+            # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
+            if self.database and self.database.converter is not None:
+                self.calibration.converter = self.database.converter
+            elif self.calibration.converter and self.calibration.converter._initialized:
+                pass  # конвертер вже завантажений з calibration.json
 
             if self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())

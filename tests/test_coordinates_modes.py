@@ -11,28 +11,24 @@ from src.geometry.coordinates import CoordinateConverter
 def test_conversions():
     lat, lon = 50.4501, 30.5234  # Kyiv
 
-    # Reset initialization to clean state
-    CoordinateConverter.reset()
-    CoordinateConverter.configure_projection("UTM", reference_gps=(lat, lon))
-
     # Test automatic UTM projection
-    x_utm, y_utm = CoordinateConverter.gps_to_metric(lat, lon)
+    conv = CoordinateConverter("UTM", reference_gps=(lat, lon))
+    x_utm, y_utm = conv.gps_to_metric(lat, lon)
 
     # Now it should be initialized
-    assert CoordinateConverter._initialized is True
+    assert conv._initialized is True
 
-    lat_utm, lon_utm = CoordinateConverter.metric_to_gps(x_utm, y_utm)
+    lat_utm, lon_utm = conv.metric_to_gps(x_utm, y_utm)
     assert abs(lat - lat_utm) < 1e-7
     assert abs(lon - lon_utm) < 1e-7
 
     # Test Web Mercator
-    CoordinateConverter.reset()
-    CoordinateConverter.configure_projection("WEB_MERCATOR")
-    x_wm, y_wm = CoordinateConverter.gps_to_metric(lat, lon)
+    conv_wm = CoordinateConverter("WEB_MERCATOR")
+    x_wm, y_wm = conv_wm.gps_to_metric(lat, lon)
 
-    assert CoordinateConverter._initialized is True
+    assert conv_wm._initialized is True
 
-    lat_wm, lon_wm = CoordinateConverter.metric_to_gps(x_wm, y_wm)
+    lat_wm, lon_wm = conv_wm.metric_to_gps(x_wm, y_wm)
     assert abs(lat - lat_wm) < 1e-7
     assert abs(lon - lon_wm) < 1e-7
 
@@ -52,8 +48,7 @@ def test_haversine_distance():
 
 
 def test_uninitialized_error():
-    # Reset initialization strictly for testing error
-    CoordinateConverter.reset()
-    CoordinateConverter._projection_mode = "UTM"
+    # Create UTM converter without reference
+    conv = CoordinateConverter("UTM")
     with pytest.raises(RuntimeError, match="CoordinateConverter is not initialized."):
-        CoordinateConverter.metric_to_gps(100.0, 100.0)
+        conv.metric_to_gps(100.0, 100.0)

@@ -21,30 +21,28 @@ def test_projection_difference():
         print(f"\nPoint: GPS({lat}, {lon})")
 
         # 1. WebMercator
-        CoordinateConverter.configure_projection("WEB_MERCATOR")
-        mx_w, my_w = CoordinateConverter.gps_to_metric(lat, lon)
+        conv_wm = CoordinateConverter("WEB_MERCATOR")
+        mx_w, my_w = conv_wm.gps_to_metric(lat, lon)
         print(f"WEB_MERCATOR: ({mx_w:.2f}, {my_w:.2f})")
 
         # 2. UTM
-        CoordinateConverter.configure_projection("UTM", (lat, lon))
-        mx_u, my_u = CoordinateConverter.gps_to_metric(lat, lon)
+        conv_utm = CoordinateConverter("UTM", (lat, lon))
+        mx_u, my_u = conv_utm.gps_to_metric(lat, lon)
         print(f"UTM (ref=this): ({mx_u:.2f}, {my_u:.2f})")
 
         # Тест репродуктивності (UTM з іншим референсом)
         ref_gps = (lat + 0.1, lon + 0.1)
-        CoordinateConverter.configure_projection("UTM", ref_gps)
-        mx_u2, my_u2 = CoordinateConverter.gps_to_metric(lat, lon)
+        conv_utm2 = CoordinateConverter("UTM", ref_gps)
+        mx_u2, my_u2 = conv_utm2.gps_to_metric(lat, lon)
         print(f"UTM (ref={ref_gps[0]:.2f}, {ref_gps[1]:.2f}): ({mx_u2:.2f}, {my_u2:.2f})")
 
         # Порівняємо відстані між точками (чи зберігається масштаб)
         p2_gps = (lat + 0.01, lon + 0.01)
 
-        CoordinateConverter.configure_projection("WEB_MERCATOR")
-        m2_w = CoordinateConverter.gps_to_metric(*p2_gps)
+        m2_w = conv_wm.gps_to_metric(*p2_gps)
         dist_w = ((mx_w - m2_w[0]) ** 2 + (my_w - m2_w[1]) ** 2) ** 0.5
 
-        CoordinateConverter.configure_projection("UTM", (lat, lon))
-        m2_u = CoordinateConverter.gps_to_metric(*p2_gps)
+        m2_u = conv_utm.gps_to_metric(*p2_gps)
         dist_u = ((mx_u - m2_u[0]) ** 2 + (my_u - m2_u[1]) ** 2) ** 0.5
 
         real_dist = CoordinateConverter.haversine_distance((lat, lon), p2_gps)
