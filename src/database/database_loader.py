@@ -54,8 +54,8 @@ class DatabaseLoader:
 
             if "actual_num_frames" in self.metadata:
                 actual_num = int(self.metadata["actual_num_frames"])
-                self.global_descriptors = self.global_descriptors[:actual_num]
-                self.frame_poses = self.frame_poses[:actual_num]
+                # DO NOT SLICE with actual_num_frames! The arrays are sized to num_frames exactly, 
+                # and are indexed by absolute visual frame_id!
             
             if "frame_index_map" in self.db_file["metadata"]:
                 self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
@@ -209,7 +209,7 @@ class DatabaseLoader:
         return res
 
     def get_num_frames(self) -> int:
-        return int(self.metadata.get("actual_num_frames", self.metadata.get("num_frames", 0)))
+        return int(self.metadata.get("num_frames", 0))
 
     def close(self) -> None:
         if self.db_file is not None:

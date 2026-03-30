@@ -80,9 +80,9 @@ class GuiConfig(BaseModel):
 
 
 class YoloConfig(BaseModel):
-    model_path: str = "yolo11n-seg.pt"
+    model_path: str = "yolo11x-seg.pt"
     vram_required_mb: float = 200.0
-    description: str = "YOLOv11n-seg (Nano) for dynamic object masking"
+    description: str = "YOLOv11x-seg (Nano) for dynamic object masking"
 
 
 class ModelSettings(BaseModel):
