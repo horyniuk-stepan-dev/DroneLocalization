@@ -36,7 +36,6 @@ class DatabaseGenerationWorker(QThread):
 
             builder = DatabaseBuilder(
                 output_path=self.output_path,
-                matcher=None,  # Will be initialized inside builder if needed
                 config=self.config,
             )
 

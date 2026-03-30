@@ -182,37 +182,12 @@ class DatabaseLoader:
 
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
         """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
-        """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         if frame_id in self._feature_cache:
             return self._feature_cache[frame_id]
 
         if self.db_file is None:
             raise RuntimeError("Database not opened")
 
-        schema = self.metadata.get("hdf5_schema", "v1")
-        if schema == "v2":
-            lf = self.db_file["local_features"]
-            n = int(lf["kp_counts"][frame_id])
-            if n == 0:
-                raise ValueError(f"Кадр {frame_id} не має keypoints (kp_count=0).")
-            res = {
-                "keypoints": lf["keypoints"][frame_id, :n],
-                "descriptors": lf["descriptors"][frame_id, :n].astype("float32"),  # float16→32
-                "coords_2d": lf["coords_2d"][frame_id, :n],
-            }
-        else:
-            # Стара схема v1 — зворотня сумісність
-            group_name = f"local_features/frame_{frame_id}"
-            if group_name not in self.db_file:
-                raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
-            g = self.db_file[group_name]
-            res = {
-                "keypoints": g["keypoints"][:],
-                "descriptors": g["descriptors"][:],
-                "coords_2d": g["coords_2d"][:],
-            }
-
-        # LRU-витіснення
         schema = self.metadata.get("hdf5_schema", "v1")
         if schema == "v2":
             lf = self.db_file["local_features"]
@@ -254,7 +229,5 @@ class DatabaseLoader:
             logger.info("Database file closed")
 
         # Очищення кешу при закритті БД
-        self._size_cache.clear()
-        self._feature_cache.clear()
         self._size_cache.clear()
         self._feature_cache.clear()

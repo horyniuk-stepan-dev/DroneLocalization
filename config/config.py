@@ -18,9 +18,6 @@ class DatabaseConfig(BaseModel):
     keypoint_video_scale: float = 0.5
     inter_frame_min_matches: int = 15
     inter_frame_ransac_thresh: float = 3.0
-    keyframe_min_translation_px: float = 15.0
-    keyframe_min_rotation_deg: float = 1.5
-    keyframe_always_save_first: bool = True
     # HDF5 schema v2: pre-allocated масиви
     hdf5_compression: str = "lzf"  # "gzip" | "lzf" | None  (lzf = вбудований, без pip)
     hdf5_chunk_frames: int = 64  # розмір chunk по осі кадрів
