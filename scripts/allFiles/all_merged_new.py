@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any
 
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
@@ -121,6 +122,18 @@ class MultiAnchorCalibration:
     def __init__(self, converter: CoordinateConverter | None = None) -> None:
         self.anchors: list[AnchorCalibration] = []
         self.converter = converter or CoordinateConverter("WEB_MERCATOR")
+        self._interp: PchipInterpolator | None = None  # кешований інтерполятор
+
+    def _rebuild_interpolators(self) -> None:
+        """Перебудовує PCHIP-інтерполятор. Викликати після кожної зміни anchors."""
+        if len(self.anchors) < 2:
+            self._interp = None
+            return
+
+        ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
+        matrices = np.stack([a.affine_matrix.ravel() for a in self.anchors])  # (N, 6)
+        # PchipInterpolator обробляє multi-column масиви нативно
+        self._interp = PchipInterpolator(ids, matrices, extrapolate=True)
 
     @property
     def is_calibrated(self) -> bool:
@@ -142,6 +155,7 @@ class MultiAnchorCalibration:
             logger.info(
                 f"Added new anchor for frame {frame_id}. Total anchors: {len(self.anchors)}"
             )
+        self._rebuild_interpolators()
 
     def get_anchor(self, frame_id: int) -> AnchorCalibration | None:
         return next((a for a in self.anchors if a.frame_id == frame_id), None)
@@ -151,31 +165,44 @@ class MultiAnchorCalibration:
         self.anchors = [a for a in self.anchors if a.frame_id != frame_id]
         success = len(self.anchors) < initial_len
         if success:
+            self._rebuild_interpolators()
             logger.info(f"Removed anchor for frame {frame_id}")
         return success
 
     def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple[float, float] | None:
         if not self.is_calibrated:
             return None
-        if len(self.anchors) == 1 or frame_id <= self.anchors[0].frame_id:
+
+        # Якщо якір один — екстраполяція неможлива, повертаємо його координати
+        if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
-        if frame_id >= self.anchors[-1].frame_id:
-            return self.anchors[-1].pixel_to_metric(x, y)
 
-        from scipy.interpolate import PchipInterpolator
+        # PCHIP: інтерполяція/екстраполяція матриці → застосування до точки
+        if self._interp is not None:
+            flat = self._interp(float(frame_id))  # (6,) float64
+            if flat is not None and not np.any(np.isnan(flat)):
+                M = flat.reshape(2, 3).astype(np.float32)
+                pt = np.array([[x, y]], dtype=np.float32)
+                result = GeometryTransforms.apply_affine(pt, M)[0]
+                return float(result[0]), float(result[1])
 
-        X = [a.frame_id for a in self.anchors]
-        Y = np.array([a.pixel_to_metric(x, y) for a in self.anchors])
-
-        interp = PchipInterpolator(X, Y)
-        res = interp(frame_id)
-        return float(res[0]), float(res[1])
+        # Fallback — лінійна інтерполяція
+        for i in range(len(self.anchors) - 1):
+            a1, a2 = self.anchors[i], self.anchors[i + 1]
+            if a1.frame_id <= frame_id <= a2.frame_id:
+                dist_1 = abs(frame_id - a1.frame_id)
+                dist_2 = abs(frame_id - a2.frame_id)
+                total = dist_1 + dist_2
+                if total == 0:
+                    return a1.pixel_to_metric(x, y)
+                w2 = dist_1 / total
+                m1 = a1.pixel_to_metric(x, y)
+                m2 = a2.pixel_to_metric(x, y)
+                return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
+        return None
 
     def save(self, path: str) -> None:
-        if not self.is_calibrated:
-            raise RuntimeError("Немає даних для збереження")
-
-        # Зберігаємо також метадані проєкції
+        """Збереження якорів та метаданих проєкції у JSON."""
         data = {
             "version": self.VERSION,
             "projection": self.converter.export_metadata(),
@@ -236,8 +263,8 @@ class MultiAnchorCalibration:
                 self.anchors.append(AnchorCalibration.from_dict(item))
 
         self.anchors.sort(key=lambda a: a.frame_id)
+        self._rebuild_interpolators()
         logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")
-
 
 # ================================================================================
 # File: calibration\__init__.py
@@ -692,6 +719,7 @@ import torch
 
 from config.config import get_cfg
 from src.models.wrappers.feature_extractor import FeatureExtractor
+from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
@@ -805,6 +833,13 @@ class DatabaseBuilder:
         logger.info("Loading neural network models...")
         yolo_model = model_manager.load_yolo()
         yolo_wrapper = YOLOWrapper(yolo_model, model_manager.device)
+
+        # MaskingStrategy — абстракція над YOLO/none/інші стратегії (конфіг: preprocessing.masking_strategy)
+        masking_strategy_name = get_cfg(self.config, "preprocessing.masking_strategy", "yolo")
+        logger.info(f"Loading masking strategy: {masking_strategy_name}")
+        masking_strategy = create_masking_strategy(
+            masking_strategy_name, model_manager, model_manager.device
+        )
 
         local_model = model_manager.load_aliked()
         nv_model = model_manager.load_dinov2()
@@ -945,7 +980,14 @@ class DatabaseBuilder:
 
                 prev_features = features
 
+                # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
+                # навіть якщо кадр не є keyframe (пропущений через малий рух).
+                self.db_file["global_descriptors"]["frame_poses"][i] = current_pose
+
                 if not save_this_frame:
+                    progress_percent = int((i + 1) / num_frames * 100)
+                    if progress_callback:
+                        progress_callback(progress_percent)
                     continue
 
                 frame_index_map.append(i)
@@ -984,7 +1026,10 @@ class DatabaseBuilder:
         min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
         min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
 
-        cx, cy = 1920.0 / 2.0, 1080.0 / 2.0
+        # Розміри беремо з конфігу — всі кадри нормалізуються до target_size перед обробкою
+        target_w = get_cfg(self.config, "preprocessing.target_width", 1920)
+        target_h = get_cfg(self.config, "preprocessing.target_height", 1080)
+        cx, cy = target_w / 2.0, target_h / 2.0
         p_src = np.array([cx, cy, 1.0], dtype=np.float64)
         p_dst = H.astype(np.float64) @ p_src
         if p_dst[2] != 0:
@@ -1101,7 +1146,12 @@ class DatabaseBuilder:
 
     def create_hdf5_structure(self, num_frames: int, width: int, height: int):
         """Create optimal HDF5 hierarchy with compression and pre-allocated arrays"""
-        logger.info(f"Creating HDF5 structure for {num_frames} frames (pre-allocated)")
+        compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
+        chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
+        logger.info(
+            f"Creating HDF5 structure for {num_frames} frames "
+            f"(compression={compression}, chunks={chunk_f})"
+        )
 
         with h5py.File(self.output_path, "w") as f:
             # Global descriptors
@@ -1110,16 +1160,21 @@ class DatabaseBuilder:
                 "descriptors",
                 shape=(num_frames, self.descriptor_dim),
                 dtype="float32",
-                compression="lzf",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), self.descriptor_dim),
             )
             g1.create_dataset(
-                "frame_poses", shape=(num_frames, 3, 3), dtype="float64", compression="lzf"
+                "frame_poses",
+                shape=(num_frames, 3, 3),
+                dtype="float64",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), 3, 3),
             )
 
             # Local features (pre-allocated arrays)
             max_kp = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
             fallback_extractor = get_cfg(self.config, "localization.fallback_extractor", "aliked")
-            
+
             # Determine feature dimension
             feature_dim = 128
             if fallback_extractor == "superpoint":
@@ -1128,17 +1183,39 @@ class DatabaseBuilder:
                 feature_dim = 64
 
             g2 = f.create_group("local_features")
+            g2.attrs["frame_width"] = width
+            g2.attrs["frame_height"] = height
             g2.create_dataset(
-                "keypoints", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+                "keypoints",
+                shape=(num_frames, max_kp, 2),
+                dtype="float32",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kp, 2),
+                fillvalue=0.0,
             )
             g2.create_dataset(
-                "descriptors", shape=(num_frames, max_kp, feature_dim), dtype="float16", compression="lzf"
+                "descriptors",
+                shape=(num_frames, max_kp, feature_dim),
+                dtype="float16",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kp, feature_dim),
+                fillvalue=0.0,
             )
             g2.create_dataset(
-                "coords_2d", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+                "coords_2d",
+                shape=(num_frames, max_kp, 2),
+                dtype="float32",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kp, 2),
+                fillvalue=0.0,
             )
             g2.create_dataset(
-                "num_kp", shape=(num_frames,), dtype="int32", compression="lzf"
+                "num_kp",
+                shape=(num_frames,),
+                dtype="int32",
+                compression=compression,
+                chunks=(min(num_frames, 4096),),
+                fillvalue=0,
             )
 
             g3 = f.create_group("metadata")
@@ -1163,7 +1240,6 @@ class DatabaseBuilder:
         self.db_file["local_features"]["descriptors"][frame_id, :num, :] = features["descriptors"]
         self.db_file["local_features"]["coords_2d"][frame_id, :num, :] = features["coords_2d"]
         self.db_file["local_features"]["num_kp"][frame_id] = num
-
 
 # ================================================================================
 # File: database\database_loader.py
@@ -1224,8 +1300,8 @@ class DatabaseLoader:
 
             if "actual_num_frames" in self.metadata:
                 actual_num = int(self.metadata["actual_num_frames"])
-                self.global_descriptors = self.global_descriptors[:actual_num]
-                self.frame_poses = self.frame_poses[:actual_num]
+                # DO NOT SLICE with actual_num_frames! The arrays are sized to num_frames exactly,
+                # and are indexed by absolute visual frame_id!
             
             if "frame_index_map" in self.db_file["metadata"]:
                 self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
@@ -1316,11 +1392,23 @@ class DatabaseLoader:
         if self.db_file is None:
             return 1080, 1920
 
-        h, w = 1080, 1920
-        # If the file uses the new schema, we can't get frame size per frame easily anymore without breaking the API.
-        # Fallback to global metadata for all frames, which is the same anyway.
+        # Схема v2: розміри збережені один раз в local_features.attrs
+        schema = self.metadata.get("hdf5_schema", "v1")
+        if schema == "v2" and "local_features" in self.db_file:
+            lf_attrs = self.db_file["local_features"].attrs
+            h = int(lf_attrs.get("frame_height", self.metadata.get("frame_height", 1080)))
+            w = int(lf_attrs.get("frame_width", self.metadata.get("frame_width", 1920)))
+            self._size_cache[frame_id] = (h, w)
+            return h, w
+
+        # Схема v1: fallback — спочатку metadata, потім група кадру
         h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
         w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
+        group_name = f"local_features/frame_{frame_id}"
+        if group_name in self.db_file:
+            g = self.db_file[group_name]
+            if "height" in g.attrs and "width" in g.attrs:
+                h, w = int(g.attrs["height"]), int(g.attrs["width"])
 
         res = (int(h), int(w))
         self._size_cache[frame_id] = res
@@ -1334,34 +1422,46 @@ class DatabaseLoader:
         if self.db_file is None:
             raise RuntimeError("Database not opened")
 
+        schema = self.metadata.get("hdf5_schema", "v1")
         g = self.db_file["local_features"]
-        
-        # Check backwards compatibility with old frame_X groups
-        if f"frame_{frame_id}" in g:
-            old_g = g[f"frame_{frame_id}"]
+
+        if schema == "v2":
+            n = int(g["kp_counts"][frame_id])
+            if n == 0:
+                raise ValueError(f"Кадр {frame_id} не має keypoints (kp_count=0).")
             res = {
-                "keypoints": old_g["keypoints"][:],
-                "descriptors": old_g["descriptors"][:],
-                "coords_2d": old_g["coords_2d"][:],
+                "keypoints": g["keypoints"][frame_id, :n],
+                "descriptors": g["descriptors"][frame_id, :n].astype(np.float32),  # float16→32
+                "coords_2d": g["coords_2d"][frame_id, :n],
             }
         else:
-            # New format
-            num = int(g["num_kp"][frame_id])
-            res = {
-                "keypoints": g["keypoints"][frame_id, :num, :],
-                "descriptors": g["descriptors"][frame_id, :num, :].astype(np.float32), 
-                "coords_2d": g["coords_2d"][frame_id, :num, :]
-            }
-        # Обмежуємо розмір кешу (аналог lru_cache з maxsize)
+            # Стара схема v1 — зворотня сумісність
+            if f"frame_{frame_id}" in g:
+                old_g = g[f"frame_{frame_id}"]
+                res = {
+                    "keypoints": old_g["keypoints"][:],
+                    "descriptors": old_g["descriptors"][:],
+                    "coords_2d": old_g["coords_2d"][:],
+                }
+            else:
+                # v1 pre-allocated без груп
+                num = int(g["num_kp"][frame_id])
+                res = {
+                    "keypoints": g["keypoints"][frame_id, :num],
+                    "descriptors": g["descriptors"][frame_id, :num].astype(np.float32),
+                    "coords_2d": g["coords_2d"][frame_id, :num],
+                }
+
+        # Обмежуємо розмір кешу (аналог lru_cache з maxsize=200)
         if len(self._feature_cache) > 200:
-            # Видаляємо перший знайдений ключ (проста заміна LRU)
             self._feature_cache.pop(next(iter(self._feature_cache)))
 
         self._feature_cache[frame_id] = res
         return res
 
     def get_num_frames(self) -> int:
-        return int(self.metadata.get("actual_num_frames", self.metadata.get("num_frames", 0)))
+        """Повертає кількість pre-allocated слотів у БД (індексація за абсолютним frame_id)."""
+        return int(self.metadata.get("num_frames", 0))
 
     def close(self) -> None:
         if self.db_file is not None:
@@ -1372,7 +1472,6 @@ class DatabaseLoader:
         # Очищення кешу при закритті БД
         self._size_cache.clear()
         self._feature_cache.clear()
-
 
 # ================================================================================
 # File: database\__init__.py
@@ -6171,11 +6270,129 @@ class FeatureExtractor:
 
 
 # ================================================================================
+# File: models\wrappers\masking_strategy.py
+# ================================================================================
+# src/models/wrappers/masking_strategy.py
+#
+# Поліморфний інтерфейс маскування динамічних об'єктів (Strategy Pattern).
+# Дозволяє підміняти реалізацію (YOLO, EfficientViT-SAM, none) через конфіг.
+
+from abc import ABC, abstractmethod
+
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class MaskingStrategy(ABC):
+    """Абстрактний інтерфейс для стратегій маскування динамічних об'єктів."""
+
+    @abstractmethod
+    def get_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
+        """Повертає бінарну маску: 255 = статичний фон, 0 = динамічний об'єкт.
+
+        Args:
+            frame_rgb: RGB зображення (H, W, 3), uint8
+
+        Returns:
+            Бінарна маска (H, W), uint8: 255 = статика, 0 = динаміка
+        """
+
+    @abstractmethod
+    def get_mask_batch(self, frames_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        """Батчева обробка кадрів.
+
+        Args:
+            frames_rgb: список RGB зображень
+
+        Returns:
+            Список бінарних масок (одна на кадр)
+        """
+
+
+class YOLOMaskingStrategy(MaskingStrategy):
+    """Стратегія маскування через YOLO сегментацію.
+
+    Делегує обробку існуючому YOLOWrapper, зберігаючи всю логіку
+    micro-batching, over-masking та фільтрації за класами.
+    """
+
+    def __init__(self, yolo_wrapper):
+        """
+        Args:
+            yolo_wrapper: екземпляр YOLOWrapper (вже ініціалізований)
+        """
+        self._wrapper = yolo_wrapper
+        logger.info("YOLOMaskingStrategy initialized")
+
+    def get_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
+        static_mask, _detections = self._wrapper.detect_and_mask(frame_rgb)
+        return static_mask
+
+    def get_mask_batch(self, frames_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        results = self._wrapper.detect_and_mask_batch(frames_rgb)
+        return [static_mask for static_mask, _detections in results]
+
+
+class NoMaskingStrategy(MaskingStrategy):
+    """Заглушка без маскування — повертає повністю білу маску.
+
+    Використовується для тестів та режиму без YOLO.
+    """
+
+    def __init__(self):
+        logger.info("NoMaskingStrategy initialized (masking disabled)")
+
+    def get_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
+        h, w = frame_rgb.shape[:2]
+        return np.ones((h, w), dtype=np.uint8) * 255
+
+    def get_mask_batch(self, frames_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        return [self.get_mask(f) for f in frames_rgb]
+
+
+def create_masking_strategy(
+    strategy_name: str,
+    model_manager=None,
+    device: str = "cuda",
+) -> MaskingStrategy:
+    """Фабрика стратегій маскування.
+
+    Args:
+        strategy_name: назва стратегії з конфігу ("yolo" | "none")
+        model_manager: ModelManager для завантаження моделей
+        device: пристрій для інференсу ("cuda" | "cpu")
+
+    Returns:
+        Екземпляр MaskingStrategy
+    """
+    if strategy_name == "yolo":
+        if model_manager is None:
+            raise ValueError("model_manager is required for YOLO masking strategy")
+        from src.models.wrappers.yolo_wrapper import YOLOWrapper
+
+        yolo_model = model_manager.load_yolo()
+        yolo_wrapper = YOLOWrapper(yolo_model, device)
+        return YOLOMaskingStrategy(yolo_wrapper)
+
+    if strategy_name == "none":
+        return NoMaskingStrategy()
+
+    raise ValueError(f"Unknown masking strategy: '{strategy_name}'. Supported: 'yolo', 'none'")
+
+
+# ================================================================================
 # File: models\wrappers\yolo_wrapper.py
 # ================================================================================
 import cv2
 import numpy as np
 import torch
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class YOLOWrapper:
@@ -6194,93 +6411,41 @@ class YOLOWrapper:
     @torch.no_grad()
     def detect_and_mask(self, image: np.ndarray) -> tuple:
         """
-        Detect objects and create static mask
+        Detect objects and create static mask (single image).
+        Делегує до batch-методу для уникнення дублювання логіки.
 
         Returns:
             static_mask: Binary mask of static areas (255 for static, 0 for dynamic)
             detections: List of detection dicts
         """
-        # verbose=False вимикає зайве логування кожного кадру в консоль
-        # half=True для FP16 інференсу
-        # conf=0.50 відкидає слабкі передбачення, щоб уникнути хибних величезних масок
-        results = self.model(image, verbose=False, half=self.use_half, conf=0.50)
-        result = results[0]
-
-        height, width = image.shape[:2]
-        static_mask = np.ones((height, width), dtype=np.uint8) * 255
-
-        total_pixels = height * width
-        MAX_SINGLE_MASK_RATIO = 0.40  # Якщо один об'єкт займає більше 40% кадру — ігноруємо
-        MAX_COMBINED_MASK_RATIO = (
-            0.70  # Якщо ВСІ маски разом займають > 70% — ймовірно помилка сегментації
-        )
-
-        detections = []
-
-        if result.masks is not None:
-            masks = result.masks.data.cpu().numpy()
-            boxes = result.boxes.data.cpu().numpy()
-            classes = result.boxes.cls.cpu().numpy().astype(int)
-            confidences = result.boxes.conf.cpu().numpy()
-
-            # Vectorized: знайти всі динамічні маски одразу
-            dynamic_mask_indices = [
-                i for i, cls in enumerate(classes) if cls in self.dynamic_classes
-            ]
-
-            for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
-                detections.append(
-                    {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
-                )
-
-            # Об'єднуємо всі динамічні маски за один раз
-            if dynamic_mask_indices:
-                combined_dynamic = np.zeros((height, width), dtype=np.float32)
-                for idx in dynamic_mask_indices:
-                    mask_resized = cv2.resize(
-                        masks[idx], (width, height), interpolation=cv2.INTER_NEAREST
-                    )
-
-                    # Перевіряємо, чи маска не є аномально великою (наприклад, помилково розпізнане поле як гігантська "вантажівка" чи "потяг")
-                    mask_area = np.sum(mask_resized > 0.5)
-                    if mask_area / total_pixels > MAX_SINGLE_MASK_RATIO:
-                        continue  # Ігноруємо цю величезну маску
-
-                    combined_dynamic = np.maximum(combined_dynamic, mask_resized)
-                # Перевірка сумарної площі масок
-                combined_area = np.sum(combined_dynamic > 0.5)
-                if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
-                    static_mask[combined_dynamic > 0.5] = 0
-                else:
-                    from src.utils.logging_utils import get_logger
-
-                    logger = get_logger(__name__)
-                    logger.warning(
-                        f"YOLO OVER-MASKING DETECTED ({combined_area / total_pixels:.2%}). Frame preserved."
-                    )
-
-        return static_mask, detections
+        results = self.detect_and_mask_batch([image])
+        if not results:
+            return np.ones(image.shape[:2], dtype=np.uint8) * 255, []
+        return results[0]
 
     @torch.no_grad()
     def detect_and_mask_batch(self, images: list[np.ndarray]) -> list[tuple]:
         """
         Detect objects and create static masks for a batch of images.
+        Повертає list[(static_mask, detections)] того самого порядку.
         """
         if not images:
             return []
 
         # YOLO expects list of images or a 4D tensor (B, H, W, 3). Ultralytics natively handles list of ndarrays.
+        # half=True для FP16 інференсу
+        # conf=0.50 відкидає слабкі передбачення
         results = self.model(images, verbose=False, half=self.use_half, conf=0.50)
-        
+
         output = []
+        MAX_SINGLE_MASK_RATIO = 0.40
+        MAX_COMBINED_MASK_RATIO = 0.70
+
         for result, image in zip(results, images):
             height, width = image.shape[:2]
             static_mask = np.ones((height, width), dtype=np.uint8) * 255
             detections = []
-
             total_pixels = height * width
-            MAX_SINGLE_MASK_RATIO = 0.40
-            MAX_COMBINED_MASK_RATIO = 0.70
 
             if result.masks is not None:
                 masks = result.masks.data.cpu().numpy()
@@ -6307,10 +6472,15 @@ class YOLOWrapper:
                         if mask_area / total_pixels > MAX_SINGLE_MASK_RATIO:
                             continue
                         combined_dynamic = np.maximum(combined_dynamic, mask_resized)
-                        
+
                     combined_area = np.sum(combined_dynamic > 0.5)
                     if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
                         static_mask[combined_dynamic > 0.5] = 0
+                    else:
+                        logger.warning(
+                            f"YOLO OVER-MASKING DETECTED ({combined_area / total_pixels:.2%}). "
+                            "Frame preserved."
+                        )
 
             output.append((static_mask, detections))
 
@@ -6737,13 +6907,16 @@ class CalibrationPropagationWorker(QThread):
         anchor_features = {}
         for anchor in anchors:
             try:
-                anchor_features[anchor.frame_id] = self._all_features[anchor.frame_id]
+                feat = self._all_features.get(anchor.frame_id)
+                if feat is not None:
+                    anchor_features[anchor.frame_id] = feat
+
                 frame_affine[anchor.frame_id] = anchor.affine_matrix
                 frame_valid[anchor.frame_id] = True
                 frame_rmse[anchor.frame_id] = getattr(anchor, "rmse_m", 0.0)
                 frame_matches[anchor.frame_id] = getattr(anchor, "inliers_count", 0)
             except Exception as e:
-                self.error.emit(f"Не вдалося завантажити якір {anchor.frame_id}: {e}")
+                self.error.emit(f"Не вдалося ініціалізувати якір {anchor.frame_id}: {e}")
                 return
 
         segments = self._build_segments(anchors, num_frames)
@@ -7020,6 +7193,9 @@ class CalibrationPropagationWorker(QThread):
                         break
                     try:
                         pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
+                        # Пропускаємо кадри з вироженою позою (не збережені / zeros)
+                        if np.abs(np.linalg.det(pose_frame)) < 1e-9:
+                            continue
                         # H від frame до anchor через збережені pose-ланцюги
                         H = (inv_pose_anchor @ pose_frame).astype(np.float32)
                         result[frame_id] = {"H": H, "matches": 50}  # 50 = estimated
@@ -7127,7 +7303,6 @@ class CalibrationPropagationWorker(QThread):
         finally:
             self.database._load_hot_data()
 
-
 # ================================================================================
 # File: workers\database_worker.py
 # ================================================================================
@@ -7169,7 +7344,6 @@ class DatabaseGenerationWorker(QThread):
 
             builder = DatabaseBuilder(
                 output_path=self.output_path,
-                matcher=None,  # Will be initialized inside builder if needed
                 config=self.config,
             )
 
@@ -7543,173 +7717,6 @@ class RealtimeTrackingWorker(QThread):
 
 
 # ================================================================================
-# config/config.py
-#
-# Єдиний конфіг для всього застосунку з валідацією через Pydantic.
-
-from typing import Any
-
-from pydantic import BaseModel
-
-
-class Dinov2Config(BaseModel):
-    descriptor_dim: int = 1024
-    input_size: int = 336
-
-
-class DatabaseConfig(BaseModel):
-    frame_step: int = 3
-    prefetch_queue_size: int = 32
-    keypoint_video_scale: float = 0.5
-    inter_frame_min_matches: int = 15
-    inter_frame_ransac_thresh: float = 3.0
-    keyframe_min_translation_px: float = 15.0
-    keyframe_min_rotation_deg: float = 1.5
-    keyframe_always_save_first: bool = True
-
-
-class ConfidenceConfig(BaseModel):
-    inlier_weight: float = 0.7
-    stability_weight: float = 0.3
-    rmse_norm_m: float = 10.0
-    disagreement_norm_m: float = 5.0
-    confidence_max_inliers: int = 80
-
-
-class LocalizationConfig(BaseModel):
-    min_matches: int = 12
-    min_inliers_accept: int = 10
-    ratio_threshold: float = 0.85
-    ransac_threshold: float = 3.0
-    retrieval_top_k: int = 12
-    early_stop_inliers: int = 40
-    retrieval_only_min_score: float = 0.90
-    auto_rotation: bool = True
-    enable_lightglue_fallback: bool = True
-    fallback_extractor: str = "aliked"
-    confidence: ConfidenceConfig = ConfidenceConfig()
-
-
-class TrackingConfig(BaseModel):
-    kalman_process_noise: float = 2.0
-    kalman_measurement_noise: float = 5.0
-    outlier_window: int = 10
-    outlier_threshold_std: float = 25.0
-    max_speed_mps: float = 60.0
-    max_consecutive_outliers: int = 5
-    process_fps: float = 1.0
-
-
-class PreprocessingConfig(BaseModel):
-    clahe_clip_limit: float = 3.0
-    clahe_tile_grid: list[int] = [8, 8]
-    histogram_matching: bool = True
-    reference_image_path: str = "config/reference_style.png"
-
-
-class GuiConfig(BaseModel):
-    video_fps: int = 30
-
-
-class YoloConfig(BaseModel):
-    model_path: str = "yolo11x-seg.pt"
-    vram_required_mb: float = 1200.0
-    description: str = "YOLOv11x-seg (Extra Large) for dynamic object masking"
-
-
-class ModelSettings(BaseModel):
-    hub_repo: str | None = ""
-    hub_model: str | None = ""
-    top_k: int = 2048
-    vram_required_mb: float = 500.0
-    model_path: str | None = ""
-    max_keypoints: int = 4096
-    nms_radius: int = 4
-    depth_confidence: float = -1.0
-    width_confidence: float = -1.0
-    detection_threshold: float = 0.001
-
-
-class CespConfig(BaseModel):
-    enabled: bool = False
-    weights_path: str | None = None
-    scales: list[int] = [1, 2, 4]
-
-
-class VramManagementConfig(BaseModel):
-    max_vram_ratio: float = 0.8
-    default_required_mb: float = 2000.0
-
-
-class PerformanceConfig(BaseModel):
-    propagation_max_workers: int = 4
-    fp16_enabled: bool = True
-
-
-class ModelsConfig(BaseModel):
-    use_cuda: bool = True
-    yolo: YoloConfig = YoloConfig()
-    xfeat: ModelSettings = ModelSettings(
-        hub_repo="verlab/accelerated_features",
-        hub_model="XFeat",
-        top_k=2048,
-        vram_required_mb=300.0,
-    )
-    aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
-    superpoint: ModelSettings = ModelSettings(
-        nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
-    )
-    lightglue: ModelSettings = ModelSettings(vram_required_mb=1000.0)
-    dinov2: ModelSettings = ModelSettings(
-        hub_repo="facebookresearch/dinov2", hub_model="dinov2_vitl14", vram_required_mb=1600.0
-    )
-    cesp: CespConfig = CespConfig()
-    vram_management: VramManagementConfig = VramManagementConfig()
-    performance: PerformanceConfig = PerformanceConfig()
-
-
-class ProjectionConfig(BaseModel):
-    default_mode: str = "WEB_MERCATOR"
-    strict_projection: bool = True
-    fallback_to_webmercator: bool = True
-    anchor_rmse_threshold_m: float = 3.0
-    anchor_max_error_m: float = 5.0
-    propagation_disagreement_threshold_m: float = 2.0
-    localizer_sample_points: int = 9
-    localizer_expected_spread_m: float = 150.0
-
-
-class AppConfig(BaseModel):
-    dinov2: Dinov2Config = Dinov2Config()
-    database: DatabaseConfig = DatabaseConfig()
-    localization: LocalizationConfig = LocalizationConfig()
-    tracking: TrackingConfig = TrackingConfig()
-    preprocessing: PreprocessingConfig = PreprocessingConfig()
-    gui: GuiConfig = GuiConfig()
-    models: ModelsConfig = ModelsConfig()
-    projection: ProjectionConfig = ProjectionConfig()
-
-
-def get_cfg(config: Any, path: str, default: Any = None) -> Any:
-    """Централізований доступ до конфігу з dot-path.
-    Працює як зі словниками, так і з Pydantic-моделями.
-    """
-    keys = path.split(".")
-    current = config
-
-    for key in keys:
-        if isinstance(current, dict):
-            if key not in current:
-                return default
-            current = current[key]
-        elif hasattr(current, key):
-            current = getattr(current, key)
-        else:
-            return default
-    return current
-
-
-# Екземпляр конфігу за замовчуванням
-APP_SETTINGS = AppConfig()
-# Також надаємо доступ як до словника для зворотньої сумісності
-APP_CONFIG = APP_SETTINGS.model_dump()
+# File: workers\__init__.py
+# ================================================================================
+"""Worker threads module"""

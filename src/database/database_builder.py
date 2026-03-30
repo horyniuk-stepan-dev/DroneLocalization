@@ -10,6 +10,7 @@ import torch
 
 from config.config import get_cfg
 from src.models.wrappers.feature_extractor import FeatureExtractor
+from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
@@ -123,6 +124,13 @@ class DatabaseBuilder:
         logger.info("Loading neural network models...")
         yolo_model = model_manager.load_yolo()
         yolo_wrapper = YOLOWrapper(yolo_model, model_manager.device)
+
+        # MaskingStrategy — абстракція над YOLO/none/інші стратегії (конфіг: preprocessing.masking_strategy)
+        masking_strategy_name = get_cfg(self.config, "preprocessing.masking_strategy", "yolo")
+        logger.info(f"Loading masking strategy: {masking_strategy_name}")
+        masking_strategy = create_masking_strategy(
+            masking_strategy_name, model_manager, model_manager.device
+        )
 
         local_model = model_manager.load_aliked()
         nv_model = model_manager.load_dinov2()
@@ -263,7 +271,14 @@ class DatabaseBuilder:
 
                 prev_features = features
 
+                # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
+                # навіть якщо кадр не є keyframe (пропущений через малий рух).
+                self.db_file["global_descriptors"]["frame_poses"][i] = current_pose
+
                 if not save_this_frame:
+                    progress_percent = int((i + 1) / num_frames * 100)
+                    if progress_callback:
+                        progress_callback(progress_percent)
                     continue
 
                 frame_index_map.append(i)
@@ -302,7 +317,10 @@ class DatabaseBuilder:
         min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
         min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
 
-        cx, cy = 1920.0 / 2.0, 1080.0 / 2.0
+        # Розміри беремо з конфігу — всі кадри нормалізуються до target_size перед обробкою
+        target_w = get_cfg(self.config, "preprocessing.target_width", 1920)
+        target_h = get_cfg(self.config, "preprocessing.target_height", 1080)
+        cx, cy = target_w / 2.0, target_h / 2.0
         p_src = np.array([cx, cy, 1.0], dtype=np.float64)
         p_dst = H.astype(np.float64) @ p_src
         if p_dst[2] != 0:
@@ -419,7 +437,12 @@ class DatabaseBuilder:
 
     def create_hdf5_structure(self, num_frames: int, width: int, height: int):
         """Create optimal HDF5 hierarchy with compression and pre-allocated arrays"""
-        logger.info(f"Creating HDF5 structure for {num_frames} frames (pre-allocated)")
+        compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
+        chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
+        logger.info(
+            f"Creating HDF5 structure for {num_frames} frames "
+            f"(compression={compression}, chunks={chunk_f})"
+        )
 
         with h5py.File(self.output_path, "w") as f:
             # Global descriptors
@@ -428,16 +451,21 @@ class DatabaseBuilder:
                 "descriptors",
                 shape=(num_frames, self.descriptor_dim),
                 dtype="float32",
-                compression="lzf",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), self.descriptor_dim),
             )
             g1.create_dataset(
-                "frame_poses", shape=(num_frames, 3, 3), dtype="float64", compression="lzf"
+                "frame_poses",
+                shape=(num_frames, 3, 3),
+                dtype="float64",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), 3, 3),
             )
 
             # Local features (pre-allocated arrays)
             max_kp = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
             fallback_extractor = get_cfg(self.config, "localization.fallback_extractor", "aliked")
-            
+
             # Determine feature dimension
             feature_dim = 128
             if fallback_extractor == "superpoint":
@@ -446,17 +474,39 @@ class DatabaseBuilder:
                 feature_dim = 64
 
             g2 = f.create_group("local_features")
+            g2.attrs["frame_width"] = width
+            g2.attrs["frame_height"] = height
             g2.create_dataset(
-                "keypoints", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+                "keypoints",
+                shape=(num_frames, max_kp, 2),
+                dtype="float32",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kp, 2),
+                fillvalue=0.0,
             )
             g2.create_dataset(
-                "descriptors", shape=(num_frames, max_kp, feature_dim), dtype="float16", compression="lzf"
+                "descriptors",
+                shape=(num_frames, max_kp, feature_dim),
+                dtype="float16",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kp, feature_dim),
+                fillvalue=0.0,
             )
             g2.create_dataset(
-                "coords_2d", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+                "coords_2d",
+                shape=(num_frames, max_kp, 2),
+                dtype="float32",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kp, 2),
+                fillvalue=0.0,
             )
             g2.create_dataset(
-                "num_kp", shape=(num_frames,), dtype="int32", compression="lzf"
+                "num_kp",
+                shape=(num_frames,),
+                dtype="int32",
+                compression=compression,
+                chunks=(min(num_frames, 4096),),
+                fillvalue=0,
             )
 
             g3 = f.create_group("metadata")

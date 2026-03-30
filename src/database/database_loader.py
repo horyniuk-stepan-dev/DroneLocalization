@@ -54,8 +54,8 @@ class DatabaseLoader:
 
             if "actual_num_frames" in self.metadata:
                 actual_num = int(self.metadata["actual_num_frames"])
-                self.global_descriptors = self.global_descriptors[:actual_num]
-                self.frame_poses = self.frame_poses[:actual_num]
+                # DO NOT SLICE with actual_num_frames! The arrays are sized to num_frames exactly,
+                # and are indexed by absolute visual frame_id!
             
             if "frame_index_map" in self.db_file["metadata"]:
                 self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
@@ -146,11 +146,23 @@ class DatabaseLoader:
         if self.db_file is None:
             return 1080, 1920
 
-        h, w = 1080, 1920
-        # If the file uses the new schema, we can't get frame size per frame easily anymore without breaking the API.
-        # Fallback to global metadata for all frames, which is the same anyway.
+        # Схема v2: розміри збережені один раз в local_features.attrs
+        schema = self.metadata.get("hdf5_schema", "v1")
+        if schema == "v2" and "local_features" in self.db_file:
+            lf_attrs = self.db_file["local_features"].attrs
+            h = int(lf_attrs.get("frame_height", self.metadata.get("frame_height", 1080)))
+            w = int(lf_attrs.get("frame_width", self.metadata.get("frame_width", 1920)))
+            self._size_cache[frame_id] = (h, w)
+            return h, w
+
+        # Схема v1: fallback — спочатку metadata, потім група кадру
         h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
         w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
+        group_name = f"local_features/frame_{frame_id}"
+        if group_name in self.db_file:
+            g = self.db_file[group_name]
+            if "height" in g.attrs and "width" in g.attrs:
+                h, w = int(g.attrs["height"]), int(g.attrs["width"])
 
         res = (int(h), int(w))
         self._size_cache[frame_id] = res
@@ -164,34 +176,46 @@ class DatabaseLoader:
         if self.db_file is None:
             raise RuntimeError("Database not opened")
 
+        schema = self.metadata.get("hdf5_schema", "v1")
         g = self.db_file["local_features"]
-        
-        # Check backwards compatibility with old frame_X groups
-        if f"frame_{frame_id}" in g:
-            old_g = g[f"frame_{frame_id}"]
+
+        if schema == "v2":
+            n = int(g["kp_counts"][frame_id])
+            if n == 0:
+                raise ValueError(f"Кадр {frame_id} не має keypoints (kp_count=0).")
             res = {
-                "keypoints": old_g["keypoints"][:],
-                "descriptors": old_g["descriptors"][:],
-                "coords_2d": old_g["coords_2d"][:],
+                "keypoints": g["keypoints"][frame_id, :n],
+                "descriptors": g["descriptors"][frame_id, :n].astype(np.float32),  # float16→32
+                "coords_2d": g["coords_2d"][frame_id, :n],
             }
         else:
-            # New format
-            num = int(g["num_kp"][frame_id])
-            res = {
-                "keypoints": g["keypoints"][frame_id, :num, :],
-                "descriptors": g["descriptors"][frame_id, :num, :].astype(np.float32), 
-                "coords_2d": g["coords_2d"][frame_id, :num, :]
-            }
-        # Обмежуємо розмір кешу (аналог lru_cache з maxsize)
+            # Стара схема v1 — зворотня сумісність
+            if f"frame_{frame_id}" in g:
+                old_g = g[f"frame_{frame_id}"]
+                res = {
+                    "keypoints": old_g["keypoints"][:],
+                    "descriptors": old_g["descriptors"][:],
+                    "coords_2d": old_g["coords_2d"][:],
+                }
+            else:
+                # v1 pre-allocated без груп
+                num = int(g["num_kp"][frame_id])
+                res = {
+                    "keypoints": g["keypoints"][frame_id, :num],
+                    "descriptors": g["descriptors"][frame_id, :num].astype(np.float32),
+                    "coords_2d": g["coords_2d"][frame_id, :num],
+                }
+
+        # Обмежуємо розмір кешу (аналог lru_cache з maxsize=200)
         if len(self._feature_cache) > 200:
-            # Видаляємо перший знайдений ключ (проста заміна LRU)
             self._feature_cache.pop(next(iter(self._feature_cache)))
 
         self._feature_cache[frame_id] = res
         return res
 
     def get_num_frames(self) -> int:
-        return int(self.metadata.get("actual_num_frames", self.metadata.get("num_frames", 0)))
+        """Повертає кількість pre-allocated слотів у БД (індексація за абсолютним frame_id)."""
+        return int(self.metadata.get("num_frames", 0))
 
     def close(self) -> None:
         if self.db_file is not None:
