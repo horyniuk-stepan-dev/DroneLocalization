@@ -136,6 +136,10 @@ class FeatureMatcher:
     def _lightglue_match(self, query_features: dict, ref_features: dict) -> tuple:
         """Matches features using Neural LightGlue Matcher"""
         try:
+            if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
+                logger.warning("Empty keypoints array provided to LightGlue.")
+                return np.empty((0, 2)), np.empty((0, 2))
+
             device = next(self.lightglue.parameters()).device
 
             # Підготовка тензорів для LightGlue

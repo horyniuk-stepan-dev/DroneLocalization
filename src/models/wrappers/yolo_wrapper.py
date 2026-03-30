@@ -85,3 +85,58 @@ class YOLOWrapper:
                     )
 
         return static_mask, detections
+
+    @torch.no_grad()
+    def detect_and_mask_batch(self, images: list[np.ndarray]) -> list[tuple]:
+        """
+        Detect objects and create static masks for a batch of images.
+        """
+        if not images:
+            return []
+
+        # YOLO expects list of images or a 4D tensor (B, H, W, 3). Ultralytics natively handles list of ndarrays.
+        results = self.model(images, verbose=False, half=self.use_half, conf=0.50)
+        
+        output = []
+        for result, image in zip(results, images):
+            height, width = image.shape[:2]
+            static_mask = np.ones((height, width), dtype=np.uint8) * 255
+            detections = []
+
+            total_pixels = height * width
+            MAX_SINGLE_MASK_RATIO = 0.40
+            MAX_COMBINED_MASK_RATIO = 0.70
+
+            if result.masks is not None:
+                masks = result.masks.data.cpu().numpy()
+                boxes = result.boxes.data.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy().astype(int)
+                confidences = result.boxes.conf.cpu().numpy()
+
+                dynamic_mask_indices = [
+                    i for i, cls in enumerate(classes) if cls in self.dynamic_classes
+                ]
+
+                for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
+                    detections.append(
+                        {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
+                    )
+
+                if dynamic_mask_indices:
+                    combined_dynamic = np.zeros((height, width), dtype=np.float32)
+                    for idx in dynamic_mask_indices:
+                        mask_resized = cv2.resize(
+                            masks[idx], (width, height), interpolation=cv2.INTER_NEAREST
+                        )
+                        mask_area = np.sum(mask_resized > 0.5)
+                        if mask_area / total_pixels > MAX_SINGLE_MASK_RATIO:
+                            continue
+                        combined_dynamic = np.maximum(combined_dynamic, mask_resized)
+                        
+                    combined_area = np.sum(combined_dynamic > 0.5)
+                    if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
+                        static_mask[combined_dynamic > 0.5] = 0
+
+            output.append((static_mask, detections))
+
+        return output

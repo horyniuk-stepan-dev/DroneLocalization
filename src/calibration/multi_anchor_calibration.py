@@ -1,4 +1,9 @@
-import json
+try:
+    import orjson as _json_lib
+    _USE_ORJSON = True
+except ImportError:
+    import json as _json_lib
+    _USE_ORJSON = False
 from datetime import datetime
 from typing import Any
 
@@ -143,20 +148,14 @@ class MultiAnchorCalibration:
         if frame_id >= self.anchors[-1].frame_id:
             return self.anchors[-1].pixel_to_metric(x, y)
 
-        # Знаходимо сегмент — тепер логіка одна і читається зверху вниз
-        for i in range(len(self.anchors) - 1):
-            a1, a2 = self.anchors[i], self.anchors[i + 1]
-            if a1.frame_id <= frame_id <= a2.frame_id:
-                dist_1 = abs(frame_id - a1.frame_id)
-                dist_2 = abs(frame_id - a2.frame_id)
-                total = dist_1 + dist_2
-                if total == 0:
-                    return a1.pixel_to_metric(x, y)
-                w2 = dist_1 / total  # ближчий до a2 → більше вагу a2
-                m1 = a1.pixel_to_metric(x, y)
-                m2 = a2.pixel_to_metric(x, y)
-                return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
-        return None
+        from scipy.interpolate import PchipInterpolator
+
+        X = [a.frame_id for a in self.anchors]
+        Y = np.array([a.pixel_to_metric(x, y) for a in self.anchors])
+
+        interp = PchipInterpolator(X, Y)
+        res = interp(frame_id)
+        return float(res[0]), float(res[1])
 
     def save(self, path: str) -> None:
         if not self.is_calibrated:
@@ -169,16 +168,29 @@ class MultiAnchorCalibration:
             "anchors": [a.to_dict() for a in self.anchors],
         }
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        if _USE_ORJSON:
+            raw = _json_lib.dumps(
+                data,
+                option=_json_lib.OPT_INDENT_2 | getattr(_json_lib, "OPT_NON_STR_KEYS", 0),
+            )
+            with open(path, "wb") as f:
+                f.write(raw)
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                _json_lib.dump(data, f, indent=2, ensure_ascii=False)
         logger.success(
             f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)"
         )
 
     def load(self, path: str) -> None:
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            content = f.read()
+
+        if _USE_ORJSON:
+            data = _json_lib.loads(content)
+        else:
+            data = _json_lib.loads(content.decode("utf-8"))
 
         self.anchors.clear()
         version = data.get("version", "1.0")

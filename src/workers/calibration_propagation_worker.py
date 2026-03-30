@@ -55,8 +55,12 @@ class CalibrationPropagationWorker(QThread):
 
     def _propagate(self):
         num_frames = self.database.get_num_frames()
-        anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
-
+        all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        anchors = [a for a in all_anchors if a.frame_id < num_frames]
+        
+        if len(anchors) < len(all_anchors):
+            logger.warning(f"Filtered {len(all_anchors) - len(anchors)} out-of-bounds anchors (DB has {num_frames} frames).")
+            
         if not anchors:
             self.error.emit("Немає якорів калібрування")
             return

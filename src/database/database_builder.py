@@ -215,6 +215,10 @@ class DatabaseBuilder:
             self.db_file = h5py.File(self.output_path, "a")
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
+            prev_features = None
+            db_index = 0
+            frame_index_map = []
+            use_keyframe_selection = get_cfg(self.config, "database.keyframe_min_translation_px", 0.0) > 0
             while True:
                 idx, data = frame_queue.get()
                 if idx == -1 or data is None:
@@ -223,6 +227,7 @@ class DatabaseBuilder:
                 frame, frame_rgb = data
                 i = idx
 
+                # Sequential processing (restored original logic)
                 static_mask, detections = yolo_wrapper.detect_and_mask(frame_rgb)
                 features = feature_extractor.extract_features(frame_rgb, static_mask)
                 features["coords_2d"] = features["keypoints"]
@@ -241,17 +246,29 @@ class DatabaseBuilder:
 
                 if i == 0 or prev_features is None:
                     current_pose = np.eye(3, dtype=np.float64)
+                    save_this_frame = True
                 else:
                     H_step = self._compute_inter_frame_H(prev_features, features)
                     if H_step is not None:
                         current_pose = current_pose @ H_step.astype(np.float64)
+                        if use_keyframe_selection:
+                            save_this_frame = self._is_significant_motion(H_step)
+                        else:
+                            save_this_frame = True
                     else:
                         logger.warning(
                             f"Frame {i}: inter-frame match failed, reusing previous pose"
                         )
+                        save_this_frame = True
 
                 prev_features = features
-                self.save_frame_data(i, features, current_pose)
+
+                if not save_this_frame:
+                    continue
+
+                frame_index_map.append(i)
+                self.save_frame_data(db_index, features, current_pose)
+                db_index += 1
 
                 progress_percent = int((i + 1) / num_frames * 100)
                 if progress_callback:
@@ -259,6 +276,13 @@ class DatabaseBuilder:
 
                 if (i + 1) % 100 == 0:
                     logger.info(f"Processed {i + 1}/{num_frames} frames ({progress_percent}%)")
+
+            # Save the index mapping
+            if "metadata" in self.db_file:
+                self.db_file["metadata"].attrs["actual_num_frames"] = db_index
+                self.db_file["metadata"].create_dataset(
+                    "frame_index_map", data=np.array(frame_index_map, dtype=np.int32)
+                )
 
         except Exception as e:
             logger.error(f"Error during database building: {e}")
@@ -272,6 +296,29 @@ class DatabaseBuilder:
             cap.release()
 
         logger.success(f"Database build completed successfully: {self.output_path}")
+
+    def _is_significant_motion(self, H: np.ndarray) -> bool:
+        """Повертає True якщо гомографія H відповідає значному руху."""
+        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
+        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
+
+        cx, cy = 1920.0 / 2.0, 1080.0 / 2.0
+        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
+        p_dst = H.astype(np.float64) @ p_src
+        if p_dst[2] != 0:
+            p_dst /= p_dst[2]
+        translation = float(np.linalg.norm(p_dst[:2] - np.array([cx, cy])))
+
+        if translation >= min_t:
+            return True
+
+        A = H[:2, :2].astype(np.float64)
+        det = np.linalg.det(A)
+        if abs(det) < 1e-6:
+            return True
+        angle_rad = np.arctan2(A[1, 0], A[0, 0])
+        angle_deg = abs(np.degrees(angle_rad))
+        return angle_deg >= min_r
 
     def _draw_keypoints_frame(
         self,
@@ -371,22 +418,46 @@ class DatabaseBuilder:
         return H.astype(np.float32)
 
     def create_hdf5_structure(self, num_frames: int, width: int, height: int):
-        """Create optimal HDF5 hierarchy with compression"""
-        logger.info(f"Creating HDF5 structure for {num_frames} frames")
+        """Create optimal HDF5 hierarchy with compression and pre-allocated arrays"""
+        logger.info(f"Creating HDF5 structure for {num_frames} frames (pre-allocated)")
 
         with h5py.File(self.output_path, "w") as f:
+            # Global descriptors
             g1 = f.create_group("global_descriptors")
             g1.create_dataset(
                 "descriptors",
                 shape=(num_frames, self.descriptor_dim),
                 dtype="float32",
-                compression="gzip",
+                compression="lzf",
             )
             g1.create_dataset(
-                "frame_poses", shape=(num_frames, 3, 3), dtype="float64", compression="gzip"
+                "frame_poses", shape=(num_frames, 3, 3), dtype="float64", compression="lzf"
             )
 
-            f.create_group("local_features")
+            # Local features (pre-allocated arrays)
+            max_kp = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
+            fallback_extractor = get_cfg(self.config, "localization.fallback_extractor", "aliked")
+            
+            # Determine feature dimension
+            feature_dim = 128
+            if fallback_extractor == "superpoint":
+                feature_dim = 256
+            elif fallback_extractor == "xfeat":
+                feature_dim = 64
+
+            g2 = f.create_group("local_features")
+            g2.create_dataset(
+                "keypoints", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+            )
+            g2.create_dataset(
+                "descriptors", shape=(num_frames, max_kp, feature_dim), dtype="float16", compression="lzf"
+            )
+            g2.create_dataset(
+                "coords_2d", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+            )
+            g2.create_dataset(
+                "num_kp", shape=(num_frames,), dtype="int32", compression="lzf"
+            )
 
             g3 = f.create_group("metadata")
             g3.attrs["num_frames"] = num_frames
@@ -398,17 +469,15 @@ class DatabaseBuilder:
         logger.success("HDF5 structure created successfully")
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
-        """Save extracted data for a single frame"""
+        """Save extracted data for a single frame into pre-allocated arrays"""
         self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
         self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
-        frame_group = self.db_file["local_features"].create_group(f"frame_{frame_id}")
-        frame_group.create_dataset(
-            "keypoints", data=features["keypoints"], dtype="float32", compression="gzip"
-        )
-        frame_group.create_dataset(
-            "descriptors", data=features["descriptors"], dtype="float32", compression="gzip"
-        )
-        frame_group.create_dataset(
-            "coords_2d", data=features["coords_2d"], dtype="float32", compression="gzip"
-        )
+        num = len(features["keypoints"])
+        
+        # Write only up to 'num' elements.
+        self.db_file["local_features"]["keypoints"][frame_id, :num, :] = features["keypoints"]
+        # Automatic conversion to float16 since the dataset is created with float16
+        self.db_file["local_features"]["descriptors"][frame_id, :num, :] = features["descriptors"]
+        self.db_file["local_features"]["coords_2d"][frame_id, :num, :] = features["coords_2d"]
+        self.db_file["local_features"]["num_kp"][frame_id] = num

@@ -1,3 +1,5 @@
+
+
 # ================================================================================
 # File: __init__.py
 # ================================================================================
@@ -10,7 +12,14 @@ __author__ = "Drone Localization Team"
 # ================================================================================
 # File: calibration\multi_anchor_calibration.py
 # ================================================================================
-import json
+try:
+    import orjson as _json_lib
+    _USE_ORJSON = True
+except ImportError:
+    import json as _json_lib
+    _USE_ORJSON = False
+from datetime import datetime
+from typing import Any
 
 import numpy as np
 
@@ -26,12 +35,16 @@ class AnchorCalibration:
     Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та повними QA-метриками.
     """
 
-    def __init__(self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict = None):
+    def __init__(
+        self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict[str, Any] | None = None
+    ):
         self.frame_id = frame_id
         self.affine_matrix = affine_matrix
+        self.update_qa(qa_data or {})
 
-        # QA fields
-        self.qa_data = qa_data or {}
+    def update_qa(self, qa_data: dict[str, Any]) -> None:
+        """Оновлює QA метрики якоря без перестворення об'єкта."""
+        self.qa_data = qa_data
 
         # Основні метрики якості
         self.rmse_m = float(self.qa_data.get("rmse_m", 0.0))
@@ -47,17 +60,17 @@ class AnchorCalibration:
         # Метадані та UX
         self.transform_type = self.qa_data.get("transform_type", "unknown")
         self.projection_mode = self.qa_data.get("projection_mode", "WEB_MERCATOR")
-        self.created_at = self.qa_data.get("created_at", "")
+        self.created_at = self.qa_data.get("created_at", datetime.now().isoformat())
         self.updated_at = self.qa_data.get("updated_at", self.created_at)
         self.notes = self.qa_data.get("notes", "")
         self.quality_flag = self.qa_data.get("quality_flag", "normal")  # 'normal', 'warning', 'bad'
 
-    def pixel_to_metric(self, x: float, y: float) -> tuple:
+    def pixel_to_metric(self, x: float, y: float) -> tuple[float, float]:
         pt = np.array([[x, y]], dtype=np.float32)
         result = GeometryTransforms.apply_affine(pt, self.affine_matrix)[0]
         return float(result[0]), float(result[1])
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "frame_id": self.frame_id,
             "affine_matrix": self.affine_matrix.tolist(),
@@ -79,7 +92,7 @@ class AnchorCalibration:
         }
 
     @staticmethod
-    def from_dict(data: dict) -> "AnchorCalibration":
+    def from_dict(data: dict[str, Any]) -> "AnchorCalibration":
         # Підтримка зовсім старих форматів без qa_data
         qa = data.get("qa_data", {})
 
@@ -103,29 +116,25 @@ class AnchorCalibration:
 class MultiAnchorCalibration:
     """Менеджер декількох якорів калібрування з підтримкою версіонування та проєкцій"""
 
-    VERSION = "2.2"
+    VERSION: str = "2.2"
 
-    def __init__(self):
-        self.anchors = []
+    def __init__(self, converter: CoordinateConverter | None = None) -> None:
+        self.anchors: list[AnchorCalibration] = []
+        self.converter = converter or CoordinateConverter("WEB_MERCATOR")
 
     @property
     def is_calibrated(self) -> bool:
         return len(self.anchors) > 0
 
-    def add_anchor(self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict = None):
+    def add_anchor(
+        self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict[str, Any] | None = None
+    ) -> None:
         existing = next((a for a in self.anchors if a.frame_id == frame_id), None)
         if existing:
             existing.affine_matrix = affine_matrix
             if qa_data:
-                # Оновлюємо QA дані
-                new_anchor = AnchorCalibration(frame_id, affine_matrix, qa_data)
-                existing.qa_data = new_anchor.qa_data
-                existing.rmse_m = new_anchor.rmse_m
-                existing.max_err_m = new_anchor.max_err_m
-                existing.inliers_count = new_anchor.inliers_count
-                existing.points_2d = new_anchor.points_2d
-                existing.points_gps = new_anchor.points_gps
-                existing.updated_at = new_anchor.updated_at
+                existing.update_qa(qa_data)
+                existing.updated_at = datetime.now().isoformat()
             logger.info(f"Updated anchor for frame {frame_id}")
         else:
             self.anchors.append(AnchorCalibration(frame_id, affine_matrix, qa_data))
@@ -145,7 +154,7 @@ class MultiAnchorCalibration:
             logger.info(f"Removed anchor for frame {frame_id}")
         return success
 
-    def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple | None:
+    def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple[float, float] | None:
         if not self.is_calibrated:
             return None
         if len(self.anchors) == 1 or frame_id <= self.anchors[0].frame_id:
@@ -153,58 +162,65 @@ class MultiAnchorCalibration:
         if frame_id >= self.anchors[-1].frame_id:
             return self.anchors[-1].pixel_to_metric(x, y)
 
-        # Знаходимо сегмент — тепер логіка одна і читається зверху вниз
-        for i in range(len(self.anchors) - 1):
-            a1, a2 = self.anchors[i], self.anchors[i + 1]
-            if a1.frame_id <= frame_id <= a2.frame_id:
-                dist_1 = abs(frame_id - a1.frame_id)
-                dist_2 = abs(frame_id - a2.frame_id)
-                total = dist_1 + dist_2
-                if total == 0:
-                    return a1.pixel_to_metric(x, y)
-                w2 = dist_1 / total  # ближчий до a2 → більше вагу a2
-                m1 = a1.pixel_to_metric(x, y)
-                m2 = a2.pixel_to_metric(x, y)
-                return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
-        return None
+        from scipy.interpolate import PchipInterpolator
 
-    def save(self, path: str):
+        X = [a.frame_id for a in self.anchors]
+        Y = np.array([a.pixel_to_metric(x, y) for a in self.anchors])
+
+        interp = PchipInterpolator(X, Y)
+        res = interp(frame_id)
+        return float(res[0]), float(res[1])
+
+    def save(self, path: str) -> None:
         if not self.is_calibrated:
             raise RuntimeError("Немає даних для збереження")
 
         # Зберігаємо також метадані проєкції
         data = {
             "version": self.VERSION,
-            "projection": CoordinateConverter.export_projection_metadata(),
+            "projection": self.converter.export_metadata(),
             "anchors": [a.to_dict() for a in self.anchors],
         }
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        if _USE_ORJSON:
+            raw = _json_lib.dumps(
+                data,
+                option=_json_lib.OPT_INDENT_2 | getattr(_json_lib, "OPT_NON_STR_KEYS", 0),
+            )
+            with open(path, "wb") as f:
+                f.write(raw)
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                _json_lib.dump(data, f, indent=2, ensure_ascii=False)
         logger.success(
             f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)"
         )
 
-    def load(self, path: str):
+    def load(self, path: str) -> None:
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            content = f.read()
+
+        if _USE_ORJSON:
+            data = _json_lib.loads(content)
+        else:
+            data = _json_lib.loads(content.decode("utf-8"))
 
         self.anchors.clear()
         version = data.get("version", "1.0")
 
         # 1. Відновлення проєкції
         if "projection" in data:
-            CoordinateConverter.load_projection_metadata(data["projection"])
+            self.converter = CoordinateConverter.from_metadata(data["projection"])
         elif "reference_gps" in data and data["reference_gps"] is not None:
             # Fallback для v2.0
-            CoordinateConverter.configure_projection("UTM", data["reference_gps"])
+            self.converter = CoordinateConverter("UTM", tuple(data["reference_gps"]))
         else:
             # Fallback для v1.0 або відсутніх даних
             logger.warning(
                 "No projection metadata found in calibration file. Defaulting to WEB_MERCATOR fallback."
             )
-            CoordinateConverter.configure_projection("WEB_MERCATOR")
+            self.converter = CoordinateConverter("WEB_MERCATOR")
 
         # 2. Завантаження якорів
         if version == "1.0" and "affine_matrix" in data and "calib_frame_id" in data:
@@ -233,8 +249,10 @@ class MultiAnchorCalibration:
 # File: core\export_results.py
 # ================================================================================
 import csv
-import json
 from datetime import datetime
+from typing import Any
+
+import geojson
 
 from src.utils.logging_utils import get_logger
 
@@ -245,7 +263,7 @@ class ResultExporter:
     """Експорт результатів локалізації у різні формати."""
 
     @staticmethod
-    def export_csv(results: list[dict], output_path: str):
+    def export_csv(results: list[dict[str, Any]], output_path: str) -> None:
         """
         Експорт у CSV файл.
 
@@ -277,40 +295,59 @@ class ResultExporter:
         logger.success(f"Exported {len(results)} results to CSV: {output_path}")
 
     @staticmethod
-    def export_geojson(results: list[dict], output_path: str):
-        """Експорт у GeoJSON (для GIS-систем)."""
+    def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
+        """Експорт у GeoJSON (для GIS-систем). Додає точки та полігони FOV."""
         features = []
         for r in results:
             if "lat" not in r or "lon" not in r:
                 continue
-            feature = {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [r["lon"], r["lat"]]},
-                "properties": {
+
+            # 1. Point feature (trajectory)
+            point = geojson.Feature(
+                geometry=geojson.Point((r["lon"], r["lat"])),
+                properties={
+                    "type": "trajectory_point",
                     "frame_id": r.get("frame_id"),
                     "confidence": r.get("confidence"),
                     "timestamp": r.get("timestamp"),
                     "matched_frame": r.get("matched_frame"),
                 },
-            }
-            features.append(feature)
+            )
+            features.append(point)
 
-        geojson = {
-            "type": "FeatureCollection",
-            "features": features,
-            "properties": {
-                "exported_at": datetime.now().isoformat(),
-                "total_points": len(features),
-            },
-        }
+            # 2. Polygon feature (FOV) - якщо є дані
+            fov = r.get("fov_polygon")
+            if fov and len(fov) >= 3:
+                # GeoJSON Polygon coordinates must be a list of rings,
+                # each ring is a list of [lon, lat] points, first and last must be same.
+                coords = [[lon, lat] for lat, lon in fov]
+                # Close the polygon
+                if coords[0] != coords[-1]:
+                    coords.append(coords[0])
+
+                polygon = geojson.Feature(
+                    geometry=geojson.Polygon([coords]),
+                    properties={
+                        "type": "fov_polygon",
+                        "frame_id": r.get("frame_id"),
+                        "confidence": r.get("confidence"),
+                    },
+                )
+                features.append(polygon)
+
+        feature_collection = geojson.FeatureCollection(
+            features, properties={"exported_at": datetime.now().isoformat()}
+        )
 
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(geojson, f, indent=2, ensure_ascii=False)
+            geojson.dump(feature_collection, f, indent=2, ensure_ascii=False)
 
-        logger.success(f"Exported {len(features)} points to GeoJSON: {output_path}")
+        logger.success(f"Exported {len(features)} features to GeoJSON: {output_path}")
 
     @staticmethod
-    def export_kml(results: list[dict], output_path: str, name: str = "Drone Track"):
+    def export_kml(
+        results: list[dict[str, Any]], output_path: str, name: str = "Drone Track"
+    ) -> None:
         """Експорт у KML (для Google Earth)."""
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
@@ -653,6 +690,7 @@ import h5py
 import numpy as np
 import torch
 
+from config.config import get_cfg
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
@@ -668,9 +706,9 @@ class DatabaseBuilder:
         self.config = config or {}
         self.matcher = matcher
         db_cfg = self.config.get("database", {})
-        self.descriptor_dim = self.config.get("dinov2", {}).get("descriptor_dim", 384)
-        self.prefetch_size = db_cfg.get("prefetch_queue_size", 32)
-        self.kp_scale_cfg = db_cfg.get("keypoint_video_scale", 0.5)
+        self.descriptor_dim = get_cfg(self.config, "dinov2.descriptor_dim", 384)
+        self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
+        self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
@@ -691,7 +729,7 @@ class DatabaseBuilder:
         logger.info(f"Starting database build from video: {video_path}")
 
         # Читаємо налаштування з конфігу (з дефолтом)
-        frame_step = self.config.get("database", {}).get("frame_step", 3)
+        frame_step = get_cfg(self.config, "database.frame_step", 3)
         if frame_step < 1:
             frame_step = 1
 
@@ -772,7 +810,7 @@ class DatabaseBuilder:
         nv_model = model_manager.load_dinov2()
 
         cesp = None
-        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
+        if get_cfg(self.config, "models.cesp.enabled", False):
             try:
                 cesp = model_manager.load_cesp()
             except Exception:
@@ -799,7 +837,7 @@ class DatabaseBuilder:
             else:
                 # Use a small dummy tensor directly to save VRAM
                 with torch.no_grad():
-                    dino_size = self.config.get("dinov2", {}).get("input_size", 336)
+                    dino_size = get_cfg(self.config, "dinov2.input_size", 336)
                     dummy_input = torch.zeros((1, 3, dino_size, dino_size)).to(model_manager.device)
                     # Use the same logic as FeatureExtractor
                     if cesp is not None:
@@ -829,7 +867,7 @@ class DatabaseBuilder:
         # cuDNN benchmark conditionally (Fix 5)
 
         if torch.cuda.is_available():
-            model_type = self.config.get("models", {}).get("local_extractor", "xfeat")
+            model_type = get_cfg(self.config, "localization.fallback_extractor", "aliked")
             if model_type in ("xfeat", "aliked"):  # CNN-based types
                 torch.backends.cudnn.benchmark = True
                 logger.info(f"cuDNN benchmark ENABLED for {model_type}")
@@ -859,6 +897,10 @@ class DatabaseBuilder:
             self.db_file = h5py.File(self.output_path, "a")
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
+            prev_features = None
+            db_index = 0
+            frame_index_map = []
+            use_keyframe_selection = get_cfg(self.config, "database.keyframe_min_translation_px", 0.0) > 0
             while True:
                 idx, data = frame_queue.get()
                 if idx == -1 or data is None:
@@ -867,6 +909,7 @@ class DatabaseBuilder:
                 frame, frame_rgb = data
                 i = idx
 
+                # Sequential processing (restored original logic)
                 static_mask, detections = yolo_wrapper.detect_and_mask(frame_rgb)
                 features = feature_extractor.extract_features(frame_rgb, static_mask)
                 features["coords_2d"] = features["keypoints"]
@@ -885,17 +928,29 @@ class DatabaseBuilder:
 
                 if i == 0 or prev_features is None:
                     current_pose = np.eye(3, dtype=np.float64)
+                    save_this_frame = True
                 else:
                     H_step = self._compute_inter_frame_H(prev_features, features)
                     if H_step is not None:
                         current_pose = current_pose @ H_step.astype(np.float64)
+                        if use_keyframe_selection:
+                            save_this_frame = self._is_significant_motion(H_step)
+                        else:
+                            save_this_frame = True
                     else:
                         logger.warning(
                             f"Frame {i}: inter-frame match failed, reusing previous pose"
                         )
+                        save_this_frame = True
 
                 prev_features = features
-                self.save_frame_data(i, features, current_pose)
+
+                if not save_this_frame:
+                    continue
+
+                frame_index_map.append(i)
+                self.save_frame_data(db_index, features, current_pose)
+                db_index += 1
 
                 progress_percent = int((i + 1) / num_frames * 100)
                 if progress_callback:
@@ -903,6 +958,13 @@ class DatabaseBuilder:
 
                 if (i + 1) % 100 == 0:
                     logger.info(f"Processed {i + 1}/{num_frames} frames ({progress_percent}%)")
+
+            # Save the index mapping
+            if "metadata" in self.db_file:
+                self.db_file["metadata"].attrs["actual_num_frames"] = db_index
+                self.db_file["metadata"].create_dataset(
+                    "frame_index_map", data=np.array(frame_index_map, dtype=np.int32)
+                )
 
         except Exception as e:
             logger.error(f"Error during database building: {e}")
@@ -916,6 +978,29 @@ class DatabaseBuilder:
             cap.release()
 
         logger.success(f"Database build completed successfully: {self.output_path}")
+
+    def _is_significant_motion(self, H: np.ndarray) -> bool:
+        """Повертає True якщо гомографія H відповідає значному руху."""
+        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
+        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
+
+        cx, cy = 1920.0 / 2.0, 1080.0 / 2.0
+        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
+        p_dst = H.astype(np.float64) @ p_src
+        if p_dst[2] != 0:
+            p_dst /= p_dst[2]
+        translation = float(np.linalg.norm(p_dst[:2] - np.array([cx, cy])))
+
+        if translation >= min_t:
+            return True
+
+        A = H[:2, :2].astype(np.float64)
+        det = np.linalg.det(A)
+        if abs(det) < 1e-6:
+            return True
+        angle_rad = np.arctan2(A[1, 0], A[0, 0])
+        angle_deg = abs(np.degrees(angle_rad))
+        return angle_deg >= min_r
 
     def _draw_keypoints_frame(
         self,
@@ -990,9 +1075,8 @@ class DatabaseBuilder:
         """
         Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
         """
-        db_cfg = self.config.get("database", {})
-        min_matches = db_cfg.get("inter_frame_min_matches", 15)
-        ransac_thresh = db_cfg.get("inter_frame_ransac_thresh", 3.0)
+        min_matches = get_cfg(self.config, "database.inter_frame_min_matches", 15)
+        ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
 
         if self.matcher is None:
             from src.localization.matcher import FeatureMatcher
@@ -1016,22 +1100,46 @@ class DatabaseBuilder:
         return H.astype(np.float32)
 
     def create_hdf5_structure(self, num_frames: int, width: int, height: int):
-        """Create optimal HDF5 hierarchy with compression"""
-        logger.info(f"Creating HDF5 structure for {num_frames} frames")
+        """Create optimal HDF5 hierarchy with compression and pre-allocated arrays"""
+        logger.info(f"Creating HDF5 structure for {num_frames} frames (pre-allocated)")
 
         with h5py.File(self.output_path, "w") as f:
+            # Global descriptors
             g1 = f.create_group("global_descriptors")
             g1.create_dataset(
                 "descriptors",
                 shape=(num_frames, self.descriptor_dim),
                 dtype="float32",
-                compression="gzip",
+                compression="lzf",
             )
             g1.create_dataset(
-                "frame_poses", shape=(num_frames, 3, 3), dtype="float64", compression="gzip"
+                "frame_poses", shape=(num_frames, 3, 3), dtype="float64", compression="lzf"
             )
 
-            f.create_group("local_features")
+            # Local features (pre-allocated arrays)
+            max_kp = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
+            fallback_extractor = get_cfg(self.config, "localization.fallback_extractor", "aliked")
+            
+            # Determine feature dimension
+            feature_dim = 128
+            if fallback_extractor == "superpoint":
+                feature_dim = 256
+            elif fallback_extractor == "xfeat":
+                feature_dim = 64
+
+            g2 = f.create_group("local_features")
+            g2.create_dataset(
+                "keypoints", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+            )
+            g2.create_dataset(
+                "descriptors", shape=(num_frames, max_kp, feature_dim), dtype="float16", compression="lzf"
+            )
+            g2.create_dataset(
+                "coords_2d", shape=(num_frames, max_kp, 2), dtype="float32", compression="lzf"
+            )
+            g2.create_dataset(
+                "num_kp", shape=(num_frames,), dtype="int32", compression="lzf"
+            )
 
             g3 = f.create_group("metadata")
             g3.attrs["num_frames"] = num_frames
@@ -1043,28 +1151,30 @@ class DatabaseBuilder:
         logger.success("HDF5 structure created successfully")
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
-        """Save extracted data for a single frame"""
+        """Save extracted data for a single frame into pre-allocated arrays"""
         self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
         self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
-        frame_group = self.db_file["local_features"].create_group(f"frame_{frame_id}")
-        frame_group.create_dataset(
-            "keypoints", data=features["keypoints"], dtype="float32", compression="gzip"
-        )
-        frame_group.create_dataset(
-            "descriptors", data=features["descriptors"], dtype="float32", compression="gzip"
-        )
-        frame_group.create_dataset(
-            "coords_2d", data=features["coords_2d"], dtype="float32", compression="gzip"
-        )
+        num = len(features["keypoints"])
+        
+        # Write only up to 'num' elements.
+        self.db_file["local_features"]["keypoints"][frame_id, :num, :] = features["keypoints"]
+        # Automatic conversion to float16 since the dataset is created with float16
+        self.db_file["local_features"]["descriptors"][frame_id, :num, :] = features["descriptors"]
+        self.db_file["local_features"]["coords_2d"][frame_id, :num, :] = features["coords_2d"]
+        self.db_file["local_features"]["num_kp"][frame_id] = num
 
 
 # ================================================================================
 # File: database\database_loader.py
 # ================================================================================
+import json
+from typing import Any
+
 import h5py
 import numpy as np
 
+from src.geometry.coordinates import CoordinateConverter
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -1075,29 +1185,27 @@ class DatabaseLoader:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.db_file = None
-        self.global_descriptors = None
-        self.frame_poses = None
-        self.metadata = {}
+        self.db_file: h5py.File | None = None
+        self.global_descriptors: np.ndarray | None = None
+        self.frame_poses: np.ndarray | None = None
+        self.metadata: dict[str, Any] = {}
+        self.converter: CoordinateConverter | None = None
 
         # Дані пропагації калібрування (заповнюються після калібрування)
-        self.h_to_calib = None  # (N, 3, 3) — H(frame_i → calib_frame)
-        self.frame_gps = None  # (N, 2)    — (lat, lon) центру кожного кадру
-        self.frame_valid = None  # (N,)      — True якщо кадр має GPS
-        self.calib_frame_id = None  # int
-        self.frame_rmse = None  # (N,)      — RMSE кожного кадру
-        self.frame_disagreement = None  # (N,)   — Розбіжність між гілками
-        self.frame_matches = None  # (N,)      — Кількість точок (inliers)
+        self.frame_affine: np.ndarray | None = None  # (N, 2, 3) — Metric Affine Matrices
+        self.frame_valid: np.ndarray | None = None  # (N,)      — True якщо кадр має GPS
+        self.frame_rmse: np.ndarray | None = None  # (N,)      — RMSE кожного кадру
+        self.frame_disagreement: np.ndarray | None = None  # (N,)   — Розбіжність між гілками
+        self.frame_matches: np.ndarray | None = None  # (N,)      — Кількість точок (inliers)
 
-        # Кешування
-        self._feature_cache: dict[int, dict] = {}
+        # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
-        self._cache_max_size = 200
+        self._feature_cache: dict[int, dict[str, np.ndarray]] = {}
 
         logger.info(f"Initializing DatabaseLoader with path: {db_path}")
         self._load_hot_data()
 
-    def _load_hot_data(self):
+    def _load_hot_data(self) -> None:
         """Load global descriptors (DINOv2), poses and propagation data into RAM"""
         logger.info("Loading hot data into RAM...")
 
@@ -1114,6 +1222,16 @@ class DatabaseLoader:
                 self.metadata[key] = value
                 logger.debug(f"Metadata - {key}: {value}")
 
+            if "actual_num_frames" in self.metadata:
+                actual_num = int(self.metadata["actual_num_frames"])
+                self.global_descriptors = self.global_descriptors[:actual_num]
+                self.frame_poses = self.frame_poses[:actual_num]
+            
+            if "frame_index_map" in self.db_file["metadata"]:
+                self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
+            else:
+                self.frame_index_map = np.arange(len(self.global_descriptors))
+
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
 
@@ -1123,8 +1241,8 @@ class DatabaseLoader:
             logger.error(f"Failed to load database: {e}")
             raise
 
-    def _load_propagation_data(self):
-        if "calibration" not in self.db_file:
+    def _load_propagation_data(self) -> None:
+        if self.db_file is None or "calibration" not in self.db_file:
             logger.info("No propagation data in database (not calibrated yet)")
             self.frame_affine = None
             self.frame_valid = None
@@ -1133,14 +1251,10 @@ class DatabaseLoader:
             grp = self.db_file["calibration"]
 
             # 1. Відновлення проєкції (пріоритет)
-            import json
-
-            from src.geometry.coordinates import CoordinateConverter
-
             if "projection_json" in grp.attrs:
                 try:
                     meta = json.loads(grp.attrs["projection_json"])
-                    CoordinateConverter.load_projection_metadata(meta)
+                    self.converter = CoordinateConverter.from_metadata(meta)
                     logger.success(f"Projection restored from HDF5: {meta['mode']}")
                 except Exception as e:
                     logger.warning(f"Could not load projection metadata: {e}")
@@ -1148,14 +1262,14 @@ class DatabaseLoader:
                 # Fallback для v2.0 (UTM)
                 try:
                     ref_gps = json.loads(grp.attrs["reference_gps"])
-                    CoordinateConverter.configure_projection("UTM", ref_gps)
+                    self.converter = CoordinateConverter("UTM", tuple(ref_gps))
                     logger.success(f"UTM auto-initialized from legacy reference GPS: {ref_gps}")
                 except Exception as e:
                     logger.warning(f"Could not init UTM from legacy attr: {e}")
             else:
                 # Fallback для v1.0 (WebMercator)
                 logger.info("No projection metadata found. Defaulting to WEB_MERCATOR fallback.")
-                CoordinateConverter.configure_projection("WEB_MERCATOR")
+                self.converter = CoordinateConverter("WEB_MERCATOR")
 
             # 2. Завантаження датасетів
             if "frame_affine" in grp:
@@ -1182,11 +1296,11 @@ class DatabaseLoader:
 
     @property
     def is_propagated(self) -> bool:
-        return getattr(self, "frame_affine", None) is not None
+        return self.frame_affine is not None
 
     def get_frame_affine(self, frame_id: int) -> np.ndarray | None:
-        """Повертає унікальну афінну матрицю для конкретного кадру"""
-        if not self.is_propagated:
+        """Повертає афінну матрицю для конкретного кадру"""
+        if not self.is_propagated or self.frame_affine is None or self.frame_valid is None:
             return None
         if frame_id < 0 or frame_id >= len(self.frame_valid):
             return None
@@ -1194,72 +1308,70 @@ class DatabaseLoader:
             return None
         return self.frame_affine[frame_id]
 
-    def get_h_to_anchor(self, frame_id: int):
-        """
-        Повертає (H_to_anchor, anchor_frame_id) для вказаного frame_id,
-        або None якщо пропагація не виконана.
-
-        Поточна реалізація: CalibrationPropagationWorker зберігає вже готову
-        affine матрицю для кожного кадру напряму (через інтерполяцію між якорями),
-        тому окремий H(ref→anchor) не потрібен — localizer читає frame_affine напряму
-        через get_frame_affine(). Метод залишений для сумісності з API
-        localizer._get_anchor_for_ref() і завжди повертає None,
-        щоб localizer йшов основним шляхом через get_frame_affine().
-        """
-        return None
-
     def get_frame_size(self, frame_id: int) -> tuple[int, int]:
         """Повертає (height, width) для вказаного кадру"""
         if frame_id in self._size_cache:
             return self._size_cache[frame_id]
 
-        group_name = f"local_features/frame_{frame_id}"
+        if self.db_file is None:
+            return 1080, 1920
+
         h, w = 1080, 1920
-        if group_name in self.db_file:
-            g = self.db_file[group_name]
-            if "height" in g.attrs and "width" in g.attrs:
-                h, w = int(g.attrs["height"]), int(g.attrs["width"])
-            else:
-                # Fallback до загальних метаданих або стандартних значень
-                h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
-                w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
+        # If the file uses the new schema, we can't get frame size per frame easily anymore without breaking the API.
+        # Fallback to global metadata for all frames, which is the same anyway.
+        h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
+        w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
 
-        if len(self._size_cache) >= self._cache_max_size:
-            self._size_cache.pop(next(iter(self._size_cache)))
-        self._size_cache[frame_id] = (int(h), int(w))
-        return int(h), int(w)
+        res = (int(h), int(w))
+        self._size_cache[frame_id] = res
+        return res
 
-    def get_local_features(self, frame_id: int) -> dict:
+    def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
         """Повертає локальні ознаки XFeat для вказаного кадру"""
         if frame_id in self._feature_cache:
             return self._feature_cache[frame_id]
 
-        group_name = f"local_features/frame_{frame_id}"
-        if group_name not in self.db_file:
-            raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
-        g = self.db_file[group_name]
+        if self.db_file is None:
+            raise RuntimeError("Database not opened")
 
-        result = {
-            "keypoints": g["keypoints"][:],
-            "descriptors": g["descriptors"][:],
-            "coords_2d": g["coords_2d"][:],
-        }
-
-        if len(self._feature_cache) >= self._cache_max_size:
-            # Видаляємо найстаріший запис (FIFO)
+        g = self.db_file["local_features"]
+        
+        # Check backwards compatibility with old frame_X groups
+        if f"frame_{frame_id}" in g:
+            old_g = g[f"frame_{frame_id}"]
+            res = {
+                "keypoints": old_g["keypoints"][:],
+                "descriptors": old_g["descriptors"][:],
+                "coords_2d": old_g["coords_2d"][:],
+            }
+        else:
+            # New format
+            num = int(g["num_kp"][frame_id])
+            res = {
+                "keypoints": g["keypoints"][frame_id, :num, :],
+                "descriptors": g["descriptors"][frame_id, :num, :].astype(np.float32), 
+                "coords_2d": g["coords_2d"][frame_id, :num, :]
+            }
+        # Обмежуємо розмір кешу (аналог lru_cache з maxsize)
+        if len(self._feature_cache) > 200:
+            # Видаляємо перший знайдений ключ (проста заміна LRU)
             self._feature_cache.pop(next(iter(self._feature_cache)))
 
-        self._feature_cache[frame_id] = result
-        return result
+        self._feature_cache[frame_id] = res
+        return res
 
     def get_num_frames(self) -> int:
-        return int(self.metadata.get("num_frames", 0))
+        return int(self.metadata.get("actual_num_frames", self.metadata.get("num_frames", 0)))
 
-    def close(self):
+    def close(self) -> None:
         if self.db_file is not None:
             self.db_file.close()
             self.db_file = None
             logger.info("Database file closed")
+
+        # Очищення кешу при закритті БД
+        self._size_cache.clear()
+        self._feature_cache.clear()
 
 
 # ================================================================================
@@ -1272,7 +1384,7 @@ class DatabaseLoader:
 # File: geometry\coordinates.py
 # ================================================================================
 import math
-import threading
+from typing import Any
 
 from pyproj import CRS, Transformer
 
@@ -1282,84 +1394,31 @@ logger = get_logger(__name__)
 
 
 class CoordinateConverter:
-    """Детермінована конвертація координат (WebMercator або UTM)"""
+    """Детермінована конвертація координат (WebMercator або UTM) на основі екземпляра."""
 
-    _lock = threading.Lock()
-    _transformer_to_metric = None
-    _transformer_to_gps = None
-    _initialized = False
-    _projection_mode = "WEB_MERCATOR"
-    _reference_gps = None
+    def __init__(
+        self, mode: str = "WEB_MERCATOR", reference_gps: tuple[float, float] | None = None
+    ):
+        self._mode = mode.upper()
+        self._reference_gps = reference_gps
+        self._transformer_to_metric: Transformer | None = None
+        self._transformer_to_gps: Transformer | None = None
+        self._initialized = False
 
-    @classmethod
-    def reset(cls):
-        """Скидає проєкцію при зміні проєкту/відеобази."""
-        with cls._lock:
-            cls._initialized = False
-            cls._reference_gps = None
-            cls._transformer_to_metric = None
-            cls._transformer_to_gps = None
-            logger.info("CoordinateConverter reset")
+        if self._mode == "WEB_MERCATOR":
+            self._initialize_projection(0.0, 0.0)
+        elif self._reference_gps:
+            self._initialize_projection(*self._reference_gps)
 
-    @classmethod
-    def configure_projection(cls, mode: str, reference_gps: tuple = None):
-        """
-        Явне налаштування проєкції для проєкту.
-        mode: 'WEB_MERCATOR' (EPSG:3857) або 'UTM'
-        reference_gps: (lat, lon) обов'язковий тільки для UTM
-        """
-        with cls._lock:
-            mode = mode.upper()
-            if mode not in ["UTM", "WEB_MERCATOR"]:
-                raise ValueError(f"Unsupported projection mode: {mode}")
-
-            cls._projection_mode = mode
-            if reference_gps:
-                cls._reference_gps = (float(reference_gps[0]), float(reference_gps[1]))
-            else:
-                cls._reference_gps = None
-
-            # WEB_MERCATOR не потребує reference point
-            if mode == "WEB_MERCATOR":
-                cls._initialize_projection(0, 0)
-            elif cls._reference_gps:
-                cls._initialize_projection(*cls._reference_gps)
-            else:
-                logger.warning(
-                    "UTM configuration called without reference_gps. Initialization deferred."
-                )
-                cls._initialized = False
-
-            logger.info(f"CoordinateConverter configured: {mode} (ref={cls._reference_gps})")
-
-    @classmethod
-    def export_projection_metadata(cls) -> dict:
-        """Експорт поточних налаштувань для серіалізації в JSON/HDF5"""
-        return {"mode": cls._projection_mode, "reference_gps": cls._reference_gps}
-
-    @classmethod
-    def load_projection_metadata(cls, meta: dict):
-        """Відновлення проєкції з метаданих"""
-        if not meta:
-            logger.warning("No projection metadata found, falling back to WEB_MERCATOR")
-            cls.configure_projection("WEB_MERCATOR")
-            return
-
-        mode = meta.get("mode", "WEB_MERCATOR")
-        ref = meta.get("reference_gps")
-        cls.configure_projection(mode, tuple(ref) if ref else None)
-
-    @classmethod
-    def _initialize_projection(cls, lat: float, lon: float):
+    def _initialize_projection(self, lat: float, lon: float) -> None:
         wgs84_crs = CRS("EPSG:4326")
 
-        if cls._projection_mode == "UTM":
-            # Якщо референс не заданий явно, ініціалізуємо UTM по першій точці
-            if cls._reference_gps is None:
-                cls._reference_gps = (lat, lon)
-                logger.warning(f"Auto-initializing UTM reference from point: {cls._reference_gps}")
+        if self._mode == "UTM":
+            if self._reference_gps is None:
+                self._reference_gps = (lat, lon)
+                logger.warning(f"Auto-initializing UTM reference from point: {self._reference_gps}")
 
-            ref_lat, ref_lon = cls._reference_gps
+            ref_lat, ref_lon = self._reference_gps
             zone_number = int((ref_lon + 180) / 6) + 1
             target_crs = CRS(proj="utm", zone=zone_number, ellps="WGS84")
             logger.info(
@@ -1369,40 +1428,54 @@ class CoordinateConverter:
             target_crs = CRS("EPSG:3857")
             logger.info("Initialized WEB_MERCATOR projection (EPSG:3857)")
 
-        cls._transformer_to_metric = Transformer.from_crs(wgs84_crs, target_crs, always_xy=True)
-        cls._transformer_to_gps = Transformer.from_crs(target_crs, wgs84_crs, always_xy=True)
-        cls._initialized = True
+        self._transformer_to_metric = Transformer.from_crs(wgs84_crs, target_crs, always_xy=True)
+        self._transformer_to_gps = Transformer.from_crs(target_crs, wgs84_crs, always_xy=True)
+        self._initialized = True
+
+    def gps_to_metric(self, lat: float, lon: float) -> tuple[float, float]:
+        if not self._initialized:
+            if self._mode == "WEB_MERCATOR":
+                self._initialize_projection(lat, lon)
+            else:
+                raise RuntimeError(
+                    "CoordinateConverter (UTM) must be initialized with reference_gps."
+                )
+
+        if self._transformer_to_metric is None:
+            raise RuntimeError("Transformer not initialized.")
+
+        x, y = self._transformer_to_metric.transform(lon, lat)
+        return float(x), float(y)
+
+    def metric_to_gps(self, x: float, y: float) -> tuple[float, float]:
+        if not self._initialized:
+            if self._mode == "WEB_MERCATOR":
+                self._initialize_projection(0.0, 0.0)
+            else:
+                raise RuntimeError("CoordinateConverter is not initialized.")
+
+        if self._transformer_to_gps is None:
+            raise RuntimeError("Transformer not initialized.")
+
+        lon, lat = self._transformer_to_gps.transform(x, y)
+        return float(lat), float(lon)
+
+    def export_metadata(self) -> dict[str, Any]:
+        """Експорт налаштувань для серіалізації."""
+        return {"mode": self._mode, "reference_gps": self._reference_gps}
+
+    @classmethod
+    def from_metadata(cls, meta: dict[str, Any]) -> "CoordinateConverter":
+        """Створення конвертера з метаданих."""
+        if not meta:
+            return cls("WEB_MERCATOR")
+        mode = meta.get("mode", "WEB_MERCATOR")
+        ref = meta.get("reference_gps")
+        return cls(mode, tuple(ref) if ref else None)
 
     @staticmethod
-    def gps_to_metric(lat: float, lon: float) -> tuple:
-        with CoordinateConverter._lock:
-            if not CoordinateConverter._initialized:
-                # Fallback для WebMercator, якщо не було конфігурації
-                if CoordinateConverter._projection_mode == "WEB_MERCATOR":
-                    CoordinateConverter._initialize_projection(lat, lon)
-                else:
-                    raise RuntimeError(
-                        "CoordinateConverter (UTM) must be configured with reference_gps before use."
-                    )
-
-            x, y = CoordinateConverter._transformer_to_metric.transform(lon, lat)
-            return x, y
-
-    @staticmethod
-    def metric_to_gps(x: float, y: float) -> tuple:
-        with CoordinateConverter._lock:
-            if not CoordinateConverter._initialized:
-                if CoordinateConverter._projection_mode == "WEB_MERCATOR":
-                    CoordinateConverter._initialize_projection(0, 0)
-                else:
-                    raise RuntimeError("CoordinateConverter is not initialized.")
-
-            lon, lat = CoordinateConverter._transformer_to_gps.transform(x, y)
-            return lat, lon
-
-    @staticmethod
-    def haversine_distance(coord1: tuple, coord2: tuple) -> float:
-        """Розрахунок фізичної відстані між двома GPS точками в метрах"""
+    def haversine_distance(coord1: tuple[float, float], coord2: tuple[float, float]) -> float:
+        """Розрахунок фізичної відстані між двома GPS точками в метрах."""
         lat1, lon1 = coord1
         lat2, lon2 = coord2
         R = 6371000  # Радіус Землі
@@ -1416,6 +1489,10 @@ class CoordinateConverter:
             + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
         )
         return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# Глобальний екземпляр для зворотної сумісності (тимчасово)
+DEFAULT_CONVERTER = CoordinateConverter("WEB_MERCATOR")
 
 
 # ================================================================================
@@ -1512,6 +1589,9 @@ class GeometryTransforms:
                 logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
                 return False
 
+            # 5. Check Rotation Stability (avoid 180-degree flips if not expected, though drones can rotate)
+            # For now, we allow any rotation as drones can turn, but we could cap it if we have IMU data.
+
             return True
 
         except Exception as e:
@@ -1536,11 +1616,11 @@ class GeometryTransforms:
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
-        # Use standard RANSAC instead of USAC_MAGSAC for stability in OpenCV
+        # Use USAC_MAGSAC for better outlier rejection and accuracy (OpenCV 4.5+)
         H, mask = cv2.findHomography(
             src_pts_cv,
             dst_pts_cv,
-            method=cv2.RANSAC,
+            method=cv2.USAC_MAGSAC,
             ransacReprojThreshold=ransac_threshold,
             maxIters=max_iters,
             confidence=confidence,
@@ -2818,6 +2898,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
+from config.config import get_cfg
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
@@ -2865,17 +2946,16 @@ class CalibrationMixin:
                 return
 
             # Налаштування проєкції, якщо вона ще не ініціалізована
-            proj_meta = CoordinateConverter.export_projection_metadata()
-            if not CoordinateConverter._initialized:
+            if not self.calibration.converter._initialized:
                 # Використовуємо налаштування з конфігу або за замовчуванням
-                proj_cfg = self.config.get("projection", {})
-                mode = proj_cfg.get("default_mode", "WEB_MERCATOR")
-                CoordinateConverter.configure_projection(
-                    mode, points_gps[0] if mode == "UTM" else None
-                )
+                mode = get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")
+                reference_gps = points_gps[0] if mode == "UTM" else None
+                self.calibration.converter = CoordinateConverter(mode, reference_gps)
 
             pts_2d_np = np.array(points_2d, dtype=np.float32)
-            pts_metric = [CoordinateConverter.gps_to_metric(lat, lon) for lat, lon in points_gps]
+            pts_metric = [
+                self.calibration.converter.gps_to_metric(lat, lon) for lat, lon in points_gps
+            ]
             pts_metric_np = np.array(pts_metric, dtype=np.float32)
 
             # 1. Спроба обчислити різні типи трансформацій
@@ -2919,9 +2999,8 @@ class CalibrationMixin:
                 return
 
             # 2. Перевірка порогів якості з конфігу
-            proj_cfg = self.config.get("projection", {})
-            rmse_threshold = proj_cfg.get("anchor_rmse_threshold_m", 3.0)
-            max_err_threshold = proj_cfg.get("anchor_max_error_m", 5.0)
+            rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
+            max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
 
             # 3. QA Діалог підтвердження
             from datetime import datetime
@@ -2961,7 +3040,7 @@ class CalibrationMixin:
                 "max_err_m": max_p,
                 "inliers_count": len(pts_2d_np),
                 "transform_type": best_type,
-                "projection_mode": CoordinateConverter._projection_mode,
+                "projection_mode": self.calibration.converter._mode,
                 "created_at": datetime.now().isoformat(),
                 "points_2d": points_2d,
                 "points_gps": points_gps,
@@ -2983,7 +3062,9 @@ class CalibrationMixin:
                     err = np.linalg.norm(trans - pm)
 
                     # Перевіряємо зворотну конвертацію для візуалізації зсуву в градусах
-                    lat_c, lon_c = CoordinateConverter.metric_to_gps(trans[0], trans[1])
+                    lat_c, lon_c = self.calibration.converter.metric_to_gps(
+                        float(trans[0]), float(trans[1])
+                    )
                     lat_t, lon_t = points_gps[j][0], points_gps[j][1]
 
                     dist_err = CoordinateConverter.haversine_distance(
@@ -3118,8 +3199,7 @@ class CalibrationMixin:
             if matches_data is not None:
                 avg_matches = float(np.mean(matches_data[valid_mask]))
 
-        proj_cfg = self.config.get("projection", {})
-        rmse_thresh = proj_cfg.get("anchor_rmse_threshold_m", 3.0)
+        rmse_thresh = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
 
         report = (
             f"<b>Пропагація завершена!</b><br><br>"
@@ -3182,7 +3262,9 @@ class CalibrationMixin:
                         ]:
                             mx_d = affine[0, 0] * px + affine[0, 1] * py + affine[0, 2]
                             my_d = affine[1, 0] * px + affine[1, 1] * py + affine[1, 2]
-                            lat_d, lon_d = CoordinateConverter.metric_to_gps(mx_d, my_d)
+                            lat_d, lon_d = self.calibration.converter.metric_to_gps(
+                                float(mx_d), float(my_d)
+                            )
                             logger.warning(
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
@@ -3192,14 +3274,16 @@ class CalibrationMixin:
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
-                    lat_c, lon_c = CoordinateConverter.metric_to_gps(mx, my)
+                    lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
                     # 2. Низ центру (часто там дорога)
                     mx_b, my_b = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
                     )
-                    lat_b, lon_b = CoordinateConverter.metric_to_gps(mx_b, my_b)
+                    lat_b, lon_b = self.calibration.converter.metric_to_gps(
+                        float(mx_b), float(my_b)
+                    )
 
                     rmse = (
                         float(rmse_data[i]) if rmse_data is not None and i < len(rmse_data) else 0.0
@@ -3240,7 +3324,9 @@ class CalibrationMixin:
                             affine[0, 0] * px + affine[0, 1] * py + affine[0, 2],
                             affine[1, 0] * px + affine[1, 1] * py + affine[1, 2],
                         )
-                        lat_p, lon_p = CoordinateConverter.metric_to_gps(mx_p, my_p)
+                        lat_p, lon_p = self.calibration.converter.metric_to_gps(
+                            float(mx_p), float(my_p)
+                        )
                         points_to_show.append(
                             {
                                 "lat": float(lat_p),
@@ -3405,7 +3491,7 @@ class DatabaseMixin:
     def _start_database_generation(self, video_path: str, save_path: str):
         from src.geometry.coordinates import CoordinateConverter
 
-        CoordinateConverter.reset()
+        self.calibration.converter = CoordinateConverter("WEB_MERCATOR")
 
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
@@ -3513,7 +3599,7 @@ class DatabaseMixin:
 
         from src.geometry.coordinates import CoordinateConverter
 
-        CoordinateConverter.reset()
+        self.calibration.converter = CoordinateConverter("WEB_MERCATOR")
 
         try:
             db_path = self.project_manager.database_path
@@ -3591,8 +3677,6 @@ class DatabaseMixin:
 
         import numpy as np
 
-        from src.geometry.coordinates import CoordinateConverter
-
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid
         frame_affine = self.database.frame_affine
@@ -3617,7 +3701,9 @@ class DatabaseMixin:
                 metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
                 metric_y = M[1, 0] * center_px[0, 0] + M[1, 1] * center_px[0, 1] + M[1, 2]
 
-                lat, lon = CoordinateConverter.metric_to_gps(metric_x, metric_y)
+                lat, lon = self.calibration.converter.metric_to_gps(
+                    float(metric_x), float(metric_y)
+                )
                 points_to_show.append({"lat": float(lat), "lon": float(lon), "label": str(i)})
 
         if not points_to_show:
@@ -3756,7 +3842,7 @@ import torch
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
-from src.geometry.coordinates import CoordinateConverter
+from config.config import get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
@@ -3938,7 +4024,7 @@ class PanoramaMixin:
         nv = self.model_manager.load_dinov2()
 
         cesp = None
-        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
+        if get_cfg(self.config, "models.cesp.enabled", False):
             try:
                 cesp = self.model_manager.load_cesp()
             except Exception:
@@ -3969,7 +4055,7 @@ class PanoramaMixin:
                     [(0, 0), (cw, 0), (cw, ch), (0, ch)], res["fov_polygon"]
                 ):
                     pts_pano.append((px + off_x, py + off_y))
-                    pts_metric.append(CoordinateConverter.gps_to_metric(lat, lon))
+                    pts_metric.append(self.calibration.converter.gps_to_metric(lat, lon))
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -3988,7 +4074,9 @@ class PanoramaMixin:
 
         corners_px = np.array([[0, 0], [W, 0], [W, H], [0, H]], dtype=np.float32)
         corners_m = GeometryTransforms.apply_affine(corners_px, M)
-        return [CoordinateConverter.metric_to_gps(*pt) for pt in corners_m]
+        return [
+            self.calibration.converter.metric_to_gps(float(pt[0]), float(pt[1])) for pt in corners_m
+        ]
 
 
 # ================================================================================
@@ -3999,6 +4087,7 @@ import numpy as np
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from config.config import get_cfg
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
@@ -4018,7 +4107,7 @@ class TrackingMixin:
 
         # Опціональне завантаження CESP для покращення DINOv2 global descriptors
         cesp = None
-        if self.config.get("models", {}).get("cesp", {}).get("enabled", False):
+        if get_cfg(self.config, "models.cesp.enabled", False):
             try:
                 cesp = self.model_manager.load_cesp()
             except Exception as e:
@@ -4037,13 +4126,12 @@ class TrackingMixin:
 
     def _ensure_utm_initialized(self) -> bool:
         """Перевіряє чи ініціалізована проєкція UTM, якщо ні - пробує ініціалізувати з калібрування."""
-        from src.geometry.coordinates import CoordinateConverter
 
-        if CoordinateConverter._initialized:
+        if self.calibration.converter._initialized:
             return True
 
         if self.calibration and self.calibration.reference_gps:
-            CoordinateConverter.gps_to_metric(
+            self.calibration.converter.gps_to_metric(
                 self.calibration.reference_gps[0], self.calibration.reference_gps[1]
             )
             return True
@@ -4815,7 +4903,6 @@ class VideoWidget(QGraphicsView):
 import numpy as np
 
 from config.config import get_cfg
-from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
@@ -4846,7 +4933,8 @@ class Localizer:
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
             threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 25.0),
-            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 200.0),
+            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 60.0),
+            max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
         # Створюємо FastRetrieval один раз — нормалізація дескрипторів відбувається лише тут
@@ -4856,6 +4944,8 @@ class Localizer:
         self.model_manager = self.config.get("_model_manager", None)
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
         self.min_inliers_for_accept = get_cfg(self.config, "localization.min_inliers_accept", 10)
+        self.retrieval_top_k = get_cfg(self.config, "localization.retrieval_top_k", 8)
+        self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
 
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
@@ -4869,7 +4959,7 @@ class Localizer:
         best_global_candidates = []
         best_query_features = None
 
-        top_k = self.config.get("localization", {}).get("retrieval_top_k", 8)
+        top_k = self.retrieval_top_k
 
         # 1. Екстракція ознак для всіх дозволених кутів обертання та вибір найкращого ракурсу
         for angle in angles_to_try:
@@ -4916,8 +5006,9 @@ class Localizer:
         best_mkpts_q_inliers = None
         best_mkpts_r_inliers = None
         best_total_matches = 0
+        best_rmse = 999.0
 
-        early_stop = self.config.get("localization", {}).get("early_stop_inliers", 30)
+        early_stop = self.early_stop_inliers
 
         # 2. Локальний пошук (XFeat) ТІЛЬКИ для найкращого знайденого ракурсу
         for candidate_id, score in best_global_candidates:
@@ -4934,19 +5025,25 @@ class Localizer:
                 if H_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     inliers = int(np.sum(inlier_mask))
+                    pts_q_in = mkpts_q[inlier_mask]
+                    pts_r_in = mkpts_r[inlier_mask]
+
+                    # Розрахунок RMSE для оцінки якості геометрії
+                    pts_q_transformed = GeometryTransforms.apply_homography(pts_q_in, H_eval)
+                    rmse = float(
+                        np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
+                    )
+
                     if inliers > best_inliers and inliers >= self.min_matches:
                         best_inliers = inliers
                         best_candidate_id = candidate_id
-                        best_H_query_to_ref = H_eval  # Homography матриця (3x3)
-
-                        pts_q_in = mkpts_q[inlier_mask]
-                        pts_r_in = mkpts_r[inlier_mask]
-
+                        best_H_query_to_ref = H_eval
                         best_mkpts_q_inliers = pts_q_in
                         best_mkpts_r_inliers = pts_r_in
                         best_total_matches = len(mkpts_q)
+                        best_rmse = rmse
                         logger.debug(
-                            f"Homography estimated for candidate {candidate_id} with {inliers} inliers"
+                            f"Homography for {candidate_id}: {inliers} inliers, RMSE: {rmse:.2f}"
                         )
 
             if best_inliers >= early_stop:
@@ -4999,7 +5096,6 @@ class Localizer:
             rot_height, rot_width = height, width
 
         # 4. Багатоточкова локалізація більше не потрібна. Беремо ідеальний центр кадру
-        proj_cfg = self.config.get("projection", {})
 
         # Використовуємо знайдену Homography
         M_query_to_ref = best_H_query_to_ref
@@ -5043,7 +5139,9 @@ class Localizer:
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
 
         self.outlier_detector.add_position(filtered_pt)
-        lat, lon = CoordinateConverter.metric_to_gps(filtered_pt[0], filtered_pt[1])
+        lat, lon = self.calibration.converter.metric_to_gps(
+            float(filtered_pt[0]), float(filtered_pt[1])
+        )
 
         # Зсув для корекції FOV через фільтрацію
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
@@ -5117,12 +5215,16 @@ class Localizer:
                 )
                 for cx, cy in metric_corners:
                     try:
-                        clat, clon = CoordinateConverter.metric_to_gps(cx + dx, cy + dy)
+                        clat, clon = self.calibration.converter.metric_to_gps(
+                            float(cx + dx), float(cy + dy)
+                        )
                         gps_corners.append((clat, clon))
                     except Exception:
                         pass
 
-        confidence = self._compute_confidence(best_candidate_id, best_inliers)
+        confidence = self._compute_confidence(
+            best_candidate_id, best_inliers, best_total_matches, best_rmse
+        )
 
         # ДІАГНОСТИКА
         logger.debug(
@@ -5146,15 +5248,16 @@ class Localizer:
             "sample_spread_m": 0.0,
         }
 
-    def _compute_confidence(self, best_candidate_id: int, best_inliers: int) -> float:
+    def _compute_confidence(
+        self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
+    ) -> float:
         """Обчислює впевненість на основі QA бази даних (RMSE, Disagreement) та кількості інлаєрів."""
         # Налаштування з конфігу
-        conf_cfg = self.config.get("localization", {}).get("confidence", {})
-        max_inliers = conf_cfg.get("confidence_max_inliers", 80)
-        rmse_norm = conf_cfg.get("rmse_norm_m", 10.0)
-        diag_norm = conf_cfg.get("disagreement_norm_m", 5.0)
-        w_inlier = conf_cfg.get("inlier_weight", 0.7)
-        w_stability = conf_cfg.get("stability_weight", 0.3)
+        max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
+        rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
+        diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
+        w_inlier = get_cfg(self.config, "localization.confidence.inlier_weight", 0.7)
+        w_stability = get_cfg(self.config, "localization.confidence.stability_weight", 0.3)
 
         # 1. Показник інлаєрів (0-1)
         inlier_score = min(1.0, best_inliers / max_inliers)
@@ -5176,15 +5279,26 @@ class Localizer:
         )
         stability_score = float(np.clip(stability_score, 0.0, 1.0))
 
-        # 3. Комбінована оцінка
-        return float(np.clip(inlier_score * w_inlier + stability_score * w_stability, 0.05, 1.0))
+        # 3. Показник поточної відповідності (ПЕР-ФРЕЙМ)
+        # a) Inlier ratio
+        ratio_score = float(best_inliers / (total_matches + 1e-6))
+        # b) RMSE score (1.0 if RMSE=0, 0.5 if RMSE=thresh)
+        rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
+
+        match_score = ratio_score * 0.5 + rmse_score_val * 0.5
+
+        # 4. Комбінована оцінка
+        # (QA бази * 0.3) + (Кількість інлаєрів * 0.4) + (Якість відповідності * 0.3)
+        final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
+
+        return float(np.clip(final_conf, 0.05, 1.0))
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
         """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)"""
         if frame_id == -1:
             return None
 
-        threshold = self.config.get("localization", {}).get("retrieval_only_min_score", 0.90)
+        threshold = get_cfg(self.config, "localization.retrieval_only_min_score", 0.90)
         if score < threshold:
             return None
 
@@ -5197,7 +5311,7 @@ class Localizer:
         center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float32)
         metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
 
-        lat, lon = CoordinateConverter.metric_to_gps(float(metric_pt[0]), float(metric_pt[1]))
+        lat, lon = self.calibration.converter.metric_to_gps(metric_pt[0], metric_pt[1])
 
         return {
             "success": True,
@@ -5205,9 +5319,9 @@ class Localizer:
             "lon": lon,
             "confidence": 0.3,  # Низький confidence для retrieval-only
             "inliers": 0,
-            "matched_frame": int(frame_id),
+            "matched_frame": frame_id,
             "fallback_mode": "retrieval_only",
-            "global_score": float(score),
+            "global_score": score,
             "fov_polygon": None,
         }
 
@@ -5219,6 +5333,7 @@ import faiss
 import numpy as np
 import torch
 
+from config.config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -5269,7 +5384,7 @@ class FeatureMatcher:
     def __init__(self, model_manager=None, config=None):
         self.config = config or {}
         self.model_manager = model_manager
-        self.ratio_threshold = self.config.get("localization", {}).get("ratio_threshold", 0.95)
+        self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.95)
 
         # Завантажуємо LightGlue (ALIKED) через ModelManager
         self.lightglue = None
@@ -5352,6 +5467,10 @@ class FeatureMatcher:
     def _lightglue_match(self, query_features: dict, ref_features: dict) -> tuple:
         """Matches features using Neural LightGlue Matcher"""
         try:
+            if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
+                logger.warning("Empty keypoints array provided to LightGlue.")
+                return np.empty((0, 2)), np.empty((0, 2))
+
             device = next(self.lightglue.parameters()).device
 
             # Підготовка тензорів для LightGlue
@@ -5410,6 +5529,7 @@ from contextlib import contextmanager
 
 import torch
 
+from config.config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -5419,7 +5539,7 @@ class ModelManager:
     def __init__(self, config=None, device="cuda"):
         self.config = config or {}
 
-        use_cuda = self.config.get("models", {}).get("use_cuda", True)
+        use_cuda = get_cfg(self.config, "models.use_cuda", True)
         if not use_cuda:
             logger.info("CUDA force disabled in configuration")
 
@@ -5430,10 +5550,10 @@ class ModelManager:
         self.model_usage = {}
 
         # Конфігурація VRAM
-        m_cfg = self.config.get("models", {})
-        vram_cfg = m_cfg.get("vram_management", {})
-        self.max_vram_ratio = vram_cfg.get("max_vram_ratio", 0.8)
-        self.default_vram_required = vram_cfg.get("default_required_mb", 2000.0)
+        self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
+        self.default_vram_required = get_cfg(
+            self.config, "models.vram_management.default_required_mb", 2000.0
+        )
 
         logger.info(f"ModelManager initialized with device: {self.device}")
         if self.device == "cuda":
@@ -5466,9 +5586,8 @@ class ModelManager:
     def load_yolo(self):
         name = "yolo"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            model_path = cfg.get("model_path", "yolo11x-seg.pt")
-            vram_req = cfg.get("vram_required_mb", 1200.0)
+            model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11x-seg.pt")
+            vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
 
             logger.info(f"Loading YOLO model: {model_path}...")
             self._ensure_vram_available(vram_req)
@@ -5488,11 +5607,10 @@ class ModelManager:
     def load_xfeat(self):
         name = "xfeat"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            repo = cfg.get("hub_repo", "verlab/accelerated_features")
-            model_name = cfg.get("hub_model", "XFeat")
-            top_k = cfg.get("top_k", 2048)
-            vram_req = cfg.get("vram_required_mb", 300.0)
+            repo = get_cfg(self.config, "models.xfeat.hub_repo", "verlab/accelerated_features")
+            model_name = get_cfg(self.config, "models.xfeat.hub_model", "XFeat")
+            top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
+            vram_req = get_cfg(self.config, "models.xfeat.vram_required_mb", 300.0)
 
             logger.info(f"Loading XFeat model ({repo}/{model_name})...")
             self._ensure_vram_available(vram_req)
@@ -5513,8 +5631,7 @@ class ModelManager:
     def load_superpoint(self):
         name = "superpoint"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            vram_req = cfg.get("vram_required_mb", 500.0)
+            vram_req = get_cfg(self.config, "models.superpoint.vram_required_mb", 500.0)
 
             logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
             self._ensure_vram_available(vram_req)
@@ -5522,8 +5639,10 @@ class ModelManager:
                 from lightglue import SuperPoint
 
                 sp_config = {
-                    "nms_radius": cfg.get("nms_radius", 4),
-                    "max_num_keypoints": cfg.get("max_keypoints", 4096),
+                    "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
+                    "max_num_keypoints": get_cfg(
+                        self.config, "models.superpoint.max_keypoints", 4096
+                    ),
                 }
                 model = SuperPoint(**sp_config).eval().to(self.device)
                 self.models[name] = model
@@ -5537,8 +5656,7 @@ class ModelManager:
     def load_lightglue(self):
         name = "lightglue"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            vram_req = cfg.get("vram_required_mb", 1000.0)
+            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
             logger.info("Loading LightGlue model...")
             self._ensure_vram_available(vram_req)
@@ -5546,8 +5664,12 @@ class ModelManager:
                 from lightglue import LightGlue
 
                 lg_config = {
-                    "depth_confidence": cfg.get("depth_confidence", -1),
-                    "width_confidence": cfg.get("width_confidence", -1),
+                    "depth_confidence": get_cfg(
+                        self.config, "models.lightglue.depth_confidence", -1
+                    ),
+                    "width_confidence": get_cfg(
+                        self.config, "models.lightglue.width_confidence", -1
+                    ),
                 }
                 model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
                 self.models[name] = model
@@ -5561,10 +5683,9 @@ class ModelManager:
     def load_dinov2(self):
         name = "dinov2"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            repo = cfg.get("hub_repo", "facebookresearch/dinov2")
-            model_name = cfg.get("hub_model", "dinov2_vitl14")
-            vram_req = cfg.get("vram_required_mb", 1600.0)
+            repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
+            model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
+            vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
 
             logger.info(f"Loading DINOv2 ({model_name}) model...")
             self._ensure_vram_available(vram_req)
@@ -5583,9 +5704,8 @@ class ModelManager:
         """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
         name = "aliked"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get(name, {})
-            vram_req = cfg.get("vram_required_mb", 400.0)
-            max_keypoints = cfg.get("max_keypoints", 4096)
+            vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
+            max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
 
             logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
             self._ensure_vram_available(vram_req)
@@ -5605,8 +5725,7 @@ class ModelManager:
         """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
         name = "lightglue_aliked"
         if name not in self.models:
-            cfg = self.config.get("models", {}).get("lightglue", {})
-            vram_req = cfg.get("vram_required_mb", 1000.0)
+            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
             logger.info("Loading LightGlue (ALIKED weights)...")
             self._ensure_vram_available(vram_req)
@@ -5616,8 +5735,12 @@ class ModelManager:
                 model = (
                     LightGlue(
                         features="aliked",
-                        depth_confidence=cfg.get("depth_confidence", -1),
-                        width_confidence=cfg.get("width_confidence", -1),
+                        depth_confidence=get_cfg(
+                            self.config, "models.lightglue.depth_confidence", -1
+                        ),
+                        width_confidence=get_cfg(
+                            self.config, "models.lightglue.width_confidence", -1
+                        ),
                     )
                     .eval()
                     .to(self.device)
@@ -5638,12 +5761,11 @@ class ModelManager:
             try:
                 from src.models.wrappers.cesp_module import CESP
 
-                cesp_cfg = self.config.get("models", {}).get("cesp", {})
-                scales = cesp_cfg.get("scales", [1, 2, 4])
+                scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
                 cesp = CESP(dim=1024, scales=tuple(scales))
 
                 # Завантаження pretrained ваг (якщо є)
-                weights_path = cesp_cfg.get("weights_path", None)
+                weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
                 if weights_path:
                     cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
                     logger.success(f"CESP pretrained weights loaded from {weights_path}")
@@ -5823,10 +5945,12 @@ class CESP(nn.Module):
 # ================================================================================
 # File: models\wrappers\feature_extractor.py
 # ================================================================================
+import contextlib
 import numpy as np
 import torch
 import torchvision.transforms as T
 
+from config.config import get_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
 
@@ -5845,7 +5969,7 @@ class FeatureExtractor:
         self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
 
         # Трансформації для DINOv2 (ImageNet стандарти)
-        dino_size = self.config.get("dinov2", {}).get("input_size", 336)
+        dino_size = get_cfg(self.config, "dinov2.input_size", 336)
         self.dino_size = dino_size
         self.dinov2_transform = T.Compose(
             [
@@ -5854,19 +5978,27 @@ class FeatureExtractor:
             ]
         )
 
-        # FP16 mixed precision для прискорення GPU інференсу
-        self.use_fp16 = (
+        self.use_half = (
             device == "cuda"
             and torch.cuda.is_available()
-            and self.config.get("performance", {}).get("fp16", True)
+            and get_cfg(self.config, "models.performance.fp16_enabled", True)
         )
-        if self.use_fp16:
+        self.amp_dtype = torch.float16 if self.use_half else torch.float32
+        
+        if self.use_half:
             logger.info("FP16 mixed precision ENABLED for inference")
 
         cesp_status = "with CESP" if cesp_module is not None else "without CESP"
         logger.info(
             f"FeatureExtractor initialized with ALIKED and DINOv2 ({cesp_status}) on {device}"
         )
+        
+        if device == "cuda":
+            self.stream_global = torch.cuda.Stream()
+            self.stream_local = torch.cuda.Stream()
+        else:
+            self.stream_global = None
+            self.stream_local = None
 
     @torch.no_grad()
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
@@ -5877,24 +6009,17 @@ class FeatureExtractor:
 
         if self.cesp_module is not None:
             # CESP mode: отримуємо patch tokens замість CLS
-            if self.use_fp16:
-                with torch.cuda.amp.autocast():
-                    features = self.global_model.forward_features(dino_input)
-                    patch_tokens = features["x_norm_patchtokens"].float()
-            else:
+            with torch.cuda.amp.autocast(dtype=self.amp_dtype, enabled=self.use_half):
                 features = self.global_model.forward_features(dino_input)
-                patch_tokens = features["x_norm_patchtokens"]
+                patch_tokens = features["x_norm_patchtokens"].float()
 
             h_patches = self.dino_size // 14
             w_patches = self.dino_size // 14
             global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
             # Стандартний mode: CLS token
-            if self.use_fp16:
-                with torch.cuda.amp.autocast():
-                    global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
-            else:
-                global_desc = self.global_model(dino_input)[0].cpu().numpy()
+            with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_half):
+                global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
 
         return global_desc
 
@@ -5911,10 +6036,8 @@ class FeatureExtractor:
         # ALIKED очікує словник зі списком/тензором 'image'
         input_dict = {"image": rgb_tensor}
 
-        if self.use_fp16:
-            with torch.cuda.amp.autocast():
-                aliked_out = self.local_model(input_dict)
-        else:
+        # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
+        with contextlib.nullcontext():
             aliked_out = self.local_model(input_dict)
 
         # LightGlue ALIKED wrapper повертає батч: (1, N, 2) та (1, N, 128)
@@ -5946,10 +6069,105 @@ class FeatureExtractor:
         global_desc = self.extract_global_descriptor(image)
         local_feats["global_desc"] = global_desc
 
-        logger.success(
-            f"Extracted {len(local_feats['keypoints'])} ALIKED keypoints, global DINOv2 desc dim {len(global_desc)}"
-        )
+        # logger.success(
+        #     f"Extracted {len(local_feats['keypoints'])} ALIKED keypoints, global DINOv2 desc dim {len(global_desc)}"
+        # )
         return local_feats
+
+    @torch.no_grad()
+    def extract_features_batch(self, images: list[np.ndarray], static_masks: list[np.ndarray]) -> list[dict]:
+        """
+        Extracts features for a batch of images using CUDA streams for parallel execution.
+        """
+        B = len(images)
+        if B == 0:
+            return []
+
+        # 1. Prepare DINOv2 Tensor
+        dino_tensors = []
+        for img in images:
+            rgb = torch.from_numpy(img).float().div_(255.0)
+            dino_tensors.append(rgb.permute(2, 0, 1))
+        dino_batch = torch.stack(dino_tensors).to(self.device, non_blocking=True)
+        dino_input = self.dinov2_transform(dino_batch)
+
+        # 2. Prepare ALIKED Tensor
+        prep_images = [self.preprocessor.preprocess(img) for img in images]
+        aliked_tensors = []
+        for p_img in prep_images:
+            rgb = torch.from_numpy(p_img).float().div_(255.0)
+            aliked_tensors.append(rgb.permute(2, 0, 1))
+        aliked_batch = torch.stack(aliked_tensors).to(self.device, non_blocking=True)
+        input_dict = {"image": aliked_batch}
+
+        stream_global = self.stream_global if self.device == "cuda" else None
+        stream_local = self.stream_local if self.device == "cuda" else None
+
+        global_descs = None
+        aliked_out = None
+
+        # PARALLEL EXECUTION
+        context_global = torch.cuda.stream(stream_global) if stream_global else contextlib.nullcontext()
+        with context_global:
+            if self.cesp_module is not None:
+                with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_half):
+                    features = self.global_model.forward_features(dino_input)
+                    patch_tokens = features["x_norm_patchtokens"].float()
+                h_p, w_p = self.dino_size // 14, self.dino_size // 14
+                out_global = self.cesp_module(patch_tokens, h_p, w_p)
+            else:
+                with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_half):
+                    out_global = self.global_model(dino_input).float()
+
+        out_kpts = []
+        out_descs = []
+        context_local = torch.cuda.stream(stream_local) if stream_local else contextlib.nullcontext()
+        with context_local:
+            for b in range(B):
+                single_img = aliked_batch[b:b+1]  # shape (1, 3, H, W)
+                input_dict = {"image": single_img}
+                # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
+                aliked_out = self.local_model(input_dict)
+                out_kpts.append(aliked_out["keypoints"][0].float())
+                out_descs.append(aliked_out["descriptors"][0].float())
+
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+
+        global_descs = out_global.cpu().numpy()
+        keypoints_batch = [kp.cpu().numpy() for kp in out_kpts]
+        descriptors_batch = [desc.cpu().numpy() for desc in out_descs]
+
+        # Assembly
+        results = []
+        for i in range(B):
+            kp = keypoints_batch[i]
+            desc = descriptors_batch[i]
+            mask = static_masks[i]
+            gd = global_descs[i]
+
+            if mask is not None and len(kp) > 0:
+                ix = np.round(kp[:, 0]).astype(np.intp)
+                iy = np.round(kp[:, 1]).astype(np.intp)
+                in_bounds = (iy >= 0) & (iy < mask.shape[0]) & (ix >= 0) & (ix < mask.shape[1])
+                valid = np.zeros(len(kp), dtype=bool)
+                valid[in_bounds] = mask[iy[in_bounds], ix[in_bounds]] > 128
+
+                if valid.any():
+                    kp = kp[valid]
+                    desc = desc[valid]
+                else:
+                    kp = np.empty((0, 2), dtype=np.float32)
+                    desc = np.empty((0, 128), dtype=np.float32)
+            
+            results.append({
+                "keypoints": kp,
+                "descriptors": desc,
+                "coords_2d": kp.copy(),
+                "global_desc": gd
+            })
+
+        return results
 
 
 # ================================================================================
@@ -6042,6 +6260,61 @@ class YOLOWrapper:
                     )
 
         return static_mask, detections
+
+    @torch.no_grad()
+    def detect_and_mask_batch(self, images: list[np.ndarray]) -> list[tuple]:
+        """
+        Detect objects and create static masks for a batch of images.
+        """
+        if not images:
+            return []
+
+        # YOLO expects list of images or a 4D tensor (B, H, W, 3). Ultralytics natively handles list of ndarrays.
+        results = self.model(images, verbose=False, half=self.use_half, conf=0.50)
+        
+        output = []
+        for result, image in zip(results, images):
+            height, width = image.shape[:2]
+            static_mask = np.ones((height, width), dtype=np.uint8) * 255
+            detections = []
+
+            total_pixels = height * width
+            MAX_SINGLE_MASK_RATIO = 0.40
+            MAX_COMBINED_MASK_RATIO = 0.70
+
+            if result.masks is not None:
+                masks = result.masks.data.cpu().numpy()
+                boxes = result.boxes.data.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy().astype(int)
+                confidences = result.boxes.conf.cpu().numpy()
+
+                dynamic_mask_indices = [
+                    i for i, cls in enumerate(classes) if cls in self.dynamic_classes
+                ]
+
+                for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
+                    detections.append(
+                        {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
+                    )
+
+                if dynamic_mask_indices:
+                    combined_dynamic = np.zeros((height, width), dtype=np.float32)
+                    for idx in dynamic_mask_indices:
+                        mask_resized = cv2.resize(
+                            masks[idx], (width, height), interpolation=cv2.INTER_NEAREST
+                        )
+                        mask_area = np.sum(mask_resized > 0.5)
+                        if mask_area / total_pixels > MAX_SINGLE_MASK_RATIO:
+                            continue
+                        combined_dynamic = np.maximum(combined_dynamic, mask_resized)
+                        
+                    combined_area = np.sum(combined_dynamic > 0.5)
+                    if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
+                        static_mask[combined_dynamic > 0.5] = 0
+
+            output.append((static_mask, detections))
+
+        return output
 
 
 # ================================================================================
@@ -6136,12 +6409,12 @@ logger = get_logger(__name__)
 class OutlierDetector:
     """Detect anomalous measurements (outliers) based on trajectory history"""
 
-    def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=1000.0):
+    def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=1000.0, max_consecutive=5):
         self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
         self.max_speed_mps = max_speed_mps
         self._consecutive_outliers = 0
-        self._max_consecutive = 5  # Після 5 підряд outliers — скидаємо (дрон реально перемістився)
+        self._max_consecutive = max_consecutive
 
         logger.info("Initializing OutlierDetector")
         logger.info(
@@ -6214,6 +6487,7 @@ class OutlierDetector:
 import cv2
 import numpy as np
 
+from config.config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -6224,8 +6498,8 @@ class ImagePreprocessor:
         self.config = config or {}
         # Ініціалізуємо алгоритм локального контрасту CLAHE
         # clipLimit=3.0 дає сильне витягування тіней, tileGridSize=(8,8) - розмір блоку
-        clip = self.config.get("preprocessing", {}).get("clahe_clip_limit", 3.0)
-        tile_cfg = self.config.get("preprocessing", {}).get("clahe_tile_grid", [8, 8])
+        clip = get_cfg(self.config, "preprocessing.clahe_clip_limit", 3.0)
+        tile_cfg = get_cfg(self.config, "preprocessing.clahe_tile_grid", [8, 8])
         # Підтримуємо і список [8, 8] і число 8
         tile = tuple(tile_cfg) if isinstance(tile_cfg, list) else (tile_cfg, tile_cfg)
         self.clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tile)
@@ -6311,14 +6585,16 @@ def qpixmap_to_opencv(pixmap: QPixmap) -> np.ndarray:
 # ================================================================================
 import sys
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
 
-def setup_logging(log_level="INFO", log_file="logs/app.log"):
-    """Налаштування системи логування для всієї програми"""
+def setup_logging(log_level: str = "INFO", log_file: str = "logs/app.log") -> None:
+    """Налаштування системи логування для всієї програми."""
     logger.remove()
 
+    # Standart output (pretty console)
     logger.add(
         sys.stdout,
         level=log_level,
@@ -6328,6 +6604,7 @@ def setup_logging(log_level="INFO", log_file="logs/app.log"):
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Standard file output (text)
     logger.add(
         str(log_path),
         level=log_level,
@@ -6337,9 +6614,19 @@ def setup_logging(log_level="INFO", log_file="logs/app.log"):
         compression="zip",
     )
 
+    # JSON sink for structured logging/metrics
+    json_path = log_path.with_name("metrics.jsonl")
+    logger.add(
+        str(json_path),
+        level=log_level,
+        serialize=True,
+        rotation="10 MB",
+        retention="14 days",
+    )
 
-def get_logger(name=None):
-    """Отримання екземпляра логера"""
+
+def get_logger(name: str | None = None) -> Any:
+    """Отримання екземпляра логера."""
     if name:
         return logger.bind(name=name)
     return logger
@@ -6361,7 +6648,7 @@ import h5py
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from src.geometry.coordinates import CoordinateConverter
+from config.config import get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
 
@@ -6386,8 +6673,8 @@ class CalibrationPropagationWorker(QThread):
         self.config = config or {}
         self._is_running = True
 
-        self.min_matches = self.config.get("localization", {}).get("min_matches", 15)
-        self.ransac_thresh = self.config.get("localization", {}).get("ransac_threshold", 3.0)
+        self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
+        self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
 
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
@@ -6411,8 +6698,12 @@ class CalibrationPropagationWorker(QThread):
 
     def _propagate(self):
         num_frames = self.database.get_num_frames()
-        anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
-
+        all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        anchors = [a for a in all_anchors if a.frame_id < num_frames]
+        
+        if len(anchors) < len(all_anchors):
+            logger.warning(f"Filtered {len(all_anchors) - len(anchors)} out-of-bounds anchors (DB has {num_frames} frames).")
+            
         if not anchors:
             self.error.emit("Немає якорів калібрування")
             return
@@ -6465,9 +6756,7 @@ class CalibrationPropagationWorker(QThread):
         tail_segments = [s for s in segments if s["type"] == "tail"]
 
         logger.info(f"Parallel processing of {len(between_segments)} segments...")
-        max_workers = (
-            self.config.get("models", {}).get("performance", {}).get("propagation_max_workers", 4)
-        )
+        max_workers = get_cfg(self.config, "models.performance.propagation_max_workers", 4)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -6818,7 +7107,7 @@ class CalibrationPropagationWorker(QThread):
                     [a.to_dict() for a in anchors], ensure_ascii=False
                 )
                 grp.attrs["projection_json"] = json.dumps(
-                    CoordinateConverter.export_projection_metadata()
+                    self.calibration.converter.export_metadata()
                 )
 
                 # Датасети
@@ -7080,6 +7369,7 @@ import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from config.config import get_cfg
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
@@ -7107,7 +7397,7 @@ class RealtimeTrackingWorker(QThread):
         # Скільки кадрів розпізнавати за одну секунду ВІДЕО.
         # 1.0 = 1 кадр в секунду; 2.0 = кожні 0.5 секунд; 0.5 = кожні 2 секунди відео.
         # Ти можеш змінити це число прямо тут для тестів:
-        self.process_fps = self.config.get("tracking", {}).get("process_fps", 1.0)
+        self.process_fps = get_cfg(self.config, "tracking.process_fps", 1.0)
 
     def run(self):
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
@@ -7232,7 +7522,7 @@ class RealtimeTrackingWorker(QThread):
             if not self.model_manager:
                 return
 
-            fallback = self.config.get("localization", {}).get("fallback_extractor", "aliked")
+            fallback = get_cfg(self.config, "localization.fallback_extractor", "aliked")
             logger.info(f"Pre-warming fallback models ({fallback})...")
 
             if fallback == "aliked":
@@ -7253,6 +7543,173 @@ class RealtimeTrackingWorker(QThread):
 
 
 # ================================================================================
-# File: workers\__init__.py
-# ================================================================================
-"""Worker threads module"""
+# config/config.py
+#
+# Єдиний конфіг для всього застосунку з валідацією через Pydantic.
+
+from typing import Any
+
+from pydantic import BaseModel
+
+
+class Dinov2Config(BaseModel):
+    descriptor_dim: int = 1024
+    input_size: int = 336
+
+
+class DatabaseConfig(BaseModel):
+    frame_step: int = 3
+    prefetch_queue_size: int = 32
+    keypoint_video_scale: float = 0.5
+    inter_frame_min_matches: int = 15
+    inter_frame_ransac_thresh: float = 3.0
+    keyframe_min_translation_px: float = 15.0
+    keyframe_min_rotation_deg: float = 1.5
+    keyframe_always_save_first: bool = True
+
+
+class ConfidenceConfig(BaseModel):
+    inlier_weight: float = 0.7
+    stability_weight: float = 0.3
+    rmse_norm_m: float = 10.0
+    disagreement_norm_m: float = 5.0
+    confidence_max_inliers: int = 80
+
+
+class LocalizationConfig(BaseModel):
+    min_matches: int = 12
+    min_inliers_accept: int = 10
+    ratio_threshold: float = 0.85
+    ransac_threshold: float = 3.0
+    retrieval_top_k: int = 12
+    early_stop_inliers: int = 40
+    retrieval_only_min_score: float = 0.90
+    auto_rotation: bool = True
+    enable_lightglue_fallback: bool = True
+    fallback_extractor: str = "aliked"
+    confidence: ConfidenceConfig = ConfidenceConfig()
+
+
+class TrackingConfig(BaseModel):
+    kalman_process_noise: float = 2.0
+    kalman_measurement_noise: float = 5.0
+    outlier_window: int = 10
+    outlier_threshold_std: float = 25.0
+    max_speed_mps: float = 60.0
+    max_consecutive_outliers: int = 5
+    process_fps: float = 1.0
+
+
+class PreprocessingConfig(BaseModel):
+    clahe_clip_limit: float = 3.0
+    clahe_tile_grid: list[int] = [8, 8]
+    histogram_matching: bool = True
+    reference_image_path: str = "config/reference_style.png"
+
+
+class GuiConfig(BaseModel):
+    video_fps: int = 30
+
+
+class YoloConfig(BaseModel):
+    model_path: str = "yolo11x-seg.pt"
+    vram_required_mb: float = 1200.0
+    description: str = "YOLOv11x-seg (Extra Large) for dynamic object masking"
+
+
+class ModelSettings(BaseModel):
+    hub_repo: str | None = ""
+    hub_model: str | None = ""
+    top_k: int = 2048
+    vram_required_mb: float = 500.0
+    model_path: str | None = ""
+    max_keypoints: int = 4096
+    nms_radius: int = 4
+    depth_confidence: float = -1.0
+    width_confidence: float = -1.0
+    detection_threshold: float = 0.001
+
+
+class CespConfig(BaseModel):
+    enabled: bool = False
+    weights_path: str | None = None
+    scales: list[int] = [1, 2, 4]
+
+
+class VramManagementConfig(BaseModel):
+    max_vram_ratio: float = 0.8
+    default_required_mb: float = 2000.0
+
+
+class PerformanceConfig(BaseModel):
+    propagation_max_workers: int = 4
+    fp16_enabled: bool = True
+
+
+class ModelsConfig(BaseModel):
+    use_cuda: bool = True
+    yolo: YoloConfig = YoloConfig()
+    xfeat: ModelSettings = ModelSettings(
+        hub_repo="verlab/accelerated_features",
+        hub_model="XFeat",
+        top_k=2048,
+        vram_required_mb=300.0,
+    )
+    aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
+    superpoint: ModelSettings = ModelSettings(
+        nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
+    )
+    lightglue: ModelSettings = ModelSettings(vram_required_mb=1000.0)
+    dinov2: ModelSettings = ModelSettings(
+        hub_repo="facebookresearch/dinov2", hub_model="dinov2_vitl14", vram_required_mb=1600.0
+    )
+    cesp: CespConfig = CespConfig()
+    vram_management: VramManagementConfig = VramManagementConfig()
+    performance: PerformanceConfig = PerformanceConfig()
+
+
+class ProjectionConfig(BaseModel):
+    default_mode: str = "WEB_MERCATOR"
+    strict_projection: bool = True
+    fallback_to_webmercator: bool = True
+    anchor_rmse_threshold_m: float = 3.0
+    anchor_max_error_m: float = 5.0
+    propagation_disagreement_threshold_m: float = 2.0
+    localizer_sample_points: int = 9
+    localizer_expected_spread_m: float = 150.0
+
+
+class AppConfig(BaseModel):
+    dinov2: Dinov2Config = Dinov2Config()
+    database: DatabaseConfig = DatabaseConfig()
+    localization: LocalizationConfig = LocalizationConfig()
+    tracking: TrackingConfig = TrackingConfig()
+    preprocessing: PreprocessingConfig = PreprocessingConfig()
+    gui: GuiConfig = GuiConfig()
+    models: ModelsConfig = ModelsConfig()
+    projection: ProjectionConfig = ProjectionConfig()
+
+
+def get_cfg(config: Any, path: str, default: Any = None) -> Any:
+    """Централізований доступ до конфігу з dot-path.
+    Працює як зі словниками, так і з Pydantic-моделями.
+    """
+    keys = path.split(".")
+    current = config
+
+    for key in keys:
+        if isinstance(current, dict):
+            if key not in current:
+                return default
+            current = current[key]
+        elif hasattr(current, key):
+            current = getattr(current, key)
+        else:
+            return default
+    return current
+
+
+# Екземпляр конфігу за замовчуванням
+APP_SETTINGS = AppConfig()
+# Також надаємо доступ як до словника для зворотньої сумісності
+APP_CONFIG = APP_SETTINGS.model_dump()

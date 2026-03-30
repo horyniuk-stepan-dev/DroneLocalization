@@ -155,7 +155,7 @@ class GeometryTransforms:
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
         M, mask = cv2.estimateAffine2D(
-            src_pts_cv, dst_pts_cv, method=cv2.USAC_MAGSAC, ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
@@ -175,7 +175,7 @@ class GeometryTransforms:
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
         M, mask = cv2.estimateAffinePartial2D(
-            src_pts_cv, dst_pts_cv, method=cv2.USAC_MAGSAC, ransacReprojThreshold=ransac_threshold
+            src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):

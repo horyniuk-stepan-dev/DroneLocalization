@@ -18,6 +18,9 @@ class DatabaseConfig(BaseModel):
     keypoint_video_scale: float = 0.5
     inter_frame_min_matches: int = 15
     inter_frame_ransac_thresh: float = 3.0
+    keyframe_min_translation_px: float = 15.0
+    keyframe_min_rotation_deg: float = 1.5
+    keyframe_always_save_first: bool = True
 
 
 class ConfidenceConfig(BaseModel):
@@ -162,6 +165,6 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
 
 
 # Екземпляр конфігу за замовчуванням
-APP_CONFIG = AppConfig().model_dump()
-# Також надаємо доступ як до об'єкта для нових модулів
 APP_SETTINGS = AppConfig()
+# Також надаємо доступ як до словника для зворотньої сумісності
+APP_CONFIG = APP_SETTINGS.model_dump()

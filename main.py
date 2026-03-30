@@ -12,6 +12,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 
+import torch
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 

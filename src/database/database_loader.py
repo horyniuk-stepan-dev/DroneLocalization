@@ -52,6 +52,16 @@ class DatabaseLoader:
                 self.metadata[key] = value
                 logger.debug(f"Metadata - {key}: {value}")
 
+            if "actual_num_frames" in self.metadata:
+                actual_num = int(self.metadata["actual_num_frames"])
+                self.global_descriptors = self.global_descriptors[:actual_num]
+                self.frame_poses = self.frame_poses[:actual_num]
+            
+            if "frame_index_map" in self.db_file["metadata"]:
+                self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
+            else:
+                self.frame_index_map = np.arange(len(self.global_descriptors))
+
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
 
@@ -136,16 +146,11 @@ class DatabaseLoader:
         if self.db_file is None:
             return 1080, 1920
 
-        group_name = f"local_features/frame_{frame_id}"
         h, w = 1080, 1920
-        if group_name in self.db_file:
-            g = self.db_file[group_name]
-            if "height" in g.attrs and "width" in g.attrs:
-                h, w = int(g.attrs["height"]), int(g.attrs["width"])
-            else:
-                # Fallback до загальних метаданих або стандартних значень
-                h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
-                w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
+        # If the file uses the new schema, we can't get frame size per frame easily anymore without breaking the API.
+        # Fallback to global metadata for all frames, which is the same anyway.
+        h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
+        w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
 
         res = (int(h), int(w))
         self._size_cache[frame_id] = res
@@ -159,16 +164,24 @@ class DatabaseLoader:
         if self.db_file is None:
             raise RuntimeError("Database not opened")
 
-        group_name = f"local_features/frame_{frame_id}"
-        if group_name not in self.db_file:
-            raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
-        g = self.db_file[group_name]
-
-        res = {
-            "keypoints": g["keypoints"][:],
-            "descriptors": g["descriptors"][:],
-            "coords_2d": g["coords_2d"][:],
-        }
+        g = self.db_file["local_features"]
+        
+        # Check backwards compatibility with old frame_X groups
+        if f"frame_{frame_id}" in g:
+            old_g = g[f"frame_{frame_id}"]
+            res = {
+                "keypoints": old_g["keypoints"][:],
+                "descriptors": old_g["descriptors"][:],
+                "coords_2d": old_g["coords_2d"][:],
+            }
+        else:
+            # New format
+            num = int(g["num_kp"][frame_id])
+            res = {
+                "keypoints": g["keypoints"][frame_id, :num, :],
+                "descriptors": g["descriptors"][frame_id, :num, :].astype(np.float32), 
+                "coords_2d": g["coords_2d"][frame_id, :num, :]
+            }
         # Обмежуємо розмір кешу (аналог lru_cache з maxsize)
         if len(self._feature_cache) > 200:
             # Видаляємо перший знайдений ключ (проста заміна LRU)
@@ -178,7 +191,7 @@ class DatabaseLoader:
         return res
 
     def get_num_frames(self) -> int:
-        return int(self.metadata.get("num_frames", 0))
+        return int(self.metadata.get("actual_num_frames", self.metadata.get("num_frames", 0)))
 
     def close(self) -> None:
         if self.db_file is not None:
@@ -187,5 +200,5 @@ class DatabaseLoader:
             logger.info("Database file closed")
 
         # Очищення кешу при закритті БД
-        self.get_frame_size.cache_clear()
-        self.get_local_features.cache_clear()
+        self._size_cache.clear()
+        self._feature_cache.clear()
