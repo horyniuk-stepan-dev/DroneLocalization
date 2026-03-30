@@ -156,6 +156,16 @@ class DatabaseLoader:
             return h, w
 
         # Стара схема v1: fallback — читаємо з групи кадру (зворотня сумісність)
+        # Нова схема v2: розміри збережені один раз в local_features.attrs
+        schema = self.metadata.get("hdf5_schema", "v1")
+        if schema == "v2" and "local_features" in self.db_file:
+            lf_attrs = self.db_file["local_features"].attrs
+            h = int(lf_attrs.get("frame_height", self.metadata.get("frame_height", 1080)))
+            w = int(lf_attrs.get("frame_width", self.metadata.get("frame_width", 1920)))
+            self._size_cache[frame_id] = (h, w)
+            return h, w
+
+        # Стара схема v1: fallback — читаємо з групи кадру (зворотня сумісність)
         group_name = f"local_features/frame_{frame_id}"
         h, w = 1080, 1920
         if group_name in self.db_file:
@@ -171,6 +181,7 @@ class DatabaseLoader:
         return res
 
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
+        """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         if frame_id in self._feature_cache:
             return self._feature_cache[frame_id]
@@ -202,6 +213,30 @@ class DatabaseLoader:
             }
 
         # LRU-витіснення
+        schema = self.metadata.get("hdf5_schema", "v1")
+        if schema == "v2":
+            lf = self.db_file["local_features"]
+            n = int(lf["kp_counts"][frame_id])
+            if n == 0:
+                raise ValueError(f"Кадр {frame_id} не має keypoints (kp_count=0).")
+            res = {
+                "keypoints": lf["keypoints"][frame_id, :n],
+                "descriptors": lf["descriptors"][frame_id, :n].astype("float32"),  # float16→32
+                "coords_2d": lf["coords_2d"][frame_id, :n],
+            }
+        else:
+            # Стара схема v1 — зворотня сумісність
+            group_name = f"local_features/frame_{frame_id}"
+            if group_name not in self.db_file:
+                raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
+            g = self.db_file[group_name]
+            res = {
+                "keypoints": g["keypoints"][:],
+                "descriptors": g["descriptors"][:],
+                "coords_2d": g["coords_2d"][:],
+            }
+
+        # LRU-витіснення
         if len(self._feature_cache) > 200:
             self._feature_cache.pop(next(iter(self._feature_cache)))
 
@@ -209,6 +244,7 @@ class DatabaseLoader:
         return res
 
     def get_num_frames(self) -> int:
+        """Повертає кількість кадрів у БД (pre-allocated slots для v2)."""
         return int(self.metadata.get("num_frames", 0))
 
     def close(self) -> None:

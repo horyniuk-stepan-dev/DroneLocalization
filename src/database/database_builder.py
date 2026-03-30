@@ -11,6 +11,7 @@ import torch
 from config.config import get_cfg
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
+from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -125,6 +126,12 @@ class DatabaseBuilder:
         masking_strategy = create_masking_strategy(
             masking_strategy_name, model_manager, model_manager.device
         )
+        # Ініціалізуємо стратегію маскування (YOLO / none / ...)
+        masking_strategy_name = get_cfg(self.config, "preprocessing.masking_strategy", "yolo")
+        logger.info(f"Loading masking strategy: {masking_strategy_name}")
+        masking_strategy = create_masking_strategy(
+            masking_strategy_name, model_manager, model_manager.device
+        )
 
         local_model = model_manager.load_aliked()
         nv_model = model_manager.load_dinov2()
@@ -197,6 +204,19 @@ class DatabaseBuilder:
                 f"min_rotation={get_cfg(self.config, 'database.keyframe_min_rotation_deg', 1.5)}°)"
             )
 
+        # Adaptive Keyframe Selection (П4)
+        saved_count = 0  # лічильник РЕАЛЬНО записаних кадрів
+        frame_index_map: list[int] = []  # список збережених frame_id
+        use_keyframe_selection = (
+            get_cfg(self.config, "database.keyframe_min_translation_px", 0.0) > 0
+        )
+        if use_keyframe_selection:
+            logger.info(
+                f"Adaptive keyframe selection ENABLED "
+                f"(min_translation={get_cfg(self.config, 'database.keyframe_min_translation_px', 15.0)}px, "
+                f"min_rotation={get_cfg(self.config, 'database.keyframe_min_rotation_deg', 1.5)}°)"
+            )
+
         # cuDNN benchmark conditionally (Fix 5)
 
         if torch.cuda.is_available():
@@ -218,6 +238,8 @@ class DatabaseBuilder:
                     continue
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                orig_frame_idx = i // frame_step
+                frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
                 orig_frame_idx = i // frame_step
                 frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
 
@@ -254,20 +276,50 @@ class DatabaseBuilder:
             ):
                 """Обробляє один кадр після YOLO: feature extraction, pose, keyframe selection."""
                 features = feature_extractor.extract_features(p_frame_rgb, p_static_mask)
+            # YOLO micro-batching (П8)
+            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 2)
+            if yolo_batch_size > 1:
+                logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
+            pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
+
+            def _flush_mask_batch(batch: list) -> list:
+                """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
+                images_rgb = [b[2] for b in batch]
+                masks_list = masking_strategy.get_mask_batch(images_rgb)
+                return [(b[0], b[1], b[2], m) for b, m in zip(batch, masks_list)]
+
+            def _process_single_frame(
+                p_idx,
+                p_frame,
+                p_frame_rgb,
+                p_static_mask,
+                current_pose,
+                prev_features,
+                saved_count,
+                frame_index_map,
+            ):
+                """Обробляє один кадр після YOLO: feature extraction, pose, keyframe selection."""
+                features = feature_extractor.extract_features(p_frame_rgb, p_static_mask)
                 features["coords_2d"] = features["keypoints"]
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
+                        p_frame, features["keypoints"], p_static_mask, p_idx, num_frames
                         p_frame, features["keypoints"], p_static_mask, p_idx, num_frames
                     )
                     if kp_scale != 1.0:
                         kp_w = int(width * kp_scale)
                         kp_h = int(height * kp_scale)
                         kp_frame = cv2.resize(kp_frame, (kp_w, kp_h), interpolation=cv2.INTER_AREA)
+                        kp_w = int(width * kp_scale)
+                        kp_h = int(height * kp_scale)
+                        kp_frame = cv2.resize(kp_frame, (kp_w, kp_h), interpolation=cv2.INTER_AREA)
                     kp_writer.write(kp_frame)
 
                 if p_idx == 0 or prev_features is None:
+                if p_idx == 0 or prev_features is None:
                     current_pose = np.eye(3, dtype=np.float64)
+                    save_this_frame = True
                     save_this_frame = True
                 else:
                     H_step = self._compute_inter_frame_H(prev_features, features)
@@ -280,10 +332,33 @@ class DatabaseBuilder:
                     else:
                         logger.warning(
                             f"Frame {p_idx}: inter-frame match failed, reusing previous pose"
+                            f"Frame {p_idx}: inter-frame match failed, reusing previous pose"
                         )
                         save_this_frame = True
 
                 prev_features = features
+
+                # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
+                # навіть якщо кадр не є keyframe (пропущений через малий рух).
+                # Без цього frame_poses[frame_id] = zeros → пропагація ламається.
+                if self.db_file:
+                    self.db_file["global_descriptors"]["frame_poses"][p_idx] = current_pose
+
+                if save_this_frame:
+                    frame_index_map.append(p_idx)
+                    # Зберігаємо за ОРИГІНАЛЬНИМ індексом p_idx, а не послідовним
+                    # Це зберігає frame_id ↔ slot identity для калібрування/пропагації
+                    self.save_frame_data(p_idx, features, current_pose)
+                    saved_count += 1
+
+                    if saved_count % 100 == 0:
+                        progress_pct = int((p_idx + 1) / num_frames * 100)
+                        logger.info(
+                            f"Saved {saved_count} keyframes from {p_idx + 1}/{num_frames} processed "
+                            f"({progress_pct}%)"
+                        )
+
+                progress_percent = int((p_idx + 1) / num_frames * 100)
 
                 # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
                 # навіть якщо кадр не є keyframe (пропущений через малий рух).
@@ -348,6 +423,24 @@ class DatabaseBuilder:
             logger.error(f"Error during database building: {e}")
             raise
         finally:
+            # Зберігаємо frame_index_map і actual_num_frames у metadata
+            if self.db_file and saved_count > 0:
+                try:
+                    meta = self.db_file["metadata"]
+                    meta.attrs["actual_num_frames"] = saved_count
+                    if "frame_index_map" not in meta:
+                        meta.create_dataset(
+                            "frame_index_map",
+                            data=np.array(frame_index_map, dtype=np.int32),
+                        )
+                    if use_keyframe_selection:
+                        logger.info(
+                            f"Keyframe selection: {saved_count}/{num_frames} frames saved "
+                            f"({100 - saved_count / num_frames * 100:.1f}% reduction)"
+                        )
+                except Exception as e:
+                    logger.warning(f"Could not save frame_index_map: {e}")
+
             # Зберігаємо frame_index_map і actual_num_frames у metadata
             if self.db_file and saved_count > 0:
                 try:
@@ -501,7 +594,44 @@ class DatabaseBuilder:
         angle_deg = abs(np.degrees(angle_rad))
         return angle_deg >= min_r
 
+    def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:
+        """
+        Повертає True якщо гомографія H відповідає значному руху.
+        H: (3,3) float32 — матриця з frame_b до frame_a.
+        """
+        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
+        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
+
+        # Трансляція: зсув центру кадру через H
+        cx, cy = frame_w / 2.0, frame_h / 2.0
+        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
+        p_dst = H.astype(np.float64) @ p_src
+        p_dst /= p_dst[2]
+        translation = np.linalg.norm(p_dst[:2] - np.array([cx, cy]))
+
+        if translation >= min_t:
+            return True
+
+        # Кут: з лінійної частини H (2×2 зліва вгорі)
+        A = H[:2, :2].astype(np.float64)
+        det = np.linalg.det(A)
+        if abs(det) < 1e-6:
+            return True  # вироджена матриця → вважаємо рухом
+        angle_rad = np.arctan2(A[1, 0], A[0, 0])
+        angle_deg = abs(np.degrees(angle_rad))
+        return angle_deg >= min_r
+
     def create_hdf5_structure(self, num_frames: int, width: int, height: int):
+        """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
+        compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
+        chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
+        max_kps = get_cfg(self.config, "database.max_keypoints_stored", 2048)
+        local_desc_dim = 128  # ALIKED descriptor dim
+
+        logger.info(
+            f"Creating HDF5 v2 structure for {num_frames} frames "
+            f"(compression={compression}, chunks={chunk_f}, max_kps={max_kps})"
+        )
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
         chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
@@ -515,6 +645,7 @@ class DatabaseBuilder:
 
         with h5py.File(self.output_path, "w") as f:
             # --- global_descriptors: chunked ---
+            # --- global_descriptors: chunked ---
             g1 = f.create_group("global_descriptors")
             g1.create_dataset(
                 "descriptors",
@@ -522,8 +653,54 @@ class DatabaseBuilder:
                 dtype="float32",
                 compression=compression,
                 chunks=(min(256, num_frames), self.descriptor_dim),
+                compression=compression,
+                chunks=(min(256, num_frames), self.descriptor_dim),
             )
             g1.create_dataset(
+                "frame_poses",
+                shape=(num_frames, 3, 3),
+                dtype="float64",
+                compression=compression,
+                chunks=(min(256, num_frames), 3, 3),
+            )
+
+            # --- local_features: PRE-ALLOCATED chunked arrays (НОВА СХЕМА v2) ---
+            lf = f.create_group("local_features")
+            lf.create_dataset(
+                "keypoints",
+                shape=(num_frames, max_kps, 2),
+                dtype="float32",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kps, 2),
+                fillvalue=0.0,
+            )
+            lf.create_dataset(
+                "descriptors",
+                shape=(num_frames, max_kps, local_desc_dim),
+                dtype="float16",  # float16: -50% розміру (П2)
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kps, local_desc_dim),
+                fillvalue=0.0,
+            )
+            lf.create_dataset(
+                "coords_2d",
+                shape=(num_frames, max_kps, 2),
+                dtype="float32",
+                compression=compression,
+                chunks=(min(chunk_f, num_frames), max_kps, 2),
+                fillvalue=0.0,
+            )
+            lf.create_dataset(
+                "kp_counts",  # скільки keypoints у кожному кадрі
+                shape=(num_frames,),
+                dtype="int16",
+                compression=compression,
+                chunks=(min(num_frames, 4096),),
+                fillvalue=0,
+            )
+            # Розміри кадру — зберігаємо ОДИН РАЗ у групі
+            lf.attrs["frame_width"] = width
+            lf.attrs["frame_height"] = height
                 "frame_poses",
                 shape=(num_frames, 3, 3),
                 dtype="float64",
@@ -577,15 +754,33 @@ class DatabaseBuilder:
             g3.attrs["descriptor_dim"] = self.descriptor_dim
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
+            g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
+            g3.attrs["max_keypoints"] = max_kps
 
+        logger.success("HDF5 v2 structure created successfully")
         logger.success("HDF5 v2 structure created successfully")
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
         """Save extracted data for a single frame via slice assignment (schema v2)"""
         # global — без змін
+        """Save extracted data for a single frame via slice assignment (schema v2)"""
+        # global — без змін
         self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
         self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
+        # local — slice assignment замість create_group + create_dataset
+        kps = features["keypoints"]
+        descs = features["descriptors"]
+        c2d = features["coords_2d"]
+
+        max_kps = self.db_file["local_features"]["keypoints"].shape[1]
+        n = min(len(kps), max_kps)
+
+        lf = self.db_file["local_features"]
+        lf["keypoints"][frame_id, :n] = kps[:n]
+        lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
+        lf["coords_2d"][frame_id, :n] = c2d[:n]
+        lf["kp_counts"][frame_id] = n
         # local — slice assignment замість create_group + create_dataset
         kps = features["keypoints"]
         descs = features["descriptors"]

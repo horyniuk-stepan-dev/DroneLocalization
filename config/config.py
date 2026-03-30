@@ -71,10 +71,13 @@ class PreprocessingConfig(BaseModel):
     histogram_matching: bool = True
     reference_image_path: str = "config/reference_style.png"
     masking_strategy: str = "yolo"  # "yolo" | "none" (підготовка до EfficientViT-SAM)
+    masking_strategy: str = "yolo"  # "yolo" | "none" (підготовка до EfficientViT-SAM)
 
 
 class GuiConfig(BaseModel):
     video_fps: int = 30
+    verify_display_mode: str = "center"  # "center" | "center_corners" | "full"
+    verify_label_mode: str = "number"  # "number" | "number_rmse" | "full"
     verify_display_mode: str = "center"  # "center" | "center_corners" | "full"
     verify_label_mode: str = "number"  # "number" | "number_rmse" | "full"
 
@@ -114,6 +117,11 @@ class ModelsCacheConfig(BaseModel):
     auto_compile: bool = False
 
 
+class ModelsCacheConfig(BaseModel):
+    engine_cache_dir: str = "models/engines/"
+    auto_compile: bool = False
+
+
 class PerformanceConfig(BaseModel):
     propagation_max_workers: int = 4
     fp16_enabled: bool = True
@@ -140,6 +148,7 @@ class ModelsConfig(BaseModel):
     vram_management: VramManagementConfig = VramManagementConfig()
     performance: PerformanceConfig = PerformanceConfig()
     engines_cache: ModelsCacheConfig = ModelsCacheConfig()
+    engines_cache: ModelsCacheConfig = ModelsCacheConfig()
 
 
 class ProjectionConfig(BaseModel):
@@ -160,6 +169,13 @@ class HomographyConfig(BaseModel):
     confidence: float = 0.99
 
 
+class HomographyConfig(BaseModel):
+    backend: str = "opencv"  # "poselib" | "opencv"
+    ransac_threshold: float = 3.0
+    max_iters: int = 2000
+    confidence: float = 0.99
+
+
 class AppConfig(BaseModel):
     dinov2: Dinov2Config = Dinov2Config()
     database: DatabaseConfig = DatabaseConfig()
@@ -169,6 +185,7 @@ class AppConfig(BaseModel):
     gui: GuiConfig = GuiConfig()
     models: ModelsConfig = ModelsConfig()
     projection: ProjectionConfig = ProjectionConfig()
+    homography: HomographyConfig = HomographyConfig()
     homography: HomographyConfig = HomographyConfig()
 
 
@@ -191,6 +208,7 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
     return current
 
 
+# Єдине джерело правди — Pydantic-об'єкт
 # Єдине джерело правди — Pydantic-об'єкт
 APP_SETTINGS = AppConfig()
 # Також надаємо доступ як до словника для зворотньої сумісності
