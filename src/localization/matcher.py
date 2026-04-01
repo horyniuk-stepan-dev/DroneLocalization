@@ -1,3 +1,14 @@
+"""
+matcher.py — ВИПРАВЛЕНА ВЕРСІЯ
+
+Ключові зміни:
+- ВИПРАВЛЕННЯ БАГ 4: значення за замовчуванням ratio_threshold знижено з 0.95 до 0.75.
+  Попереднє значення 0.95 пропускало колосальну кількість хибних збігів (false positives),
+  особливо на однорідних текстурах (поля, ліси, дахи будівель). Це призводило до
+  вироджених гомографій та мікрострибків координат між сусідніми кадрами.
+  Значення 0.75 відповідає рекомендаціям Lowe's ratio test для нормалізованих дескрипторів.
+"""
+
 import faiss
 import numpy as np
 import torch
@@ -32,17 +43,13 @@ class FastRetrieval:
         return vectors / (norms + 1e-8)
 
     def find_similar_frames(self, query_desc: np.ndarray, top_k: int = 5) -> list:
-        # Підготовка запиту
         q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
         q = q.astype(np.float32)
 
         if q.ndim == 1:
             q = q[None]
 
-        # Пошук у FAISS
         scores, ids = self.index.search(q, top_k)
-
-        # Повертаємо список (id, score)
         results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
 
@@ -53,7 +60,13 @@ class FeatureMatcher:
     def __init__(self, model_manager=None, config=None):
         self.config = config or {}
         self.model_manager = model_manager
-        self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.95)
+
+        # ВИПРАВЛЕННЯ БАГ 4: знижено з 0.95 до 0.75.
+        # Значення 0.95 допускало занадто багато хибних збігів на однорідних текстурах
+        # (поля, ліси, дахи), що призводило до вироджених гомографій у MAGSAC++/LMEDS
+        # та мікрострибків координат між сусідніми кадрами.
+        # 0.75 — стандартне значення Lowe's ratio test для нормалізованих L2-дескрипторів.
+        self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.75)
 
         # Завантажуємо LightGlue (ALIKED) через ModelManager
         self.lightglue = None
@@ -65,6 +78,8 @@ class FeatureMatcher:
                 logger.warning(f"Failed to load LightGlue ALIKED: {e}. Falling back to Numpy L2.")
         else:
             logger.info("FeatureMatcher configured to use fast Numpy L2 matching")
+
+        logger.info(f"FeatureMatcher ratio_threshold = {self.ratio_threshold:.2f}")
 
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         """
@@ -83,7 +98,7 @@ class FeatureMatcher:
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def _fast_numpy_match(
-        self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80
+        self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.75
     ) -> tuple:
         """
         Highly optimized L2 matching using dot product and Mutual Nearest Neighbor (MNN).
@@ -104,10 +119,8 @@ class FeatureMatcher:
         sim = np.dot(desc_q_n, desc_r_n.T)
 
         # 3. Lowe's Ratio Test — argpartition O(n) замість argsort O(n log n)
-        # Потрібні лише top-2 для ratio test
         top2_idx = np.argpartition(-sim, kth=1, axis=1)[:, :2]
         top2_sim = np.take_along_axis(sim, top2_idx, axis=1)
-        # Сортуємо лише 2 елементи щоб best >= second_best
         order = np.argsort(-top2_sim, axis=1)
         top2_idx = np.take_along_axis(top2_idx, order, axis=1)
         top2_sim = np.take_along_axis(top2_sim, order, axis=1)
@@ -142,7 +155,6 @@ class FeatureMatcher:
 
             device = next(self.lightglue.parameters()).device
 
-            # Підготовка тензорів для LightGlue
             data = {
                 "image0": {
                     "keypoints": torch.from_numpy(query_features["keypoints"])

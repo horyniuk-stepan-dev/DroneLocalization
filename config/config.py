@@ -50,7 +50,7 @@ class TrackingConfig(BaseModel):
     kalman_measurement_noise: float = 5.0
     outlier_window: int = 10
     outlier_threshold_std: float = 25.0
-    max_speed_mps: float = 60.0
+    max_speed_mps: float = 1000.0
     max_consecutive_outliers: int = 5
     process_fps: float = 1.0
 

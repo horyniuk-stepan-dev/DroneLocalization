@@ -31,6 +31,42 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def _decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
+    """
+    Розкладає афінну матрицю 2x3 на компоненти:
+    (tx, ty, scale, angle_rad).
+
+    Для афінної матриці вигляду:
+        [s*cos(a)  -s*sin(a)  tx]
+        [s*sin(a)   s*cos(a)  ty]
+    scale = sqrt(det(R_part)), angle = atan2(M[1,0], M[0,0]).
+    При наявності шуму (незначний зсув / анізотропний масштаб)
+    беремо ізотропне наближення через норму першого стовпця.
+    """
+    tx = float(M[0, 2])
+    ty = float(M[1, 2])
+    # Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання
+    s_x = float(np.linalg.norm(M[:2, 0]))
+    s_y = float(np.linalg.norm(M[:2, 1]))
+    scale = (s_x + s_y) * 0.5
+    if scale < 1e-9:
+        scale = 1e-9
+    angle = float(np.arctan2(M[1, 0], M[0, 0]))
+    return tx, ty, scale, angle
+
+
+def _compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
+    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
+    c = np.cos(angle) * scale
+    s = np.sin(angle) * scale
+    return np.array([[c, -s, tx], [s,  c, ty]], dtype=np.float32)
+
+
+def _unwrap_angles(angles: np.ndarray) -> np.ndarray:
+    """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
+    return np.unwrap(angles)
+
+
 class AnchorCalibration:
     """
     Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та повними QA-метриками.
@@ -125,15 +161,44 @@ class MultiAnchorCalibration:
         self._interp: PchipInterpolator | None = None  # кешований інтерполятор
 
     def _rebuild_interpolators(self) -> None:
-        """Перебудовує PCHIP-інтерполятор. Викликати після кожної зміни anchors."""
+        """
+        Перебудовує PCHIP-інтерполятори на основі ДЕКОМПОЗИЦІЇ афінних матриць.
+
+        Замість поелементної інтерполяції raw-компонентів матриці (що порушує
+        жорсткість обертання і призводить до артефактів зсуву/shear), кожна
+        матриця розкладається на: (tx, ty, scale, angle).  Кути розгортаються
+        через np.unwrap для уникнення стрибків через ±π.  Для кожного з 4
+        скалярних каналів будується окремий PchipInterpolator.  При запиті
+        (_get_interpolated_matrix) компоненти відновлюються назад у валідну
+        афінну матрицю через _compose_affine.
+        """
         if len(self.anchors) < 2:
             self._interp = None
             return
 
         ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
-        matrices = np.stack([a.affine_matrix.ravel() for a in self.anchors])  # (N, 6)
-        # PchipInterpolator обробляє multi-column масиви нативно
-        self._interp = PchipInterpolator(ids, matrices, extrapolate=True)
+        decomposed = np.array(
+            [_decompose_affine(a.affine_matrix) for a in self.anchors],
+            dtype=np.float64,
+        )  # shape (N, 4): tx, ty, scale, angle
+
+        # Розгортаємо кути для коректної інтерполяції через межу ±π
+        decomposed[:, 3] = _unwrap_angles(decomposed[:, 3])
+
+        # Один багатоколонковий PCHIP-інтерполятор для всіх 4 каналів
+        self._interp = PchipInterpolator(ids, decomposed, extrapolate=True)
+
+    def _get_interpolated_matrix(self, frame_id: float) -> np.ndarray | None:
+        """Повертає інтерпольовану афінну матрицю 2x3 для заданого frame_id."""
+        if self._interp is None:
+            return None
+        components = self._interp(frame_id)  # (4,): tx, ty, scale, angle
+        if components is None or np.any(np.isnan(components)):
+            return None
+        tx, ty, scale, angle = components
+        # Захист від вироджених значень масштабу
+        scale = float(np.clip(scale, 1e-6, 1e6))
+        return _compose_affine(float(tx), float(ty), scale, float(angle))
 
     @property
     def is_calibrated(self) -> bool:
@@ -177,11 +242,10 @@ class MultiAnchorCalibration:
         if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
 
-        # PCHIP: інтерполяція/екстраполяція матриці → застосування до точки
+        # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
         if self._interp is not None:
-            flat = self._interp(float(frame_id))  # (6,) float64
-            if flat is not None and not np.any(np.isnan(flat)):
-                M = flat.reshape(2, 3).astype(np.float32)
+            M = self._get_interpolated_matrix(float(frame_id))
+            if M is not None:
                 pt = np.array([[x, y]], dtype=np.float32)
                 result = GeometryTransforms.apply_affine(pt, M)[0]
                 return float(result[0]), float(result[1])
@@ -2993,6 +3057,24 @@ class OpenProjectDialog(QDialog):
 # ================================================================================
 # File: gui\mixins\calibration_mixin.py
 # ================================================================================
+"""
+calibration_mixin.py — ВИПРАВЛЕНА ВЕРСІЯ
+
+Ключові зміни:
+- ВИПРАВЛЕННЯ БАГ 2: Змінено логіку вибору трансформації у on_anchor_added.
+  Попередня версія: estimate_affine_partial (4-DoF) як пріоритет, estimate_affine (6-DoF)
+  лише при покращенні RMSE > 15%. Це призводило до вибору матриці з від'ємним детермінантом
+  (дзеркальне відображення pixel→UTM) лише у виняткових випадках.
+
+  Нова поведінка:
+  1. При UTM-проекції: завжди використовується estimate_affine (6-DoF) якщо точок >= 4,
+     оскільки перетворення pixel→UTM ЗАВЖДИ вимагає матрицю з від'ємним детермінантом
+     (вісь Y пікселів ↓, вісь Y UTM ↑). estimate_affine_partial фізично не здатна
+     це моделювати (детермінант завжди > 0).
+  2. При WEB_MERCATOR: попередня логіка збережена (partial як пріоритет, full як fallback).
+  3. Якщо точок < 4 або estimate_affine повернула None — fallback до partial.
+"""
+
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
@@ -3017,7 +3099,6 @@ class CalibrationMixin:
             QMessageBox.warning(self, "Помилка", "Спочатку завантажте або створіть базу даних!")
             return
 
-        # Тепер передаємо повні словники якорів для редагування
         anchors_data = [a.to_dict() for a in self.calibration.anchors]
 
         self._calib_dialog = CalibrationDialog(
@@ -3026,11 +3107,10 @@ class CalibrationMixin:
             parent=self,
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
-        self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)  # Новий сигнал
+        self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)
         self._calib_dialog.calibration_complete.connect(self.on_run_propagation)
         self._calib_dialog.exec()
 
-        # Очищуємо посилання після закриття діалогу
         self._calib_dialog = None
 
     @pyqtSlot(object)
@@ -3046,7 +3126,6 @@ class CalibrationMixin:
 
             # Налаштування проєкції, якщо вона ще не ініціалізована
             if not self.calibration.converter._initialized:
-                # Використовуємо налаштування з конфігу або за замовчуванням
                 mode = get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")
                 reference_gps = points_gps[0] if mode == "UTM" else None
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
@@ -3056,12 +3135,6 @@ class CalibrationMixin:
                 self.calibration.converter.gps_to_metric(lat, lon) for lat, lon in points_gps
             ]
             pts_metric_np = np.array(pts_metric, dtype=np.float32)
-
-            # 1. Спроба обчислити різні типи трансформацій
-            M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
-
-            best_M = M_partial
-            best_type = "affine_partial"  # 4-DoF (Scale, Rotate, Translate)
 
             def calc_metrics(M, src, dst):
                 proj = GeometryTransforms.apply_affine(src, M)
@@ -3073,21 +3146,81 @@ class CalibrationMixin:
                     proj.tolist(),
                 )
 
-            rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+            # ── ВИПРАВЛЕННЯ БАГ 2: логіка вибору трансформації ─────────────────
+            #
+            # Система координат pixel vs UTM:
+            #   - Піксельна: вісь Y спрямована ВНИЗ (0 = верх кадру)
+            #   - UTM:       вісь Y спрямована ВГОРУ (на північ)
+            # Тому правильна матриця pixel→UTM ЗАВЖДИ має від'ємний детермінант
+            # (вона містить дзеркальне відображення). estimate_affine_partial (4-DoF)
+            # генерує лише матриці вигляду [s*cos -s*sin; s*sin s*cos], детермінант = s² > 0.
+            # Вона фізично не може відобразити такий простір.
+            #
+            # Рішення: при UTM-проекції завжди пробуємо estimate_affine (6-DoF) першою.
+            # При WEB_MERCATOR зберігаємо стару логіку (partial як пріоритет).
 
-            # Якщо точок >= 5, пробуємо повний Affine (6 DoF)
-            if len(pts_2d_np) >= 5:
+            is_utm = (self.calibration.converter._mode == "UTM")
+
+            best_M = None
+            best_type = "unknown"
+            rmse_p = float("inf")
+            median_p = 0.0
+            max_p = 0.0
+            proj_p = []
+
+            if is_utm:
+                # UTM: пріоритет — повна афінна (6-DoF), яка підтримує від'ємний детермінант
                 M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
                 if M_full is not None:
-                    rmse_f, median_f, max_f, proj_f = calc_metrics(M_full, pts_2d_np, pts_metric_np)
-                    # Вибираємо повний Affine тільки якщо він дає суттєве покращення (>15%)
-                    if rmse_f < rmse_p * 0.85:
-                        best_M = M_full
-                        best_type = "affine_full"
-                        rmse_p, median_p, max_p, proj_p = rmse_f, median_f, max_f, proj_f
-                        logger.info(
-                            f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)"
+                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
+                    logger.info(f"Full affine determinant for anchor {frame_id}: {det:.6f}")
+                    if det > 0:
+                        # Від'ємний детермінант очікується; якщо позитивний — попередження
+                        logger.warning(
+                            f"Anchor {frame_id}: full affine determinant is POSITIVE ({det:.4f}). "
+                            "Pixel→UTM should have negative det (Y-axis flip). "
+                            "Check point ordering or projection setup."
                         )
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                    best_M = M_full
+                    best_type = "affine_full"
+                    logger.info(
+                        f"UTM mode: using full affine for anchor {frame_id} (RMSE: {rmse_p:.2f}m, det={det:.4f})"
+                    )
+
+                # Fallback до partial якщо full не вийшла (дуже мала к-сть точок або збій)
+                if best_M is None:
+                    logger.warning(
+                        f"Anchor {frame_id}: estimate_affine failed for UTM. "
+                        "Falling back to affine_partial — metric accuracy will be degraded."
+                    )
+                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                    if M_partial is not None:
+                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                        best_M = M_partial
+                        best_type = "affine_partial (UTM fallback)"
+
+            else:
+                # WEB_MERCATOR або інші проекції: стара логіка
+                M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                best_M = M_partial
+                best_type = "affine_partial"
+
+                if M_partial is not None:
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+
+                # Пробуємо повну афінну якщо точок >= 5
+                if len(pts_2d_np) >= 5:
+                    M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
+                    if M_full is not None:
+                        rmse_f, median_f, max_f, proj_f = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                        if rmse_f < rmse_p * 0.85:
+                            best_M = M_full
+                            best_type = "affine_full"
+                            rmse_p, median_p, max_p, proj_p = rmse_f, median_f, max_f, proj_f
+                            logger.info(
+                                f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)"
+                            )
 
             if best_M is None:
                 QMessageBox.critical(
@@ -3097,11 +3230,10 @@ class CalibrationMixin:
                 )
                 return
 
-            # 2. Перевірка порогів якості з конфігу
+            # ── Перевірка порогів якості ────────────────────────────────────────
             rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
             max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
 
-            # 3. QA Діалог підтвердження
             from datetime import datetime
 
             severity_color = "green"
@@ -3132,7 +3264,7 @@ class CalibrationMixin:
             else:
                 logger.success(f"Anchor {frame_id} QA passed: RMSE={rmse_p:.2f}m")
 
-            # 4. Збереження результатів
+            # ── Збереження результатів ──────────────────────────────────────────
             qa_data = {
                 "rmse_m": rmse_p,
                 "median_err_m": median_p,
@@ -3151,7 +3283,7 @@ class CalibrationMixin:
             if self.project_manager and self.project_manager.is_loaded:
                 self.calibration.save(self.project_manager.calibration_path)
 
-            # ДІАГНОСТИКА: Детальний лог точок (тепер на рівні INFO)
+            # ── Діагностичний лог по точках ──────────────────────────────────────
             logger.info(f"--- Anchor {frame_id} Point-by-Point Analysis ---")
             for j in range(len(pts_2d_np)):
                 p2d = pts_2d_np[j]
@@ -3160,7 +3292,6 @@ class CalibrationMixin:
                     trans = GeometryTransforms.apply_affine(p2d.reshape(1, 2), best_M)[0]
                     err = np.linalg.norm(trans - pm)
 
-                    # Перевіряємо зворотну конвертацію для візуалізації зсуву в градусах
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(
                         float(trans[0]), float(trans[1])
                     )
@@ -3219,8 +3350,6 @@ class CalibrationMixin:
             return
 
         try:
-            # ОНОВЛЕНО: Ініціалізуємо FeatureMatcher, він автоматично підлаштується
-            # під розмірність дескрипторів (64 для XFeat) та використає Numpy L2
             matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося ініціалізувати матчер:\n{e}")
@@ -3271,7 +3400,6 @@ class CalibrationMixin:
             self._propagation_dialog.close()
             self._propagation_dialog = None
 
-        # Обчислюємо статистику якості
         num_frames = self.database.get_num_frames()
         valid_mask = self.database.frame_valid
         valid_count = int(np.sum(valid_mask)) if valid_mask is not None else 0
@@ -3334,7 +3462,6 @@ class CalibrationMixin:
             num_frames = self.database.get_num_frames()
             step = max(1, num_frames // 30)
 
-            # Отримуємо дані один раз
             rmse_data = getattr(self.database, "frame_rmse", None)
             dis_data = getattr(self.database, "frame_disagreement", None)
             matches_data = getattr(self.database, "frame_matches", None)
@@ -3348,7 +3475,6 @@ class CalibrationMixin:
                     w = self.database.metadata.get("frame_width", 1920)
                     h = self.database.metadata.get("frame_height", 1080)
 
-                    # ДІАГНОСТИКА: лише для першого кадру
                     if not _diag_done:
                         _diag_done = True
                         logger.warning(f"=== VERIFY DIAG frame={i} ===")
@@ -3368,14 +3494,12 @@ class CalibrationMixin:
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
 
-                    # 1. Центр кадру
                     mx, my = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
-                    # 2. Низ центру (часто там дорога)
                     mx_b, my_b = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
@@ -3394,24 +3518,19 @@ class CalibrationMixin:
                         else 0
                     )
 
-                    # Лог для вибраного кадру (кожен 3-й з тих що показуємо)
                     if (i // step) % 3 == 0:
                         logger.debug(
                             f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | BOTTOM={lat_b:.6f},{lon_b:.6f} | RMSE={rmse:.2f}m"
                         )
 
-                    # Колір базується на комбінації факторів
                     color = "green"
                     if rmse > 5.0 or dis > 10.0:
                         color = "red"
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    # 3. Крайні точки (для візуалізації перекосу/масштабу)
-                    # МАЛЮЄМО НЕ ВЕСЬ КАДР (1920x1080 - це величезна площа на карті!),
-                    # а лише центральні 20% екрану, щоб прямокутник на карті не здавався гіпер-великим.
                     cx_px, cy_px = w / 2, h / 2
-                    dw, dh = w * 0.1, h * 0.1  # 10% в кожну сторону від центру
+                    dw, dh = w * 0.1, h * 0.1
                     pts_px = [
                         (cx_px - dw, cy_px - dh),
                         (cx_px + dw, cy_px - dh),
@@ -3435,7 +3554,6 @@ class CalibrationMixin:
                             }
                         )
 
-                    # Додаємо дві основні точки
                     points_to_show.append(
                         {
                             "lat": float(lat_c),
@@ -3527,15 +3645,14 @@ class CalibrationMixin:
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
 
-
 # ================================================================================
 # File: gui\mixins\database_mixin.py
 # ================================================================================
 from pathlib import Path
-
+ 
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
-
+ 
 from src.core.export_results import ResultExporter
 from src.core.project_registry import ProjectRegistry
 from src.database.database_loader import DatabaseLoader
@@ -3543,60 +3660,69 @@ from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
 from src.utils.logging_utils import get_logger
 from src.workers.database_worker import DatabaseGenerationWorker
-
+ 
 logger = get_logger(__name__)
-
-
+ 
+ 
 class DatabaseMixin:
     # ── Реєстр проєктів (ініціалізується один раз) ───────────────────────────
-
+ 
     def _get_registry(self) -> ProjectRegistry:
         if not hasattr(self, "_project_registry"):
             self._project_registry = ProjectRegistry()
         return self._project_registry
-
+ 
     # ── Нова місія ────────────────────────────────────────────────────────────
-
+ 
     @pyqtSlot()
     def on_new_mission(self):
         dialog = NewMissionDialog(self)
         if not dialog.exec():
             return
-
+ 
         mission_data = dialog.get_mission_data()
         workspace_dir = mission_data.get("workspace_dir")
         video_path = mission_data.get("video_path")
-
+ 
         if not workspace_dir or not video_path:
             return
-
+ 
         # Створюємо структуру проєкту
         if not self.project_manager.create_project(workspace_dir, mission_data):
             QMessageBox.critical(self, "Помилка", "Не вдалося створити проєкт!")
             return
-
+ 
         # Реєструємо в реєстрі
         self._get_registry().register(
             project_dir=str(self.project_manager.project_dir),
             name=self.project_manager.project_name,
             video_path=video_path,
         )
-
+ 
         self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
         self._start_database_generation(video_path, self.project_manager.database_path)
-
+ 
     # ── Генерація бази ────────────────────────────────────────────────────────
-
+ 
     def _start_database_generation(self, video_path: str, save_path: str):
         from src.geometry.coordinates import CoordinateConverter
-
-        self.calibration.converter = CoordinateConverter("WEB_MERCATOR")
-
+ 
+        # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
+        # UTM-конвертер буде ініціалізований автоматично після отримання першого
+        # GPS-якоря у CalibrationMixin (через _on_first_gps_anchor або еквівалент),
+        # щоб забезпечити ізотропний евклідів простір для всієї геометричної математики.
+        # WEB_MERCATOR залишається лише як відображальний шар у MapWidget.
+        #
+        # Якщо якорів ще немає, залишаємо конвертер у стані "not initialized" (UTM, без ref),
+        # щоб перший GPS-якір автоматично зафіксував зону UTM.
+        if not self.calibration.is_calibrated:
+            self.calibration.converter = CoordinateConverter("UTM")  # ref_gps=None → авто при першому якорі
+ 
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
         self.control_panel.update_progress(0)
         self.control_panel.set_db_generation_running(True)
-
+ 
         # CRITICAL: Close and release the database file handle before overwriting/truncating it
         if hasattr(self, "database") and self.database:
             try:
@@ -3605,7 +3731,7 @@ class DatabaseMixin:
             except Exception as e:
                 logger.warning(f"Could not close database: {e}")
         self.database = None
-
+ 
         self.db_worker = DatabaseGenerationWorker(
             video_path=video_path,
             output_path=save_path,
@@ -3616,30 +3742,30 @@ class DatabaseMixin:
         self.db_worker.completed.connect(self.on_db_completed)
         self.db_worker.error.connect(self.on_db_error)
         self.db_worker.cancelled.connect(self.on_db_cancelled)
-
+ 
         # Connect stop button
         self.control_panel.stop_db_generation_clicked.connect(self.on_stop_db_generation)
-
+ 
         self.db_worker.start()
-
+ 
     @pyqtSlot()
     def on_stop_db_generation(self):
         if hasattr(self, "db_worker") and self.db_worker and self.db_worker.isRunning():
             self.control_panel.update_status("Зупинка... (чекаємо завершення кадру)")
             self.db_worker.stop()
-
+ 
     @pyqtSlot(int, str)
     def on_db_progress(self, percent: int, message: str):
         self.control_panel.update_progress(percent)
         self.control_panel.update_status(message)
-
+ 
     @pyqtSlot(str)
     def on_db_completed(self, db_path: str):
         self.control_panel.set_db_generation_running(False)
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.current_database_path = db_path
-
+ 
         if self.database:
             self.database.close()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -3652,14 +3778,14 @@ class DatabaseMixin:
         self.status_bar.showMessage(
             f"Проєкт: {self.project_manager.project_name} | База: {db_path}"
         )
-
+ 
         # Оновити реєстр та інфо-панель
         if self.project_manager.is_loaded:
             self._get_registry().refresh_status(str(self.project_manager.project_dir))
         self._update_project_info_panel()
-
+ 
         QMessageBox.information(self, "Успіх", "Проєкт та базу даних успішно згенеровано!")
-
+ 
     @pyqtSlot(str)
     def on_db_error(self, error_msg: str):
         self.control_panel.set_db_generation_running(False)
@@ -3668,39 +3794,39 @@ class DatabaseMixin:
         self.control_panel.update_progress(0)
         self.control_panel.update_status("Помилка генерації")
         QMessageBox.critical(self, "Помилка", f"Помилка генерації:\n{error_msg}")
-
+ 
     @pyqtSlot()
     def on_db_cancelled(self):
         self.control_panel.set_db_generation_running(False)
         self.control_panel.update_status("Генерацію скасовано користувачем")
         self.control_panel.update_progress(0)
-
+ 
     # ── Відкриття проєкту ─────────────────────────────────────────────────────
-
+ 
     @pyqtSlot()
     def on_load_database(self):
         dialog = OpenProjectDialog(self._get_registry(), parent=self)
         if not dialog.exec():
             self.status_bar.showMessage("Вибір проєкту скасовано")
             return
-
+ 
         path = dialog.get_selected_path()
         if not path:
             return
-
+ 
         self._open_project(path)
-
+ 
     def _open_project(self, path: str):
         """Завантажити проєкт за шляхом (використовується і для recent menu)."""
         if not self.project_manager.load_project(path):
             QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
             return
-
-
-
+ 
+ 
+ 
         try:
             db_path = self.project_manager.database_path
-
+ 
             # НОВЕ: Перевірка наявності бази даних
             if not Path(db_path).exists():
                 video_path = self.project_manager.settings.video_path
@@ -3720,17 +3846,17 @@ class DatabaseMixin:
                 else:
                     self.status_bar.showMessage("Завантаження скасовано: відсутня база даних")
                     return
-
+ 
             if self.database:
                 self.database.close()
-
+ 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 self.database = DatabaseLoader(db_path)
             finally:
                 QApplication.restoreOverrideCursor()
             self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
-
+ 
             # Оновити реєстр (завжди викликаємо register для збереження нових проєктів)
             registry = self._get_registry()
             registry.register(
@@ -3740,18 +3866,18 @@ class DatabaseMixin:
                 if self.project_manager.settings
                 else "",
             )
-
+ 
             # Завантажити калібрацію якщо є
             calib_path = self.project_manager.calibration_path
             if calib_path and Path(calib_path).exists():
                 self.calibration.load(calib_path)
-
+ 
             # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
             if self.database and self.database.converter is not None:
                 self.calibration.converter = self.database.converter
             elif self.calibration.converter and self.calibration.converter._initialized:
                 pass  # конвертер вже завантажений з calibration.json
-
+ 
             if self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
@@ -3764,12 +3890,12 @@ class DatabaseMixin:
                 )
             self.control_panel.update_status("Проєкт завантажено")
             self._update_project_info_panel()
-
+ 
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу проєкту:\n{e}")
-
+ 
     # ── Перевірка пропагації ─────────────────────────────────────────────────
-
+ 
     @pyqtSlot()
     def on_verify_propagation(self):
         if not self.database or not self.database.is_propagated:
@@ -3777,25 +3903,25 @@ class DatabaseMixin:
                 self, "Увага", "Дані пропагації відсутні або проєкт не завантажено!"
             )
             return
-
+ 
         import numpy as np
-
+ 
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid
         frame_affine = self.database.frame_affine
-
+ 
         # Отримуємо розміри кадру з метаданих
         width = self.database.metadata.get("frame_width", 1920)
         height = self.database.metadata.get("frame_height", 1080)
-
+ 
         # Центр кадру в пікселях
         center_px = np.array([[width / 2, height / 2]], dtype=np.float32)
-
+ 
         points_to_show = []
-
+ 
         # Збираємо тільки валідні кадри (з кроком 5 для продуктивності на карті)
         step = max(1, num_frames // 200)  # Максимум ~200 точок щоб не гальмував біндер
-
+ 
         for i in range(0, num_frames, step):
             if frame_valid[i]:
                 # Приміняємо афінну матрицю (2x3)
@@ -3803,29 +3929,29 @@ class DatabaseMixin:
                 # Metric = M * [x, y, 1]^T
                 metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
                 metric_y = M[1, 0] * center_px[0, 0] + M[1, 1] * center_px[0, 1] + M[1, 2]
-
+ 
                 lat, lon = self.calibration.converter.metric_to_gps(
                     float(metric_x), float(metric_y)
                 )
                 points_to_show.append({"lat": float(lat), "lon": float(lon), "label": str(i)})
-
+ 
         if not points_to_show:
             QMessageBox.information(
                 self, "Інформація", "Не знайдено жодного кадру з валідними координатами."
             )
             return
-
+ 
         self.map_widget.show_verification_markers(points_to_show)
         self.status_bar.showMessage(f"Відображено {len(points_to_show)} точок перевірки на карті.")
-
+ 
     # ── Перегенерація бази ────────────────────────────────────────────────────
-
+ 
     @pyqtSlot()
     def on_rebuild_database(self):
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Увага", "Спочатку завантажте проєкт!")
             return
-
+ 
         video_path = self.project_manager.settings.video_path
         if not video_path or not Path(video_path).exists():
             QMessageBox.warning(
@@ -3835,7 +3961,7 @@ class DatabaseMixin:
                 "Перевірте шлях до відео у налаштуваннях проєкту.",
             )
             return
-
+ 
         reply = QMessageBox.question(
             self,
             "Перегенерація бази",
@@ -3847,18 +3973,18 @@ class DatabaseMixin:
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-
+ 
         # Зберігаємо калібрацію перед перегенерацією
         if self.calibration.is_calibrated:
             calib_path = self.project_manager.calibration_path
             if calib_path:
                 self.calibration.save(calib_path)
                 logger.info(f"Calibration saved before rebuild: {calib_path}")
-
+ 
         self._start_database_generation(video_path, self.project_manager.database_path)
-
+ 
     # ── Експорт результатів ───────────────────────────────────────────────────
-
+ 
     @pyqtSlot()
     def on_export_results(self):
         if not hasattr(self, "_tracking_results") or not self._tracking_results:
@@ -3866,7 +3992,7 @@ class DatabaseMixin:
                 self, "Увага", "Немає результатів для експорту!\n\nСпочатку виконайте відстеження."
             )
             return
-
+ 
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Експорт результатів",
@@ -3875,7 +4001,7 @@ class DatabaseMixin:
         )
         if not path:
             return
-
+ 
         try:
             if path.endswith(".csv") or "CSV" in selected_filter:
                 if not path.endswith(".csv"):
@@ -3894,34 +4020,34 @@ class DatabaseMixin:
                     else "Drone Track"
                 )
                 ResultExporter.export_kml(self._tracking_results, path, name=name)
-
+ 
             self.status_bar.showMessage(f"Результати експортовано: {path}")
             QMessageBox.information(
                 self, "Успіх", f"Експортовано {len(self._tracking_results)} точок\n\n{path}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Помилка експорту:\n{e}")
-
+ 
     # ── Інфо-панель ───────────────────────────────────────────────────────────
-
+ 
     def _update_project_info_panel(self):
         """Оновити інформаційну панель проєкту у control_panel."""
         if not self.project_manager.is_loaded:
             self.control_panel.update_project_info()
             return
-
+ 
         num_frames = self.database.get_num_frames() if self.database else None
         num_anchors = len(self.calibration.anchors) if self.calibration else None
         num_propagated = None
         db_size_mb = None
-
+ 
         if self.database and self.database.is_propagated:
             num_propagated = int(self.database.frame_valid.sum())
-
+ 
         db_path = self.project_manager.database_path
         if db_path and Path(db_path).exists():
             db_size_mb = Path(db_path).stat().st_size / (1024 * 1024)
-
+ 
         self.control_panel.update_project_info(
             project_name=self.project_manager.project_name,
             video_path=self.project_manager.settings.video_path
@@ -3932,7 +4058,6 @@ class DatabaseMixin:
             num_propagated=num_propagated,
             db_size_mb=db_size_mb,
         )
-
 
 # ================================================================================
 # File: gui\mixins\panorama_mixin.py
@@ -5432,6 +5557,17 @@ class Localizer:
 # ================================================================================
 # File: localization\matcher.py
 # ================================================================================
+"""
+matcher.py — ВИПРАВЛЕНА ВЕРСІЯ
+
+Ключові зміни:
+- ВИПРАВЛЕННЯ БАГ 4: значення за замовчуванням ratio_threshold знижено з 0.95 до 0.75.
+  Попереднє значення 0.95 пропускало колосальну кількість хибних збігів (false positives),
+  особливо на однорідних текстурах (поля, ліси, дахи будівель). Це призводило до
+  вироджених гомографій та мікрострибків координат між сусідніми кадрами.
+  Значення 0.75 відповідає рекомендаціям Lowe's ratio test для нормалізованих дескрипторів.
+"""
+
 import faiss
 import numpy as np
 import torch
@@ -5466,17 +5602,13 @@ class FastRetrieval:
         return vectors / (norms + 1e-8)
 
     def find_similar_frames(self, query_desc: np.ndarray, top_k: int = 5) -> list:
-        # Підготовка запиту
         q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
         q = q.astype(np.float32)
 
         if q.ndim == 1:
             q = q[None]
 
-        # Пошук у FAISS
         scores, ids = self.index.search(q, top_k)
-
-        # Повертаємо список (id, score)
         results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
 
@@ -5487,7 +5619,13 @@ class FeatureMatcher:
     def __init__(self, model_manager=None, config=None):
         self.config = config or {}
         self.model_manager = model_manager
-        self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.95)
+
+        # ВИПРАВЛЕННЯ БАГ 4: знижено з 0.95 до 0.75.
+        # Значення 0.95 допускало занадто багато хибних збігів на однорідних текстурах
+        # (поля, ліси, дахи), що призводило до вироджених гомографій у MAGSAC++/LMEDS
+        # та мікрострибків координат між сусідніми кадрами.
+        # 0.75 — стандартне значення Lowe's ratio test для нормалізованих L2-дескрипторів.
+        self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.75)
 
         # Завантажуємо LightGlue (ALIKED) через ModelManager
         self.lightglue = None
@@ -5499,6 +5637,8 @@ class FeatureMatcher:
                 logger.warning(f"Failed to load LightGlue ALIKED: {e}. Falling back to Numpy L2.")
         else:
             logger.info("FeatureMatcher configured to use fast Numpy L2 matching")
+
+        logger.info(f"FeatureMatcher ratio_threshold = {self.ratio_threshold:.2f}")
 
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         """
@@ -5517,7 +5657,7 @@ class FeatureMatcher:
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def _fast_numpy_match(
-        self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.80
+        self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.75
     ) -> tuple:
         """
         Highly optimized L2 matching using dot product and Mutual Nearest Neighbor (MNN).
@@ -5538,10 +5678,8 @@ class FeatureMatcher:
         sim = np.dot(desc_q_n, desc_r_n.T)
 
         # 3. Lowe's Ratio Test — argpartition O(n) замість argsort O(n log n)
-        # Потрібні лише top-2 для ratio test
         top2_idx = np.argpartition(-sim, kth=1, axis=1)[:, :2]
         top2_sim = np.take_along_axis(sim, top2_idx, axis=1)
-        # Сортуємо лише 2 елементи щоб best >= second_best
         order = np.argsort(-top2_sim, axis=1)
         top2_idx = np.take_along_axis(top2_idx, order, axis=1)
         top2_sim = np.take_along_axis(top2_sim, order, axis=1)
@@ -5576,7 +5714,6 @@ class FeatureMatcher:
 
             device = next(self.lightglue.parameters()).device
 
-            # Підготовка тензорів для LightGlue
             data = {
                 "image0": {
                     "keypoints": torch.from_numpy(query_features["keypoints"])
@@ -5615,7 +5752,6 @@ class FeatureMatcher:
         except Exception as e:
             logger.error(f"LightGlue match failed: {e}")
             return np.empty((0, 2)), np.empty((0, 2))
-
 
 # ================================================================================
 # File: localization\__init__.py
@@ -6819,12 +6955,17 @@ def get_logger(name: str | None = None) -> Any:
 calibration_propagation_worker.py — ВИПРАВЛЕНА ВЕРСІЯ
 
 Ключові зміни:
-1. Multi-anchor Gaussian blending: кожен кадр отримує зважений вплив ВІД УСІХ якорів,
+1. ВИПРАВЛЕННЯ БАГ 1: Видалено рядок pred_uw[3] = angles[2], який примусово
+   прирівнював кут передбаченої матриці до кута правого якоря. Через це delta[3]
+   завжди дорівнювала нулю і кутовий дрейф між GPS-якорями ніколи не коригувався.
+   Тепер pred_uw зберігає справжній передбачений кут від одометричного ланцюжка,
+   а його unwrap виконується коректно разом із лівим та правим якорями.
+2. Multi-anchor Gaussian blending: кожен кадр отримує зважений вплив ВІД УСІХ якорів,
    а не лише від лівого/правого сусіда. Чим далі — тим менший вплив (exp(-d²/2σ²)).
-2. Robust chain-building: якщо матч між frame[i] і frame[i-1] провалився,
+3. Robust chain-building: якщо матч між frame[i] і frame[i-1] провалився,
    пробуємо матч з останнім успішним кадром (gap-bridging). Після max_skip_frames
    ланцюжок переривається, але решта кадрів ВСЕ ОДНО отримають координати через blending.
-3. Fallback interpolation: кадри, яким не вдалося отримати гомографію через жоден ланцюжок,
+4. Fallback interpolation: кадри, яким не вдалося отримати гомографію через жоден ланцюжок,
    отримують інтерпольовану афінну матрицю між найближчими успішними кадрами.
 """
 
@@ -6843,6 +6984,34 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Утиліти декомпозиції/складання афінних матриць (імпортуються з multi_anchor_calibration,
+# але дублюються тут щоб уникнути циклічного імпорту у worker-потоці)
+# ---------------------------------------------------------------------------
+
+def _decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
+    """
+    Розкладає афінну матрицю 2x3 на компоненти: (tx, ty, scale, angle_rad).
+    Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання.
+    """
+    tx = float(M[0, 2])
+    ty = float(M[1, 2])
+    s_x = float(np.linalg.norm(M[:2, 0]))
+    s_y = float(np.linalg.norm(M[:2, 1]))
+    scale = (s_x + s_y) * 0.5
+    if scale < 1e-9:
+        scale = 1e-9
+    angle = float(np.arctan2(M[1, 0], M[0, 0]))
+    return tx, ty, scale, angle
+
+
+def _compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
+    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
+    c = np.cos(angle) * scale
+    s = np.sin(angle) * scale
+    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float32)
+
+
 class CalibrationPropagationWorker(QThread):
     """
     Хвильова пропагація на основі візуального матчингу.
@@ -6850,9 +7019,9 @@ class CalibrationPropagationWorker(QThread):
 
     Алгоритм:
       - Для кожного кадру будується гомографія до кожного якоря (через saved poses або візуальний ланцюжок).
-      - Фінальна афінна матриця обчислюється як зважена сума внесків від ВСІХ якорів
-        з вагами w_i = exp(-(distance_i / sigma)^2), де distance_i — відстань у кадрах до якоря i.
-      - Sigma = автоматично = половина середнього інтервалу між якорями.
+      - Фінальна афінна матриця обчислюється через сегментний розподіл похибки замикання
+        (loop closure error distribution) між парами сусідніх GPS-якорів.
+      - Кути дрейфу коригуються через справжню delta між передбаченим та реальним кутом правого якоря.
       - Кадри без жодної успішної гомографії отримують інтерполяцію між найближчими сусідами.
     """
 
@@ -6914,12 +7083,11 @@ class CalibrationPropagationWorker(QThread):
             return
 
         logger.info(
-            f"Starting multi-anchor Gaussian propagation for {num_frames} frames "
+            f"Starting multi-anchor loop-closure propagation for {num_frames} frames "
             f"using {len(anchors)} anchors"
         )
 
         # --- Sigma для Gaussian blending ---
-        # Береться як половина середнього інтервалу між якорями, але не менше 50 кадрів.
         if len(anchors) >= 2:
             intervals = [anchors[i + 1].frame_id - anchors[i].frame_id for i in range(len(anchors) - 1)]
             sigma = max(50.0, float(np.mean(intervals)) * 0.5)
@@ -6959,14 +7127,11 @@ class CalibrationPropagationWorker(QThread):
             frame_matches[anchor.frame_id] = getattr(anchor, "inliers_count", 0)
 
         # --- Будуємо гомографічні ланцюжки від кожного якоря до всіх кадрів ---
-        # Результат: anchor_id -> {frame_id: {"H": ndarray(3,3), "matches": int}}
         self.progress.emit(10, "Побудова гомографічних ланцюжків від якорів...")
-        anchor_chains = self._build_all_anchor_chains(
-            anchors, anchor_features, num_frames
-        )
+        anchor_chains = self._build_all_anchor_chains(anchors, anchor_features, num_frames)
 
-        # --- Multi-anchor Gaussian blending ---
-        self.progress.emit(50, "Multi-anchor Gaussian blending...")
+        # --- Loop-closure blending ---
+        self.progress.emit(50, "Loop-closure blending...")
         self._blend_all_frames(
             anchors=anchors,
             anchor_chains=anchor_chains,
@@ -6996,15 +7161,10 @@ class CalibrationPropagationWorker(QThread):
     # Побудова ланцюжків від кожного якоря
     # -------------------------------------------------------------------------
 
-    def _build_all_anchor_chains(
-        self, anchors, anchor_features, num_frames
-    ) -> dict:
+    def _build_all_anchor_chains(self, anchors, anchor_features, num_frames) -> dict:
         """
         Для кожного якоря будує гомографічний ланцюжок до всіх кадрів бази.
-        Повертає: {anchor_frame_id: {frame_id: {"H": ..., "matches": ...}}}
-
-        Щоб зменшити витрати: від кожного якоря поширюємось у обидва боки
-        тільки в межах 3*sigma (за межами вага буде < 0.01).
+        Повертає: {anchor_frame_id: {frame_id: {"H": ndarray(3,3), "matches": int}}}
         """
         max_workers = get_cfg(self.config, "models.performance.propagation_max_workers", 4)
         result = {}
@@ -7016,7 +7176,6 @@ class CalibrationPropagationWorker(QThread):
                 logger.warning(f"No features for anchor {anchor_id}, skipping chain")
                 return anchor_id, {}
 
-            # Поширюємось у обидва боки від якоря
             frames_left = list(range(anchor_id - 1, -1, -1))
             frames_right = list(range(anchor_id + 1, num_frames))
 
@@ -7047,18 +7206,12 @@ class CalibrationPropagationWorker(QThread):
         """
         Будує гомографічний ланцюжок від anchor_id до кожного кадру у списку `frames`.
 
-        Покращення порівняно зі старою версією:
         - Якщо матч з попереднім кадром провалився — намагаємось матчити з anchor напряму,
           або з останнім успішним кадром у межах max_skip_frames.
-        - Використовує saved frame_poses якщо доступні (O(1)).
         """
         result = {}
 
-        # --- Fallback: візуальний ланцюжок з gap-bridging ---
-        # h_cache: frame_id -> H (відносно anchor)
         h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
-        # Черга "мостів": список (frame_id, H, feat) відсортований за frame_id
-        # Зберігаємо кілька останніх успішних точок для gap-bridging
         successful = [(anchor_id, np.eye(3, dtype=np.float32), anchor_feat)]
 
         for frame_id in frames:
@@ -7071,7 +7224,6 @@ class CalibrationPropagationWorker(QThread):
             H_found = None
             n_matches = 0
 
-            # Пробуємо матч з кожним з останніх successful (від найближчого до найдальшого)
             for prev_id, H_prev_to_anchor, prev_feat in reversed(successful[-self.max_skip_frames:]):
                 res = self._match_pair_with_count(curr_feat, prev_feat)
                 if res is not None:
@@ -7085,14 +7237,13 @@ class CalibrationPropagationWorker(QThread):
             if H_found is not None:
                 result[frame_id] = {"H": H_found, "matches": n_matches}
                 successful.append((frame_id, H_found, curr_feat))
-                # Обмежуємо буфер
                 if len(successful) > self.max_skip_frames + 2:
                     successful.pop(0)
 
         return result
 
     # -------------------------------------------------------------------------
-    # Multi-anchor Gaussian blending
+    # Loop-closure blending між парами якорів
     # -------------------------------------------------------------------------
 
     def _blend_all_frames(
@@ -7108,77 +7259,202 @@ class CalibrationPropagationWorker(QThread):
         frame_matches,
     ):
         """
-        Для кожного не-якірного кадру обчислює зважену суму метричних точок від усіх якорів.
-        Ваги: w_i = exp(-(dist_to_anchor_i / sigma)^2)
+        Обчислює афінні матриці для кожного кадру з рівномірним розподілом
+        похибки замикання (loop closure error distribution) між парами якорів.
 
-        Це забезпечує "розлив" від кожного опорного кадру у всі сторони:
-        - Кадр поруч з якорем майже повністю визначається цим якорем.
-        - Кадр між двома якорями плавно переходить від одного до іншого.
-        - Кадр далеко від усіх якорів отримує слабкий але ненульовий внесок від усіх.
+        Алгоритм (сегментний loop closure):
+          1. Для кожного сегменту між сусідніми якорями [A_left .. A_right]:
+             a. Будуємо одометричний ланцюжок від A_left до кожного кадру сегменту.
+             b. На фінальному якорі (A_right) обчислюємо дельту похибки:
+                delta = affine_right_true − affine_predicted_by_chain_from_left.
+                ВАЖЛИВО: predicted_at_right зберігає СПРАВЖНІЙ передбачений кут
+                від одометрії (не перезаписується значенням правого якоря).
+             c. Розподіляємо delta лінійно вздовж сегменту (t=0 на A_left → t=1 на A_right).
+          2. Кадри за межами першого/останнього якоря отримують матрицю
+             з найближчого якоря без корекції (екстраполяція).
         """
         anchor_ids = [a.frame_id for a in anchors]
 
-        for frame_id in range(num_frames):
+        # ── Сегменти між парами сусідніх якорів ────────────────────────────────
+        for seg_idx in range(len(anchors) - 1):
+            a_left = anchors[seg_idx]
+            a_right = anchors[seg_idx + 1]
+            id_left = a_left.frame_id
+            id_right = a_right.frame_id
+
+            chain_left = anchor_chains.get(id_left, {})
+            chain_right = anchor_chains.get(id_right, {})
+
+            # Декомпозиція матриць якорів
+            comp_left = np.array(_decompose_affine(a_left.affine_matrix), dtype=np.float64)
+            comp_right = np.array(_decompose_affine(a_right.affine_matrix), dtype=np.float64)
+
+            # Обчислюємо "передбачену" матрицю на правому якорі через одометрію від лівого
+            predicted_at_right = None
+            info_right_from_left = chain_left.get(id_right)
+            if info_right_from_left is not None:
+                metric_pts = self._project_to_metric(info_right_from_left["H"], a_left)
+                if metric_pts is not None:
+                    M_pred, _ = cv2.estimateAffine2D(
+                        self.grid_points, metric_pts, method=cv2.LMEDS
+                    )
+                    if M_pred is not None:
+                        predicted_at_right = np.array(
+                            _decompose_affine(M_pred), dtype=np.float64
+                        )
+
+            seg_len = id_right - id_left
+
+            for frame_id in range(id_left + 1, id_right):
+                if not self._is_running:
+                    return
+                if frame_id in anchor_ids:
+                    continue
+
+                if frame_id % 200 == 0:
+                    self.progress.emit(
+                        50 + int(frame_id / num_frames * 33),
+                        f"Loop-closure blending кадр {frame_id}/{num_frames}...",
+                    )
+
+                t = (frame_id - id_left) / seg_len  # 0..1
+
+                # --- Одометрична оцінка від лівого якоря ---
+                info_l = chain_left.get(frame_id)
+                M_from_left = None
+                if info_l is not None:
+                    metric_pts = self._project_to_metric(info_l["H"], a_left)
+                    if metric_pts is not None:
+                        M_est, _ = cv2.estimateAffine2D(
+                            self.grid_points, metric_pts, method=cv2.LMEDS
+                        )
+                        if M_est is not None:
+                            M_from_left = M_est
+
+                # --- Одометрична оцінка від правого якоря ---
+                info_r = chain_right.get(frame_id)
+                M_from_right = None
+                if info_r is not None:
+                    metric_pts = self._project_to_metric(info_r["H"], a_right)
+                    if metric_pts is not None:
+                        M_est, _ = cv2.estimateAffine2D(
+                            self.grid_points, metric_pts, method=cv2.LMEDS
+                        )
+                        if M_est is not None:
+                            M_from_right = M_est
+
+                if M_from_left is None and M_from_right is None:
+                    continue
+
+                # --- Loop-closure корекція ---
+                if M_from_left is not None and predicted_at_right is not None:
+                    comp_est = np.array(_decompose_affine(M_from_left), dtype=np.float64)
+
+                    # Розгортаємо кути ТРЬОХ точок разом:
+                    # [лівий якір, поточна одометрія, правий якір]
+                    # Це забезпечує коректний unwrap для всіх трьох значень одночасно.
+                    angles = np.unwrap([comp_left[3], comp_est[3], comp_right[3]])
+                    comp_left_uw = comp_left.copy()
+                    comp_left_uw[3] = angles[0]
+                    comp_est_uw = comp_est.copy()
+                    comp_est_uw[3] = angles[1]
+                    comp_right_uw = comp_right.copy()
+                    comp_right_uw[3] = angles[2]
+
+                    # --- ВИПРАВЛЕННЯ БАГ 1 ---
+                    # Розгортаємо кут передбаченої матриці (predicted_at_right) разом із
+                    # лівим якорем, щоб отримати коректне unwrap-значення для pred_uw.
+                    # ВИДАЛЕНО: pred_uw[3] = angles[2]
+                    # Той рядок примусово прирівнював кут pred_uw до кута правого якоря,
+                    # через що delta[3] = comp_right_uw[3] - pred_uw[3] завжди = 0.
+                    angles_pred = np.unwrap([comp_left[3], predicted_at_right[3]])
+                    pred_uw = predicted_at_right.copy()
+                    pred_uw[3] = angles_pred[1]  # справжній передбачений кут від одометрії
+
+                    # Дельта похибки замикання: різниця між ІСТИННИМ правим якорем
+                    # та тим, що одометрія ПЕРЕДБАЧИЛА для цього місця
+                    delta = comp_right_uw - pred_uw
+
+                    # Розподіляємо delta лінійно: t=0 (лівий якір) → корекція=0, t=1 → корекція=delta
+                    comp_corrected = comp_est_uw + delta * t
+
+                    scale = float(np.clip(comp_corrected[2], 1e-6, 1e6))
+                    M_final = _compose_affine(
+                        float(comp_corrected[0]),
+                        float(comp_corrected[1]),
+                        scale,
+                        float(comp_corrected[3]),
+                    )
+                elif M_from_left is not None:
+                    # Немає loop closure: використовуємо лише одометрію від лівого якоря
+                    M_final = M_from_left.astype(np.float32)
+                else:
+                    # Лише одометрія від правого якоря (зворотна)
+                    M_final = M_from_right.astype(np.float32)
+
+                # --- Disagreement між двома якорями ---
+                if M_from_left is not None and M_from_right is not None:
+                    pts_l = GeometryTransforms.apply_affine(self.grid_points, M_from_left)
+                    pts_r = GeometryTransforms.apply_affine(self.grid_points, M_from_right)
+                    frame_disagreement[frame_id] = float(
+                        np.mean(np.linalg.norm(pts_l - pts_r, axis=1))
+                    )
+
+                frame_affine[frame_id] = M_final
+                frame_valid[frame_id] = True
+
+                # RMSE між фінальною матрицею та grid_points (внутрішня якість апроксимації)
+                proj = GeometryTransforms.apply_affine(self.grid_points, M_final)
+                ref_pts = self._project_to_metric(
+                    chain_left.get(frame_id, {}).get("H", np.eye(3)), a_left
+                )
+                if ref_pts is not None:
+                    rmse = float(np.sqrt(np.mean(np.linalg.norm(proj - ref_pts, axis=1) ** 2)))
+                    frame_rmse[frame_id] = rmse
+
+                n_l = chain_left.get(frame_id, {}).get("matches", 0)
+                n_r = chain_right.get(frame_id, {}).get("matches", 0)
+                frame_matches[frame_id] = (n_l + n_r) // max(1, int(n_l > 0) + int(n_r > 0))
+
+        # ── Кадри до першого якоря (екстраполяція ліворуч) ─────────────────────
+        first_anchor = anchors[0]
+        chain_first = anchor_chains.get(first_anchor.frame_id, {})
+        for frame_id in range(0, first_anchor.frame_id):
             if not self._is_running:
                 return
-            if frame_id % 200 == 0:
-                self.progress.emit(
-                    50 + int(frame_id / num_frames * 33),
-                    f"Blending кадр {frame_id}/{num_frames}...",
-                )
-
-            # Пропускаємо самі якорі — вони вже ініціалізовані
-            if frame_id in anchor_ids:
+            if frame_valid[frame_id]:
                 continue
-
-            weighted_pts_sum = None
-            weight_total = 0.0
-            total_matches = 0
-            all_projections = []  # для disagreement
-
-            for anchor in anchors:
-                anchor_id = anchor.frame_id
-                chain = anchor_chains.get(anchor_id, {})
-                info = chain.get(frame_id)
-                if info is None:
-                    continue
-
-                metric_pts = self._project_to_metric(info["H"], anchor)
-                if metric_pts is None:
-                    continue
-
-                dist = abs(frame_id - anchor_id)
-                # Gaussian weight: повний вплив поруч, затухає вдалині
-                w = np.exp(-(dist / sigma) ** 2)
-
-                if weighted_pts_sum is None:
-                    weighted_pts_sum = metric_pts * w
-                else:
-                    weighted_pts_sum += metric_pts * w
-                weight_total += w
-                total_matches += info["matches"]
-                all_projections.append(metric_pts)
-
-            if weighted_pts_sum is None or weight_total < 1e-9:
+            info = chain_first.get(frame_id)
+            if info is None:
                 continue
-
-            final_metric_pts = weighted_pts_sum / weight_total
-
-            # Disagreement: середнє відхилення між проекціями різних якорів
-            if len(all_projections) >= 2:
-                dists = []
-                for proj in all_projections:
-                    dists.append(np.mean(np.linalg.norm(proj - final_metric_pts, axis=1)))
-                frame_disagreement[frame_id] = float(np.mean(dists))
-
-            M, _ = cv2.estimateAffine2D(self.grid_points, final_metric_pts, method=cv2.LMEDS)
+            metric_pts = self._project_to_metric(info["H"], first_anchor)
+            if metric_pts is None:
+                continue
+            M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts, method=cv2.LMEDS)
             if M is not None:
                 frame_affine[frame_id] = M
                 frame_valid[frame_id] = True
-                proj = GeometryTransforms.apply_affine(self.grid_points, M)
-                rmse = np.sqrt(np.mean(np.linalg.norm(proj - final_metric_pts, axis=1) ** 2))
-                frame_rmse[frame_id] = rmse
-                frame_matches[frame_id] = total_matches // max(1, len(all_projections))
+                frame_matches[frame_id] = info["matches"]
+
+        # ── Кадри після останнього якоря (екстраполяція праворуч) ──────────────
+        last_anchor = anchors[-1]
+        chain_last = anchor_chains.get(last_anchor.frame_id, {})
+        for frame_id in range(last_anchor.frame_id + 1, num_frames):
+            if not self._is_running:
+                return
+            if frame_valid[frame_id]:
+                continue
+            info = chain_last.get(frame_id)
+            if info is None:
+                continue
+            metric_pts = self._project_to_metric(info["H"], last_anchor)
+            if metric_pts is None:
+                continue
+            M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts, method=cv2.LMEDS)
+            if M is not None:
+                frame_affine[frame_id] = M
+                frame_valid[frame_id] = True
+                frame_matches[frame_id] = info["matches"]
 
     # -------------------------------------------------------------------------
     # Заповнення прогалин через лінійну інтерполяцію афінних матриць
@@ -7187,9 +7463,10 @@ class CalibrationPropagationWorker(QThread):
     def _fill_gaps_by_interpolation(self, frame_affine, frame_valid):
         """
         Кадри, які не отримали координат через жодну гомографію,
-        заповнюються лінійною інтерполяцією між найближчими дійсними сусідами.
-        Це остання лінія захисту — гарантує що прогалин не залишиться
-        між двома дійсними кадрами.
+        заповнюються інтерполяцією між найближчими дійсними сусідами.
+
+        Використовується декомпозиція на (tx, ty, scale, angle) з подальшою лінійною
+        інтерполяцією кожного скалярного каналу і відновленням матриці.
         """
         num_frames = len(frame_valid)
         valid_ids = np.where(frame_valid)[0]
@@ -7202,13 +7479,24 @@ class CalibrationPropagationWorker(QThread):
             right = valid_ids[i + 1]
             gap = right - left
             if gap <= 1:
-                continue  # сусідні — нема що заповнювати
+                continue
+
+            comp_left = np.array(_decompose_affine(frame_affine[left]), dtype=np.float64)
+            comp_right = np.array(_decompose_affine(frame_affine[right]), dtype=np.float64)
+
+            angles = np.array([comp_left[3], comp_right[3]])
+            angles = np.unwrap(angles)
+            comp_left[3] = angles[0]
+            comp_right[3] = angles[1]
+
             for mid in range(left + 1, right):
                 if frame_valid[mid]:
                     continue
-                t = (mid - left) / gap  # 0..1
-                M_interp = frame_affine[left] * (1 - t) + frame_affine[right] * t
-                frame_affine[mid] = M_interp
+                t = (mid - left) / gap
+                comp_mid = comp_left * (1.0 - t) + comp_right * t
+                tx, ty, scale, angle = comp_mid
+                scale = float(np.clip(scale, 1e-6, 1e6))
+                frame_affine[mid] = _compose_affine(float(tx), float(ty), scale, float(angle))
                 frame_valid[mid] = True
                 filled += 1
 
@@ -7216,7 +7504,7 @@ class CalibrationPropagationWorker(QThread):
             logger.info(f"Gap interpolation filled {filled} additional frames")
 
     # -------------------------------------------------------------------------
-    # Допоміжні методи (без змін)
+    # Допоміжні методи
     # -------------------------------------------------------------------------
 
     def _match_pair_with_count(self, features_a: dict, features_b: dict) -> tuple | None:
@@ -7275,7 +7563,7 @@ class CalibrationPropagationWorker(QThread):
 
             logger.success(
                 f"Successful propagation saved to HDF5 "
-                f"(rev 2.2, {len(anchors)} anchors, Gaussian blending)"
+                f"(rev 2.2, {len(anchors)} anchors, loop-closure blending)"
             )
         finally:
             self.database._load_hot_data()

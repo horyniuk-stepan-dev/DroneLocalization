@@ -17,6 +17,42 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def _decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
+    """
+    Розкладає афінну матрицю 2x3 на компоненти:
+    (tx, ty, scale, angle_rad).
+
+    Для афінної матриці вигляду:
+        [s*cos(a)  -s*sin(a)  tx]
+        [s*sin(a)   s*cos(a)  ty]
+    scale = sqrt(det(R_part)), angle = atan2(M[1,0], M[0,0]).
+    При наявності шуму (незначний зсув / анізотропний масштаб)
+    беремо ізотропне наближення через норму першого стовпця.
+    """
+    tx = float(M[0, 2])
+    ty = float(M[1, 2])
+    # Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання
+    s_x = float(np.linalg.norm(M[:2, 0]))
+    s_y = float(np.linalg.norm(M[:2, 1]))
+    scale = (s_x + s_y) * 0.5
+    if scale < 1e-9:
+        scale = 1e-9
+    angle = float(np.arctan2(M[1, 0], M[0, 0]))
+    return tx, ty, scale, angle
+
+
+def _compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
+    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
+    c = np.cos(angle) * scale
+    s = np.sin(angle) * scale
+    return np.array([[c, -s, tx], [s,  c, ty]], dtype=np.float32)
+
+
+def _unwrap_angles(angles: np.ndarray) -> np.ndarray:
+    """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
+    return np.unwrap(angles)
+
+
 class AnchorCalibration:
     """
     Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та повними QA-метриками.
@@ -111,15 +147,44 @@ class MultiAnchorCalibration:
         self._interp: PchipInterpolator | None = None  # кешований інтерполятор
 
     def _rebuild_interpolators(self) -> None:
-        """Перебудовує PCHIP-інтерполятор. Викликати після кожної зміни anchors."""
+        """
+        Перебудовує PCHIP-інтерполятори на основі ДЕКОМПОЗИЦІЇ афінних матриць.
+
+        Замість поелементної інтерполяції raw-компонентів матриці (що порушує
+        жорсткість обертання і призводить до артефактів зсуву/shear), кожна
+        матриця розкладається на: (tx, ty, scale, angle).  Кути розгортаються
+        через np.unwrap для уникнення стрибків через ±π.  Для кожного з 4
+        скалярних каналів будується окремий PchipInterpolator.  При запиті
+        (_get_interpolated_matrix) компоненти відновлюються назад у валідну
+        афінну матрицю через _compose_affine.
+        """
         if len(self.anchors) < 2:
             self._interp = None
             return
 
         ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
-        matrices = np.stack([a.affine_matrix.ravel() for a in self.anchors])  # (N, 6)
-        # PchipInterpolator обробляє multi-column масиви нативно
-        self._interp = PchipInterpolator(ids, matrices, extrapolate=True)
+        decomposed = np.array(
+            [_decompose_affine(a.affine_matrix) for a in self.anchors],
+            dtype=np.float64,
+        )  # shape (N, 4): tx, ty, scale, angle
+
+        # Розгортаємо кути для коректної інтерполяції через межу ±π
+        decomposed[:, 3] = _unwrap_angles(decomposed[:, 3])
+
+        # Один багатоколонковий PCHIP-інтерполятор для всіх 4 каналів
+        self._interp = PchipInterpolator(ids, decomposed, extrapolate=True)
+
+    def _get_interpolated_matrix(self, frame_id: float) -> np.ndarray | None:
+        """Повертає інтерпольовану афінну матрицю 2x3 для заданого frame_id."""
+        if self._interp is None:
+            return None
+        components = self._interp(frame_id)  # (4,): tx, ty, scale, angle
+        if components is None or np.any(np.isnan(components)):
+            return None
+        tx, ty, scale, angle = components
+        # Захист від вироджених значень масштабу
+        scale = float(np.clip(scale, 1e-6, 1e6))
+        return _compose_affine(float(tx), float(ty), scale, float(angle))
 
     @property
     def is_calibrated(self) -> bool:
@@ -163,11 +228,10 @@ class MultiAnchorCalibration:
         if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
 
-        # PCHIP: інтерполяція/екстраполяція матриці → застосування до точки
+        # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
         if self._interp is not None:
-            flat = self._interp(float(frame_id))  # (6,) float64
-            if flat is not None and not np.any(np.isnan(flat)):
-                M = flat.reshape(2, 3).astype(np.float32)
+            M = self._get_interpolated_matrix(float(frame_id))
+            if M is not None:
                 pt = np.array([[x, y]], dtype=np.float32)
                 result = GeometryTransforms.apply_affine(pt, M)[0]
                 return float(result[0]), float(result[1])
