@@ -45,9 +45,26 @@ class Localizer:
         self.retrieval_top_k = get_cfg(self.config, "localization.retrieval_top_k", 8)
         self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
 
+        # Fix #1: Захист від нескінченного циклу при виході за межі покриття
+        self._consecutive_failures = 0
+        self._max_failures = get_cfg(self.config, "localization.max_consecutive_failures", 10)
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
+        # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
+        if self._consecutive_failures >= self._max_failures:
+            self._consecutive_failures = 0
+            logger.warning(
+                f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
+                f"Resetting counter. The drone may be outside the database coverage area."
+            )
+            return {
+                "success": False,
+                "error": "out_of_coverage",
+                "detail": f"Exceeded {self._max_failures} consecutive localization failures",
+            }
+
         height, width = query_frame.shape[:2]
 
         angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
@@ -79,6 +96,7 @@ class Localizer:
                     best_global_candidates = candidates
 
         if not best_global_candidates:
+            self._consecutive_failures += 1
             return {
                 "success": False,
                 "error": (
@@ -114,6 +132,7 @@ class Localizer:
 
         # 2. Локальний пошук (XFeat) ТІЛЬКИ для найкращого знайденого ракурсу
         for candidate_id, score in best_global_candidates:
+            logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = self.database.get_local_features(candidate_id)
 
             mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
@@ -179,6 +198,7 @@ class Localizer:
                 f"best_candidate={best_candidate_id}, candidates_tried={len(best_global_candidates)}, "
                 f"query_kpts={len(best_query_features.get('keypoints', []))}"
             )
+            self._consecutive_failures += 1
             return {
                 "success": False,
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
@@ -252,6 +272,9 @@ class Localizer:
                 f"Position jump was too large relative to recent trajectory."
             )
             return {"success": False, "error": "Outlier detected — position jump filtered"}
+
+        # Успішна локалізація — скидаємо лічильник невдач
+        self._consecutive_failures = 0
 
         # Оновлення Калмана (фільтрація шумів)
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)

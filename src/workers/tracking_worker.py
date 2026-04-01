@@ -36,6 +36,15 @@ class RealtimeTrackingWorker(QThread):
         self.process_fps = get_cfg(self.config, "tracking.process_fps", 1.0)
 
     def run(self):
+        # Fix #3: Скидаємо стан трекера при кожному новому старті сесії
+        if hasattr(self.localizer, 'trajectory_filter'):
+            self.localizer.trajectory_filter.reset()
+        if hasattr(self.localizer, 'outlier_detector'):
+            self.localizer.outlier_detector.window.clear()
+            self.localizer.outlier_detector._consecutive_outliers = 0
+        if hasattr(self.localizer, '_consecutive_failures'):
+            self.localizer._consecutive_failures = 0
+
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
 

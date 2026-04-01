@@ -64,3 +64,14 @@ class TrajectoryFilter:
         filtered_y = float(self.kf.x[1, 0])
 
         return filtered_x, filtered_y
+
+    def reset(self) -> None:
+        """
+        Скидає фільтр до початкового стану.
+        Викликати при кожному новому старті трекінгу, щоб уникнути
+        хибних передбачень на основі швидкості попередньої сесії.
+        """
+        self.is_initialized = False
+        self.kf.x = np.zeros((4, 1))
+        self.kf.P = np.eye(4) * 1000.0
+        logger.info("Kalman filter reset to initial state")

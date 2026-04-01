@@ -15,31 +15,12 @@ logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Утиліти декомпозиції/складання афінних матриць (імпортуються з multi_anchor_calibration,
-# але дублюються тут щоб уникнути циклічного імпорту у worker-потоці)
+# Утиліти декомпозиції/складання афінних матриць — єдине джерело: affine_utils
 # ---------------------------------------------------------------------------
-
-def _decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
-    """
-    Розкладає афінну матрицю 2x3 на компоненти: (tx, ty, scale, angle_rad).
-    Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання.
-    """
-    tx = float(M[0, 2])
-    ty = float(M[1, 2])
-    s_x = float(np.linalg.norm(M[:2, 0]))
-    s_y = float(np.linalg.norm(M[:2, 1]))
-    scale = (s_x + s_y) * 0.5
-    if scale < 1e-9:
-        scale = 1e-9
-    angle = float(np.arctan2(M[1, 0], M[0, 0]))
-    return tx, ty, scale, angle
-
-
-def _compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
-    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
-    c = np.cos(angle) * scale
-    s = np.sin(angle) * scale
-    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float32)
+from src.geometry.affine_utils import (
+    compose_affine as _compose_affine,
+    decompose_affine as _decompose_affine,
+)
 
 
 class CalibrationPropagationWorker(QThread):

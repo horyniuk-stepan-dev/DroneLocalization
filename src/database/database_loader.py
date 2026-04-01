@@ -250,6 +250,8 @@ class DatabaseLoader:
             else:
                 # v1 pre-allocated без груп
                 num = int(g["num_kp"][frame_id])
+                if num == 0:
+                    raise ValueError(f"Кадр {frame_id} не має keypoints (num_kp=0).")
                 res = {
                     "keypoints": g["keypoints"][frame_id, :num],
                     "descriptors": g["descriptors"][frame_id, :num].astype(np.float32),
