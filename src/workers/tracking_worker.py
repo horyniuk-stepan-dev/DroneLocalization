@@ -48,13 +48,23 @@ class RealtimeTrackingWorker(QThread):
                 yolo_wrapper = YOLOWrapper(yolo_model, self.model_manager.device)
                 logger.success("YOLO loaded for dynamic object masking in tracking loop")
             except Exception as e:
-                logger.error(f"Failed to load YOLO: {e}")
-                self.error.emit(f"YOLO load error: {e}")
+                logger.error(
+                    f"Failed to load YOLO for tracking: {e} | "
+                    f"device={self.model_manager.device}. "
+                    f"Dynamic object masking will be unavailable. "
+                    f"Tracking cannot proceed without YOLO.",
+                    exc_info=True,
+                )
+                self.error.emit(f"YOLO не вдалося завантажити: {e}")
                 return
 
         cap = cv2.VideoCapture(self.video_source)
         if not cap.isOpened():
-            self.error.emit(f"Failed to open video source: {self.video_source}")
+            logger.error(
+                f"Failed to open video source: {self.video_source}. "
+                f"Check that the file exists and is a valid video format (MP4/H.264 recommended)."
+            )
+            self.error.emit(f"Не вдалося відкрити відео: {self.video_source}")
             return
 
         # Визначаємо натуральну швидкість відео (зазвичай 30 FPS)
@@ -107,7 +117,14 @@ class RealtimeTrackingWorker(QThread):
                         frame_rgb, static_mask=static_mask, dt=calculated_dt
                     )
                 except Exception as e:
-                    logger.error(f"Localization exception: {e}", exc_info=True)
+                    logger.error(
+                        f"Localization exception on video frame: {e} | "
+                        f"video_time={current_video_time_sec:.2f}s, "
+                        f"frame_shape={frame_rgb.shape}, "
+                        f"has_mask={static_mask is not None}, "
+                        f"dt={calculated_dt:.3f}s",
+                        exc_info=True,
+                    )
                     loc_result = {"success": False, "error": str(e)}
 
                 if loc_result.get("success"):
@@ -170,7 +187,12 @@ class RealtimeTrackingWorker(QThread):
 
             logger.success("Fallback models pre-warmed successfully")
         except Exception as e:
-            logger.warning(f"Fallback pre-warm failed: {e}")
+            logger.warning(
+                f"Fallback model pre-warming failed: {e} | "
+                f"fallback_type={fallback}. "
+                f"Models will be loaded on first use (slower first localization).",
+                exc_info=True,
+            )
 
     def stop(self):
         logger.info("Stopping tracking worker...")

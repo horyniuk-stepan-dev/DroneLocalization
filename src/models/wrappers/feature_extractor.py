@@ -112,7 +112,12 @@ class FeatureExtractor:
                 keypoints = keypoints[valid]
                 descriptors = descriptors[valid]
             else:
-                logger.warning("All keypoints filtered out by YOLO mask!")
+                logger.warning(
+                    f"All keypoints filtered out by YOLO mask! "
+                    f"Image {image.shape[:2]}, total_kpts={len(aliked_out['keypoints'][0])}, "
+                    f"mask_static_ratio={np.mean(static_mask > 128):.1%}. "
+                    f"The entire image may be covered by dynamic objects (vehicles, people)."
+                )
 
         return {"keypoints": keypoints, "descriptors": descriptors, "coords_2d": keypoints.copy()}
 

@@ -75,7 +75,12 @@ class FeatureMatcher:
                 self.lightglue = self.model_manager.load_lightglue_aliked()
                 logger.info("FeatureMatcher configured to use LightGlue (ALIKED)")
             except Exception as e:
-                logger.warning(f"Failed to load LightGlue ALIKED: {e}. Falling back to Numpy L2.")
+                logger.warning(
+                    f"Failed to load LightGlue ALIKED: {e}. "
+                    f"Cause: model files may be missing or VRAM insufficient. "
+                    f"Falling back to Numpy L2 matching.",
+                    exc_info=True,
+                )
         else:
             logger.info("FeatureMatcher configured to use fast Numpy L2 matching")
 
@@ -94,6 +99,12 @@ class FeatureMatcher:
         if self.lightglue is not None and desc_dim == 128:
             return self._lightglue_match(query_features, ref_features)
 
+        if self.lightglue is not None and desc_dim != 128:
+            logger.debug(
+                f"LightGlue available but descriptor dim={desc_dim} != 128 (ALIKED). "
+                f"Using Numpy L2 matching instead."
+            )
+
         # Fallback (якщо немає LightGlue або інші ознаки)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
@@ -109,6 +120,10 @@ class FeatureMatcher:
         kpts_r = ref_features["keypoints"]
 
         if len(desc_q) < 2 or len(desc_r) < 2:
+            logger.debug(
+                f"Numpy L2 match aborted: insufficient descriptors | "
+                f"query={len(desc_q)}, ref={len(desc_r)} (minimum=2)"
+            )
             return np.empty((0, 2)), np.empty((0, 2))
 
         # 1. Нормалізація дескрипторів
@@ -150,7 +165,12 @@ class FeatureMatcher:
         """Matches features using Neural LightGlue Matcher"""
         try:
             if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
-                logger.warning("Empty keypoints array provided to LightGlue.")
+                logger.warning(
+                    f"Empty keypoints provided to LightGlue | "
+                    f"query_kpts={len(query_features['keypoints'])}, "
+                    f"ref_kpts={len(ref_features['keypoints'])}. "
+                    f"Cannot match without keypoints."
+                )
                 return np.empty((0, 2)), np.empty((0, 2))
 
             device = next(self.lightglue.parameters()).device
@@ -191,5 +211,13 @@ class FeatureMatcher:
             return mkpts_q, mkpts_r
 
         except Exception as e:
-            logger.error(f"LightGlue match failed: {e}")
+            logger.error(
+                f"LightGlue match failed: {e} | "
+                f"query_kpts={len(query_features.get('keypoints', []))}, "
+                f"query_desc_shape={query_features.get('descriptors', np.empty(0)).shape}, "
+                f"ref_kpts={len(ref_features.get('keypoints', []))}, "
+                f"ref_desc_shape={ref_features.get('descriptors', np.empty(0)).shape}. "
+                f"Possible causes: CUDA OOM, tensor shape mismatch, or model corruption.",
+                exc_info=True,
+            )
             return np.empty((0, 2)), np.empty((0, 2))

@@ -1,20 +1,3 @@
-"""
-calibration_propagation_worker.py — ВИПРАВЛЕНА ВЕРСІЯ
-
-Ключові зміни:
-1. ВИПРАВЛЕННЯ БАГ 1: Видалено рядок pred_uw[3] = angles[2], який примусово
-   прирівнював кут передбаченої матриці до кута правого якоря. Через це delta[3]
-   завжди дорівнювала нулю і кутовий дрейф між GPS-якорями ніколи не коригувався.
-   Тепер pred_uw зберігає справжній передбачений кут від одометричного ланцюжка,
-   а його unwrap виконується коректно разом із лівим та правим якорями.
-2. Multi-anchor Gaussian blending: кожен кадр отримує зважений вплив ВІД УСІХ якорів,
-   а не лише від лівого/правого сусіда. Чим далі — тим менший вплив (exp(-d²/2σ²)).
-3. Robust chain-building: якщо матч між frame[i] і frame[i-1] провалився,
-   пробуємо матч з останнім успішним кадром (gap-bridging). Після max_skip_frames
-   ланцюжок переривається, але решта кадрів ВСЕ ОДНО отримають координати через blending.
-4. Fallback interpolation: кадри, яким не вдалося отримати гомографію через жоден ланцюжок,
-   отримують інтерпольовану афінну матрицю між найближчими успішними кадрами.
-"""
 
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -107,7 +90,12 @@ class CalibrationPropagationWorker(QThread):
         try:
             self._propagate()
         except Exception as e:
-            logger.error(f"Propagation failed: {e}", exc_info=True)
+            logger.error(
+                f"Propagation failed: {e} | "
+                f"num_anchors={len(self.calibration.anchors)}, "
+                f"db_frames={self.database.get_num_frames()}",
+                exc_info=True,
+            )
             self.error.emit(str(e))
 
     # -------------------------------------------------------------------------
@@ -127,11 +115,16 @@ class CalibrationPropagationWorker(QThread):
 
         if not anchors:
             self.error.emit("Немає якорів калібрування")
+            logger.error(
+                "Propagation aborted: no valid anchors. "
+                "Add at least one GPS calibration anchor before running propagation."
+            )
             return
 
         logger.info(
             f"Starting multi-anchor loop-closure propagation for {num_frames} frames "
-            f"using {len(anchors)} anchors"
+            f"using {len(anchors)} anchors: "
+            f"{[f'#{a.frame_id}' for a in anchors]}"
         )
 
         # --- Sigma для Gaussian blending ---
@@ -220,7 +213,11 @@ class CalibrationPropagationWorker(QThread):
             anchor_id = anchor.frame_id
             feat = anchor_features.get(anchor_id)
             if feat is None:
-                logger.warning(f"No features for anchor {anchor_id}, skipping chain")
+                logger.warning(
+                    f"No features for anchor #{anchor_id} — skipping chain. "
+                    f"This anchor will not contribute to propagation. "
+                    f"Cause: frame may have zero keypoints in database."
+                )
                 return anchor_id, {}
 
             frames_left = list(range(anchor_id - 1, -1, -1))
@@ -569,6 +566,10 @@ class CalibrationPropagationWorker(QThread):
                 return None
             return H, inliers
         except Exception:
+            logger.debug(
+                f"Match failed between frame pair | features_a_kpts={len(features_a.get('keypoints', []))}, "
+                f"features_b_kpts={len(features_b.get('keypoints', []))}"
+            )
             return None
 
     def _project_to_metric(self, H_to_anchor, anchor):

@@ -90,8 +90,12 @@ class YOLOWrapper:
                         static_mask[combined_dynamic > 0.5] = 0
                     else:
                         logger.warning(
-                            f"YOLO OVER-MASKING DETECTED ({combined_area / total_pixels:.2%}). "
-                            "Frame preserved."
+                            f"YOLO OVER-MASKING: {combined_area / total_pixels:.1%} of frame masked "
+                            f"(threshold={MAX_COMBINED_MASK_RATIO:.0%}) | "
+                            f"frame_size={width}x{height}, "
+                            f"dynamic_objects={len(dynamic_mask_indices)}, "
+                            f"total_detections={len(classes)}. "
+                            f"Frame preserved to avoid losing all features."
                         )
 
             output.append((static_mask, detections))

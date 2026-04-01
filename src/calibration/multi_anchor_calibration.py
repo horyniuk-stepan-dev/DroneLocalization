@@ -160,6 +160,9 @@ class MultiAnchorCalibration:
         """
         if len(self.anchors) < 2:
             self._interp = None
+            logger.debug(
+                f"Interpolator not built: need ≥2 anchors, have {len(self.anchors)}"
+            )
             return
 
         ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)

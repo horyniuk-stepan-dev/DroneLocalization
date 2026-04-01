@@ -51,8 +51,12 @@ class ModelManager:
         req = required_mb if required_mb is not None else self.default_vram_required
 
         while self.get_available_vram_mb() < req and self.models:
+            available = self.get_available_vram_mb()
             least_used = min(self.model_usage.items(), key=lambda x: x[1])[0]
-            logger.warning(f"VRAM insufficient. Unloading least used model: {least_used}")
+            logger.warning(
+                f"VRAM insufficient: need {req:.0f} MB, have {available:.0f} MB. "
+                f"Unloading least-recently-used model: '{least_used}'"
+            )
             self.unload_model(least_used)
 
     def _register_model_usage(self, name: str):
@@ -74,7 +78,13 @@ class ModelManager:
                 self.models[name] = model
                 logger.success(f"YOLO model {model_path} loaded successfully on {self.device}")
             except Exception as e:
-                logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load YOLO model: {e} | "
+                    f"model_path={model_path}, device={self.device}, "
+                    f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                    f"Check that the model file exists and is not corrupted.",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]
@@ -98,7 +108,13 @@ class ModelManager:
                 self.models[name] = model
                 logger.success(f"XFeat loaded successfully on {self.device}")
             except Exception as e:
-                logger.error(f"Failed to load XFeat: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load XFeat: {e} | "
+                    f"repo={repo}, model={model_name}, device={self.device}, "
+                    f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                    f"Check internet connection for torch.hub download.",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]
@@ -123,7 +139,12 @@ class ModelManager:
                 self.models[name] = model
                 logger.success("SuperPoint model loaded successfully")
             except Exception as e:
-                logger.error(f"Failed to load SuperPoint model: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load SuperPoint: {e} | device={self.device}, "
+                    f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                    f"Check that 'lightglue' package is installed correctly.",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]
@@ -150,7 +171,12 @@ class ModelManager:
                 self.models[name] = model
                 logger.success("LightGlue model loaded successfully")
             except Exception as e:
-                logger.error(f"Failed to load LightGlue: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load LightGlue: {e} | device={self.device}, "
+                    f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                    f"Check that 'lightglue' package is installed and VRAM is sufficient.",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]
@@ -170,7 +196,13 @@ class ModelManager:
                 self.models[name] = model
                 logger.success(f"DINOv2 model {model_name} loaded successfully")
             except Exception as e:
-                logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load DINOv2: {e} | "
+                    f"repo={repo}, model={model_name}, device={self.device}, "
+                    f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                    f"Check internet connection for torch.hub download.",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]
@@ -191,7 +223,13 @@ class ModelManager:
                 self.models[name] = model
                 logger.success(f"ALIKED loaded successfully on {self.device}")
             except Exception as e:
-                logger.error(f"Failed to load ALIKED: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load ALIKED: {e} | "
+                    f"max_keypoints={max_keypoints}, device={self.device}, "
+                    f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                    f"Check that 'lightglue' package is installed correctly.",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]
@@ -223,7 +261,11 @@ class ModelManager:
                 self.models[name] = model
                 logger.success("LightGlue (ALIKED) loaded successfully")
             except Exception as e:
-                logger.error(f"Failed to load LightGlue (ALIKED): {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load LightGlue (ALIKED): {e} | device={self.device}, "
+                    f"available_vram={self.get_available_vram_mb():.0f} MB",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]
@@ -251,7 +293,12 @@ class ModelManager:
                 self.models[name] = cesp
                 logger.success("CESP module loaded")
             except Exception as e:
-                logger.error(f"Failed to load CESP: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to load CESP: {e} | "
+                    f"weights_path={weights_path}, device={self.device}. "
+                    f"Check that the weights file exists and is compatible.",
+                    exc_info=True,
+                )
                 raise
         self._register_model_usage(name)
         return self.models[name]

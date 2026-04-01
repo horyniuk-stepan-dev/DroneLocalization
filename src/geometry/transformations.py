@@ -95,7 +95,12 @@ class GeometryTransforms:
             return True
 
         except Exception as e:
-            logger.error(f"Error during matrix validation: {e}")
+            logger.error(
+                f"Error during matrix validation: {e} | "
+                f"matrix_shape={M.shape if M is not None else None}, "
+                f"is_homography={is_homography}",
+                exc_info=True,
+            )
             return False
 
     @staticmethod
@@ -111,6 +116,10 @@ class GeometryTransforms:
         Estimate Homography using MAGSAC++ with validation and optional fallback.
         """
         if len(src_pts) < 4:
+            logger.debug(
+                f"Cannot estimate homography: need ≥4 points, got {len(src_pts)}. "
+                f"Provide more feature matches."
+            )
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
@@ -129,10 +138,17 @@ class GeometryTransforms:
         # Validate Homography
         if not GeometryTransforms.is_matrix_valid(H, is_homography=True):
             if fallback_to_affine:
-                logger.warning("Homography invalid/degenerate, falling back to Partial Affine")
+                logger.warning(
+                    f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
+                    f"Falling back to Partial Affine (4 DoF)."
+                )
                 return GeometryTransforms.estimate_affine_partial(
                     src_pts, dst_pts, ransac_threshold
                 )
+            logger.warning(
+                f"Homography invalid/degenerate and no fallback enabled | "
+                f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
+            )
             return None, None
 
         return H, mask
@@ -149,6 +165,9 @@ class GeometryTransforms:
     def estimate_affine(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
         """Compute full Affine transformation (6 DoF) using MAGSAC++"""
         if len(src_pts) < 3:
+            logger.debug(
+                f"Cannot estimate affine: need ≥3 points, got {len(src_pts)}"
+            )
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
@@ -159,6 +178,10 @@ class GeometryTransforms:
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
+            logger.debug(
+                f"Affine estimation produced invalid matrix | "
+                f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
+            )
             return None, None
 
         return M, mask
@@ -168,7 +191,10 @@ class GeometryTransforms:
         src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0
     ):
         """Compute STRICT Affine transformation (4 DoF: R+T+S only) using MAGSAC++"""
-        if len(src_pts) < 2:  # Partial needs only 2 points minimum
+        if len(src_pts) < 2:
+            logger.debug(
+                f"Cannot estimate partial affine: need ≥2 points, got {len(src_pts)}"
+            )
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
@@ -179,6 +205,10 @@ class GeometryTransforms:
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
+            logger.debug(
+                f"Partial affine estimation produced invalid matrix | "
+                f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
+            )
             return None, None
 
         return M, mask

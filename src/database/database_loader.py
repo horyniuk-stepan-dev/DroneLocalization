@@ -32,43 +32,78 @@ class DatabaseLoader:
         self._size_cache: dict[int, tuple[int, int]] = {}
         self._feature_cache: dict[int, dict[str, np.ndarray]] = {}
 
-        logger.info(f"Initializing DatabaseLoader with path: {db_path}")
+        logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
 
     def _load_hot_data(self) -> None:
         """Load global descriptors (DINOv2), poses and propagation data into RAM"""
-        logger.info("Loading hot data into RAM...")
+        logger.info(f"Loading hot data into RAM from: {self.db_path}")
 
         try:
             self.db_file = h5py.File(self.db_path, "r")
+            logger.debug(f"HDF5 file opened | top-level groups: {list(self.db_file.keys())}")
+
+            if "global_descriptors" not in self.db_file:
+                raise KeyError(
+                    f"HDF5 file is missing 'global_descriptors' group. "
+                    f"Available groups: {list(self.db_file.keys())}. "
+                    f"The database file may be corrupted or was created with an incompatible version."
+                )
 
             self.global_descriptors = self.db_file["global_descriptors"]["descriptors"][:]
             self.frame_poses = self.db_file["global_descriptors"]["frame_poses"][:]
 
-            logger.info(f"Loaded global descriptors: shape {self.global_descriptors.shape}")
-            logger.info(f"Loaded frame poses: shape {self.frame_poses.shape}")
+            logger.info(
+                f"Loaded global descriptors: shape={self.global_descriptors.shape}, "
+                f"dtype={self.global_descriptors.dtype}, "
+                f"mem={self.global_descriptors.nbytes / 1024**2:.1f} MB"
+            )
+            logger.info(f"Loaded frame poses: shape={self.frame_poses.shape}")
 
             for key, value in self.db_file["metadata"].attrs.items():
                 self.metadata[key] = value
-                logger.debug(f"Metadata - {key}: {value}")
+                logger.debug(f"Metadata — {key}: {value}")
 
             if "actual_num_frames" in self.metadata:
                 actual_num = int(self.metadata["actual_num_frames"])
+                total_slots = len(self.global_descriptors)
+                logger.info(
+                    f"Database contains {actual_num} actual frames in {total_slots} pre-allocated slots"
+                )
                 # DO NOT SLICE with actual_num_frames! The arrays are sized to num_frames exactly,
                 # and are indexed by absolute visual frame_id!
-            
+
             if "frame_index_map" in self.db_file["metadata"]:
                 self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
+                logger.debug(f"Frame index map loaded: {len(self.frame_index_map)} entries")
             else:
                 self.frame_index_map = np.arange(len(self.global_descriptors))
+                logger.debug("No frame_index_map found — using sequential indices")
 
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
 
-            logger.success("Hot data loaded successfully into RAM")
+            logger.success(
+                f"Hot data loaded successfully | "
+                f"{len(self.global_descriptors)} frames, "
+                f"descriptor_dim={self.global_descriptors.shape[1]}, "
+                f"propagated={'yes' if self.is_propagated else 'no'}"
+            )
 
+        except KeyError as e:
+            logger.error(
+                f"Database structure error: {e} | path={self.db_path}. "
+                f"This usually means the HDF5 file is incomplete or was created with a different version."
+            )
+            raise
+        except OSError as e:
+            logger.error(
+                f"Cannot open database file: {e} | path={self.db_path}. "
+                f"Check that the file exists and is not locked by another process."
+            )
+            raise
         except Exception as e:
-            logger.error(f"Failed to load database: {e}")
+            logger.error(f"Unexpected error loading database: {e} | path={self.db_path}", exc_info=True)
             raise
 
     def _load_propagation_data(self) -> None:
@@ -87,7 +122,11 @@ class DatabaseLoader:
                     self.converter = CoordinateConverter.from_metadata(meta)
                     logger.success(f"Projection restored from HDF5: {meta['mode']}")
                 except Exception as e:
-                    logger.warning(f"Could not load projection metadata: {e}")
+                    logger.warning(
+                        f"Could not load projection metadata: {e}. "
+                        f"Raw value: {grp.attrs.get('projection_json', '<missing>')}. "
+                        f"Falling back to default projection."
+                    )
             elif "reference_gps" in grp.attrs:
                 # Fallback для v2.0 (UTM)
                 try:
@@ -95,7 +134,11 @@ class DatabaseLoader:
                     self.converter = CoordinateConverter("UTM", tuple(ref_gps))
                     logger.success(f"UTM auto-initialized from legacy reference GPS: {ref_gps}")
                 except Exception as e:
-                    logger.warning(f"Could not init UTM from legacy attr: {e}")
+                    logger.warning(
+                        f"Could not init UTM from legacy attribute: {e}. "
+                        f"Raw reference_gps value: {grp.attrs.get('reference_gps', '<missing>')}. "
+                        f"Defaulting to WEB_MERCATOR."
+                    )
             else:
                 # Fallback для v1.0 (WebMercator)
                 logger.info("No projection metadata found. Defaulting to WEB_MERCATOR fallback.")
@@ -120,7 +163,11 @@ class DatabaseLoader:
                 self.frame_affine = None
                 self.frame_valid = None
         except Exception as e:
-            logger.error(f"Failed to load propagation data: {e}")
+            logger.error(
+                f"Failed to load propagation data: {e} | db_path={self.db_path}. "
+                f"Calibration data may be corrupted — recalibration recommended.",
+                exc_info=True,
+            )
             self.frame_affine = None
             self.frame_valid = None
 
@@ -174,7 +221,10 @@ class DatabaseLoader:
             return self._feature_cache[frame_id]
 
         if self.db_file is None:
-            raise RuntimeError("Database not opened")
+            raise RuntimeError(
+                f"Cannot get features for frame {frame_id}: database file is not opened. "
+                f"Call _load_hot_data() first or check that db_path={self.db_path} exists."
+            )
 
         schema = self.metadata.get("hdf5_schema", "v1")
         g = self.db_file["local_features"]

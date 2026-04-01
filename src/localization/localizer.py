@@ -81,7 +81,11 @@ class Localizer:
         if not best_global_candidates:
             return {
                 "success": False,
-                "error": "No candidates found via global descriptor (DINOv2) in any rotation",
+                "error": (
+                    f"No candidates found via global descriptor (DINOv2) in any rotation. "
+                    f"Tested angles: {angles_to_try}. "
+                    f"Image {width}x{height} may not match any frame in the database."
+                ),
             }
 
         logger.info(
@@ -165,9 +169,16 @@ class Localizer:
             fallback_res = self._localize_by_reference_frame(target_id, best_global_score)
             if fallback_res:
                 logger.info(
-                    f"Feature matching failed ({best_inliers} inliers), using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})"
+                    f"Feature matching insufficient ({best_inliers} inliers < {self.min_matches} min), "
+                    f"using retrieval-only fallback | "
+                    f"frame={target_id}, global_score={best_global_score:.3f}"
                 )
                 return fallback_res
+            logger.warning(
+                f"Localization failed: {best_inliers} inliers < {self.min_matches} minimum | "
+                f"best_candidate={best_candidate_id}, candidates_tried={len(best_global_candidates)}, "
+                f"query_kpts={len(best_query_features.get('keypoints', []))}"
+            )
             return {
                 "success": False,
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
@@ -182,10 +193,18 @@ class Localizer:
             fallback_res = self._localize_by_reference_frame(target_id, best_global_score)
             if fallback_res:
                 logger.info(
-                    f"No propagated calibration for frame {target_id}, using retrieval-only fallback"
+                    f"No propagated calibration for frame {target_id} — "
+                    f"frame may not have been reached during calibration propagation. "
+                    f"Using retrieval-only fallback."
                 )
                 return fallback_res
-            return {"success": False, "error": "No propagated calibration"}
+            return {
+                "success": False,
+                "error": (
+                    f"No propagated calibration for matched frame {best_candidate_id}. "
+                    f"Run calibration propagation to enable localization for this area."
+                ),
+            }
 
         # 4. Рахуємо розміри ПОВЕРНУТОГО зображення
         if best_global_angle in [90, 270]:
@@ -227,9 +246,10 @@ class Localizer:
 
         # 6. Перевіряємо чи нова точка — аномалія (стрибок координат)
         if self.outlier_detector.is_outlier(metric_pt, dt):
-            # Ми все одно логуємо спробу, але кажемо, що це аутлаєр
             logger.warning(
-                f"Outlier filtered at frame {best_candidate_id}: jump from previous trajectory"
+                f"Outlier filtered | matched_frame={best_candidate_id}, "
+                f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
+                f"Position jump was too large relative to recent trajectory."
             )
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
@@ -262,7 +282,9 @@ class Localizer:
 
         if is_exploded and best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
             logger.warning(
-                "Homography exploded the FOV (perspective distortion)! Falling back to inliers bounding box."
+                f"Homography exploded the FOV (max_coord={max_coord:.0f}px > 50000px threshold). "
+                f"Cause: perspective distortion from locally-clustered ALIKED matches. "
+                f"Falling back to inliers bounding box for safe FOV estimation."
             )
             pts = best_mkpts_q_inliers
             min_x, min_y = np.min(pts, axis=0)
@@ -398,10 +420,18 @@ class Localizer:
 
         threshold = get_cfg(self.config, "localization.retrieval_only_min_score", 0.90)
         if score < threshold:
+            logger.debug(
+                f"Retrieval-only fallback rejected: score {score:.3f} < threshold {threshold:.3f} | "
+                f"frame={frame_id}"
+            )
             return None
 
         affine_ref = self.database.get_frame_affine(frame_id)
         if affine_ref is None:
+            logger.debug(
+                f"Retrieval-only fallback failed: no affine matrix for frame {frame_id}. "
+                f"Frame not reached during calibration propagation."
+            )
             return None
 
         ref_h, ref_w = self.database.get_frame_size(frame_id)

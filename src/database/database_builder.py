@@ -54,7 +54,10 @@ class DatabaseBuilder:
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.error(f"Failed to open video: {video_path}")
+            logger.error(
+                f"Failed to open video: {video_path}. "
+                f"Check that the file exists and uses a supported codec (H.264/H.265 recommended)."
+            )
             raise ValueError(f"Не вдалося відкрити відео: {video_path}")
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -180,7 +183,10 @@ class DatabaseBuilder:
         except Exception as e:
             import traceback
 
-            logger.warning(f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}")
+            logger.warning(
+                f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}"
+                f"Falling back to configured default: {self.descriptor_dim}"
+            )
             logger.warning(f"Using default dimension: {self.descriptor_dim}")
 
         # Create empty database structure
@@ -300,7 +306,12 @@ class DatabaseBuilder:
                 )
 
         except Exception as e:
-            logger.error(f"Error during database building: {e}")
+            logger.error(
+                f"Error during database building: {e} | "
+                f"video={video_path}, output={self.output_path}, "
+                f"processed_frames={db_index}",
+                exc_info=True,
+            )
             raise
         finally:
             prefetch_thread.join(timeout=5)

@@ -58,10 +58,15 @@ class DatabaseGenerationWorker(QThread):
                 self.completed.emit(self.output_path)
 
         except InterruptedError as e:
-            logger.warning(f"Database generation interrupted: {e}")
+            logger.warning(f"Database generation interrupted by user: {e} | video={self.video_path}")
             self.cancelled.emit()
         except Exception as e:
-            logger.error(f"Database generation failed: {e}", exc_info=True)
+            logger.error(
+                f"Database generation failed: {e} | "
+                f"video={self.video_path}, output={self.output_path}. "
+                f"Check that the video file is valid (MP4/H.264) and disk has sufficient space.",
+                exc_info=True,
+            )
             self.error.emit(f"Критична помилка: {str(e)}")
 
     def stop(self):
