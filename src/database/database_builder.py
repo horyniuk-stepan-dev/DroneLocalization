@@ -53,7 +53,10 @@ class DatabaseBuilder:
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.error(f"Failed to open video: {video_path}")
+            logger.error(
+                f"Failed to open video: {video_path}. "
+                f"Check that the file exists and uses a supported codec (H.264/H.265 recommended)."
+            )
             raise ValueError(f"Не вдалося відкрити відео: {video_path}")
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -174,7 +177,10 @@ class DatabaseBuilder:
         except Exception as e:
             import traceback
 
-            logger.warning(f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}")
+            logger.warning(
+                f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}"
+                f"Falling back to configured default: {self.descriptor_dim}"
+            )
             logger.warning(f"Using default dimension: {self.descriptor_dim}")
 
         # Create empty database structure
@@ -269,10 +275,15 @@ class DatabaseBuilder:
                 if p_idx == 0 or prev_features is None:
                     current_pose = np.eye(3, dtype=np.float64)
                     save_this_frame = True
+                    save_this_frame = True
                 else:
                     H_step = self._compute_inter_frame_H(prev_features, features)
                     if H_step is not None:
                         current_pose = current_pose @ H_step.astype(np.float64)
+                        if use_keyframe_selection:
+                            save_this_frame = self._is_significant_motion(H_step)
+                        else:
+                            save_this_frame = True
                     else:
                         logger.warning(
                             f"Frame {p_idx}: inter-frame match failed, reusing previous pose"
@@ -342,7 +353,12 @@ class DatabaseBuilder:
                     break
 
         except Exception as e:
-            logger.error(f"Error during database building: {e}")
+            logger.error(
+                f"Error during database building: {e} | "
+                f"video={video_path}, output={self.output_path}, "
+                f"processed_frames={saved_count}",
+                exc_info=True,
+            )
             raise
         finally:
             # Зберігаємо frame_index_map і actual_num_frames у metadata
@@ -371,6 +387,32 @@ class DatabaseBuilder:
             cap.release()
 
         logger.success(f"Database build completed successfully: {self.output_path}")
+
+    def _is_significant_motion(self, H: np.ndarray) -> bool:
+        """Повертає True якщо гомографія H відповідає значному руху."""
+        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
+        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
+
+        # Розміри беремо з конфігу — всі кадри нормалізуються до target_size перед обробкою
+        target_w = get_cfg(self.config, "preprocessing.target_width", 1920)
+        target_h = get_cfg(self.config, "preprocessing.target_height", 1080)
+        cx, cy = target_w / 2.0, target_h / 2.0
+        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
+        p_dst = H.astype(np.float64) @ p_src
+        if p_dst[2] != 0:
+            p_dst /= p_dst[2]
+        translation = float(np.linalg.norm(p_dst[:2] - np.array([cx, cy])))
+
+        if translation >= min_t:
+            return True
+
+        A = H[:2, :2].astype(np.float64)
+        det = np.linalg.det(A)
+        if abs(det) < 1e-6:
+            return True
+        angle_rad = np.arctan2(A[1, 0], A[0, 0])
+        angle_deg = abs(np.degrees(angle_rad))
+        return angle_deg >= min_r
 
     def _draw_keypoints_frame(
         self,

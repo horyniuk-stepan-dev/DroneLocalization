@@ -1,3 +1,21 @@
+"""
+calibration_mixin.py — ВИПРАВЛЕНА ВЕРСІЯ
+
+Ключові зміни:
+- ВИПРАВЛЕННЯ БАГ 2: Змінено логіку вибору трансформації у on_anchor_added.
+  Попередня версія: estimate_affine_partial (4-DoF) як пріоритет, estimate_affine (6-DoF)
+  лише при покращенні RMSE > 15%. Це призводило до вибору матриці з від'ємним детермінантом
+  (дзеркальне відображення pixel→UTM) лише у виняткових випадках.
+
+  Нова поведінка:
+  1. При UTM-проекції: завжди використовується estimate_affine (6-DoF) якщо точок >= 4,
+     оскільки перетворення pixel→UTM ЗАВЖДИ вимагає матрицю з від'ємним детермінантом
+     (вісь Y пікселів ↓, вісь Y UTM ↑). estimate_affine_partial фізично не здатна
+     це моделювати (детермінант завжди > 0).
+  2. При WEB_MERCATOR: попередня логіка збережена (partial як пріоритет, full як fallback).
+  3. Якщо точок < 4 або estimate_affine повернула None — fallback до partial.
+"""
+
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
@@ -22,7 +40,6 @@ class CalibrationMixin:
             QMessageBox.warning(self, "Помилка", "Спочатку завантажте або створіть базу даних!")
             return
 
-        # Тепер передаємо повні словники якорів для редагування
         anchors_data = [a.to_dict() for a in self.calibration.anchors]
 
         self._calib_dialog = CalibrationDialog(
@@ -31,11 +48,10 @@ class CalibrationMixin:
             parent=self,
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
-        self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)  # Новий сигнал
+        self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)
         self._calib_dialog.calibration_complete.connect(self.on_run_propagation)
         self._calib_dialog.exec()
 
-        # Очищуємо посилання після закриття діалогу
         self._calib_dialog = None
 
     @pyqtSlot(object)
@@ -51,7 +67,6 @@ class CalibrationMixin:
 
             # Налаштування проєкції, якщо вона ще не ініціалізована
             if not self.calibration.converter._initialized:
-                # Використовуємо налаштування з конфігу або за замовчуванням
                 mode = get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")
                 reference_gps = points_gps[0] if mode == "UTM" else None
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
@@ -61,12 +76,6 @@ class CalibrationMixin:
                 self.calibration.converter.gps_to_metric(lat, lon) for lat, lon in points_gps
             ]
             pts_metric_np = np.array(pts_metric, dtype=np.float32)
-
-            # 1. Спроба обчислити різні типи трансформацій
-            M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
-
-            best_M = M_partial
-            best_type = "affine_partial"  # 4-DoF (Scale, Rotate, Translate)
 
             def calc_metrics(M, src, dst):
                 proj = GeometryTransforms.apply_affine(src, M)
@@ -78,21 +87,81 @@ class CalibrationMixin:
                     proj.tolist(),
                 )
 
-            rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+            # ── ВИПРАВЛЕННЯ БАГ 2: логіка вибору трансформації ─────────────────
+            #
+            # Система координат pixel vs UTM:
+            #   - Піксельна: вісь Y спрямована ВНИЗ (0 = верх кадру)
+            #   - UTM:       вісь Y спрямована ВГОРУ (на північ)
+            # Тому правильна матриця pixel→UTM ЗАВЖДИ має від'ємний детермінант
+            # (вона містить дзеркальне відображення). estimate_affine_partial (4-DoF)
+            # генерує лише матриці вигляду [s*cos -s*sin; s*sin s*cos], детермінант = s² > 0.
+            # Вона фізично не може відобразити такий простір.
+            #
+            # Рішення: при UTM-проекції завжди пробуємо estimate_affine (6-DoF) першою.
+            # При WEB_MERCATOR зберігаємо стару логіку (partial як пріоритет).
 
-            # Якщо точок >= 5, пробуємо повний Affine (6 DoF)
-            if len(pts_2d_np) >= 5:
+            is_utm = (self.calibration.converter._mode == "UTM")
+
+            best_M = None
+            best_type = "unknown"
+            rmse_p = float("inf")
+            median_p = 0.0
+            max_p = 0.0
+            proj_p = []
+
+            if is_utm:
+                # UTM: пріоритет — повна афінна (6-DoF), яка підтримує від'ємний детермінант
                 M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
                 if M_full is not None:
-                    rmse_f, median_f, max_f, proj_f = calc_metrics(M_full, pts_2d_np, pts_metric_np)
-                    # Вибираємо повний Affine тільки якщо він дає суттєве покращення (>15%)
-                    if rmse_f < rmse_p * 0.85:
-                        best_M = M_full
-                        best_type = "affine_full"
-                        rmse_p, median_p, max_p, proj_p = rmse_f, median_f, max_f, proj_f
-                        logger.info(
-                            f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)"
+                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
+                    logger.info(f"Full affine determinant for anchor {frame_id}: {det:.6f}")
+                    if det > 0:
+                        # Від'ємний детермінант очікується; якщо позитивний — попередження
+                        logger.warning(
+                            f"Anchor {frame_id}: full affine determinant is POSITIVE ({det:.4f}). "
+                            "Pixel→UTM should have negative det (Y-axis flip). "
+                            "Check point ordering or projection setup."
                         )
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                    best_M = M_full
+                    best_type = "affine_full"
+                    logger.info(
+                        f"UTM mode: using full affine for anchor {frame_id} (RMSE: {rmse_p:.2f}m, det={det:.4f})"
+                    )
+
+                # Fallback до partial якщо full не вийшла (дуже мала к-сть точок або збій)
+                if best_M is None:
+                    logger.warning(
+                        f"Anchor {frame_id}: estimate_affine failed for UTM. "
+                        "Falling back to affine_partial — metric accuracy will be degraded."
+                    )
+                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                    if M_partial is not None:
+                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                        best_M = M_partial
+                        best_type = "affine_partial (UTM fallback)"
+
+            else:
+                # WEB_MERCATOR або інші проекції: стара логіка
+                M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                best_M = M_partial
+                best_type = "affine_partial"
+
+                if M_partial is not None:
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+
+                # Пробуємо повну афінну якщо точок >= 5
+                if len(pts_2d_np) >= 5:
+                    M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
+                    if M_full is not None:
+                        rmse_f, median_f, max_f, proj_f = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                        if rmse_f < rmse_p * 0.85:
+                            best_M = M_full
+                            best_type = "affine_full"
+                            rmse_p, median_p, max_p, proj_p = rmse_f, median_f, max_f, proj_f
+                            logger.info(
+                                f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)"
+                            )
 
             if best_M is None:
                 QMessageBox.critical(
@@ -102,11 +171,10 @@ class CalibrationMixin:
                 )
                 return
 
-            # 2. Перевірка порогів якості з конфігу
+            # ── Перевірка порогів якості ────────────────────────────────────────
             rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
             max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
 
-            # 3. QA Діалог підтвердження
             from datetime import datetime
 
             severity_color = "green"
@@ -137,7 +205,7 @@ class CalibrationMixin:
             else:
                 logger.success(f"Anchor {frame_id} QA passed: RMSE={rmse_p:.2f}m")
 
-            # 4. Збереження результатів
+            # ── Збереження результатів ──────────────────────────────────────────
             qa_data = {
                 "rmse_m": rmse_p,
                 "median_err_m": median_p,
@@ -156,7 +224,7 @@ class CalibrationMixin:
             if self.project_manager and self.project_manager.is_loaded:
                 self.calibration.save(self.project_manager.calibration_path)
 
-            # ДІАГНОСТИКА: Детальний лог точок (тепер на рівні INFO)
+            # ── Діагностичний лог по точках ──────────────────────────────────────
             logger.info(f"--- Anchor {frame_id} Point-by-Point Analysis ---")
             for j in range(len(pts_2d_np)):
                 p2d = pts_2d_np[j]
@@ -165,7 +233,6 @@ class CalibrationMixin:
                     trans = GeometryTransforms.apply_affine(p2d.reshape(1, 2), best_M)[0]
                     err = np.linalg.norm(trans - pm)
 
-                    # Перевіряємо зворотну конвертацію для візуалізації зсуву в градусах
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(
                         float(trans[0]), float(trans[1])
                     )
@@ -224,8 +291,6 @@ class CalibrationMixin:
             return
 
         try:
-            # ОНОВЛЕНО: Ініціалізуємо FeatureMatcher, він автоматично підлаштується
-            # під розмірність дескрипторів (64 для XFeat) та використає Numpy L2
             matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося ініціалізувати матчер:\n{e}")
@@ -276,7 +341,6 @@ class CalibrationMixin:
             self._propagation_dialog.close()
             self._propagation_dialog = None
 
-        # Обчислюємо статистику якості
         num_frames = self.database.get_num_frames()
         valid_mask = self.database.frame_valid
         valid_count = int(np.sum(valid_mask)) if valid_mask is not None else 0
@@ -339,7 +403,6 @@ class CalibrationMixin:
             num_frames = self.database.get_num_frames()
             step = max(1, num_frames // 30)
 
-            # Отримуємо дані один раз
             rmse_data = getattr(self.database, "frame_rmse", None)
             dis_data = getattr(self.database, "frame_disagreement", None)
             matches_data = getattr(self.database, "frame_matches", None)
@@ -353,7 +416,6 @@ class CalibrationMixin:
                     w = self.database.metadata.get("frame_width", 1920)
                     h = self.database.metadata.get("frame_height", 1080)
 
-                    # ДІАГНОСТИКА: лише для першого кадру
                     if not _diag_done:
                         _diag_done = True
                         logger.warning(f"=== VERIFY DIAG frame={i} ===")
@@ -373,14 +435,12 @@ class CalibrationMixin:
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
 
-                    # 1. Центр кадру
                     mx, my = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
-                    # 2. Низ центру (часто там дорога)
                     mx_b, my_b = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
@@ -399,24 +459,19 @@ class CalibrationMixin:
                         else 0
                     )
 
-                    # Лог для вибраного кадру (кожен 3-й з тих що показуємо)
                     if (i // step) % 3 == 0:
                         logger.debug(
                             f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | BOTTOM={lat_b:.6f},{lon_b:.6f} | RMSE={rmse:.2f}m"
                         )
 
-                    # Колір базується на комбінації факторів
                     color = "green"
                     if rmse > 5.0 or dis > 10.0:
                         color = "red"
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    # 3. Крайні точки (для візуалізації перекосу/масштабу)
-                    # МАЛЮЄМО НЕ ВЕСЬ КАДР (1920x1080 - це величезна площа на карті!),
-                    # а лише центральні 20% екрану, щоб прямокутник на карті не здавався гіпер-великим.
                     cx_px, cy_px = w / 2, h / 2
-                    dw, dh = w * 0.1, h * 0.1  # 10% в кожну сторону від центру
+                    dw, dh = w * 0.1, h * 0.1
                     pts_px = [
                         (cx_px - dw, cy_px - dh),
                         (cx_px + dw, cy_px - dh),
@@ -440,7 +495,6 @@ class CalibrationMixin:
                             }
                         )
 
-                    # Додаємо дві основні точки
                     points_to_show.append(
                         {
                             "lat": float(lat_c),

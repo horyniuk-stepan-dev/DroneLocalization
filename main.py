@@ -12,6 +12,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 
+import torch
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
@@ -43,6 +45,19 @@ def main() -> None:
     logger.info("=" * 70)
     logger.info("DRONE TOPOMETRIC LOCALIZATION SYSTEM STARTING")
     logger.info("=" * 70)
+
+    # System diagnostics for debugging
+    logger.info(f"Python: {sys.version}")
+    logger.info(f"PyTorch: {torch.__version__}")
+    try:
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            logger.info(f"CUDA: {torch.version.cuda} | GPU: {gpu_name} | VRAM: {vram_total:.1f} GB")
+        else:
+            logger.warning("CUDA not available — running on CPU. Performance will be significantly reduced.")
+    except Exception as e:
+        logger.warning(f"CUDA diagnostics failed: {e}. Continuing without GPU info.")
 
     try:
         QApplication.setHighDpiScaleFactorRoundingPolicy(

@@ -1,4 +1,5 @@
 import gc
+import threading
 import time
 from contextlib import contextmanager
 
@@ -23,6 +24,9 @@ class ModelManager:
         )
         self.models = {}
         self.model_usage = {}
+
+        # Fix #4: Захист від race condition при паралельному завантаженні моделей (prewarm + main thread)
+        self._model_lock = threading.Lock()
 
         # Конфігурація VRAM
         self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
@@ -51,8 +55,12 @@ class ModelManager:
         req = required_mb if required_mb is not None else self.default_vram_required
 
         while self.get_available_vram_mb() < req and self.models:
+            available = self.get_available_vram_mb()
             least_used = min(self.model_usage.items(), key=lambda x: x[1])[0]
-            logger.warning(f"VRAM insufficient. Unloading least used model: {least_used}")
+            logger.warning(
+                f"VRAM insufficient: need {req:.0f} MB, have {available:.0f} MB. "
+                f"Unloading least-recently-used model: '{least_used}'"
+            )
             self.unload_model(least_used)
 
     def _register_model_usage(self, name: str):
@@ -60,107 +68,134 @@ class ModelManager:
 
     def load_yolo(self):
         name = "yolo"
-        if name not in self.models:
-            model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11x-seg.pt")
-            vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
+        with self._model_lock:
+            if name not in self.models:
+                model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11x-seg.pt")
+                vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
 
-            logger.info(f"Loading YOLO model: {model_path}...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from ultralytics import YOLO
+                logger.info(f"Loading YOLO model: {model_path}...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from ultralytics import YOLO
 
-                model = YOLO(model_path)
-                model.to(self.device)
-                self.models[name] = model
-                logger.success(f"YOLO model {model_path} loaded successfully on {self.device}")
-            except Exception as e:
-                logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    model = YOLO(model_path)
+                    model.to(self.device)
+                    self.models[name] = model
+                    logger.success(f"YOLO model {model_path} loaded successfully on {self.device}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load YOLO model: {e} | "
+                        f"model_path={model_path}, device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that the model file exists and is not corrupted.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_xfeat(self):
         name = "xfeat"
-        if name not in self.models:
-            repo = get_cfg(self.config, "models.xfeat.hub_repo", "verlab/accelerated_features")
-            model_name = get_cfg(self.config, "models.xfeat.hub_model", "XFeat")
-            top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
-            vram_req = get_cfg(self.config, "models.xfeat.vram_required_mb", 300.0)
+        with self._model_lock:
+            if name not in self.models:
+                repo = get_cfg(self.config, "models.xfeat.hub_repo", "verlab/accelerated_features")
+                model_name = get_cfg(self.config, "models.xfeat.hub_model", "XFeat")
+                top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
+                vram_req = get_cfg(self.config, "models.xfeat.vram_required_mb", 300.0)
 
-            logger.info(f"Loading XFeat model ({repo}/{model_name})...")
-            self._ensure_vram_available(vram_req)
-            try:
-                model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
-                # FIX: XFeat hardcodes self.dev='cuda' if available, causing crashes if we move to CPU
-                if hasattr(model, "dev"):
-                    model.dev = torch.device(self.device)
-                model = model.eval().to(self.device)
-                self.models[name] = model
-                logger.success(f"XFeat loaded successfully on {self.device}")
-            except Exception as e:
-                logger.error(f"Failed to load XFeat: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                logger.info(f"Loading XFeat model ({repo}/{model_name})...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
+                    # FIX: XFeat hardcodes self.dev='cuda' if available, causing crashes if we move to CPU
+                    if hasattr(model, "dev"):
+                        model.dev = torch.device(self.device)
+                    model = model.eval().to(self.device)
+                    self.models[name] = model
+                    logger.success(f"XFeat loaded successfully on {self.device}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load XFeat: {e} | "
+                        f"repo={repo}, model={model_name}, device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check internet connection for torch.hub download.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_superpoint(self):
         name = "superpoint"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.superpoint.vram_required_mb", 500.0)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.superpoint.vram_required_mb", 500.0)
 
-            logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import SuperPoint
+                logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import SuperPoint
 
-                sp_config = {
-                    "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
-                    "max_num_keypoints": get_cfg(
-                        self.config, "models.superpoint.max_keypoints", 4096
-                    ),
-                }
-                model = SuperPoint(**sp_config).eval().to(self.device)
-                self.models[name] = model
-                logger.success("SuperPoint model loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load SuperPoint model: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    sp_config = {
+                        "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
+                        "max_num_keypoints": get_cfg(
+                            self.config, "models.superpoint.max_keypoints", 4096
+                        ),
+                    }
+                    model = SuperPoint(**sp_config).eval().to(self.device)
+                    self.models[name] = model
+                    logger.success("SuperPoint model loaded successfully")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load SuperPoint: {e} | device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that 'lightglue' package is installed correctly.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_lightglue(self):
         name = "lightglue"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
-            logger.info("Loading LightGlue model...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import LightGlue
+                logger.info("Loading LightGlue model...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import LightGlue
 
-                lg_config = {
-                    "depth_confidence": get_cfg(
-                        self.config, "models.lightglue.depth_confidence", -1
-                    ),
-                    "width_confidence": get_cfg(
-                        self.config, "models.lightglue.width_confidence", -1
-                    ),
-                }
-                model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
-                self.models[name] = model
-                logger.success("LightGlue model loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load LightGlue: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    lg_config = {
+                        "depth_confidence": get_cfg(
+                            self.config, "models.lightglue.depth_confidence", -1
+                        ),
+                        "width_confidence": get_cfg(
+                            self.config, "models.lightglue.width_confidence", -1
+                        ),
+                    }
+                    model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
+                    self.models[name] = model
+                    logger.success("LightGlue model loaded successfully")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load LightGlue: {e} | device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that 'lightglue' package is installed and VRAM is sufficient.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_dinov2(self):
         name = "dinov2"
-        if name not in self.models:
-            repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
-            model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
-            vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
+        with self._model_lock:
+            if name not in self.models:
+                repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
+                model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
+                vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
 
             logger.info(f"Loading DINOv2 ({model_name}) model...")
             self._ensure_vram_available(vram_req)
@@ -204,92 +239,111 @@ class ModelManager:
     def load_aliked(self):
         """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
         name = "aliked"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
-            max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
+                max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
 
-            logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import ALIKED
+                logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import ALIKED
 
-                model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
-                self.models[name] = model
-                logger.success(f"ALIKED loaded successfully on {self.device}")
-            except Exception as e:
-                logger.error(f"Failed to load ALIKED: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
+                    self.models[name] = model
+                    logger.success(f"ALIKED loaded successfully on {self.device}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load ALIKED: {e} | "
+                        f"max_keypoints={max_keypoints}, device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that 'lightglue' package is installed correctly.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_lightglue_aliked(self):
         """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
         name = "lightglue_aliked"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
-            logger.info("Loading LightGlue (ALIKED weights)...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import LightGlue
+                logger.info("Loading LightGlue (ALIKED weights)...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import LightGlue
 
-                model = (
-                    LightGlue(
-                        features="aliked",
-                        depth_confidence=get_cfg(
-                            self.config, "models.lightglue.depth_confidence", -1
-                        ),
-                        width_confidence=get_cfg(
-                            self.config, "models.lightglue.width_confidence", -1
-                        ),
+                    model = (
+                        LightGlue(
+                            features="aliked",
+                            depth_confidence=get_cfg(
+                                self.config, "models.lightglue.depth_confidence", -1
+                            ),
+                            width_confidence=get_cfg(
+                                self.config, "models.lightglue.width_confidence", -1
+                            ),
+                        )
+                        .eval()
+                        .to(self.device)
                     )
-                    .eval()
-                    .to(self.device)
-                )
-                self.models[name] = model
-                logger.success("LightGlue (ALIKED) loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load LightGlue (ALIKED): {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    self.models[name] = model
+                    logger.success("LightGlue (ALIKED) loaded successfully")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load LightGlue (ALIKED): {e} | device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_cesp(self):
         """Завантажує CESP модуль для покращення DINOv2 global descriptors"""
         name = "cesp"
-        if name not in self.models:
-            logger.info("Loading CESP module...")
-            try:
-                from src.models.wrappers.cesp_module import CESP
+        with self._model_lock:
+            if name not in self.models:
+                logger.info("Loading CESP module...")
+                try:
+                    from src.models.wrappers.cesp_module import CESP
 
-                scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
-                cesp = CESP(dim=1024, scales=tuple(scales))
+                    scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
+                    cesp = CESP(dim=1024, scales=tuple(scales))
 
-                # Завантаження pretrained ваг (якщо є)
-                weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
-                if weights_path:
-                    cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
-                    logger.success(f"CESP pretrained weights loaded from {weights_path}")
-                else:
-                    logger.warning("CESP initialized WITHOUT pretrained weights (random init)")
+                    # Завантаження pretrained ваг (якщо є)
+                    weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
+                    if weights_path:
+                        cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
+                        logger.success(f"CESP pretrained weights loaded from {weights_path}")
+                    else:
+                        logger.warning("CESP initialized WITHOUT pretrained weights (random init)")
 
-                cesp = cesp.eval().to(self.device)
-                self.models[name] = cesp
-                logger.success("CESP module loaded")
-            except Exception as e:
-                logger.error(f"Failed to load CESP: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    cesp = cesp.eval().to(self.device)
+                    self.models[name] = cesp
+                    logger.success("CESP module loaded")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load CESP: {e} | "
+                        f"weights_path={weights_path}, device={self.device}. "
+                        f"Check that the weights file exists and is compatible.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def unload_model(self, model_name: str):
-        if model_name in self.models:
-            logger.info(f"Unloading model: {model_name}")
-            del self.models[model_name]
-            del self.model_usage[model_name]
-            if self.device != "cpu":
-                torch.cuda.empty_cache()
-                gc.collect()
+        with self._model_lock:
+            if model_name in self.models:
+                logger.info(f"Unloading model: {model_name}")
+                del self.models[model_name]
+                del self.model_usage[model_name]
+                if self.device != "cpu":
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
     @contextmanager
     def inference_context(self):

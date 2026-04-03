@@ -2,6 +2,10 @@ import cv2
 import numpy as np
 import torch
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
 
 class YOLOWrapper:
     """Wrapper for YOLOv11 segmentation (compatible with YOLOv8 API)"""
@@ -19,6 +23,8 @@ class YOLOWrapper:
     @torch.no_grad()
     def detect_and_mask(self, image: np.ndarray) -> tuple:
         """
+        Detect objects and create static mask (single image).
+        Делегує до batch-методу для уникнення дублювання логіки.
         Detect objects and create static mask (single image).
         Делегує до batch-методу для уникнення дублювання логіки.
 
@@ -57,11 +63,23 @@ class YOLOWrapper:
                 boxes = result.boxes.data.cpu().numpy()
                 classes = result.boxes.cls.cpu().numpy().astype(int)
                 confidences = result.boxes.conf.cpu().numpy()
+            if result.masks is not None:
+                masks = result.masks.data.cpu().numpy()
+                boxes = result.boxes.data.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy().astype(int)
+                confidences = result.boxes.conf.cpu().numpy()
 
                 dynamic_mask_indices = [
                     i for i, cls in enumerate(classes) if cls in self.dynamic_classes
                 ]
+                dynamic_mask_indices = [
+                    i for i, cls in enumerate(classes) if cls in self.dynamic_classes
+                ]
 
+                for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
+                    detections.append(
+                        {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
+                    )
                 for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
                     detections.append(
                         {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}

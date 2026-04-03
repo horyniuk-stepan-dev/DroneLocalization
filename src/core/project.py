@@ -95,7 +95,12 @@ class ProjectManager:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to create project: {e}", exc_info=True)
+            logger.error(
+                f"Failed to create project: {e} | "
+                f"workspace_dir={workspace_dir}, mission_name={mission_data.get('mission_name', '?')}. "
+                f"Check disk permissions and available space.",
+                exc_info=True,
+            )
             self.project_dir = None
             self.settings = None
             return False
@@ -105,12 +110,19 @@ class ProjectManager:
         try:
             dir_path = Path(project_dir)
             if not dir_path.is_dir():
-                logger.error(f"Project directory does not exist: {project_dir}")
+                logger.error(
+                    f"Project directory does not exist: {project_dir}. "
+                    f"It may have been moved or deleted."
+                )
                 return False
 
             json_file = dir_path / "project.json"
             if not json_file.exists():
-                logger.error(f"Valid project not found. Missing project.json in: {project_dir}")
+                logger.error(
+                    f"Missing project.json in: {project_dir}. "
+                    f"This directory may not be a valid project or project.json was deleted. "
+                    f"Available files: {[f.name for f in dir_path.iterdir() if f.is_file()][:10]}"
+                )
                 return False
 
             with open(json_file, encoding="utf-8") as f:
@@ -123,7 +135,11 @@ class ProjectManager:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load project: {e}", exc_info=True)
+            logger.error(
+                f"Failed to load project: {e} | dir={project_dir}. "
+                f"The project.json file may be corrupted or have invalid format.",
+                exc_info=True,
+            )
             self.project_dir = None
             self.settings = None
             return False
@@ -139,5 +155,10 @@ class ProjectManager:
                 json.dump(asdict(self.settings), f, indent=4, ensure_ascii=False)
             return True
         except Exception as e:
-            logger.error(f"Failed to save project settings: {e}", exc_info=True)
+            logger.error(
+                f"Failed to save project settings: {e} | "
+                f"path={self.project_dir / 'project.json'}. "
+                f"Check disk permissions and available space.",
+                exc_info=True,
+            )
             return False

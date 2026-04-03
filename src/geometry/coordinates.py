@@ -53,11 +53,16 @@ class CoordinateConverter:
                 self._initialize_projection(lat, lon)
             else:
                 raise RuntimeError(
-                    "CoordinateConverter (UTM) must be initialized with reference_gps."
+                    f"CoordinateConverter (UTM) must be initialized with reference_gps "
+                    f"before converting ({lat}, {lon}). "
+                    f"Call __init__ with reference_gps parameter first."
                 )
 
         if self._transformer_to_metric is None:
-            raise RuntimeError("Transformer not initialized.")
+            raise RuntimeError(
+                f"GPS-to-metric transformer not initialized (mode={self._mode}). "
+                f"Cannot convert ({lat}, {lon}). This is a bug — _initialize_projection should have been called."
+            )
 
         x, y = self._transformer_to_metric.transform(lon, lat)
         return float(x), float(y)
@@ -70,7 +75,10 @@ class CoordinateConverter:
                 raise RuntimeError("CoordinateConverter is not initialized.")
 
         if self._transformer_to_gps is None:
-            raise RuntimeError("Transformer not initialized.")
+            raise RuntimeError(
+                f"Metric-to-GPS transformer not initialized (mode={self._mode}). "
+                f"Cannot convert ({x}, {y}). This is a bug — _initialize_projection should have been called."
+            )
 
         lon, lat = self._transformer_to_gps.transform(x, y)
         return float(lat), float(lon)

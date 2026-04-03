@@ -1,4 +1,6 @@
+
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import h5py
@@ -12,10 +14,26 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Утиліти декомпозиції/складання афінних матриць — єдине джерело: affine_utils
+# ---------------------------------------------------------------------------
+from src.geometry.affine_utils import (
+    compose_affine as _compose_affine,
+    decompose_affine as _decompose_affine,
+)
+
+
 class CalibrationPropagationWorker(QThread):
     """
     Хвильова пропагація на основі візуального матчингу.
     Генерує фінальну метричну афінну матрицю (2x3) для кожного кадру в базі.
+
+    Алгоритм:
+      - Для кожного кадру будується гомографія до кожного якоря (через saved poses або візуальний ланцюжок).
+      - Фінальна афінна матриця обчислюється через сегментний розподіл похибки замикання
+        (loop closure error distribution) між парами сусідніх GPS-якорів.
+      - Кути дрейфу коригуються через справжню delta між передбаченим та реальним кутом правого якоря.
+      - Кадри без жодної успішної гомографії отримують інтерполяцію між найближчими сусідами.
     """
 
     progress = pyqtSignal(int, str)
@@ -36,10 +54,13 @@ class CalibrationPropagationWorker(QThread):
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
 
+        # Скільки кадрів можна "перестрибнути" при побудові ланцюжка,
+        # якщо матч з безпосереднім сусідом провалився.
+        self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 5)
+
         # Базова сітка точок для точної апроксимації афінної матриці (4x4)
         grid_x = np.linspace(0, self.frame_w, 4)
         grid_y = np.linspace(0, self.frame_h, 4)
-
         gx, gy = np.meshgrid(grid_x, grid_y)
         self.grid_points = np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float32)
 
@@ -50,30 +71,58 @@ class CalibrationPropagationWorker(QThread):
         try:
             self._propagate()
         except Exception as e:
-            logger.error(f"Propagation failed: {e}", exc_info=True)
+            logger.error(
+                f"Propagation failed: {e} | "
+                f"num_anchors={len(self.calibration.anchors)}, "
+                f"db_frames={self.database.get_num_frames()}",
+                exc_info=True,
+            )
             self.error.emit(str(e))
+
+    # -------------------------------------------------------------------------
+    # Головний метод
+    # -------------------------------------------------------------------------
 
     def _propagate(self):
         num_frames = self.database.get_num_frames()
-        anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        anchors = [a for a in all_anchors if a.frame_id < num_frames]
+
+        if len(anchors) < len(all_anchors):
+            logger.warning(
+                f"Filtered {len(all_anchors) - len(anchors)} out-of-bounds anchors "
+                f"(DB has {num_frames} frames)."
+            )
 
         if not anchors:
             self.error.emit("Немає якорів калібрування")
+            logger.error(
+                "Propagation aborted: no valid anchors. "
+                "Add at least one GPS calibration anchor before running propagation."
+            )
             return
 
         logger.info(
-            f"Starting visual wave propagation for {num_frames} frames using {len(anchors)} anchors"
+            f"Starting multi-anchor loop-closure propagation for {num_frames} frames "
+            f"using {len(anchors)} anchors: "
+            f"{[f'#{a.frame_id}' for a in anchors]}"
         )
+
+        # --- Sigma для Gaussian blending ---
+        if len(anchors) >= 2:
+            intervals = [anchors[i + 1].frame_id - anchors[i].frame_id for i in range(len(anchors) - 1)]
+            sigma = max(50.0, float(np.mean(intervals)) * 0.5)
+        else:
+            sigma = max(50.0, num_frames * 0.2)
+        logger.info(f"Gaussian sigma = {sigma:.1f} frames")
 
         frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float32)
         frame_valid = np.zeros(num_frames, dtype=bool)
-
-        # QA metrics
         frame_rmse = np.zeros(num_frames, dtype=np.float32)
         frame_disagreement = np.zeros(num_frames, dtype=np.float32)
         frame_matches = np.zeros(num_frames, dtype=np.int32)
 
-        # Оптимізація A: Batch prefetch всіх фіч у RAM
+        # --- Prefetch фіч ---
         self.progress.emit(0, "Передзавантаження фіч у RAM...")
         self._all_features = {}
         for i in range(num_frames):
@@ -87,70 +136,38 @@ class CalibrationPropagationWorker(QThread):
                 self.progress.emit(int(i / num_frames * 10), f"Prefetch: {i}/{num_frames}")
         logger.info(f"Prefetched features for {len(self._all_features)} frames")
 
+        # --- Ініціалізація якорів ---
         anchor_features = {}
         for anchor in anchors:
-            try:
-                anchor_features[anchor.frame_id] = self._all_features[anchor.frame_id]
-                frame_affine[anchor.frame_id] = anchor.affine_matrix
-                frame_valid[anchor.frame_id] = True
-                frame_rmse[anchor.frame_id] = getattr(anchor, "rmse_m", 0.0)
-                frame_matches[anchor.frame_id] = getattr(anchor, "inliers_count", 0)
-            except Exception as e:
-                self.error.emit(f"Не вдалося завантажити якір {anchor.frame_id}: {e}")
-                return
+            feat = self._all_features.get(anchor.frame_id)
+            if feat is not None:
+                anchor_features[anchor.frame_id] = feat
+            frame_affine[anchor.frame_id] = anchor.affine_matrix
+            frame_valid[anchor.frame_id] = True
+            frame_rmse[anchor.frame_id] = getattr(anchor, "rmse_m", 0.0)
+            frame_matches[anchor.frame_id] = getattr(anchor, "inliers_count", 0)
 
-        segments = self._build_segments(anchors, num_frames)
-        total_segments = len(segments)
+        # --- Будуємо гомографічні ланцюжки від кожного якоря до всіх кадрів ---
+        self.progress.emit(10, "Побудова гомографічних ланцюжків від якорів...")
+        anchor_chains = self._build_all_anchor_chains(anchors, anchor_features, num_frames)
 
-        # Fix 7: Паралельна propagation по незалежних сегментах
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # --- Loop-closure blending ---
+        self.progress.emit(50, "Loop-closure blending...")
+        self._blend_all_frames(
+            anchors=anchors,
+            anchor_chains=anchor_chains,
+            num_frames=num_frames,
+            sigma=sigma,
+            frame_affine=frame_affine,
+            frame_valid=frame_valid,
+            frame_rmse=frame_rmse,
+            frame_disagreement=frame_disagreement,
+            frame_matches=frame_matches,
+        )
 
-        between_segments = [s for s in segments if s["type"] == "between"]
-        tail_segments = [s for s in segments if s["type"] == "tail"]
-
-        logger.info(f"Parallel processing of {len(between_segments)} segments...")
-        max_workers = get_cfg(self.config, "models.performance.propagation_max_workers", 4)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    self._process_segment,
-                    seg,
-                    anchor_features,
-                    frame_affine,
-                    frame_valid,
-                    frame_rmse,
-                    frame_disagreement,
-                    frame_matches,
-                    i,
-                    total_segments,
-                    num_frames,
-                ): seg
-                for i, seg in enumerate(between_segments)
-            }
-            for future in as_completed(futures):
-                if not self._is_running:
-                    break
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Segment processing failed: {e}")
-
-        # Хвости зазвичай дешевші і можуть бути послідовними або теж паралельними
-        for i, seg in enumerate(tail_segments):
-            if not self._is_running:
-                break
-            self._process_segment(
-                seg,
-                anchor_features,
-                frame_affine,
-                frame_valid,
-                frame_rmse,
-                frame_disagreement,
-                frame_matches,
-                len(between_segments) + i,
-                total_segments,
-                num_frames,
-            )
+        # --- Fallback: заповнення кадрів без координат через інтерполяцію ---
+        self.progress.emit(85, "Заповнення прогалин через інтерполяцію...")
+        self._fill_gaps_by_interpolation(frame_affine, frame_valid)
 
         valid_count = int(np.sum(frame_valid))
         self.progress.emit(90, "Збереження результатів у HDF5...")
@@ -161,262 +178,359 @@ class CalibrationPropagationWorker(QThread):
         self.progress.emit(100, f"Готово! {valid_count}/{num_frames} кадрів отримали координати.")
         self.completed.emit()
 
-    def _build_segments(self, anchors: list, num_frames: int) -> list:
-        segments = []
-        if anchors[0].frame_id > 0:
-            segments.append(
-                {
-                    "type": "tail",
-                    "frames": list(range(anchors[0].frame_id - 1, -1, -1)),
-                    "anchor": anchors[0],
-                }
-            )
+    # -------------------------------------------------------------------------
+    # Побудова ланцюжків від кожного якоря
+    # -------------------------------------------------------------------------
 
-        for i in range(len(anchors) - 1):
-            left_anchor = anchors[i]
-            right_anchor = anchors[i + 1]
-            segments.append(
-                {
-                    "type": "between",
-                    "left_anchor": left_anchor,
-                    "right_anchor": right_anchor,
-                    "frames": list(range(left_anchor.frame_id + 1, right_anchor.frame_id)),
-                }
-            )
+    def _build_all_anchor_chains(self, anchors, anchor_features, num_frames) -> dict:
+        """
+        Для кожного якоря будує гомографічний ланцюжок до всіх кадрів бази.
+        Повертає: {anchor_frame_id: {frame_id: {"H": ndarray(3,3), "matches": int}}}
+        """
+        max_workers = get_cfg(self.config, "models.performance.propagation_max_workers", 4)
+        result = {}
 
-        if anchors[-1].frame_id < num_frames - 1:
-            segments.append(
-                {
-                    "type": "tail",
-                    "frames": list(range(anchors[-1].frame_id + 1, num_frames)),
-                    "anchor": anchors[-1],
-                }
-            )
+        def build_for_anchor(anchor):
+            anchor_id = anchor.frame_id
+            feat = anchor_features.get(anchor_id)
+            if feat is None:
+                logger.warning(
+                    f"No features for anchor #{anchor_id} — skipping chain. "
+                    f"This anchor will not contribute to propagation. "
+                    f"Cause: frame may have zero keypoints in database."
+                )
+                return anchor_id, {}
 
-        # Валідація: сегменти НЕ повинні перетинатися — це гарантує
-        # thread-safety при паралельному записі в numpy-масиви через ThreadPoolExecutor
-        all_frame_ids = set()
-        for seg in segments:
-            seg_frames = set(seg["frames"])
-            overlap = all_frame_ids & seg_frames
-            assert not overlap, (
-                f"CRITICAL: Segment overlap detected on frames {overlap}! "
-                f"This would cause race conditions in ThreadPoolExecutor."
-            )
-            all_frame_ids |= seg_frames
+            frames_left = list(range(anchor_id - 1, -1, -1))
+            frames_right = list(range(anchor_id + 1, num_frames))
 
-        return segments
+            chain_left = self._build_robust_chain(frames_left, anchor_id, feat)
+            chain_right = self._build_robust_chain(frames_right, anchor_id, feat)
 
-    def _process_segment(
+            chain = {anchor_id: {"H": np.eye(3, dtype=np.float32), "matches": 100}}
+            chain.update(chain_left)
+            chain.update(chain_right)
+            return anchor_id, chain
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(build_for_anchor, a): a for a in anchors}
+            total = len(futures)
+            for done_count, future in enumerate(as_completed(futures)):
+                if not self._is_running:
+                    break
+                anchor_id, chain = future.result()
+                result[anchor_id] = chain
+                self.progress.emit(
+                    10 + int(done_count / total * 35),
+                    f"Ланцюжок від якоря {anchor_id}: {len(chain)} кадрів",
+                )
+
+        return result
+
+    def _build_robust_chain(self, frames, anchor_id, anchor_feat) -> dict:
+        """
+        Будує гомографічний ланцюжок від anchor_id до кожного кадру у списку `frames`.
+
+        - Якщо матч з попереднім кадром провалився — намагаємось матчити з anchor напряму,
+          або з останнім успішним кадром у межах max_skip_frames.
+        """
+        result = {}
+
+        h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
+        successful = [(anchor_id, np.eye(3, dtype=np.float32), anchor_feat)]
+
+        for frame_id in frames:
+            if not self._is_running:
+                break
+            curr_feat = self._all_features.get(frame_id)
+            if curr_feat is None:
+                continue
+
+            H_found = None
+            n_matches = 0
+
+            for prev_id, H_prev_to_anchor, prev_feat in reversed(successful[-self.max_skip_frames:]):
+                res = self._match_pair_with_count(curr_feat, prev_feat)
+                if res is not None:
+                    H_curr_to_prev, n = res
+                    H_found = (
+                        H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)
+                    ).astype(np.float32)
+                    n_matches = n
+                    break
+
+            if H_found is not None:
+                result[frame_id] = {"H": H_found, "matches": n_matches}
+                successful.append((frame_id, H_found, curr_feat))
+                if len(successful) > self.max_skip_frames + 2:
+                    successful.pop(0)
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # Loop-closure blending між парами якорів
+    # -------------------------------------------------------------------------
+
+    def _blend_all_frames(
         self,
-        segment,
-        anchor_features,
+        anchors,
+        anchor_chains,
+        num_frames,
+        sigma,
         frame_affine,
         frame_valid,
         frame_rmse,
         frame_disagreement,
         frame_matches,
-        seg_idx,
-        total_segments,
-        num_frames,
     ):
-        if segment["type"] == "tail":
-            anchor = segment["anchor"]
-            frames = segment["frames"]
-            self._wave_from_anchor(
-                frames=frames,
-                anchor=anchor,
-                anchor_feat=anchor_features[anchor.frame_id],
-                frame_affine=frame_affine,
-                frame_valid=frame_valid,
-                frame_rmse=frame_rmse,
-                frame_matches=frame_matches,
-                seg_idx=seg_idx,
-                total_segments=total_segments,
-                num_frames=num_frames,
-            )
-        elif segment["type"] == "between":
-            left_anchor = segment["left_anchor"]
-            right_anchor = segment["right_anchor"]
-            frames = segment["frames"]
+        """
+        Обчислює афінні матриці для кожного кадру з рівномірним розподілом
+        похибки замикання (loop closure error distribution) між парами якорів.
 
-            h_left_res = self._build_homography_chain(
-                frames, left_anchor, anchor_features[left_anchor.frame_id]
-            )
-            frames_reversed = list(reversed(frames))
-            h_right_res = self._build_homography_chain(
-                frames_reversed, right_anchor, anchor_features[right_anchor.frame_id]
-            )
+        Алгоритм (сегментний loop closure):
+          1. Для кожного сегменту між сусідніми якорями [A_left .. A_right]:
+             a. Будуємо одометричний ланцюжок від A_left до кожного кадру сегменту.
+             b. На фінальному якорі (A_right) обчислюємо дельту похибки:
+                delta = affine_right_true − affine_predicted_by_chain_from_left.
+                ВАЖЛИВО: predicted_at_right зберігає СПРАВЖНІЙ передбачений кут
+                від одометрії (не перезаписується значенням правого якоря).
+             c. Розподіляємо delta лінійно вздовж сегменту (t=0 на A_left → t=1 на A_right).
+          2. Кадри за межами першого/останнього якоря отримують матрицю
+             з найближчого якоря без корекції (екстраполяція).
+        """
+        anchor_ids = [a.frame_id for a in anchors]
 
-            total_frames_in_seg = len(frames)
-            for local_idx, frame_id in enumerate(frames):
+        # ── Сегменти між парами сусідніх якорів ────────────────────────────────
+        for seg_idx in range(len(anchors) - 1):
+            a_left = anchors[seg_idx]
+            a_right = anchors[seg_idx + 1]
+            id_left = a_left.frame_id
+            id_right = a_right.frame_id
+
+            chain_left = anchor_chains.get(id_left, {})
+            chain_right = anchor_chains.get(id_right, {})
+
+            # Декомпозиція матриць якорів
+            comp_left = np.array(_decompose_affine(a_left.affine_matrix), dtype=np.float64)
+            comp_right = np.array(_decompose_affine(a_right.affine_matrix), dtype=np.float64)
+
+            # Обчислюємо "передбачену" матрицю на правому якорі через одометрію від лівого
+            predicted_at_right = None
+            info_right_from_left = chain_left.get(id_right)
+            if info_right_from_left is not None:
+                metric_pts = self._project_to_metric(info_right_from_left["H"], a_left)
+                if metric_pts is not None:
+                    M_pred, _ = cv2.estimateAffine2D(
+                        self.grid_points, metric_pts, method=cv2.LMEDS
+                    )
+                    if M_pred is not None:
+                        predicted_at_right = np.array(
+                            _decompose_affine(M_pred), dtype=np.float64
+                        )
+
+            seg_len = id_right - id_left
+
+            for frame_id in range(id_left + 1, id_right):
                 if not self._is_running:
                     return
+                if frame_id in anchor_ids:
+                    continue
 
-                if local_idx % 10 == 0:
-                    prog = int(
-                        (
-                            seg_idx / total_segments
-                            + local_idx / (total_frames_in_seg * total_segments)
+                if frame_id % 200 == 0:
+                    self.progress.emit(
+                        50 + int(frame_id / num_frames * 33),
+                        f"Loop-closure blending кадр {frame_id}/{num_frames}...",
+                    )
+
+                t = (frame_id - id_left) / seg_len  # 0..1
+
+                # --- Одометрична оцінка від лівого якоря ---
+                info_l = chain_left.get(frame_id)
+                M_from_left = None
+                if info_l is not None:
+                    metric_pts = self._project_to_metric(info_l["H"], a_left)
+                    if metric_pts is not None:
+                        M_est, _ = cv2.estimateAffine2D(
+                            self.grid_points, metric_pts, method=cv2.LMEDS
                         )
-                        * 90
-                    )
-                    self.progress.emit(prog, f"Блендінг: кадр {frame_id}/{num_frames}...")
+                        if M_est is not None:
+                            M_from_left = M_est
 
-                H_to_left_info = h_left_res.get(frame_id)
-                H_to_right_info = h_right_res.get(frame_id)
-
-                metric_pts_left = None
-                n_left = 0
-                if H_to_left_info:
-                    metric_pts_left = self._project_to_metric(H_to_left_info["H"], left_anchor)
-                    n_left = H_to_left_info["matches"]
-
-                metric_pts_right = None
-                n_right = 0
-                if H_to_right_info:
-                    metric_pts_right = self._project_to_metric(H_to_right_info["H"], right_anchor)
-                    n_right = H_to_right_info["matches"]
-
-                final_metric_pts = None
-                disagreement = 0.0
-
-                if metric_pts_left is not None and metric_pts_right is not None:
-                    disagreement = np.mean(
-                        np.linalg.norm(metric_pts_left - metric_pts_right, axis=1)
-                    )
-
-                    dist_to_left = abs(frame_id - left_anchor.frame_id)
-                    dist_to_right = abs(frame_id - right_anchor.frame_id)
-                    weight_left = dist_to_right / (dist_to_left + dist_to_right)
-                    weight_right = 1.0 - weight_left
-                    final_metric_pts = (
-                        metric_pts_left * weight_left + metric_pts_right * weight_right
-                    )
-                    frame_matches[frame_id] = int((n_left + n_right) / 2)
-                elif metric_pts_left is not None:
-                    final_metric_pts = metric_pts_left
-                    frame_matches[frame_id] = n_left
-                elif metric_pts_right is not None:
-                    final_metric_pts = metric_pts_right
-                    frame_matches[frame_id] = n_right
-
-                if final_metric_pts is not None:
-                    M, _ = cv2.estimateAffine2D(self.grid_points, final_metric_pts)
-                    if M is not None:
-                        frame_affine[frame_id] = M
-                        frame_valid[frame_id] = True
-                        proj = GeometryTransforms.apply_affine(self.grid_points, M)
-                        rmse = np.sqrt(
-                            np.mean(np.linalg.norm(proj - final_metric_pts, axis=1) ** 2)
+                # --- Одометрична оцінка від правого якоря ---
+                info_r = chain_right.get(frame_id)
+                M_from_right = None
+                if info_r is not None:
+                    metric_pts = self._project_to_metric(info_r["H"], a_right)
+                    if metric_pts is not None:
+                        M_est, _ = cv2.estimateAffine2D(
+                            self.grid_points, metric_pts, method=cv2.LMEDS
                         )
-                        frame_rmse[frame_id] = rmse
-                        frame_disagreement[frame_id] = disagreement
+                        if M_est is not None:
+                            M_from_right = M_est
 
-    def _wave_from_anchor(
-        self,
-        frames,
-        anchor,
-        anchor_feat,
-        frame_affine,
-        frame_valid,
-        frame_rmse,
-        frame_matches,
-        seg_idx,
-        total_segments,
-        num_frames,
-    ):
-        h_chain = self._build_homography_chain(frames, anchor, anchor_feat)
-        total_frames_in_seg = len(frames)
+                if M_from_left is None and M_from_right is None:
+                    continue
 
-        for local_idx, frame_id in enumerate(frames):
+                # --- Loop-closure корекція ---
+                if M_from_left is not None and predicted_at_right is not None:
+                    comp_est = np.array(_decompose_affine(M_from_left), dtype=np.float64)
+
+                    # Розгортаємо кути ТРЬОХ точок разом:
+                    # [лівий якір, поточна одометрія, правий якір]
+                    # Це забезпечує коректний unwrap для всіх трьох значень одночасно.
+                    angles = np.unwrap([comp_left[3], comp_est[3], comp_right[3]])
+                    comp_left_uw = comp_left.copy()
+                    comp_left_uw[3] = angles[0]
+                    comp_est_uw = comp_est.copy()
+                    comp_est_uw[3] = angles[1]
+                    comp_right_uw = comp_right.copy()
+                    comp_right_uw[3] = angles[2]
+
+                    # --- ВИПРАВЛЕННЯ БАГ 1 ---
+                    # Розгортаємо кут передбаченої матриці (predicted_at_right) разом із
+                    # лівим якорем, щоб отримати коректне unwrap-значення для pred_uw.
+                    # ВИДАЛЕНО: pred_uw[3] = angles[2]
+                    # Той рядок примусово прирівнював кут pred_uw до кута правого якоря,
+                    # через що delta[3] = comp_right_uw[3] - pred_uw[3] завжди = 0.
+                    angles_pred = np.unwrap([comp_left[3], predicted_at_right[3]])
+                    pred_uw = predicted_at_right.copy()
+                    pred_uw[3] = angles_pred[1]  # справжній передбачений кут від одометрії
+
+                    # Дельта похибки замикання: різниця між ІСТИННИМ правим якорем
+                    # та тим, що одометрія ПЕРЕДБАЧИЛА для цього місця
+                    delta = comp_right_uw - pred_uw
+
+                    # Розподіляємо delta лінійно: t=0 (лівий якір) → корекція=0, t=1 → корекція=delta
+                    comp_corrected = comp_est_uw + delta * t
+
+                    scale = float(np.clip(comp_corrected[2], 1e-6, 1e6))
+                    M_final = _compose_affine(
+                        float(comp_corrected[0]),
+                        float(comp_corrected[1]),
+                        scale,
+                        float(comp_corrected[3]),
+                    )
+                elif M_from_left is not None:
+                    # Немає loop closure: використовуємо лише одометрію від лівого якоря
+                    M_final = M_from_left.astype(np.float32)
+                else:
+                    # Лише одометрія від правого якоря (зворотна)
+                    M_final = M_from_right.astype(np.float32)
+
+                # --- Disagreement між двома якорями ---
+                if M_from_left is not None and M_from_right is not None:
+                    pts_l = GeometryTransforms.apply_affine(self.grid_points, M_from_left)
+                    pts_r = GeometryTransforms.apply_affine(self.grid_points, M_from_right)
+                    frame_disagreement[frame_id] = float(
+                        np.mean(np.linalg.norm(pts_l - pts_r, axis=1))
+                    )
+
+                frame_affine[frame_id] = M_final
+                frame_valid[frame_id] = True
+
+                # RMSE між фінальною матрицею та grid_points (внутрішня якість апроксимації)
+                proj = GeometryTransforms.apply_affine(self.grid_points, M_final)
+                ref_pts = self._project_to_metric(
+                    chain_left.get(frame_id, {}).get("H", np.eye(3)), a_left
+                )
+                if ref_pts is not None:
+                    rmse = float(np.sqrt(np.mean(np.linalg.norm(proj - ref_pts, axis=1) ** 2)))
+                    frame_rmse[frame_id] = rmse
+
+                n_l = chain_left.get(frame_id, {}).get("matches", 0)
+                n_r = chain_right.get(frame_id, {}).get("matches", 0)
+                frame_matches[frame_id] = (n_l + n_r) // max(1, int(n_l > 0) + int(n_r > 0))
+
+        # ── Кадри до першого якоря (екстраполяція ліворуч) ─────────────────────
+        first_anchor = anchors[0]
+        chain_first = anchor_chains.get(first_anchor.frame_id, {})
+        for frame_id in range(0, first_anchor.frame_id):
             if not self._is_running:
                 return
-
-            if local_idx % 20 == 0:
-                prog = int(
-                    (seg_idx / total_segments + local_idx / (total_frames_in_seg * total_segments))
-                    * 90
-                )
-                self.progress.emit(
-                    prog, f"Хвиля від {anchor.frame_id}: кадр {frame_id}/{num_frames}..."
-                )
-
-            info = h_chain.get(frame_id)
-            if info:
-                metric_pts = self._project_to_metric(info["H"], anchor)
-                if metric_pts is not None:
-                    M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts)
-                    if M is not None:
-                        frame_affine[frame_id] = M
-                        frame_valid[frame_id] = True
-                        proj = GeometryTransforms.apply_affine(self.grid_points, M)
-                        rmse = np.sqrt(np.mean(np.linalg.norm(proj - metric_pts, axis=1) ** 2))
-                        frame_rmse[frame_id] = rmse
-                        frame_matches[frame_id] = info["matches"]
-
-    def _build_homography_chain(self, frames, anchor, anchor_feat):
-        """
-        Fix 4: Використання збережених frame_poses для миттєвої пропагації.
-        O(1) замість O(N) GPU-викликів матчингу.
-        """
-        result = {anchor.frame_id: {"H": np.eye(3, dtype=np.float32), "matches": 100}}
-        anchor_id = anchor.frame_id
-
-        try:
-            pose_anchor = self.database.frame_poses[anchor_id].astype(np.float64)
-            if np.abs(np.linalg.det(pose_anchor)) > 1e-9:
-                inv_pose_anchor = np.linalg.inv(pose_anchor)
-
-                for frame_id in frames:
-                    if not self._is_running:
-                        break
-                    try:
-                        pose_frame = self.database.frame_poses[frame_id].astype(np.float64)
-                        # H від frame до anchor через збережені pose-ланцюги
-                        H = (inv_pose_anchor @ pose_frame).astype(np.float32)
-                        result[frame_id] = {"H": H, "matches": 50}  # 50 = estimated
-                    except Exception:
-                        continue
-                return result
-        except Exception as e:
-            logger.warning(
-                f"Failed to use saved poses for anchor {anchor_id}, falling back to visual: {e}"
-            )
-
-        # Fallback до візуальної пропагації (тільки якщо поз немає)
-        h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
-        matches_cache = {anchor_id: 100}
-        prev_features = anchor_feat
-        prev_frame_id = anchor_id
-
-        for frame_id in frames:
-            if not self._is_running:
-                break
-            try:
-                curr_features = self._all_features.get(frame_id)
-                if curr_features is None:
-                    continue
-
-                res = self._match_pair_with_count(curr_features, prev_features)
-                if res is None:
-                    continue
-                H_curr_to_prev, n_matches = res
-
-                H_prev_to_anchor = h_cache[prev_frame_id]
-                H_curr_to_anchor = (
-                    H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)
-                ).astype(np.float32)
-
-                h_cache[frame_id] = H_curr_to_anchor
-                matches_cache[frame_id] = n_matches
-                result[frame_id] = {"H": H_curr_to_anchor, "matches": n_matches}
-
-                prev_features = curr_features
-                prev_frame_id = frame_id
-            except Exception:
+            if frame_valid[frame_id]:
                 continue
-        return result
+            info = chain_first.get(frame_id)
+            if info is None:
+                continue
+            metric_pts = self._project_to_metric(info["H"], first_anchor)
+            if metric_pts is None:
+                continue
+            M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts, method=cv2.LMEDS)
+            if M is not None:
+                frame_affine[frame_id] = M
+                frame_valid[frame_id] = True
+                frame_matches[frame_id] = info["matches"]
+
+        # ── Кадри після останнього якоря (екстраполяція праворуч) ──────────────
+        last_anchor = anchors[-1]
+        chain_last = anchor_chains.get(last_anchor.frame_id, {})
+        for frame_id in range(last_anchor.frame_id + 1, num_frames):
+            if not self._is_running:
+                return
+            if frame_valid[frame_id]:
+                continue
+            info = chain_last.get(frame_id)
+            if info is None:
+                continue
+            metric_pts = self._project_to_metric(info["H"], last_anchor)
+            if metric_pts is None:
+                continue
+            M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts, method=cv2.LMEDS)
+            if M is not None:
+                frame_affine[frame_id] = M
+                frame_valid[frame_id] = True
+                frame_matches[frame_id] = info["matches"]
+
+    # -------------------------------------------------------------------------
+    # Заповнення прогалин через лінійну інтерполяцію афінних матриць
+    # -------------------------------------------------------------------------
+
+    def _fill_gaps_by_interpolation(self, frame_affine, frame_valid):
+        """
+        Кадри, які не отримали координат через жодну гомографію,
+        заповнюються інтерполяцією між найближчими дійсними сусідами.
+
+        Використовується декомпозиція на (tx, ty, scale, angle) з подальшою лінійною
+        інтерполяцією кожного скалярного каналу і відновленням матриці.
+        """
+        num_frames = len(frame_valid)
+        valid_ids = np.where(frame_valid)[0]
+        if len(valid_ids) < 2:
+            return
+
+        filled = 0
+        for i in range(len(valid_ids) - 1):
+            left = valid_ids[i]
+            right = valid_ids[i + 1]
+            gap = right - left
+            if gap <= 1:
+                continue
+
+            comp_left = np.array(_decompose_affine(frame_affine[left]), dtype=np.float64)
+            comp_right = np.array(_decompose_affine(frame_affine[right]), dtype=np.float64)
+
+            angles = np.array([comp_left[3], comp_right[3]])
+            angles = np.unwrap(angles)
+            comp_left[3] = angles[0]
+            comp_right[3] = angles[1]
+
+            for mid in range(left + 1, right):
+                if frame_valid[mid]:
+                    continue
+                t = (mid - left) / gap
+                comp_mid = comp_left * (1.0 - t) + comp_right * t
+                tx, ty, scale, angle = comp_mid
+                scale = float(np.clip(scale, 1e-6, 1e6))
+                frame_affine[mid] = _compose_affine(float(tx), float(ty), scale, float(angle))
+                frame_valid[mid] = True
+                filled += 1
+
+        if filled > 0:
+            logger.info(f"Gap interpolation filled {filled} additional frames")
+
+    # -------------------------------------------------------------------------
+    # Допоміжні методи
+    # -------------------------------------------------------------------------
 
     def _match_pair_with_count(self, features_a: dict, features_b: dict) -> tuple | None:
         try:
@@ -433,6 +547,10 @@ class CalibrationPropagationWorker(QThread):
                 return None
             return H, inliers
         except Exception:
+            logger.debug(
+                f"Match failed between frame pair | features_a_kpts={len(features_a.get('keypoints', []))}, "
+                f"features_b_kpts={len(features_b.get('keypoints', []))}"
+            )
             return None
 
     def _project_to_metric(self, H_to_anchor, anchor):
@@ -453,8 +571,7 @@ class CalibrationPropagationWorker(QThread):
                     del f["calibration"]
                 grp = f.create_group("calibration")
 
-                # Дані та метадані версії 2.1
-                grp.attrs["version"] = "2.1"
+                grp.attrs["version"] = "2.2"
                 grp.attrs["num_anchors"] = len(anchors)
                 grp.attrs["anchors_json"] = json.dumps(
                     [a.to_dict() for a in anchors], ensure_ascii=False
@@ -463,7 +580,6 @@ class CalibrationPropagationWorker(QThread):
                     self.calibration.converter.export_metadata()
                 )
 
-                # Датасети
                 grp.create_dataset("frame_affine", data=frame_affine, compression="gzip")
                 grp.create_dataset(
                     "frame_valid", data=frame_valid.astype(np.uint8), compression="gzip"
@@ -475,7 +591,8 @@ class CalibrationPropagationWorker(QThread):
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
             logger.success(
-                f"Successful propagation saved to HDF5 (rev 2.1, {len(anchors)} anchors)"
+                f"Successful propagation saved to HDF5 "
+                f"(rev 2.2, {len(anchors)} anchors, loop-closure blending)"
             )
         finally:
             self.database._load_hot_data()

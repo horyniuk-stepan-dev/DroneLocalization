@@ -28,7 +28,10 @@ class PanoramaWorker(QThread):
             if not cap.isOpened():
                 cap = cv2.VideoCapture(self.video_path)
                 if not cap.isOpened():
-                    raise ValueError("Не вдалося відкрити відеофайл")
+                    raise ValueError(
+                        f"Не вдалося відкрити відеофайл: {self.video_path}. "
+                        f"Переконайтесь, що файл існує і має підтримуваний кодек (MP4/H.264)."
+                    )
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             frames_to_stitch = []
@@ -69,12 +72,25 @@ class PanoramaWorker(QThread):
                 self.progress.emit(100, "Панораму збережено!")
                 self.completed.emit(self.output_path)
             else:
+                status_names = {
+                    cv2.Stitcher_ERR_NEED_MORE_IMGS: "ERR_NEED_MORE_IMGS (недостатньо кадрів з перекриттям)",
+                    cv2.Stitcher_ERR_HOMOGRAPHY_EST_FAIL: "ERR_HOMOGRAPHY_EST_FAIL (не вдалося знайти гомографію)",
+                    cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL: "ERR_CAMERA_PARAMS_ADJUST_FAIL (помилка калібрування камери)",
+                }
+                status_name = status_names.get(status, f"UNKNOWN_CODE_{status}")
                 raise ValueError(
-                    f"Помилка зшивання (Код OpenCV: {status}). Спробуйте змінити крок кадрів."
+                    f"Помилка зшивання панорами: {status_name}. "
+                    f"Зібрано {len(frames_to_stitch)} кадрів, крок={self.frame_step}. "
+                    f"Спробуйте зменшити крок кадрів або переконатися, що кадри мають достатнє перекриття."
                 )
 
         except Exception as e:
-            logger.error(f"Panorama generation failed: {e}")
+            logger.error(
+                f"Panorama generation failed: {e} | "
+                f"video={self.video_path}, output={self.output_path}, "
+                f"frame_step={self.frame_step}",
+                exc_info=True,
+            )
             self.error.emit(str(e))
 
     def stop(self):

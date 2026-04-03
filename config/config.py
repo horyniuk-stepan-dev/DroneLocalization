@@ -18,16 +18,9 @@ class DatabaseConfig(BaseModel):
     keypoint_video_scale: float = 0.5
     inter_frame_min_matches: int = 15
     inter_frame_ransac_thresh: float = 3.0
-    # HDF5 schema v2: pre-allocated масиви
-    hdf5_compression: str = "lzf"  # "gzip" | "lzf" | None  (lzf = вбудований, без pip)
-    hdf5_chunk_frames: int = 64  # розмір chunk по осі кадрів
-    max_keypoints_stored: int = 2048  # фіксований розмір другої осі keypoints
-    # Adaptive Keyframe Selection (П4)
-    keyframe_min_translation_px: float = 15.0  # мінімальний зсув у пікселях
-    keyframe_min_rotation_deg: float = 1.5  # мінімальний кут повороту
-    keyframe_always_save_first: bool = True  # перший кадр завжди зберігається
-    # YOLO micro-batching (П8)
-    yolo_batch_size: int = 2  # кількість кадрів у батчі YOLO (1 = без батчингу)
+    keyframe_min_translation_px: float = 15.0
+    keyframe_min_rotation_deg: float = 1.5
+    keyframe_always_save_first: bool = True
 
 
 class ConfidenceConfig(BaseModel):
@@ -57,7 +50,7 @@ class TrackingConfig(BaseModel):
     kalman_measurement_noise: float = 5.0
     outlier_window: int = 10
     outlier_threshold_std: float = 25.0
-    max_speed_mps: float = 60.0
+    max_speed_mps: float = 1000.0
     max_consecutive_outliers: int = 5
     process_fps: float = 1.0
 
@@ -188,7 +181,7 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
     return current
 
 
-# Єдине джерело правди — Pydantic-об'єкт
+# Екземпляр конфігу за замовчуванням
 APP_SETTINGS = AppConfig()
-# dict-представлення того самого об'єкта (для зворотної сумісності)
+# Також надаємо доступ як до словника для зворотньої сумісності
 APP_CONFIG = APP_SETTINGS.model_dump()

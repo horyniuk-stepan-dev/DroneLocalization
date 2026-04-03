@@ -28,7 +28,11 @@ class ProjectRegistry:
                 self._projects = data.get("projects", [])
                 logger.debug(f"ProjectRegistry loaded: {len(self._projects)} projects")
             except Exception as e:
-                logger.warning(f"Failed to load project registry: {e}")
+                logger.warning(
+                    f"Failed to load project registry: {e} | "
+                    f"path={self._registry_path}. "
+                    f"Registry will be reset. This is safe but recent project history will be lost."
+                )
                 self._projects = []
         else:
             self._projects = []
@@ -40,7 +44,12 @@ class ProjectRegistry:
             with open(self._registry_path, "w", encoding="utf-8") as f:
                 json.dump({"projects": self._projects}, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"Failed to save project registry: {e}")
+            logger.error(
+                f"Failed to save project registry: {e} | "
+                f"path={self._registry_path}. "
+                f"Check disk permissions for {self._registry_dir}.",
+                exc_info=True,
+            )
 
     def _find_index(self, project_dir: str) -> int:
         """Знайти індекс проєкту за шляхом."""

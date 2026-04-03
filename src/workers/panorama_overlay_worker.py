@@ -24,17 +24,30 @@ class PanoramaOverlayWorker(QThread):
             logger.info(f"Starting background panorama overlay for {self.image_path}")
             img = cv2.imread(self.image_path)
             if img is None:
-                raise ValueError("Не вдалося прочитати файл зображення панорами")
+                raise ValueError(
+                    f"Не вдалося прочитати файл панорами: {self.image_path}. "
+                    f"Переконайтеся, що файл існує та має підтримуваний формат (PNG, JPEG, TIFF)."
+                )
+
+            logger.info(f"Panorama image loaded: {img.shape[1]}x{img.shape[0]} px")
 
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             loc_result = self.localizer.localize_frame(img_rgb)
 
             if not loc_result.get("success"):
-                raise RuntimeError(loc_result.get("error", "Не вдалося локалізувати панораму"))
+                error_reason = loc_result.get('error', 'Невідома причина')
+                raise RuntimeError(
+                    f"Не вдалося локалізувати панораму: {error_reason}. "
+                    f"Переконайтесь, що база даних калібрована і панорама відповідає району бази."
+                )
 
             fov = loc_result.get("fov_polygon")
             if not fov or len(fov) != 4:
-                raise RuntimeError("Локалізатор не повернув коректні кути (FOV) для панорами")
+                raise RuntimeError(
+                    f"Локалізатор не повернув коректні кути (FOV) для панорами. "
+                    f"Отримано fov={fov} (очікується 4 кути). "
+                    f"Можливо, гомографія виродилася через недостатню кількість inliers."
+                )
 
             h, w = img.shape[:2]
             scale = 1.0
@@ -61,5 +74,9 @@ class PanoramaOverlayWorker(QThread):
             logger.success("Panorama successfully processed in background")
 
         except Exception as e:
-            logger.error(f"Panorama overlay worker failed: {e}")
+            logger.error(
+                f"Panorama overlay worker failed: {e} | "
+                f"image_path={self.image_path}",
+                exc_info=True,
+            )
             self.error.emit(str(e))

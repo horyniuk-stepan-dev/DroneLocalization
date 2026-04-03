@@ -3,7 +3,7 @@ try:
 
     _USE_ORJSON = True
 except ImportError:
-    import json as _json_lib  # type: ignore[assignment]  # fallback якщо orjson не встановлено
+    import json as _json_lib
 
     _USE_ORJSON = False
 from datetime import datetime
@@ -17,6 +17,18 @@ from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+# Єдине джерело — src.geometry.affine_utils (усунення дублювання)
+from src.geometry.affine_utils import (
+    compose_affine as _compose_affine,
+)
+from src.geometry.affine_utils import (
+    decompose_affine as _decompose_affine,
+)
+from src.geometry.affine_utils import (
+    unwrap_angles as _unwrap_angles,
+)
 
 
 class AnchorCalibration:
@@ -113,15 +125,45 @@ class MultiAnchorCalibration:
         self._interp: PchipInterpolator | None = None  # кешований інтерполятор
 
     def _rebuild_interpolators(self) -> None:
-        """Перебудовує PCHIP-інтерполятор. Викликати після кожної зміни anchors."""
+        """
+        Перебудовує PCHIP-інтерполятори на основі ДЕКОМПОЗИЦІЇ афінних матриць.
+
+        Замість поелементної інтерполяції raw-компонентів матриці (що порушує
+        жорсткість обертання і призводить до артефактів зсуву/shear), кожна
+        матриця розкладається на: (tx, ty, scale, angle).  Кути розгортаються
+        через np.unwrap для уникнення стрибків через ±π.  Для кожного з 4
+        скалярних каналів будується окремий PchipInterpolator.  При запиті
+        (_get_interpolated_matrix) компоненти відновлюються назад у валідну
+        афінну матрицю через _compose_affine.
+        """
         if len(self.anchors) < 2:
             self._interp = None
+            logger.debug(f"Interpolator not built: need ≥2 anchors, have {len(self.anchors)}")
             return
 
         ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
-        matrices = np.stack([a.affine_matrix.ravel() for a in self.anchors])  # (N, 6)
-        # PchipInterpolator обробляє multi-column масиви нативно
-        self._interp = PchipInterpolator(ids, matrices, extrapolate=False)
+        decomposed = np.array(
+            [_decompose_affine(a.affine_matrix) for a in self.anchors],
+            dtype=np.float64,
+        )  # shape (N, 4): tx, ty, scale, angle
+
+        # Розгортаємо кути для коректної інтерполяції через межу ±π
+        decomposed[:, 3] = _unwrap_angles(decomposed[:, 3])
+
+        # Один багатоколонковий PCHIP-інтерполятор для всіх 4 каналів
+        self._interp = PchipInterpolator(ids, decomposed, extrapolate=True)
+
+    def _get_interpolated_matrix(self, frame_id: float) -> np.ndarray | None:
+        """Повертає інтерпольовану афінну матрицю 2x3 для заданого frame_id."""
+        if self._interp is None:
+            return None
+        components = self._interp(frame_id)  # (4,): tx, ty, scale, angle
+        if components is None or np.any(np.isnan(components)):
+            return None
+        tx, ty, scale, angle = components
+        # Захист від вироджених значень масштабу
+        scale = float(np.clip(scale, 1e-6, 1e6))
+        return _compose_affine(float(tx), float(ty), scale, float(angle))
 
     @property
     def is_calibrated(self) -> bool:
@@ -161,22 +203,19 @@ class MultiAnchorCalibration:
         if not self.is_calibrated:
             return None
 
-        # Граничні умови
-        if len(self.anchors) == 1 or frame_id <= self.anchors[0].frame_id:
+        # Якщо якір один — екстраполяція неможлива, повертаємо його координати
+        if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
-        if frame_id >= self.anchors[-1].frame_id:
-            return self.anchors[-1].pixel_to_metric(x, y)
 
-        # PCHIP: інтерполяція матриці → застосування до точки
+        # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
         if self._interp is not None:
-            flat = self._interp(float(frame_id))  # (6,) float64
-            if flat is not None and not np.any(np.isnan(flat)):
-                M = flat.reshape(2, 3).astype(np.float32)
+            M = self._get_interpolated_matrix(float(frame_id))
+            if M is not None:
                 pt = np.array([[x, y]], dtype=np.float32)
                 result = GeometryTransforms.apply_affine(pt, M)[0]
                 return float(result[0]), float(result[1])
 
-        # Fallback — лінійна інтерполяція (якщо PCHIP недоступний або NaN)
+        # Fallback — лінійна інтерполяція
         for i in range(len(self.anchors) - 1):
             a1, a2 = self.anchors[i], self.anchors[i + 1]
             if a1.frame_id <= frame_id <= a2.frame_id:
@@ -192,10 +231,7 @@ class MultiAnchorCalibration:
         return None
 
     def save(self, path: str) -> None:
-        if not self.is_calibrated:
-            raise RuntimeError("Немає даних для збереження")
-
-        # Зберігаємо також метадані проєкції
+        """Збереження якорів та метаданих проєкції у JSON."""
         data = {
             "version": self.VERSION,
             "projection": self.converter.export_metadata(),
@@ -205,7 +241,7 @@ class MultiAnchorCalibration:
         if _USE_ORJSON:
             raw = _json_lib.dumps(
                 data,
-                option=_json_lib.OPT_INDENT_2 | _json_lib.OPT_NON_STR_KEYS,
+                option=_json_lib.OPT_INDENT_2 | getattr(_json_lib, "OPT_NON_STR_KEYS", 0),
             )
             with open(path, "wb") as f:
                 f.write(raw)
@@ -220,12 +256,11 @@ class MultiAnchorCalibration:
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
         with open(path, "rb") as f:
             content = f.read()
+
         if _USE_ORJSON:
             data = _json_lib.loads(content)
         else:
-            import json
-
-            data = json.loads(content)
+            data = _json_lib.loads(content.decode("utf-8"))
 
         self.anchors.clear()
         version = data.get("version", "1.0")

@@ -56,7 +56,10 @@ class OutlierDetector:
             if self._consecutive_outliers >= self._max_consecutive:
                 logger.warning(
                     f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
-                    f"accepting new position as legitimate movement"
+                    f"accepting new position as legitimate movement. "
+                    f"Position: ({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"last known: ({last_pos[0]:.1f}, {last_pos[1]:.1f}), "
+                    f"distance={distance:.1f}m"
                 )
                 self.window.clear()
                 self._consecutive_outliers = 0
@@ -64,11 +67,17 @@ class OutlierDetector:
 
             if is_speed_outlier:
                 logger.warning(
-                    f"OUTLIER DETECTED: Speed too high ({instantaneous_speed:.2f} m/s > {self.max_speed_mps} m/s)"
+                    f"OUTLIER DETECTED (speed): {instantaneous_speed:.1f} m/s > {self.max_speed_mps} m/s | "
+                    f"distance={distance:.1f}m, dt={dt:.3f}s, "
+                    f"position=({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"consecutive={self._consecutive_outliers}/{self._max_consecutive}"
                 )
             else:
                 logger.warning(
-                    f"OUTLIER DETECTED: Z-score {z_score:.2f} > {self.threshold_std}, distance {distance:.0f}m"
+                    f"OUTLIER DETECTED (z-score): z={z_score:.2f} > {self.threshold_std} | "
+                    f"distance={distance:.1f}m, mean_dist={mean_dist:.1f}m, std={std_dist:.1f}m, "
+                    f"position=({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"consecutive={self._consecutive_outliers}/{self._max_consecutive}"
                 )
             return True
 
