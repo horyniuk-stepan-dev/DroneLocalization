@@ -58,7 +58,9 @@ class DatabaseGenerationWorker(QThread):
                 self.completed.emit(self.output_path)
 
         except InterruptedError as e:
-            logger.warning(f"Database generation interrupted by user: {e} | video={self.video_path}")
+            logger.warning(
+                f"Database generation interrupted by user: {e} | video={self.video_path}"
+            )
             self.cancelled.emit()
         except Exception as e:
             logger.error(

@@ -37,12 +37,12 @@ class RealtimeTrackingWorker(QThread):
 
     def run(self):
         # Fix #3: Скидаємо стан трекера при кожному новому старті сесії
-        if hasattr(self.localizer, 'trajectory_filter'):
+        if hasattr(self.localizer, "trajectory_filter"):
             self.localizer.trajectory_filter.reset()
-        if hasattr(self.localizer, 'outlier_detector'):
+        if hasattr(self.localizer, "outlier_detector"):
             self.localizer.outlier_detector.window.clear()
             self.localizer.outlier_detector._consecutive_outliers = 0
-        if hasattr(self.localizer, '_consecutive_failures'):
+        if hasattr(self.localizer, "_consecutive_failures"):
             self.localizer._consecutive_failures = 0
 
         # Fix 6: Pre-warm fallback моделей при старті трекінгу

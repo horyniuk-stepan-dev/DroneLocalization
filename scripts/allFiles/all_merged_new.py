@@ -14,9 +14,11 @@ __author__ = "Drone Localization Team"
 # ================================================================================
 try:
     import orjson as _json_lib
+
     _USE_ORJSON = True
 except ImportError:
     import json as _json_lib
+
     _USE_ORJSON = False
 from datetime import datetime
 from typing import Any
@@ -31,40 +33,16 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def _decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
-    """
-    Розкладає афінну матрицю 2x3 на компоненти:
-    (tx, ty, scale, angle_rad).
-
-    Для афінної матриці вигляду:
-        [s*cos(a)  -s*sin(a)  tx]
-        [s*sin(a)   s*cos(a)  ty]
-    scale = sqrt(det(R_part)), angle = atan2(M[1,0], M[0,0]).
-    При наявності шуму (незначний зсув / анізотропний масштаб)
-    беремо ізотропне наближення через норму першого стовпця.
-    """
-    tx = float(M[0, 2])
-    ty = float(M[1, 2])
-    # Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання
-    s_x = float(np.linalg.norm(M[:2, 0]))
-    s_y = float(np.linalg.norm(M[:2, 1]))
-    scale = (s_x + s_y) * 0.5
-    if scale < 1e-9:
-        scale = 1e-9
-    angle = float(np.arctan2(M[1, 0], M[0, 0]))
-    return tx, ty, scale, angle
-
-
-def _compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
-    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
-    c = np.cos(angle) * scale
-    s = np.sin(angle) * scale
-    return np.array([[c, -s, tx], [s,  c, ty]], dtype=np.float32)
-
-
-def _unwrap_angles(angles: np.ndarray) -> np.ndarray:
-    """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
-    return np.unwrap(angles)
+# Єдине джерело — src.geometry.affine_utils (усунення дублювання)
+from src.geometry.affine_utils import (
+    compose_affine as _compose_affine,
+)
+from src.geometry.affine_utils import (
+    decompose_affine as _decompose_affine,
+)
+from src.geometry.affine_utils import (
+    unwrap_angles as _unwrap_angles,
+)
 
 
 class AnchorCalibration:
@@ -174,6 +152,7 @@ class MultiAnchorCalibration:
         """
         if len(self.anchors) < 2:
             self._interp = None
+            logger.debug(f"Interpolator not built: need ≥2 anchors, have {len(self.anchors)}")
             return
 
         ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
@@ -329,6 +308,7 @@ class MultiAnchorCalibration:
         self.anchors.sort(key=lambda a: a.frame_id)
         self._rebuild_interpolators()
         logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")
+
 
 # ================================================================================
 # File: calibration\__init__.py
@@ -605,7 +585,12 @@ class ProjectManager:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to create project: {e}", exc_info=True)
+            logger.error(
+                f"Failed to create project: {e} | "
+                f"workspace_dir={workspace_dir}, mission_name={mission_data.get('mission_name', '?')}. "
+                f"Check disk permissions and available space.",
+                exc_info=True,
+            )
             self.project_dir = None
             self.settings = None
             return False
@@ -615,12 +600,19 @@ class ProjectManager:
         try:
             dir_path = Path(project_dir)
             if not dir_path.is_dir():
-                logger.error(f"Project directory does not exist: {project_dir}")
+                logger.error(
+                    f"Project directory does not exist: {project_dir}. "
+                    f"It may have been moved or deleted."
+                )
                 return False
 
             json_file = dir_path / "project.json"
             if not json_file.exists():
-                logger.error(f"Valid project not found. Missing project.json in: {project_dir}")
+                logger.error(
+                    f"Missing project.json in: {project_dir}. "
+                    f"This directory may not be a valid project or project.json was deleted. "
+                    f"Available files: {[f.name for f in dir_path.iterdir() if f.is_file()][:10]}"
+                )
                 return False
 
             with open(json_file, encoding="utf-8") as f:
@@ -633,7 +625,11 @@ class ProjectManager:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load project: {e}", exc_info=True)
+            logger.error(
+                f"Failed to load project: {e} | dir={project_dir}. "
+                f"The project.json file may be corrupted or have invalid format.",
+                exc_info=True,
+            )
             self.project_dir = None
             self.settings = None
             return False
@@ -649,7 +645,12 @@ class ProjectManager:
                 json.dump(asdict(self.settings), f, indent=4, ensure_ascii=False)
             return True
         except Exception as e:
-            logger.error(f"Failed to save project settings: {e}", exc_info=True)
+            logger.error(
+                f"Failed to save project settings: {e} | "
+                f"path={self.project_dir / 'project.json'}. "
+                f"Check disk permissions and available space.",
+                exc_info=True,
+            )
             return False
 
 
@@ -686,7 +687,11 @@ class ProjectRegistry:
                 self._projects = data.get("projects", [])
                 logger.debug(f"ProjectRegistry loaded: {len(self._projects)} projects")
             except Exception as e:
-                logger.warning(f"Failed to load project registry: {e}")
+                logger.warning(
+                    f"Failed to load project registry: {e} | "
+                    f"path={self._registry_path}. "
+                    f"Registry will be reset. This is safe but recent project history will be lost."
+                )
                 self._projects = []
         else:
             self._projects = []
@@ -698,7 +703,12 @@ class ProjectRegistry:
             with open(self._registry_path, "w", encoding="utf-8") as f:
                 json.dump({"projects": self._projects}, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"Failed to save project registry: {e}")
+            logger.error(
+                f"Failed to save project registry: {e} | "
+                f"path={self._registry_path}. "
+                f"Check disk permissions for {self._registry_dir}.",
+                exc_info=True,
+            )
 
     def _find_index(self, project_dir: str) -> int:
         """Знайти індекс проєкту за шляхом."""
@@ -784,7 +794,6 @@ import torch
 from config.config import get_cfg
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
-from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -827,7 +836,10 @@ class DatabaseBuilder:
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.error(f"Failed to open video: {video_path}")
+            logger.error(
+                f"Failed to open video: {video_path}. "
+                f"Check that the file exists and uses a supported codec (H.264/H.265 recommended)."
+            )
             raise ValueError(f"Не вдалося відкрити відео: {video_path}")
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -893,12 +905,7 @@ class DatabaseBuilder:
                 logger.warning(f"VideoWriter initialization crashed: {e}")
                 kp_writer = None
 
-        # Initialize neural network wrappers
-        logger.info("Loading neural network models...")
-        yolo_model = model_manager.load_yolo()
-        yolo_wrapper = YOLOWrapper(yolo_model, model_manager.device)
-
-        # MaskingStrategy — абстракція над YOLO/none/інші стратегії (конфіг: preprocessing.masking_strategy)
+        # Ініціалізуємо стратегію маскування (YOLO / none / ...)
         masking_strategy_name = get_cfg(self.config, "preprocessing.masking_strategy", "yolo")
         logger.info(f"Loading masking strategy: {masking_strategy_name}")
         masking_strategy = create_masking_strategy(
@@ -953,7 +960,10 @@ class DatabaseBuilder:
         except Exception as e:
             import traceback
 
-            logger.warning(f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}")
+            logger.warning(
+                f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}"
+                f"Falling back to configured default: {self.descriptor_dim}"
+            )
             logger.warning(f"Using default dimension: {self.descriptor_dim}")
 
         # Create empty database structure
@@ -962,6 +972,19 @@ class DatabaseBuilder:
 
         current_pose = np.eye(3, dtype=np.float32)
         prev_features = None
+
+        # Adaptive Keyframe Selection (П4)
+        saved_count = 0  # лічильник РЕАЛЬНО записаних кадрів
+        frame_index_map: list[int] = []  # список збережених frame_id
+        use_keyframe_selection = (
+            get_cfg(self.config, "database.keyframe_min_translation_px", 0.0) > 0
+        )
+        if use_keyframe_selection:
+            logger.info(
+                f"Adaptive keyframe selection ENABLED "
+                f"(min_translation={get_cfg(self.config, 'database.keyframe_min_translation_px', 15.0)}px, "
+                f"min_rotation={get_cfg(self.config, 'database.keyframe_min_rotation_deg', 1.5)}°)"
+            )
 
         # cuDNN benchmark conditionally (Fix 5)
 
@@ -984,8 +1007,8 @@ class DatabaseBuilder:
                     continue
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                db_index = i // frame_step
-                frame_queue.put((db_index, (frame, frame_rgb)))
+                orig_frame_idx = i // frame_step
+                frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
 
             frame_queue.put((-1, None))
 
@@ -996,36 +1019,43 @@ class DatabaseBuilder:
             self.db_file = h5py.File(self.output_path, "a")
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
-            prev_features = None
-            db_index = 0
-            frame_index_map = []
-            use_keyframe_selection = get_cfg(self.config, "database.keyframe_min_translation_px", 0.0) > 0
-            while True:
-                idx, data = frame_queue.get()
-                if idx == -1 or data is None:
-                    break
+            # YOLO micro-batching (П8)
+            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 2)
+            if yolo_batch_size > 1:
+                logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
+            pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
 
-                frame, frame_rgb = data
-                i = idx
+            def _flush_mask_batch(batch: list) -> list:
+                """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
+                images_rgb = [b[2] for b in batch]
+                masks_list = masking_strategy.get_mask_batch(images_rgb)
+                return [(b[0], b[1], b[2], m) for b, m in zip(batch, masks_list)]
 
-                # Sequential processing (restored original logic)
-                static_mask, detections = yolo_wrapper.detect_and_mask(frame_rgb)
-                features = feature_extractor.extract_features(frame_rgb, static_mask)
+            def _process_single_frame(
+                p_idx,
+                p_frame,
+                p_frame_rgb,
+                p_static_mask,
+                current_pose,
+                prev_features,
+                saved_count,
+                frame_index_map,
+            ):
+                """Обробляє один кадр після YOLO: feature extraction, pose, keyframe selection."""
+                features = feature_extractor.extract_features(p_frame_rgb, p_static_mask)
                 features["coords_2d"] = features["keypoints"]
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
-                        frame, features["keypoints"], static_mask, i, num_frames
+                        p_frame, features["keypoints"], p_static_mask, p_idx, num_frames
                     )
                     if kp_scale != 1.0:
-                        kp_width = int(width * kp_scale)
-                        kp_height = int(height * kp_scale)
-                        kp_frame = cv2.resize(
-                            kp_frame, (kp_width, kp_height), interpolation=cv2.INTER_AREA
-                        )
+                        kp_w = int(width * kp_scale)
+                        kp_h = int(height * kp_scale)
+                        kp_frame = cv2.resize(kp_frame, (kp_w, kp_h), interpolation=cv2.INTER_AREA)
                     kp_writer.write(kp_frame)
 
-                if i == 0 or prev_features is None:
+                if p_idx == 0 or prev_features is None:
                     current_pose = np.eye(3, dtype=np.float64)
                     save_this_frame = True
                 else:
@@ -1033,49 +1063,101 @@ class DatabaseBuilder:
                     if H_step is not None:
                         current_pose = current_pose @ H_step.astype(np.float64)
                         if use_keyframe_selection:
-                            save_this_frame = self._is_significant_motion(H_step)
+                            save_this_frame = self._is_significant_motion(H_step, width, height)
                         else:
                             save_this_frame = True
                     else:
                         logger.warning(
-                            f"Frame {i}: inter-frame match failed, reusing previous pose"
+                            f"Frame {p_idx}: inter-frame match failed, reusing previous pose"
                         )
-                        save_this_frame = True
+                        save_this_frame = True  # Or False? Usually better to keep it if tracking fails
 
                 prev_features = features
 
                 # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
                 # навіть якщо кадр не є keyframe (пропущений через малий рух).
+                # Без цього frame_poses[frame_id] = zeros → пропагація ламається.
+                if self.db_file:
+                    self.db_file["global_descriptors"]["frame_poses"][p_idx] = current_pose
 
+                if save_this_frame:
+                    frame_index_map.append(p_idx)
+                    # Зберігаємо за ОРИГІНАЛЬНИМ індексом p_idx, а не послідовним
+                    # Це зберігає frame_id ↔ slot identity для калібрування/пропагації
+                    self.save_frame_data(p_idx, features, current_pose)
+                    saved_count += 1
 
-                if not save_this_frame:
-                    progress_percent = int((i + 1) / num_frames * 100)
-                    if progress_callback:
-                        progress_callback(progress_percent)
-                    continue
+                    if saved_count % 100 == 0:
+                        progress_pct = int((p_idx + 1) / num_frames * 100)
+                        logger.info(
+                            f"Saved {saved_count} keyframes from {p_idx + 1}/{num_frames} processed "
+                            f"({progress_pct}%)"
+                        )
 
-                frame_index_map.append(i)
-                self.save_frame_data(db_index, features, current_pose)
-                db_index += 1
-
-                progress_percent = int((i + 1) / num_frames * 100)
+                progress_percent = int((p_idx + 1) / num_frames * 100)
                 if progress_callback:
                     progress_callback(progress_percent)
 
-                if (i + 1) % 100 == 0:
-                    logger.info(f"Processed {i + 1}/{num_frames} frames ({progress_percent}%)")
+                return current_pose, prev_features, saved_count
 
-            # Save the index mapping
-            if "metadata" in self.db_file:
-                self.db_file["metadata"].attrs["actual_num_frames"] = db_index
-                self.db_file["metadata"].create_dataset(
-                    "frame_index_map", data=np.array(frame_index_map, dtype=np.int32)
-                )
+            while True:
+                idx, data = frame_queue.get()
+
+                if idx != -1 and data is not None:
+                    frame, frame_rgb = data
+                    pending_frames.append((idx, frame, frame_rgb))
+                    if len(pending_frames) < yolo_batch_size:
+                        continue  # накопичуємо батч
+
+                # Якщо EOF або батч повний — обробляємо все накопичене
+                if not pending_frames:
+                    break
+
+                processed = _flush_mask_batch(pending_frames)
+                pending_frames = []
+
+                for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
+                    current_pose, prev_features, saved_count = _process_single_frame(
+                        p_idx,
+                        p_frame,
+                        p_frame_rgb,
+                        p_static_mask,
+                        current_pose,
+                        prev_features,
+                        saved_count,
+                        frame_index_map,
+                    )
+
+                if idx == -1:
+                    break
 
         except Exception as e:
-            logger.error(f"Error during database building: {e}")
+            logger.error(
+                f"Error during database building: {e} | "
+                f"video={video_path}, output={self.output_path}, "
+                f"processed_frames={saved_count}",
+                exc_info=True,
+            )
             raise
         finally:
+            # Зберігаємо frame_index_map і actual_num_frames у metadata
+            if self.db_file and saved_count > 0:
+                try:
+                    meta = self.db_file["metadata"]
+                    meta.attrs["actual_num_frames"] = saved_count
+                    if "frame_index_map" not in meta:
+                        meta.create_dataset(
+                            "frame_index_map",
+                            data=np.array(frame_index_map, dtype=np.int32),
+                        )
+                    if use_keyframe_selection:
+                        logger.info(
+                            f"Keyframe selection: {saved_count}/{num_frames} frames saved "
+                            f"({100 - saved_count / num_frames * 100:.1f}% reduction)"
+                        )
+                except Exception as e:
+                    logger.warning(f"Could not save frame_index_map: {e}")
+
             prefetch_thread.join(timeout=5)
             if kp_writer is not None:
                 kp_writer.release()
@@ -1084,32 +1166,6 @@ class DatabaseBuilder:
             cap.release()
 
         logger.success(f"Database build completed successfully: {self.output_path}")
-
-    def _is_significant_motion(self, H: np.ndarray) -> bool:
-        """Повертає True якщо гомографія H відповідає значному руху."""
-        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
-        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
-
-        # Розміри беремо з конфігу — всі кадри нормалізуються до target_size перед обробкою
-        target_w = get_cfg(self.config, "preprocessing.target_width", 1920)
-        target_h = get_cfg(self.config, "preprocessing.target_height", 1080)
-        cx, cy = target_w / 2.0, target_h / 2.0
-        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
-        p_dst = H.astype(np.float64) @ p_src
-        if p_dst[2] != 0:
-            p_dst /= p_dst[2]
-        translation = float(np.linalg.norm(p_dst[:2] - np.array([cx, cy])))
-
-        if translation >= min_t:
-            return True
-
-        A = H[:2, :2].astype(np.float64)
-        det = np.linalg.det(A)
-        if abs(det) < 1e-6:
-            return True
-        angle_rad = np.arctan2(A[1, 0], A[0, 0])
-        angle_deg = abs(np.degrees(angle_rad))
-        return angle_deg >= min_r
 
     def _draw_keypoints_frame(
         self,
@@ -1208,79 +1264,100 @@ class DatabaseBuilder:
 
         return H.astype(np.float32)
 
+    def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:
+        """
+        Повертає True якщо гомографія H відповідає значному руху.
+        H: (3,3) float32 — матриця з frame_b до frame_a.
+        """
+        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
+        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
+
+        # Трансляція: зсув центру кадру через H
+        cx, cy = frame_w / 2.0, frame_h / 2.0
+        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
+        p_dst = H.astype(np.float64) @ p_src
+        p_dst /= p_dst[2]
+        translation = np.linalg.norm(p_dst[:2] - np.array([cx, cy]))
+
+        if translation >= min_t:
+            return True
+
+        # Кут: з лінійної частини H (2×2 зліва вгорі)
+        A = H[:2, :2].astype(np.float64)
+        det = np.linalg.det(A)
+        if abs(det) < 1e-6:
+            return True  # вироджена матриця → вважаємо рухом
+        angle_rad = np.arctan2(A[1, 0], A[0, 0])
+        angle_deg = abs(np.degrees(angle_rad))
+        return angle_deg >= min_r
+
     def create_hdf5_structure(self, num_frames: int, width: int, height: int):
-        """Create optimal HDF5 hierarchy with compression and pre-allocated arrays"""
+        """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
         chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
+        max_kps = get_cfg(self.config, "database.max_keypoints_stored", 2048)
+        local_desc_dim = 128  # ALIKED descriptor dim
+
         logger.info(
-            f"Creating HDF5 structure for {num_frames} frames "
-            f"(compression={compression}, chunks={chunk_f})"
+            f"Creating HDF5 v2 structure for {num_frames} frames "
+            f"(compression={compression}, chunks={chunk_f}, max_kps={max_kps})"
         )
 
         with h5py.File(self.output_path, "w") as f:
-            # Global descriptors
+            # --- global_descriptors: chunked ---
             g1 = f.create_group("global_descriptors")
             g1.create_dataset(
                 "descriptors",
                 shape=(num_frames, self.descriptor_dim),
                 dtype="float32",
                 compression=compression,
-                chunks=(min(chunk_f, num_frames), self.descriptor_dim),
+                chunks=(min(256, num_frames), self.descriptor_dim),
             )
             g1.create_dataset(
                 "frame_poses",
                 shape=(num_frames, 3, 3),
                 dtype="float64",
                 compression=compression,
-                chunks=(min(chunk_f, num_frames), 3, 3),
+                chunks=(min(256, num_frames), 3, 3),
             )
 
-            # Local features (pre-allocated arrays)
-            max_kp = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
-            fallback_extractor = get_cfg(self.config, "localization.fallback_extractor", "aliked")
-
-            # Determine feature dimension
-            feature_dim = 128
-            if fallback_extractor == "superpoint":
-                feature_dim = 256
-            elif fallback_extractor == "xfeat":
-                feature_dim = 64
-
-            g2 = f.create_group("local_features")
-            g2.attrs["frame_width"] = width
-            g2.attrs["frame_height"] = height
-            g2.create_dataset(
+            # --- local_features: PRE-ALLOCATED chunked arrays (НОВА СХЕМА v2) ---
+            lf = f.create_group("local_features")
+            lf.create_dataset(
                 "keypoints",
-                shape=(num_frames, max_kp, 2),
+                shape=(num_frames, max_kps, 2),
                 dtype="float32",
                 compression=compression,
-                chunks=(min(chunk_f, num_frames), max_kp, 2),
+                chunks=(min(chunk_f, num_frames), max_kps, 2),
                 fillvalue=0.0,
             )
-            g2.create_dataset(
+            lf.create_dataset(
                 "descriptors",
-                shape=(num_frames, max_kp, feature_dim),
-                dtype="float16",
+                shape=(num_frames, max_kps, local_desc_dim),
+                dtype="float16",  # float16: -50% розміру (П2)
                 compression=compression,
-                chunks=(min(chunk_f, num_frames), max_kp, feature_dim),
+                chunks=(min(chunk_f, num_frames), max_kps, local_desc_dim),
                 fillvalue=0.0,
             )
-            g2.create_dataset(
+            lf.create_dataset(
                 "coords_2d",
-                shape=(num_frames, max_kp, 2),
+                shape=(num_frames, max_kps, 2),
                 dtype="float32",
                 compression=compression,
-                chunks=(min(chunk_f, num_frames), max_kp, 2),
+                chunks=(min(chunk_f, num_frames), max_kps, 2),
                 fillvalue=0.0,
             )
-            g2.create_dataset(
-                "num_kp",
+            lf.create_dataset(
+                "kp_counts",  # скільки keypoints у кожному кадрі
                 shape=(num_frames,),
-                dtype="int32",
+                dtype="int16",
                 compression=compression,
                 chunks=(min(num_frames, 4096),),
                 fillvalue=0,
             )
+            # Розміри кадру — зберігаємо ОДИН РАЗ у групі
+            lf.attrs["frame_width"] = width
+            lf.attrs["frame_height"] = height
 
             g3 = f.create_group("metadata")
             g3.attrs["num_frames"] = num_frames
@@ -1288,22 +1365,31 @@ class DatabaseBuilder:
             g3.attrs["frame_width"] = width
             g3.attrs["frame_height"] = height
             g3.attrs["descriptor_dim"] = self.descriptor_dim
+            g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
+            g3.attrs["max_keypoints"] = max_kps
 
-        logger.success("HDF5 structure created successfully")
+        logger.success("HDF5 v2 structure created successfully")
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
-        """Save extracted data for a single frame into pre-allocated arrays"""
+        """Save extracted data for a single frame via slice assignment (schema v2)"""
+        # global — без змін
         self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
         self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
-        num = len(features["keypoints"])
-        
-        # Write only up to 'num' elements.
-        self.db_file["local_features"]["keypoints"][frame_id, :num, :] = features["keypoints"]
-        # Automatic conversion to float16 since the dataset is created with float16
-        self.db_file["local_features"]["descriptors"][frame_id, :num, :] = features["descriptors"]
-        self.db_file["local_features"]["coords_2d"][frame_id, :num, :] = features["coords_2d"]
-        self.db_file["local_features"]["num_kp"][frame_id] = num
+        # local — slice assignment замість create_group + create_dataset
+        kps = features["keypoints"]
+        descs = features["descriptors"]
+        c2d = features["coords_2d"]
+
+        max_kps = self.db_file["local_features"]["keypoints"].shape[1]
+        n = min(len(kps), max_kps)
+
+        lf = self.db_file["local_features"]
+        lf["keypoints"][frame_id, :n] = kps[:n]
+        lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
+        lf["coords_2d"][frame_id, :n] = c2d[:n]
+        lf["kp_counts"][frame_id] = n
+
 
 # ================================================================================
 # File: database\database_loader.py
@@ -1342,43 +1428,80 @@ class DatabaseLoader:
         self._size_cache: dict[int, tuple[int, int]] = {}
         self._feature_cache: dict[int, dict[str, np.ndarray]] = {}
 
-        logger.info(f"Initializing DatabaseLoader with path: {db_path}")
+        logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
 
     def _load_hot_data(self) -> None:
         """Load global descriptors (DINOv2), poses and propagation data into RAM"""
-        logger.info("Loading hot data into RAM...")
+        logger.info(f"Loading hot data into RAM from: {self.db_path}")
 
         try:
             self.db_file = h5py.File(self.db_path, "r")
+            logger.debug(f"HDF5 file opened | top-level groups: {list(self.db_file.keys())}")
+
+            if "global_descriptors" not in self.db_file:
+                raise KeyError(
+                    f"HDF5 file is missing 'global_descriptors' group. "
+                    f"Available groups: {list(self.db_file.keys())}. "
+                    f"The database file may be corrupted or was created with an incompatible version."
+                )
 
             self.global_descriptors = self.db_file["global_descriptors"]["descriptors"][:]
             self.frame_poses = self.db_file["global_descriptors"]["frame_poses"][:]
 
-            logger.info(f"Loaded global descriptors: shape {self.global_descriptors.shape}")
-            logger.info(f"Loaded frame poses: shape {self.frame_poses.shape}")
+            logger.info(
+                f"Loaded global descriptors: shape={self.global_descriptors.shape}, "
+                f"dtype={self.global_descriptors.dtype}, "
+                f"mem={self.global_descriptors.nbytes / 1024**2:.1f} MB"
+            )
+            logger.info(f"Loaded frame poses: shape={self.frame_poses.shape}")
 
             for key, value in self.db_file["metadata"].attrs.items():
                 self.metadata[key] = value
-                logger.debug(f"Metadata - {key}: {value}")
+                logger.debug(f"Metadata — {key}: {value}")
 
             if "actual_num_frames" in self.metadata:
                 actual_num = int(self.metadata["actual_num_frames"])
+                total_slots = len(self.global_descriptors)
+                logger.info(
+                    f"Database contains {actual_num} actual frames in {total_slots} pre-allocated slots"
+                )
                 # DO NOT SLICE with actual_num_frames! The arrays are sized to num_frames exactly,
                 # and are indexed by absolute visual frame_id!
-            
+
             if "frame_index_map" in self.db_file["metadata"]:
                 self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
+                logger.debug(f"Frame index map loaded: {len(self.frame_index_map)} entries")
             else:
                 self.frame_index_map = np.arange(len(self.global_descriptors))
+                logger.debug("No frame_index_map found — using sequential indices")
 
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
 
-            logger.success("Hot data loaded successfully into RAM")
+            logger.success(
+                f"Hot data loaded successfully | "
+                f"{len(self.global_descriptors)} frames, "
+                f"descriptor_dim={self.global_descriptors.shape[1]}, "
+                f"propagated={'yes' if self.is_propagated else 'no'}"
+            )
 
+        except KeyError as e:
+            logger.error(
+                f"Database structure error: {e} | path={self.db_path}. "
+                f"This usually means the HDF5 file is incomplete or was created with a different version."
+            )
+            raise
+        except OSError as e:
+            logger.error(
+                f"Cannot open database file: {e} | path={self.db_path}. "
+                f"Check that the file exists and is not locked by another process."
+            )
+            raise
         except Exception as e:
-            logger.error(f"Failed to load database: {e}")
+            logger.error(
+                f"Unexpected error loading database: {e} | path={self.db_path}", exc_info=True
+            )
             raise
 
     def _load_propagation_data(self) -> None:
@@ -1397,7 +1520,11 @@ class DatabaseLoader:
                     self.converter = CoordinateConverter.from_metadata(meta)
                     logger.success(f"Projection restored from HDF5: {meta['mode']}")
                 except Exception as e:
-                    logger.warning(f"Could not load projection metadata: {e}")
+                    logger.warning(
+                        f"Could not load projection metadata: {e}. "
+                        f"Raw value: {grp.attrs.get('projection_json', '<missing>')}. "
+                        f"Falling back to default projection."
+                    )
             elif "reference_gps" in grp.attrs:
                 # Fallback для v2.0 (UTM)
                 try:
@@ -1405,7 +1532,11 @@ class DatabaseLoader:
                     self.converter = CoordinateConverter("UTM", tuple(ref_gps))
                     logger.success(f"UTM auto-initialized from legacy reference GPS: {ref_gps}")
                 except Exception as e:
-                    logger.warning(f"Could not init UTM from legacy attr: {e}")
+                    logger.warning(
+                        f"Could not init UTM from legacy attribute: {e}. "
+                        f"Raw reference_gps value: {grp.attrs.get('reference_gps', '<missing>')}. "
+                        f"Defaulting to WEB_MERCATOR."
+                    )
             else:
                 # Fallback для v1.0 (WebMercator)
                 logger.info("No projection metadata found. Defaulting to WEB_MERCATOR fallback.")
@@ -1430,7 +1561,11 @@ class DatabaseLoader:
                 self.frame_affine = None
                 self.frame_valid = None
         except Exception as e:
-            logger.error(f"Failed to load propagation data: {e}")
+            logger.error(
+                f"Failed to load propagation data: {e} | db_path={self.db_path}. "
+                f"Calibration data may be corrupted — recalibration recommended.",
+                exc_info=True,
+            )
             self.frame_affine = None
             self.frame_valid = None
 
@@ -1456,7 +1591,7 @@ class DatabaseLoader:
         if self.db_file is None:
             return 1080, 1920
 
-        # Схема v2: розміри збережені один раз в local_features.attrs
+        # Нова схема v2: розміри збережені один раз в local_features.attrs
         schema = self.metadata.get("hdf5_schema", "v1")
         if schema == "v2" and "local_features" in self.db_file:
             lf_attrs = self.db_file["local_features"].attrs
@@ -1465,21 +1600,22 @@ class DatabaseLoader:
             self._size_cache[frame_id] = (h, w)
             return h, w
 
-        # Схема v1: fallback — спочатку metadata, потім група кадру
-        h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
-        w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
+        # Стара схема v1: fallback — читаємо з групи кадру (зворотня сумісність)
         group_name = f"local_features/frame_{frame_id}"
         if group_name in self.db_file:
             g = self.db_file[group_name]
             if "height" in g.attrs and "width" in g.attrs:
                 h, w = int(g.attrs["height"]), int(g.attrs["width"])
+            else:
+                h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
+                w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
 
         res = (int(h), int(w))
         self._size_cache[frame_id] = res
         return res
 
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
-        """Повертає локальні ознаки XFeat для вказаного кадру"""
+        """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         if frame_id in self._feature_cache:
             return self._feature_cache[frame_id]
 
@@ -1487,36 +1623,29 @@ class DatabaseLoader:
             raise RuntimeError("Database not opened")
 
         schema = self.metadata.get("hdf5_schema", "v1")
-        g = self.db_file["local_features"]
-
         if schema == "v2":
-            n = int(g["kp_counts"][frame_id])
+            lf = self.db_file["local_features"]
+            n = int(lf["kp_counts"][frame_id])
             if n == 0:
                 raise ValueError(f"Кадр {frame_id} не має keypoints (kp_count=0).")
             res = {
-                "keypoints": g["keypoints"][frame_id, :n],
-                "descriptors": g["descriptors"][frame_id, :n].astype(np.float32),  # float16→32
-                "coords_2d": g["coords_2d"][frame_id, :n],
+                "keypoints": lf["keypoints"][frame_id, :n],
+                "descriptors": lf["descriptors"][frame_id, :n].astype("float32"),  # float16→32
+                "coords_2d": lf["coords_2d"][frame_id, :n],
             }
         else:
             # Стара схема v1 — зворотня сумісність
-            if f"frame_{frame_id}" in g:
-                old_g = g[f"frame_{frame_id}"]
-                res = {
-                    "keypoints": old_g["keypoints"][:],
-                    "descriptors": old_g["descriptors"][:],
-                    "coords_2d": old_g["coords_2d"][:],
-                }
-            else:
-                # v1 pre-allocated без груп
-                num = int(g["num_kp"][frame_id])
-                res = {
-                    "keypoints": g["keypoints"][frame_id, :num],
-                    "descriptors": g["descriptors"][frame_id, :num].astype(np.float32),
-                    "coords_2d": g["coords_2d"][frame_id, :num],
-                }
+            group_name = f"local_features/frame_{frame_id}"
+            if group_name not in self.db_file:
+                raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
+            g = self.db_file[group_name]
+            res = {
+                "keypoints": g["keypoints"][:],
+                "descriptors": g["descriptors"][:],
+                "coords_2d": g["coords_2d"][:],
+            }
 
-        # Обмежуємо розмір кешу (аналог lru_cache з maxsize=200)
+        # LRU-витіснення
         if len(self._feature_cache) > 200:
             self._feature_cache.pop(next(iter(self._feature_cache)))
 
@@ -1524,7 +1653,7 @@ class DatabaseLoader:
         return res
 
     def get_num_frames(self) -> int:
-        """Повертає кількість pre-allocated слотів у БД (індексація за абсолютним frame_id)."""
+        """Повертає кількість кадрів у БД (pre-allocated slots для v2)."""
         return int(self.metadata.get("num_frames", 0))
 
     def close(self) -> None:
@@ -1537,10 +1666,61 @@ class DatabaseLoader:
         self._size_cache.clear()
         self._feature_cache.clear()
 
+
 # ================================================================================
 # File: database\__init__.py
 # ================================================================================
 """Database module"""
+
+
+# ================================================================================
+# File: geometry\affine_utils.py
+# ================================================================================
+"""
+Утиліти декомпозиції/складання ізотропних афінних матриць.
+
+Єдине джерело істини для decompose/compose — використовується в:
+  - src.calibration.multi_anchor_calibration
+  - src.workers.calibration_propagation_worker
+"""
+
+import numpy as np
+
+
+def decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
+    """
+    Розкладає афінну матрицю 2x3 на компоненти:
+    (tx, ty, scale, angle_rad).
+
+    Для афінної матриці вигляду:
+        [s*cos(a)  -s*sin(a)  tx]
+        [s*sin(a)   s*cos(a)  ty]
+    scale = sqrt(det(R_part)), angle = atan2(M[1,0], M[0,0]).
+    При наявності шуму (незначний зсув / анізотропний масштаб)
+    беремо ізотропне наближення через норму першого стовпця.
+    """
+    tx = float(M[0, 2])
+    ty = float(M[1, 2])
+    # Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання
+    s_x = float(np.linalg.norm(M[:2, 0]))
+    s_y = float(np.linalg.norm(M[:2, 1]))
+    scale = (s_x + s_y) * 0.5
+    if scale < 1e-9:
+        scale = 1e-9
+    angle = float(np.arctan2(M[1, 0], M[0, 0]))
+    return tx, ty, scale, angle
+
+
+def compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
+    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
+    c = np.cos(angle) * scale
+    s = np.sin(angle) * scale
+    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float32)
+
+
+def unwrap_angles(angles: np.ndarray) -> np.ndarray:
+    """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
+    return np.unwrap(angles)
 
 
 # ================================================================================
@@ -1601,11 +1781,16 @@ class CoordinateConverter:
                 self._initialize_projection(lat, lon)
             else:
                 raise RuntimeError(
-                    "CoordinateConverter (UTM) must be initialized with reference_gps."
+                    f"CoordinateConverter (UTM) must be initialized with reference_gps "
+                    f"before converting ({lat}, {lon}). "
+                    f"Call __init__ with reference_gps parameter first."
                 )
 
         if self._transformer_to_metric is None:
-            raise RuntimeError("Transformer not initialized.")
+            raise RuntimeError(
+                f"GPS-to-metric transformer not initialized (mode={self._mode}). "
+                f"Cannot convert ({lat}, {lon}). This is a bug — _initialize_projection should have been called."
+            )
 
         x, y = self._transformer_to_metric.transform(lon, lat)
         return float(x), float(y)
@@ -1618,7 +1803,10 @@ class CoordinateConverter:
                 raise RuntimeError("CoordinateConverter is not initialized.")
 
         if self._transformer_to_gps is None:
-            raise RuntimeError("Transformer not initialized.")
+            raise RuntimeError(
+                f"Metric-to-GPS transformer not initialized (mode={self._mode}). "
+                f"Cannot convert ({x}, {y}). This is a bug — _initialize_projection should have been called."
+            )
 
         lon, lat = self._transformer_to_gps.transform(x, y)
         return float(lat), float(lon)
@@ -1667,6 +1855,16 @@ import numpy as np
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+# PoseLib: LO-RANSAC з 4-точковим розв'язувачем (кращий за MAGSAC++ на малих datasets)
+try:
+    import poselib
+
+    _POSELIB_AVAILABLE = True
+    logger.info(f"PoseLib {poselib.__version__} available — LO-RANSAC enabled")
+except ImportError:
+    _POSELIB_AVAILABLE = False
+    logger.info("PoseLib not installed — using OpenCV MAGSAC++ for homography estimation")
 
 
 class GeometryTransforms:
@@ -1758,7 +1956,12 @@ class GeometryTransforms:
             return True
 
         except Exception as e:
-            logger.error(f"Error during matrix validation: {e}")
+            logger.error(
+                f"Error during matrix validation: {e} | "
+                f"matrix_shape={M.shape if M is not None else None}, "
+                f"is_homography={is_homography}",
+                exc_info=True,
+            )
             return False
 
     @staticmethod
@@ -1769,17 +1972,35 @@ class GeometryTransforms:
         max_iters: int = 2000,
         confidence: float = 0.99,
         fallback_to_affine: bool = True,
+        backend: str = "opencv",
     ):
         """
-        Estimate Homography using MAGSAC++ with validation and optional fallback.
+        Estimate Homography with configurable backend.
+
+        Args:
+            backend: "poselib" (LO-RANSAC) або "opencv" (MAGSAC++, default)
         """
         if len(src_pts) < 4:
+            logger.debug(
+                f"Cannot estimate homography: need ≥4 points, got {len(src_pts)}. "
+                f"Provide more feature matches."
+            )
             return None, None
 
+        # PoseLib backend (LO-RANSAC)
+        if backend == "poselib" and _POSELIB_AVAILABLE:
+            H, mask = GeometryTransforms._estimate_homography_poselib(
+                src_pts, dst_pts, ransac_threshold, max_iters, confidence
+            )
+            if GeometryTransforms.is_matrix_valid(H, is_homography=True):
+                return H, mask
+            # Якщо PoseLib дав невалідну матрицю — fallback
+            logger.debug("PoseLib homography invalid, falling back to OpenCV")
+
+        # OpenCV backend (USAC_MAGSAC)
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
         dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
 
-        # Use USAC_MAGSAC for better outlier rejection and accuracy (OpenCV 4.5+)
         H, mask = cv2.findHomography(
             src_pts_cv,
             dst_pts_cv,
@@ -1792,13 +2013,56 @@ class GeometryTransforms:
         # Validate Homography
         if not GeometryTransforms.is_matrix_valid(H, is_homography=True):
             if fallback_to_affine:
-                logger.warning("Homography invalid/degenerate, falling back to Partial Affine")
+                logger.warning(
+                    f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
+                    f"Falling back to Partial Affine (4 DoF)."
+                )
                 return GeometryTransforms.estimate_affine_partial(
                     src_pts, dst_pts, ransac_threshold
                 )
+            logger.warning(
+                f"Homography invalid/degenerate and no fallback enabled | "
+                f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
+            )
             return None, None
 
         return H, mask
+
+    @staticmethod
+    def _estimate_homography_poselib(
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        ransac_threshold: float = 3.0,
+        max_iters: int = 2000,
+        confidence: float = 0.99,
+    ):
+        """
+        Estimate Homography через PoseLib LO-RANSAC.
+        Повертає (H, mask) у форматі сумісному з OpenCV.
+        """
+        pts_src = src_pts.reshape(-1, 2).astype(np.float64)
+        pts_dst = dst_pts.reshape(-1, 2).astype(np.float64)
+
+        ransac_opt = {
+            "max_reproj_error": ransac_threshold,
+            "max_iterations": max_iters,
+            "confidence": confidence,
+        }
+
+        H, info = poselib.estimate_homography(pts_src, pts_dst, ransac_opt)
+
+        if H is None:
+            return None, None
+
+        # Конвертація inlier mask у формат (N, 1) uint8 — аналог OpenCV
+        inliers = info.get("inliers", [])
+        n_pts = len(pts_src)
+        mask = np.zeros((n_pts, 1), dtype=np.uint8)
+        for idx in inliers:
+            if 0 <= idx < n_pts:
+                mask[idx] = 1
+
+        return np.array(H, dtype=np.float64), mask
 
     @staticmethod
     def apply_homography(points: np.ndarray, H: np.ndarray) -> np.ndarray:
@@ -1812,6 +2076,7 @@ class GeometryTransforms:
     def estimate_affine(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
         """Compute full Affine transformation (6 DoF) using MAGSAC++"""
         if len(src_pts) < 3:
+            logger.debug(f"Cannot estimate affine: need ≥3 points, got {len(src_pts)}")
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
@@ -1822,6 +2087,10 @@ class GeometryTransforms:
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
+            logger.debug(
+                f"Affine estimation produced invalid matrix | "
+                f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
+            )
             return None, None
 
         return M, mask
@@ -1831,7 +2100,8 @@ class GeometryTransforms:
         src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0
     ):
         """Compute STRICT Affine transformation (4 DoF: R+T+S only) using MAGSAC++"""
-        if len(src_pts) < 2:  # Partial needs only 2 points minimum
+        if len(src_pts) < 2:
+            logger.debug(f"Cannot estimate partial affine: need ≥2 points, got {len(src_pts)}")
             return None, None
 
         src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
@@ -1842,6 +2112,10 @@ class GeometryTransforms:
         )
 
         if not GeometryTransforms.is_matrix_valid(M, is_homography=False):
+            logger.debug(
+                f"Partial affine estimation produced invalid matrix | "
+                f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
+            )
             return None, None
 
         return M, mask
@@ -1957,6 +2231,13 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.verify_propagation_clicked.connect(self.on_verify_propagation)
         cp.clear_map_clicked.connect(self.map_widget.clear_trajectory)
         cp.export_results_clicked.connect(self.on_export_results)
+        self.map_widget.mapClicked.connect(self._on_map_clicked)
+
+    def _on_map_clicked(self, lat: float, lon: float):
+        """Handle map click by showing coordinates in the status bar."""
+        msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
+        self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
+        logger.info(f"Map click: {lat=}, {lon=}")
 
 
 # ================================================================================
@@ -4873,9 +5154,19 @@ class MapBridge(QObject):
     showVerificationMarkersSignal = pyqtSignal(str)
     clearVerificationMarkersSignal = pyqtSignal()
 
+    # JS -> Python: Map Click
+    mapClickedSignal = pyqtSignal(float, float)
+
+    @pyqtSlot(float, float)
+    def mapClicked(self, lat: float, lon: float):
+        """Called from JavaScript when the map is clicked."""
+        self.mapClickedSignal.emit(lat, lon)
+
 
 class MapWidget(QWebEngineView):
     """Interactive map widget backed by Leaflet via QWebChannel."""
+
+    mapClicked = pyqtSignal(float, float)  # Public signal
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4885,6 +5176,8 @@ class MapWidget(QWebEngineView):
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
 
         self.bridge = MapBridge()
+        self.bridge.mapClickedSignal.connect(self.mapClicked)  # Re-emit for convenience
+
         self._channel = QWebChannel()
         self._channel.registerObject("mapBridge", self.bridge)
         self.page().setWebChannel(self._channel)
@@ -5161,7 +5454,7 @@ class Localizer:
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
             threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 25.0),
-            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 60.0),
+            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 1000.0),
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
@@ -5175,9 +5468,26 @@ class Localizer:
         self.retrieval_top_k = get_cfg(self.config, "localization.retrieval_top_k", 8)
         self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
 
+        # Fix #1: Захист від нескінченного циклу при виході за межі покриття
+        self._consecutive_failures = 0
+        self._max_failures = get_cfg(self.config, "localization.max_consecutive_failures", 10)
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
+        # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
+        if self._consecutive_failures >= self._max_failures:
+            self._consecutive_failures = 0
+            logger.warning(
+                f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
+                f"Resetting counter. The drone may be outside the database coverage area."
+            )
+            return {
+                "success": False,
+                "error": "out_of_coverage",
+                "detail": f"Exceeded {self._max_failures} consecutive localization failures",
+            }
+
         height, width = query_frame.shape[:2]
 
         angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
@@ -5209,9 +5519,14 @@ class Localizer:
                     best_global_candidates = candidates
 
         if not best_global_candidates:
+            self._consecutive_failures += 1
             return {
                 "success": False,
-                "error": "No candidates found via global descriptor (DINOv2) in any rotation",
+                "error": (
+                    f"No candidates found via global descriptor (DINOv2) in any rotation. "
+                    f"Tested angles: {angles_to_try}. "
+                    f"Image {width}x{height} may not match any frame in the database."
+                ),
             }
 
         logger.info(
@@ -5240,6 +5555,7 @@ class Localizer:
 
         # 2. Локальний пошук (XFeat) ТІЛЬКИ для найкращого знайденого ракурсу
         for candidate_id, score in best_global_candidates:
+            logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = self.database.get_local_features(candidate_id)
 
             mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
@@ -5295,9 +5611,17 @@ class Localizer:
             fallback_res = self._localize_by_reference_frame(target_id, best_global_score)
             if fallback_res:
                 logger.info(
-                    f"Feature matching failed ({best_inliers} inliers), using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})"
+                    f"Feature matching insufficient ({best_inliers} inliers < {self.min_matches} min), "
+                    f"using retrieval-only fallback | "
+                    f"frame={target_id}, global_score={best_global_score:.3f}"
                 )
                 return fallback_res
+            logger.warning(
+                f"Localization failed: {best_inliers} inliers < {self.min_matches} minimum | "
+                f"best_candidate={best_candidate_id}, candidates_tried={len(best_global_candidates)}, "
+                f"query_kpts={len(best_query_features.get('keypoints', []))}"
+            )
+            self._consecutive_failures += 1
             return {
                 "success": False,
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
@@ -5312,10 +5636,18 @@ class Localizer:
             fallback_res = self._localize_by_reference_frame(target_id, best_global_score)
             if fallback_res:
                 logger.info(
-                    f"No propagated calibration for frame {target_id}, using retrieval-only fallback"
+                    f"No propagated calibration for frame {target_id} — "
+                    f"frame may not have been reached during calibration propagation. "
+                    f"Using retrieval-only fallback."
                 )
                 return fallback_res
-            return {"success": False, "error": "No propagated calibration"}
+            return {
+                "success": False,
+                "error": (
+                    f"No propagated calibration for matched frame {best_candidate_id}. "
+                    f"Run calibration propagation to enable localization for this area."
+                ),
+            }
 
         # 4. Рахуємо розміри ПОВЕРНУТОГО зображення
         if best_global_angle in [90, 270]:
@@ -5357,11 +5689,15 @@ class Localizer:
 
         # 6. Перевіряємо чи нова точка — аномалія (стрибок координат)
         if self.outlier_detector.is_outlier(metric_pt, dt):
-            # Ми все одно логуємо спробу, але кажемо, що це аутлаєр
             logger.warning(
-                f"Outlier filtered at frame {best_candidate_id}: jump from previous trajectory"
+                f"Outlier filtered | matched_frame={best_candidate_id}, "
+                f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
+                f"Position jump was too large relative to recent trajectory."
             )
             return {"success": False, "error": "Outlier detected — position jump filtered"}
+
+        # Успішна локалізація — скидаємо лічильник невдач
+        self._consecutive_failures = 0
 
         # Оновлення Калмана (фільтрація шумів)
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
@@ -5392,7 +5728,9 @@ class Localizer:
 
         if is_exploded and best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
             logger.warning(
-                "Homography exploded the FOV (perspective distortion)! Falling back to inliers bounding box."
+                f"Homography exploded the FOV (max_coord={max_coord:.0f}px > 50000px threshold). "
+                f"Cause: perspective distortion from locally-clustered ALIKED matches. "
+                f"Falling back to inliers bounding box for safe FOV estimation."
             )
             pts = best_mkpts_q_inliers
             min_x, min_y = np.min(pts, axis=0)
@@ -5528,10 +5866,18 @@ class Localizer:
 
         threshold = get_cfg(self.config, "localization.retrieval_only_min_score", 0.90)
         if score < threshold:
+            logger.debug(
+                f"Retrieval-only fallback rejected: score {score:.3f} < threshold {threshold:.3f} | "
+                f"frame={frame_id}"
+            )
             return None
 
         affine_ref = self.database.get_frame_affine(frame_id)
         if affine_ref is None:
+            logger.debug(
+                f"Retrieval-only fallback failed: no affine matrix for frame {frame_id}. "
+                f"Frame not reached during calibration propagation."
+            )
             return None
 
         ref_h, ref_w = self.database.get_frame_size(frame_id)
@@ -5634,7 +5980,12 @@ class FeatureMatcher:
                 self.lightglue = self.model_manager.load_lightglue_aliked()
                 logger.info("FeatureMatcher configured to use LightGlue (ALIKED)")
             except Exception as e:
-                logger.warning(f"Failed to load LightGlue ALIKED: {e}. Falling back to Numpy L2.")
+                logger.warning(
+                    f"Failed to load LightGlue ALIKED: {e}. "
+                    f"Cause: model files may be missing or VRAM insufficient. "
+                    f"Falling back to Numpy L2 matching.",
+                    exc_info=True,
+                )
         else:
             logger.info("FeatureMatcher configured to use fast Numpy L2 matching")
 
@@ -5653,6 +6004,12 @@ class FeatureMatcher:
         if self.lightglue is not None and desc_dim == 128:
             return self._lightglue_match(query_features, ref_features)
 
+        if self.lightglue is not None and desc_dim != 128:
+            logger.debug(
+                f"LightGlue available but descriptor dim={desc_dim} != 128 (ALIKED). "
+                f"Using Numpy L2 matching instead."
+            )
+
         # Fallback (якщо немає LightGlue або інші ознаки)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
@@ -5668,6 +6025,10 @@ class FeatureMatcher:
         kpts_r = ref_features["keypoints"]
 
         if len(desc_q) < 2 or len(desc_r) < 2:
+            logger.debug(
+                f"Numpy L2 match aborted: insufficient descriptors | "
+                f"query={len(desc_q)}, ref={len(desc_r)} (minimum=2)"
+            )
             return np.empty((0, 2)), np.empty((0, 2))
 
         # 1. Нормалізація дескрипторів
@@ -5709,7 +6070,12 @@ class FeatureMatcher:
         """Matches features using Neural LightGlue Matcher"""
         try:
             if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
-                logger.warning("Empty keypoints array provided to LightGlue.")
+                logger.warning(
+                    f"Empty keypoints provided to LightGlue | "
+                    f"query_kpts={len(query_features['keypoints'])}, "
+                    f"ref_kpts={len(ref_features['keypoints'])}. "
+                    f"Cannot match without keypoints."
+                )
                 return np.empty((0, 2)), np.empty((0, 2))
 
             device = next(self.lightglue.parameters()).device
@@ -5750,7 +6116,15 @@ class FeatureMatcher:
             return mkpts_q, mkpts_r
 
         except Exception as e:
-            logger.error(f"LightGlue match failed: {e}")
+            logger.error(
+                f"LightGlue match failed: {e} | "
+                f"query_kpts={len(query_features.get('keypoints', []))}, "
+                f"query_desc_shape={query_features.get('descriptors', np.empty(0)).shape}, "
+                f"ref_kpts={len(ref_features.get('keypoints', []))}, "
+                f"ref_desc_shape={ref_features.get('descriptors', np.empty(0)).shape}. "
+                f"Possible causes: CUDA OOM, tensor shape mismatch, or model corruption.",
+                exc_info=True,
+            )
             return np.empty((0, 2)), np.empty((0, 2))
 
 # ================================================================================
@@ -5763,6 +6137,7 @@ class FeatureMatcher:
 # File: models\model_manager.py
 # ================================================================================
 import gc
+import threading
 import time
 from contextlib import contextmanager
 
@@ -5787,6 +6162,9 @@ class ModelManager:
         )
         self.models = {}
         self.model_usage = {}
+
+        # Fix #4: Захист від race condition при паралельному завантаженні моделей (prewarm + main thread)
+        self._model_lock = threading.Lock()
 
         # Конфігурація VRAM
         self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
@@ -5815,8 +6193,12 @@ class ModelManager:
         req = required_mb if required_mb is not None else self.default_vram_required
 
         while self.get_available_vram_mb() < req and self.models:
+            available = self.get_available_vram_mb()
             least_used = min(self.model_usage.items(), key=lambda x: x[1])[0]
-            logger.warning(f"VRAM insufficient. Unloading least used model: {least_used}")
+            logger.warning(
+                f"VRAM insufficient: need {req:.0f} MB, have {available:.0f} MB. "
+                f"Unloading least-recently-used model: '{least_used}'"
+            )
             self.unload_model(least_used)
 
     def _register_model_usage(self, name: str):
@@ -5824,210 +6206,282 @@ class ModelManager:
 
     def load_yolo(self):
         name = "yolo"
-        if name not in self.models:
-            model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11x-seg.pt")
-            vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
+        with self._model_lock:
+            if name not in self.models:
+                model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11x-seg.pt")
+                vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
 
-            logger.info(f"Loading YOLO model: {model_path}...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from ultralytics import YOLO
+                logger.info(f"Loading YOLO model: {model_path}...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from ultralytics import YOLO
 
-                model = YOLO(model_path)
-                model.to(self.device)
-                self.models[name] = model
-                logger.success(f"YOLO model {model_path} loaded successfully on {self.device}")
-            except Exception as e:
-                logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    model = YOLO(model_path)
+                    model.to(self.device)
+                    self.models[name] = model
+                    logger.success(f"YOLO model {model_path} loaded successfully on {self.device}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load YOLO model: {e} | "
+                        f"model_path={model_path}, device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that the model file exists and is not corrupted.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_xfeat(self):
         name = "xfeat"
-        if name not in self.models:
-            repo = get_cfg(self.config, "models.xfeat.hub_repo", "verlab/accelerated_features")
-            model_name = get_cfg(self.config, "models.xfeat.hub_model", "XFeat")
-            top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
-            vram_req = get_cfg(self.config, "models.xfeat.vram_required_mb", 300.0)
+        with self._model_lock:
+            if name not in self.models:
+                repo = get_cfg(self.config, "models.xfeat.hub_repo", "verlab/accelerated_features")
+                model_name = get_cfg(self.config, "models.xfeat.hub_model", "XFeat")
+                top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
+                vram_req = get_cfg(self.config, "models.xfeat.vram_required_mb", 300.0)
 
-            logger.info(f"Loading XFeat model ({repo}/{model_name})...")
-            self._ensure_vram_available(vram_req)
-            try:
-                model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
-                # FIX: XFeat hardcodes self.dev='cuda' if available, causing crashes if we move to CPU
-                if hasattr(model, "dev"):
-                    model.dev = torch.device(self.device)
-                model = model.eval().to(self.device)
-                self.models[name] = model
-                logger.success(f"XFeat loaded successfully on {self.device}")
-            except Exception as e:
-                logger.error(f"Failed to load XFeat: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                logger.info(f"Loading XFeat model ({repo}/{model_name})...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
+                    # FIX: XFeat hardcodes self.dev='cuda' if available, causing crashes if we move to CPU
+                    if hasattr(model, "dev"):
+                        model.dev = torch.device(self.device)
+                    model = model.eval().to(self.device)
+                    self.models[name] = model
+                    logger.success(f"XFeat loaded successfully on {self.device}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load XFeat: {e} | "
+                        f"repo={repo}, model={model_name}, device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check internet connection for torch.hub download.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_superpoint(self):
         name = "superpoint"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.superpoint.vram_required_mb", 500.0)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.superpoint.vram_required_mb", 500.0)
 
-            logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import SuperPoint
+                logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import SuperPoint
 
-                sp_config = {
-                    "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
-                    "max_num_keypoints": get_cfg(
-                        self.config, "models.superpoint.max_keypoints", 4096
-                    ),
-                }
-                model = SuperPoint(**sp_config).eval().to(self.device)
-                self.models[name] = model
-                logger.success("SuperPoint model loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load SuperPoint model: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    sp_config = {
+                        "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
+                        "max_num_keypoints": get_cfg(
+                            self.config, "models.superpoint.max_keypoints", 4096
+                        ),
+                    }
+                    model = SuperPoint(**sp_config).eval().to(self.device)
+                    self.models[name] = model
+                    logger.success("SuperPoint model loaded successfully")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load SuperPoint: {e} | device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that 'lightglue' package is installed correctly.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_lightglue(self):
         name = "lightglue"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
-            logger.info("Loading LightGlue model...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import LightGlue
+                logger.info("Loading LightGlue model...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import LightGlue
 
-                lg_config = {
-                    "depth_confidence": get_cfg(
-                        self.config, "models.lightglue.depth_confidence", -1
-                    ),
-                    "width_confidence": get_cfg(
-                        self.config, "models.lightglue.width_confidence", -1
-                    ),
-                }
-                model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
-                self.models[name] = model
-                logger.success("LightGlue model loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load LightGlue: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    lg_config = {
+                        "depth_confidence": get_cfg(
+                            self.config, "models.lightglue.depth_confidence", -1
+                        ),
+                        "width_confidence": get_cfg(
+                            self.config, "models.lightglue.width_confidence", -1
+                        ),
+                    }
+                    model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
+                    self.models[name] = model
+                    logger.success("LightGlue model loaded successfully")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load LightGlue: {e} | device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that 'lightglue' package is installed and VRAM is sufficient.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_dinov2(self):
         name = "dinov2"
-        if name not in self.models:
-            repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
-            model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
-            vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
+        with self._model_lock:
+            if name not in self.models:
+                repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
+                model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
+                vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
 
             logger.info(f"Loading DINOv2 ({model_name}) model...")
             self._ensure_vram_available(vram_req)
+
+            # Спроба завантажити TensorRT engine (якщо скомпільований)
+            trt_loaded = False
+            engine_dir = get_cfg(
+                self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
+            )
             try:
-                model = torch.hub.load(repo, model_name)
-                model = model.eval().to(self.device)
-                self.models[name] = model
-                logger.success(f"DINOv2 model {model_name} loaded successfully")
+                from src.models.wrappers.trt_dinov2_wrapper import (
+                    TensorRTDINOv2Wrapper,
+                    is_trt_available,
+                )
+
+                if is_trt_available():
+                    import os
+
+                    engine_path = os.path.join(engine_dir, "dinov2_vitl14_fp16.engine")
+                    if os.path.exists(engine_path):
+                        model = TensorRTDINOv2Wrapper(engine_path)
+                        self.models[name] = model
+                        trt_loaded = True
+                        logger.success(f"DINOv2 TensorRT FP16 engine loaded: {engine_path}")
             except Exception as e:
-                logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
-                raise
+                logger.debug(f"TensorRT DINOv2 not available, using PyTorch: {e}")
+
+            # Fallback: стандартний PyTorch hub
+            if not trt_loaded:
+                try:
+                    model = torch.hub.load(repo, model_name)
+                    model = model.eval().to(self.device)
+                    self.models[name] = model
+                    logger.success(f"DINOv2 model {model_name} loaded successfully (PyTorch)")
+                except Exception as e:
+                    logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
+                    raise
         self._register_model_usage(name)
         return self.models[name]
 
     def load_aliked(self):
         """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
         name = "aliked"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
-            max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
+                max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
 
-            logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import ALIKED
+                logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import ALIKED
 
-                model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
-                self.models[name] = model
-                logger.success(f"ALIKED loaded successfully on {self.device}")
-            except Exception as e:
-                logger.error(f"Failed to load ALIKED: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
+                    self.models[name] = model
+                    logger.success(f"ALIKED loaded successfully on {self.device}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load ALIKED: {e} | "
+                        f"max_keypoints={max_keypoints}, device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Check that 'lightglue' package is installed correctly.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_lightglue_aliked(self):
         """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
         name = "lightglue_aliked"
-        if name not in self.models:
-            vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
 
-            logger.info("Loading LightGlue (ALIKED weights)...")
-            self._ensure_vram_available(vram_req)
-            try:
-                from lightglue import LightGlue
+                logger.info("Loading LightGlue (ALIKED weights)...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from lightglue import LightGlue
 
-                model = (
-                    LightGlue(
-                        features="aliked",
-                        depth_confidence=get_cfg(
-                            self.config, "models.lightglue.depth_confidence", -1
-                        ),
-                        width_confidence=get_cfg(
-                            self.config, "models.lightglue.width_confidence", -1
-                        ),
+                    model = (
+                        LightGlue(
+                            features="aliked",
+                            depth_confidence=get_cfg(
+                                self.config, "models.lightglue.depth_confidence", -1
+                            ),
+                            width_confidence=get_cfg(
+                                self.config, "models.lightglue.width_confidence", -1
+                            ),
+                        )
+                        .eval()
+                        .to(self.device)
                     )
-                    .eval()
-                    .to(self.device)
-                )
-                self.models[name] = model
-                logger.success("LightGlue (ALIKED) loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load LightGlue (ALIKED): {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    self.models[name] = model
+                    logger.success("LightGlue (ALIKED) loaded successfully")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load LightGlue (ALIKED): {e} | device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_cesp(self):
         """Завантажує CESP модуль для покращення DINOv2 global descriptors"""
         name = "cesp"
-        if name not in self.models:
-            logger.info("Loading CESP module...")
-            try:
-                from src.models.wrappers.cesp_module import CESP
+        with self._model_lock:
+            if name not in self.models:
+                logger.info("Loading CESP module...")
+                try:
+                    from src.models.wrappers.cesp_module import CESP
 
-                scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
-                cesp = CESP(dim=1024, scales=tuple(scales))
+                    scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
+                    cesp = CESP(dim=1024, scales=tuple(scales))
 
-                # Завантаження pretrained ваг (якщо є)
-                weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
-                if weights_path:
-                    cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
-                    logger.success(f"CESP pretrained weights loaded from {weights_path}")
-                else:
-                    logger.warning("CESP initialized WITHOUT pretrained weights (random init)")
+                    # Завантаження pretrained ваг (якщо є)
+                    weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
+                    if weights_path:
+                        cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
+                        logger.success(f"CESP pretrained weights loaded from {weights_path}")
+                    else:
+                        logger.warning("CESP initialized WITHOUT pretrained weights (random init)")
 
-                cesp = cesp.eval().to(self.device)
-                self.models[name] = cesp
-                logger.success("CESP module loaded")
-            except Exception as e:
-                logger.error(f"Failed to load CESP: {e}", exc_info=True)
-                raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    cesp = cesp.eval().to(self.device)
+                    self.models[name] = cesp
+                    logger.success("CESP module loaded")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load CESP: {e} | "
+                        f"weights_path={weights_path}, device={self.device}. "
+                        f"Check that the weights file exists and is compatible.",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def unload_model(self, model_name: str):
-        if model_name in self.models:
-            logger.info(f"Unloading model: {model_name}")
-            del self.models[model_name]
-            del self.model_usage[model_name]
-            if self.device != "cpu":
-                torch.cuda.empty_cache()
-                gc.collect()
+        with self._model_lock:
+            if model_name in self.models:
+                logger.info(f"Unloading model: {model_name}")
+                del self.models[model_name]
+                del self.model_usage[model_name]
+                if self.device != "cpu":
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
     @contextmanager
     def inference_context(self):
@@ -6298,7 +6752,12 @@ class FeatureExtractor:
                 keypoints = keypoints[valid]
                 descriptors = descriptors[valid]
             else:
-                logger.warning("All keypoints filtered out by YOLO mask!")
+                logger.warning(
+                    f"All keypoints filtered out by YOLO mask! "
+                    f"Image {image.shape[:2]}, total_kpts={len(aliked_out['keypoints'][0])}, "
+                    f"mask_static_ratio={np.mean(static_mask > 128):.1%}. "
+                    f"The entire image may be covered by dynamic objects (vehicles, people)."
+                )
 
         return {"keypoints": keypoints, "descriptors": descriptors, "coords_2d": keypoints.copy()}
 
@@ -6524,6 +6983,131 @@ def create_masking_strategy(
 
 
 # ================================================================================
+# File: models\wrappers\trt_dinov2_wrapper.py
+# ================================================================================
+# src/models/wrappers/trt_dinov2_wrapper.py
+#
+# TensorRT runtime wrapper для DINOv2 ViT-L/14.
+# Завантажує скомпільований .engine файл та виконує інференс без PyTorch overhead.
+
+from pathlib import Path
+
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+# TensorRT доступний не на всіх системах
+try:
+    import pycuda.autoinit  # noqa: F401 — ініціалізує CUDA context
+    import pycuda.driver as cuda
+    import tensorrt as trt
+
+    _TRT_AVAILABLE = True
+except ImportError:
+    _TRT_AVAILABLE = False
+
+
+def is_trt_available() -> bool:
+    """Перевіряє чи TensorRT runtime доступний."""
+    return _TRT_AVAILABLE
+
+
+class TensorRTDINOv2Wrapper:
+    """Runtime wrapper для TensorRT DINOv2 engine.
+
+    Забезпечує інтерфейс forward(image_tensor) -> np.ndarray (1024-dim)
+    сумісний із PyTorch DINOv2 wrapper.
+
+    Використання:
+        wrapper = TensorRTDINOv2Wrapper("models/engines/dinov2_vitl14_fp16.engine")
+        descriptor = wrapper.forward(image_np)  # (1024,) float32
+    """
+
+    def __init__(self, engine_path: str, input_size: int = 336):
+        if not _TRT_AVAILABLE:
+            raise ImportError("TensorRT not available. Install tensorrt and pycuda packages.")
+
+        engine_file = Path(engine_path)
+        if not engine_file.exists():
+            raise FileNotFoundError(
+                f"TensorRT engine not found: {engine_path}. "
+                f"Run: python scripts/compile_dinov2_trt.py --output {engine_file.parent}"
+            )
+
+        self.input_size = input_size
+        self._load_engine(str(engine_file))
+        logger.success(f"TensorRT DINOv2 engine loaded: {engine_path}")
+
+    def _load_engine(self, engine_path: str):
+        """Завантажує TensorRT engine та виділяє GPU пам'ять."""
+        trt_logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(trt_logger)
+
+        with open(engine_path, "rb") as f:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+
+        self.context = self.engine.create_execution_context()
+
+        # Виділення пам'яті для input та output
+        self.input_shape = (1, 3, self.input_size, self.input_size)
+        self.output_shape = (1, 1024)  # DINOv2 ViT-L/14 output dim
+
+        input_nbytes = int(np.prod(self.input_shape) * np.float32(0).nbytes)
+        output_nbytes = int(np.prod(self.output_shape) * np.float32(0).nbytes)
+
+        # GPU буфери
+        self.d_input = cuda.mem_alloc(input_nbytes)
+        self.d_output = cuda.mem_alloc(output_nbytes)
+
+        # CPU буфери (page-locked для швидкого копіювання)
+        self.h_input = cuda.pagelocked_empty(self.input_shape, dtype=np.float32)
+        self.h_output = cuda.pagelocked_empty(self.output_shape, dtype=np.float32)
+
+        self.stream = cuda.Stream()
+        logger.debug(f"TRT buffers allocated: input={input_nbytes}B, output={output_nbytes}B")
+
+    def forward(self, image_chw: np.ndarray) -> np.ndarray:
+        """Виконує інференс TensorRT engine.
+
+        Args:
+            image_chw: нормалізоване зображення (3, H, W) float32
+                       (ImageNet normalization: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        Returns:
+            global_descriptor: (1024,) float32
+        """
+        # Копіюємо дані у page-locked буфер
+        np.copyto(self.h_input, image_chw.reshape(self.input_shape).astype(np.float32))
+
+        # Host → Device
+        cuda.memcpy_htod_async(self.d_input, self.h_input, self.stream)
+
+        # Інференс
+        self.context.execute_async_v2(
+            bindings=[int(self.d_input), int(self.d_output)],
+            stream_handle=self.stream.handle,
+        )
+
+        # Device → Host
+        cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.stream)
+        self.stream.synchronize()
+
+        return self.h_output.reshape(-1).copy()  # (1024,)
+
+    def __del__(self):
+        """Звільнює GPU ресурси."""
+        try:
+            if hasattr(self, "d_input"):
+                self.d_input.free()
+            if hasattr(self, "d_output"):
+                self.d_output.free()
+        except Exception:
+            pass  # Ігноруємо помилки при garbage collection
+
+
+# ================================================================================
 # File: models\wrappers\yolo_wrapper.py
 # ================================================================================
 import cv2
@@ -6553,40 +7137,44 @@ class YOLOWrapper:
         """
         Detect objects and create static mask (single image).
         Делегує до batch-методу для уникнення дублювання логіки.
+        Detect objects and create static mask (single image).
+        Делегує до batch-методу для уникнення дублювання логіки.
 
         Returns:
             static_mask: Binary mask of static areas (255 for static, 0 for dynamic)
             detections: List of detection dicts
         """
-        results = self.detect_and_mask_batch([image])
-        if not results:
-            return np.ones(image.shape[:2], dtype=np.uint8) * 255, []
-        return results[0]
+        return self.detect_and_mask_batch([image])[0]
 
     @torch.no_grad()
     def detect_and_mask_batch(self, images: list[np.ndarray]) -> list[tuple]:
         """
-        Detect objects and create static masks for a batch of images.
+        Обробляє список зображень одним викликом YOLO.
         Повертає list[(static_mask, detections)] того самого порядку.
         """
         if not images:
             return []
 
-        # YOLO expects list of images or a 4D tensor (B, H, W, 3). Ultralytics natively handles list of ndarrays.
+        # verbose=False вимикає зайве логування кожного кадру в консоль
         # half=True для FP16 інференсу
         # conf=0.50 відкидає слабкі передбачення
         results = self.model(images, verbose=False, half=self.use_half, conf=0.50)
 
-        output = []
         MAX_SINGLE_MASK_RATIO = 0.40
         MAX_COMBINED_MASK_RATIO = 0.70
 
+        output = []
         for result, image in zip(results, images):
             height, width = image.shape[:2]
             static_mask = np.ones((height, width), dtype=np.uint8) * 255
-            detections = []
             total_pixels = height * width
+            detections = []
 
+            if result.masks is not None:
+                masks = result.masks.data.cpu().numpy()
+                boxes = result.boxes.data.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy().astype(int)
+                confidences = result.boxes.conf.cpu().numpy()
             if result.masks is not None:
                 masks = result.masks.data.cpu().numpy()
                 boxes = result.boxes.data.cpu().numpy()
@@ -6596,7 +7184,14 @@ class YOLOWrapper:
                 dynamic_mask_indices = [
                     i for i, cls in enumerate(classes) if cls in self.dynamic_classes
                 ]
+                dynamic_mask_indices = [
+                    i for i, cls in enumerate(classes) if cls in self.dynamic_classes
+                ]
 
+                for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
+                    detections.append(
+                        {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
+                    )
                 for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
                     detections.append(
                         {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
@@ -6617,13 +7212,15 @@ class YOLOWrapper:
                     if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
                         static_mask[combined_dynamic > 0.5] = 0
                     else:
+                        from src.utils.logging_utils import get_logger
+
+                        logger = get_logger(__name__)
                         logger.warning(
                             f"YOLO OVER-MASKING DETECTED ({combined_area / total_pixels:.2%}). "
                             "Frame preserved."
                         )
 
             output.append((static_mask, detections))
-
         return output
 
 
@@ -6703,6 +7300,17 @@ class TrajectoryFilter:
 
         return filtered_x, filtered_y
 
+    def reset(self) -> None:
+        """
+        Скидає фільтр до початкового стану.
+        Викликати при кожному новому старті трекінгу, щоб уникнути
+        хибних передбачень на основі швидкості попередньої сесії.
+        """
+        self.is_initialized = False
+        self.kf.x = np.zeros((4, 1))
+        self.kf.P = np.eye(4) * 1000.0
+        logger.info("Kalman filter reset to initial state")
+
 
 # ================================================================================
 # File: tracking\outlier_detector.py
@@ -6765,7 +7373,10 @@ class OutlierDetector:
             if self._consecutive_outliers >= self._max_consecutive:
                 logger.warning(
                     f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
-                    f"accepting new position as legitimate movement"
+                    f"accepting new position as legitimate movement. "
+                    f"Position: ({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"last known: ({last_pos[0]:.1f}, {last_pos[1]:.1f}), "
+                    f"distance={distance:.1f}m"
                 )
                 self.window.clear()
                 self._consecutive_outliers = 0
@@ -6773,11 +7384,17 @@ class OutlierDetector:
 
             if is_speed_outlier:
                 logger.warning(
-                    f"OUTLIER DETECTED: Speed too high ({instantaneous_speed:.2f} m/s > {self.max_speed_mps} m/s)"
+                    f"OUTLIER DETECTED (speed): {instantaneous_speed:.1f} m/s > {self.max_speed_mps} m/s | "
+                    f"distance={distance:.1f}m, dt={dt:.3f}s, "
+                    f"position=({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"consecutive={self._consecutive_outliers}/{self._max_consecutive}"
                 )
             else:
                 logger.warning(
-                    f"OUTLIER DETECTED: Z-score {z_score:.2f} > {self.threshold_std}, distance {distance:.0f}m"
+                    f"OUTLIER DETECTED (z-score): z={z_score:.2f} > {self.threshold_std} | "
+                    f"distance={distance:.1f}m, mean_dist={mean_dist:.1f}m, std={std_dist:.1f}m, "
+                    f"position=({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"consecutive={self._consecutive_outliers}/{self._max_consecutive}"
                 )
             return True
 
@@ -6951,23 +7568,6 @@ def get_logger(name: str | None = None) -> Any:
 # ================================================================================
 # File: workers\calibration_propagation_worker.py
 # ================================================================================
-"""
-calibration_propagation_worker.py — ВИПРАВЛЕНА ВЕРСІЯ
-
-Ключові зміни:
-1. ВИПРАВЛЕННЯ БАГ 1: Видалено рядок pred_uw[3] = angles[2], який примусово
-   прирівнював кут передбаченої матриці до кута правого якоря. Через це delta[3]
-   завжди дорівнювала нулю і кутовий дрейф між GPS-якорями ніколи не коригувався.
-   Тепер pred_uw зберігає справжній передбачений кут від одометричного ланцюжка,
-   а його unwrap виконується коректно разом із лівим та правим якорями.
-2. Multi-anchor Gaussian blending: кожен кадр отримує зважений вплив ВІД УСІХ якорів,
-   а не лише від лівого/правого сусіда. Чим далі — тим менший вплив (exp(-d²/2σ²)).
-3. Robust chain-building: якщо матч між frame[i] і frame[i-1] провалився,
-   пробуємо матч з останнім успішним кадром (gap-bridging). Після max_skip_frames
-   ланцюжок переривається, але решта кадрів ВСЕ ОДНО отримають координати через blending.
-4. Fallback interpolation: кадри, яким не вдалося отримати гомографію через жоден ланцюжок,
-   отримують інтерпольовану афінну матрицю між найближчими успішними кадрами.
-"""
 
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6985,31 +7585,12 @@ logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Утиліти декомпозиції/складання афінних матриць (імпортуються з multi_anchor_calibration,
-# але дублюються тут щоб уникнути циклічного імпорту у worker-потоці)
+# Утиліти декомпозиції/складання афінних матриць — єдине джерело: affine_utils
 # ---------------------------------------------------------------------------
-
-def _decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
-    """
-    Розкладає афінну матрицю 2x3 на компоненти: (tx, ty, scale, angle_rad).
-    Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання.
-    """
-    tx = float(M[0, 2])
-    ty = float(M[1, 2])
-    s_x = float(np.linalg.norm(M[:2, 0]))
-    s_y = float(np.linalg.norm(M[:2, 1]))
-    scale = (s_x + s_y) * 0.5
-    if scale < 1e-9:
-        scale = 1e-9
-    angle = float(np.arctan2(M[1, 0], M[0, 0]))
-    return tx, ty, scale, angle
-
-
-def _compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
-    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
-    c = np.cos(angle) * scale
-    s = np.sin(angle) * scale
-    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float32)
+from src.geometry.affine_utils import (
+    compose_affine as _compose_affine,
+    decompose_affine as _decompose_affine,
+)
 
 
 class CalibrationPropagationWorker(QThread):
@@ -7060,7 +7641,12 @@ class CalibrationPropagationWorker(QThread):
         try:
             self._propagate()
         except Exception as e:
-            logger.error(f"Propagation failed: {e}", exc_info=True)
+            logger.error(
+                f"Propagation failed: {e} | "
+                f"num_anchors={len(self.calibration.anchors)}, "
+                f"db_frames={self.database.get_num_frames()}",
+                exc_info=True,
+            )
             self.error.emit(str(e))
 
     # -------------------------------------------------------------------------
@@ -7080,11 +7666,16 @@ class CalibrationPropagationWorker(QThread):
 
         if not anchors:
             self.error.emit("Немає якорів калібрування")
+            logger.error(
+                "Propagation aborted: no valid anchors. "
+                "Add at least one GPS calibration anchor before running propagation."
+            )
             return
 
         logger.info(
             f"Starting multi-anchor loop-closure propagation for {num_frames} frames "
-            f"using {len(anchors)} anchors"
+            f"using {len(anchors)} anchors: "
+            f"{[f'#{a.frame_id}' for a in anchors]}"
         )
 
         # --- Sigma для Gaussian blending ---
@@ -7173,7 +7764,11 @@ class CalibrationPropagationWorker(QThread):
             anchor_id = anchor.frame_id
             feat = anchor_features.get(anchor_id)
             if feat is None:
-                logger.warning(f"No features for anchor {anchor_id}, skipping chain")
+                logger.warning(
+                    f"No features for anchor #{anchor_id} — skipping chain. "
+                    f"This anchor will not contribute to propagation. "
+                    f"Cause: frame may have zero keypoints in database."
+                )
                 return anchor_id, {}
 
             frames_left = list(range(anchor_id - 1, -1, -1))
@@ -7522,6 +8117,10 @@ class CalibrationPropagationWorker(QThread):
                 return None
             return H, inliers
         except Exception:
+            logger.debug(
+                f"Match failed between frame pair | features_a_kpts={len(features_a.get('keypoints', []))}, "
+                f"features_b_kpts={len(features_b.get('keypoints', []))}"
+            )
             return None
 
     def _project_to_metric(self, H_to_anchor, anchor):
@@ -7631,10 +8230,15 @@ class DatabaseGenerationWorker(QThread):
                 self.completed.emit(self.output_path)
 
         except InterruptedError as e:
-            logger.warning(f"Database generation interrupted: {e}")
+            logger.warning(f"Database generation interrupted by user: {e} | video={self.video_path}")
             self.cancelled.emit()
         except Exception as e:
-            logger.error(f"Database generation failed: {e}", exc_info=True)
+            logger.error(
+                f"Database generation failed: {e} | "
+                f"video={self.video_path}, output={self.output_path}. "
+                f"Check that the video file is valid (MP4/H.264) and disk has sufficient space.",
+                exc_info=True,
+            )
             self.error.emit(f"Критична помилка: {str(e)}")
 
     def stop(self):
@@ -7671,17 +8275,30 @@ class PanoramaOverlayWorker(QThread):
             logger.info(f"Starting background panorama overlay for {self.image_path}")
             img = cv2.imread(self.image_path)
             if img is None:
-                raise ValueError("Не вдалося прочитати файл зображення панорами")
+                raise ValueError(
+                    f"Не вдалося прочитати файл панорами: {self.image_path}. "
+                    f"Переконайтеся, що файл існує та має підтримуваний формат (PNG, JPEG, TIFF)."
+                )
+
+            logger.info(f"Panorama image loaded: {img.shape[1]}x{img.shape[0]} px")
 
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             loc_result = self.localizer.localize_frame(img_rgb)
 
             if not loc_result.get("success"):
-                raise RuntimeError(loc_result.get("error", "Не вдалося локалізувати панораму"))
+                error_reason = loc_result.get('error', 'Невідома причина')
+                raise RuntimeError(
+                    f"Не вдалося локалізувати панораму: {error_reason}. "
+                    f"Переконайтесь, що база даних калібрована і панорама відповідає району бази."
+                )
 
             fov = loc_result.get("fov_polygon")
             if not fov or len(fov) != 4:
-                raise RuntimeError("Локалізатор не повернув коректні кути (FOV) для панорами")
+                raise RuntimeError(
+                    f"Локалізатор не повернув коректні кути (FOV) для панорами. "
+                    f"Отримано fov={fov} (очікується 4 кути). "
+                    f"Можливо, гомографія виродилася через недостатню кількість inliers."
+                )
 
             h, w = img.shape[:2]
             scale = 1.0
@@ -7708,7 +8325,11 @@ class PanoramaOverlayWorker(QThread):
             logger.success("Panorama successfully processed in background")
 
         except Exception as e:
-            logger.error(f"Panorama overlay worker failed: {e}")
+            logger.error(
+                f"Panorama overlay worker failed: {e} | "
+                f"image_path={self.image_path}",
+                exc_info=True,
+            )
             self.error.emit(str(e))
 
 
@@ -7745,7 +8366,10 @@ class PanoramaWorker(QThread):
             if not cap.isOpened():
                 cap = cv2.VideoCapture(self.video_path)
                 if not cap.isOpened():
-                    raise ValueError("Не вдалося відкрити відеофайл")
+                    raise ValueError(
+                        f"Не вдалося відкрити відеофайл: {self.video_path}. "
+                        f"Переконайтесь, що файл існує і має підтримуваний кодек (MP4/H.264)."
+                    )
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             frames_to_stitch = []
@@ -7786,12 +8410,25 @@ class PanoramaWorker(QThread):
                 self.progress.emit(100, "Панораму збережено!")
                 self.completed.emit(self.output_path)
             else:
+                status_names = {
+                    cv2.Stitcher_ERR_NEED_MORE_IMGS: "ERR_NEED_MORE_IMGS (недостатньо кадрів з перекриттям)",
+                    cv2.Stitcher_ERR_HOMOGRAPHY_EST_FAIL: "ERR_HOMOGRAPHY_EST_FAIL (не вдалося знайти гомографію)",
+                    cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL: "ERR_CAMERA_PARAMS_ADJUST_FAIL (помилка калібрування камери)",
+                }
+                status_name = status_names.get(status, f"UNKNOWN_CODE_{status}")
                 raise ValueError(
-                    f"Помилка зшивання (Код OpenCV: {status}). Спробуйте змінити крок кадрів."
+                    f"Помилка зшивання панорами: {status_name}. "
+                    f"Зібрано {len(frames_to_stitch)} кадрів, крок={self.frame_step}. "
+                    f"Спробуйте зменшити крок кадрів або переконатися, що кадри мають достатнє перекриття."
                 )
 
         except Exception as e:
-            logger.error(f"Panorama generation failed: {e}")
+            logger.error(
+                f"Panorama generation failed: {e} | "
+                f"video={self.video_path}, output={self.output_path}, "
+                f"frame_step={self.frame_step}",
+                exc_info=True,
+            )
             self.error.emit(str(e))
 
     def stop(self):
@@ -7839,6 +8476,15 @@ class RealtimeTrackingWorker(QThread):
         self.process_fps = get_cfg(self.config, "tracking.process_fps", 1.0)
 
     def run(self):
+        # Fix #3: Скидаємо стан трекера при кожному новому старті сесії
+        if hasattr(self.localizer, 'trajectory_filter'):
+            self.localizer.trajectory_filter.reset()
+        if hasattr(self.localizer, 'outlier_detector'):
+            self.localizer.outlier_detector.window.clear()
+            self.localizer.outlier_detector._consecutive_outliers = 0
+        if hasattr(self.localizer, '_consecutive_failures'):
+            self.localizer._consecutive_failures = 0
+
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
 
@@ -7851,13 +8497,23 @@ class RealtimeTrackingWorker(QThread):
                 yolo_wrapper = YOLOWrapper(yolo_model, self.model_manager.device)
                 logger.success("YOLO loaded for dynamic object masking in tracking loop")
             except Exception as e:
-                logger.error(f"Failed to load YOLO: {e}")
-                self.error.emit(f"YOLO load error: {e}")
+                logger.error(
+                    f"Failed to load YOLO for tracking: {e} | "
+                    f"device={self.model_manager.device}. "
+                    f"Dynamic object masking will be unavailable. "
+                    f"Tracking cannot proceed without YOLO.",
+                    exc_info=True,
+                )
+                self.error.emit(f"YOLO не вдалося завантажити: {e}")
                 return
 
         cap = cv2.VideoCapture(self.video_source)
         if not cap.isOpened():
-            self.error.emit(f"Failed to open video source: {self.video_source}")
+            logger.error(
+                f"Failed to open video source: {self.video_source}. "
+                f"Check that the file exists and is a valid video format (MP4/H.264 recommended)."
+            )
+            self.error.emit(f"Не вдалося відкрити відео: {self.video_source}")
             return
 
         # Визначаємо натуральну швидкість відео (зазвичай 30 FPS)
@@ -7910,7 +8566,14 @@ class RealtimeTrackingWorker(QThread):
                         frame_rgb, static_mask=static_mask, dt=calculated_dt
                     )
                 except Exception as e:
-                    logger.error(f"Localization exception: {e}", exc_info=True)
+                    logger.error(
+                        f"Localization exception on video frame: {e} | "
+                        f"video_time={current_video_time_sec:.2f}s, "
+                        f"frame_shape={frame_rgb.shape}, "
+                        f"has_mask={static_mask is not None}, "
+                        f"dt={calculated_dt:.3f}s",
+                        exc_info=True,
+                    )
                     loc_result = {"success": False, "error": str(e)}
 
                 if loc_result.get("success"):
@@ -7973,7 +8636,12 @@ class RealtimeTrackingWorker(QThread):
 
             logger.success("Fallback models pre-warmed successfully")
         except Exception as e:
-            logger.warning(f"Fallback pre-warm failed: {e}")
+            logger.warning(
+                f"Fallback model pre-warming failed: {e} | "
+                f"fallback_type={fallback}. "
+                f"Models will be loaded on first use (slower first localization).",
+                exc_info=True,
+            )
 
     def stop(self):
         logger.info("Stopping tracking worker...")

@@ -100,7 +100,7 @@ class CalibrationMixin:
             # Рішення: при UTM-проекції завжди пробуємо estimate_affine (6-DoF) першою.
             # При WEB_MERCATOR зберігаємо стару логіку (partial як пріоритет).
 
-            is_utm = (self.calibration.converter._mode == "UTM")
+            is_utm = self.calibration.converter._mode == "UTM"
 
             best_M = None
             best_type = "unknown"
@@ -135,9 +135,13 @@ class CalibrationMixin:
                         f"Anchor {frame_id}: estimate_affine failed for UTM. "
                         "Falling back to affine_partial — metric accuracy will be degraded."
                     )
-                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                    M_partial, _ = GeometryTransforms.estimate_affine_partial(
+                        pts_2d_np, pts_metric_np
+                    )
                     if M_partial is not None:
-                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                        rmse_p, median_p, max_p, proj_p = calc_metrics(
+                            M_partial, pts_2d_np, pts_metric_np
+                        )
                         best_M = M_partial
                         best_type = "affine_partial (UTM fallback)"
 
@@ -148,13 +152,17 @@ class CalibrationMixin:
                 best_type = "affine_partial"
 
                 if M_partial is not None:
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(
+                        M_partial, pts_2d_np, pts_metric_np
+                    )
 
                 # Пробуємо повну афінну якщо точок >= 5
                 if len(pts_2d_np) >= 5:
                     M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
                     if M_full is not None:
-                        rmse_f, median_f, max_f, proj_f = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                        rmse_f, median_f, max_f, proj_f = calc_metrics(
+                            M_full, pts_2d_np, pts_metric_np
+                        )
                         if rmse_f < rmse_p * 0.85:
                             best_M = M_full
                             best_type = "affine_full"

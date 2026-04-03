@@ -13,7 +13,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 
 import torch
-
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
@@ -55,7 +54,9 @@ def main() -> None:
             vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
             logger.info(f"CUDA: {torch.version.cuda} | GPU: {gpu_name} | VRAM: {vram_total:.1f} GB")
         else:
-            logger.warning("CUDA not available — running on CPU. Performance will be significantly reduced.")
+            logger.warning(
+                "CUDA not available — running on CPU. Performance will be significantly reduced."
+            )
     except Exception as e:
         logger.warning(f"CUDA diagnostics failed: {e}. Continuing without GPU info.")
 

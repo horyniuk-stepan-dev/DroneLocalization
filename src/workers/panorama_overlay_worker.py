@@ -35,7 +35,7 @@ class PanoramaOverlayWorker(QThread):
             loc_result = self.localizer.localize_frame(img_rgb)
 
             if not loc_result.get("success"):
-                error_reason = loc_result.get('error', 'Невідома причина')
+                error_reason = loc_result.get("error", "Невідома причина")
                 raise RuntimeError(
                     f"Не вдалося локалізувати панораму: {error_reason}. "
                     f"Переконайтесь, що база даних калібрована і панорама відповідає району бази."
@@ -75,8 +75,7 @@ class PanoramaOverlayWorker(QThread):
 
         except Exception as e:
             logger.error(
-                f"Panorama overlay worker failed: {e} | "
-                f"image_path={self.image_path}",
+                f"Panorama overlay worker failed: {e} | image_path={self.image_path}",
                 exc_info=True,
             )
             self.error.emit(str(e))

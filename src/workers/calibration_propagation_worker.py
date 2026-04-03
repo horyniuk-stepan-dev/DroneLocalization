@@ -1,4 +1,3 @@
-
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,6 +18,8 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 from src.geometry.affine_utils import (
     compose_affine as _compose_affine,
+)
+from src.geometry.affine_utils import (
     decompose_affine as _decompose_affine,
 )
 
@@ -110,7 +111,9 @@ class CalibrationPropagationWorker(QThread):
 
         # --- Sigma для Gaussian blending ---
         if len(anchors) >= 2:
-            intervals = [anchors[i + 1].frame_id - anchors[i].frame_id for i in range(len(anchors) - 1)]
+            intervals = [
+                anchors[i + 1].frame_id - anchors[i].frame_id for i in range(len(anchors) - 1)
+            ]
             sigma = max(50.0, float(np.mean(intervals)) * 0.5)
         else:
             sigma = max(50.0, num_frames * 0.2)
@@ -249,7 +252,9 @@ class CalibrationPropagationWorker(QThread):
             H_found = None
             n_matches = 0
 
-            for prev_id, H_prev_to_anchor, prev_feat in reversed(successful[-self.max_skip_frames:]):
+            for prev_id, H_prev_to_anchor, prev_feat in reversed(
+                successful[-self.max_skip_frames :]
+            ):
                 res = self._match_pair_with_count(curr_feat, prev_feat)
                 if res is not None:
                     H_curr_to_prev, n = res
@@ -320,13 +325,9 @@ class CalibrationPropagationWorker(QThread):
             if info_right_from_left is not None:
                 metric_pts = self._project_to_metric(info_right_from_left["H"], a_left)
                 if metric_pts is not None:
-                    M_pred, _ = cv2.estimateAffine2D(
-                        self.grid_points, metric_pts, method=cv2.LMEDS
-                    )
+                    M_pred, _ = cv2.estimateAffine2D(self.grid_points, metric_pts, method=cv2.LMEDS)
                     if M_pred is not None:
-                        predicted_at_right = np.array(
-                            _decompose_affine(M_pred), dtype=np.float64
-                        )
+                        predicted_at_right = np.array(_decompose_affine(M_pred), dtype=np.float64)
 
             seg_len = id_right - id_left
 
