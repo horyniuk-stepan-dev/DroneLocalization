@@ -86,6 +86,7 @@ class GeometryTransforms:
                 return False
 
             # 3. Check Aspect Ratio (should be close to 1.0 for drone imagery)
+            # 5-DoF дозволяє анізотропію, але в межах реалістичної геометрії камери (зазвичай між 0.5 та 2.0)
             aspect_ratio = scale_u / (scale_v + 1e-9)
             if not (0.5 < aspect_ratio < 2.0):
                 logger.debug(
@@ -99,9 +100,7 @@ class GeometryTransforms:
                 logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
                 return False
 
-            # 5. Check Rotation Stability (avoid 180-degree flips if not expected, though drones can rotate)
-            # For now, we allow any rotation as drones can turn, but we could cap it if we have IMU data.
-
+            # 5. Check Rotation Stability
             return True
 
         except Exception as e:
@@ -164,11 +163,10 @@ class GeometryTransforms:
             if fallback_to_affine:
                 logger.warning(
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
-                    f"Falling back to Partial Affine (4 DoF)."
+                    f"Falling back to Full Affine (5 DoF)."
                 )
-                return GeometryTransforms.estimate_affine_partial(
-                    src_pts, dst_pts, ransac_threshold
-                )
+                # ВИПРАВЛЕНО: Тепер використовуємо estimate_affine (5-DoF) замість estimate_affine_partial
+                return GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
             logger.warning(
                 f"Homography invalid/degenerate and no fallback enabled | "
                 f"src_pts={len(src_pts)}, threshold={ransac_threshold}"

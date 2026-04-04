@@ -1070,7 +1070,9 @@ class DatabaseBuilder:
                         logger.warning(
                             f"Frame {p_idx}: inter-frame match failed, reusing previous pose"
                         )
-                        save_this_frame = True  # Or False? Usually better to keep it if tracking fails
+                        save_this_frame = (
+                            True  # Or False? Usually better to keep it if tracking fails
+                        )
 
                 prev_features = features
 
@@ -1681,7 +1683,8 @@ class DatabaseLoader:
 
 Єдине джерело істини для decompose/compose — використовується в:
   - src.calibration.multi_anchor_calibration
-  - src.workers.calibration_propagation_worker
+  - src.workers.calibration_propagation_worker (графова оптимізація)
+  - src.geometry.pose_graph_optimizer
 """
 
 import numpy as np
@@ -1701,7 +1704,6 @@ def decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
     """
     tx = float(M[0, 2])
     ty = float(M[1, 2])
-    # Ізотропний масштаб: середнє між нормами обох стовпців матриці обертання
     s_x = float(np.linalg.norm(M[:2, 0]))
     s_y = float(np.linalg.norm(M[:2, 1]))
     scale = (s_x + s_y) * 0.5
@@ -1721,6 +1723,29 @@ def compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarr
 def unwrap_angles(angles: np.ndarray) -> np.ndarray:
     """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
     return np.unwrap(angles)
+
+def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, float]:
+    """
+    Розкладає афінну матрицю 2x3 на 5 компонентів для збереження анізотропії:
+    (tx, ty, sx, sy, angle_rad).
+    """
+    tx = float(M[0, 2])
+    ty = float(M[1, 2])
+    sx = float(np.linalg.norm(M[:2, 0]))
+    sy = float(np.linalg.norm(M[:2, 1]))
+    angle = float(np.arctan2(M[1, 0], M[0, 0]))
+    return tx, ty, sx, sy, angle
+
+def compose_affine_5dof(tx: float, ty: float, sx: float, sy: float, angle: float) -> np.ndarray:
+    """
+    Збирає афінну матрицю 2x3 з незалежними масштабами X та Y.
+    """
+    c = np.cos(angle)
+    s = np.sin(angle)
+    return np.array([
+        [c * sx, -s * sy, tx],
+        [s * sx,  c * sy, ty]
+    ], dtype=np.float64)
 
 
 # ================================================================================
@@ -1847,6 +1872,390 @@ DEFAULT_CONVERTER = CoordinateConverter("WEB_MERCATOR")
 
 
 # ================================================================================
+# File: geometry\pose_graph_optimizer.py
+# ================================================================================
+"""
+Оптимізатор 5-DoF графу поз для калібрувальної пропагації координат.
+Містить незалежні масштаби для осей X та Y (вирішення проблеми анізотропії).
+"""
+
+from collections import deque
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class GraphEdge:
+    """Ребро графу між кадрами з відносним перетворенням."""
+    from_id: int
+    to_id: int
+    dtx: float
+    dty: float
+    log_dsx: float
+    log_dsy: float
+    dtheta: float
+    weight: float
+    edge_type: str
+    inliers: int = 0
+    rmse: float = 0.0
+
+
+class PoseGraphOptimizer:
+    """5-DoF Pose Graph Optimizer з Levenberg-Marquardt."""
+
+    def __init__(self, frame_w: int = 1920, frame_h: int = 1080) -> None:
+        # frame_id → [center_x_metric, center_y_metric, log_sx, log_sy, θ]
+        self._free_nodes: dict[int, np.ndarray] = {}
+        self._fixed_nodes: dict[int, np.ndarray] = {}
+        self._edges: list[GraphEdge] = []
+        self._node_ids: set[int] = set()
+        
+        self._initialized_nodes: set[int] = set()
+        self._sign: float = 1.0
+        
+        self.cx = frame_w / 2.0
+        self.cy = frame_h / 2.0
+
+    @property
+    def num_nodes(self) -> int: return len(self._node_ids)
+    @property
+    def num_edges(self) -> int: return len(self._edges)
+    @property
+    def num_free(self) -> int: return len(self._free_nodes)
+    @property
+    def num_fixed(self) -> int: return len(self._fixed_nodes)
+    @property
+    def edges(self) -> list[GraphEdge]: return self._edges
+
+    def add_node(self, frame_id: int, initial_state: np.ndarray | None = None) -> None:
+        self._node_ids.add(frame_id)
+        if initial_state is not None:
+            self._free_nodes[frame_id] = np.array(initial_state, dtype=np.float64)
+            self._initialized_nodes.add(frame_id)
+        elif frame_id not in self._free_nodes and frame_id not in self._fixed_nodes:
+            self._free_nodes[frame_id] = np.zeros(5, dtype=np.float64)
+
+    def fix_node(self, frame_id: int, affine_2x3: np.ndarray) -> None:
+        det = affine_2x3[0,0] * affine_2x3[1,1] - affine_2x3[0,1] * affine_2x3[1,0]
+        if det < 0:
+            self._sign = -1.0
+            
+        state = _affine_to_state(affine_2x3, self.cx, self.cy)
+        self._fixed_nodes[frame_id] = state
+        self._node_ids.add(frame_id)
+        self._initialized_nodes.add(frame_id)
+        self._free_nodes.pop(frame_id, None)
+
+    def add_edge(
+        self, from_id: int, to_id: int, relative_affine_2x3: np.ndarray,
+        weight: float, edge_type: str = "temporal", inliers: int = 0, rmse: float = 0.0
+    ) -> None:
+        M = relative_affine_2x3
+        tx, ty, sx, sy, angle = decompose_affine_5dof(M)
+        
+        c_x_local = M[0, 0] * self.cx + M[0, 1] * self.cy + tx
+        c_y_local = M[1, 0] * self.cx + M[1, 1] * self.cy + ty
+        dtx = c_x_local - self.cx
+        dty = c_y_local - self.cy
+
+        edge = GraphEdge(
+            from_id=from_id, to_id=to_id, dtx=dtx, dty=dty,
+            log_dsx=np.log(max(sx, 1e-9)), log_dsy=np.log(max(sy, 1e-9)),
+            dtheta=angle, weight=weight, edge_type=edge_type, inliers=inliers, rmse=rmse
+        )
+        self._edges.append(edge)
+        self._node_ids.add(from_id)
+        self._node_ids.add(to_id)
+
+    def initialize_from_bfs(self) -> int:
+        if not self._fixed_nodes:
+            logger.warning("No fixed nodes for BFS initialization")
+            return 0
+
+        adj: dict[int, list[tuple[int, GraphEdge]]] = {}
+        for edge in self._edges:
+            adj.setdefault(edge.from_id, []).append((edge.to_id, edge))
+            adj.setdefault(edge.to_id, []).append((edge.from_id, edge))
+
+        queue: deque[int] = deque(self._fixed_nodes.keys())
+        count = 0
+        
+        while queue:
+            current = queue.popleft()
+            current_state = self._get_node_state(current)
+
+            for neighbor_id, edge in adj.get(current, []):
+                if neighbor_id in self._initialized_nodes:
+                    continue
+
+                if edge.from_id == current:
+                    predicted = _predict_forward(current_state, edge, self._sign)
+                else:
+                    predicted = _predict_inverse(current_state, edge, self._sign)
+
+                self._free_nodes[neighbor_id] = predicted
+                self._initialized_nodes.add(neighbor_id)
+                queue.append(neighbor_id)
+                count += 1
+
+        logger.info(f"BFS initialization: {count} nodes initialized from {len(self._fixed_nodes)} anchors")
+        return count
+
+    def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6) -> dict[int, np.ndarray]:
+        if not self._edges:
+            logger.warning("No edges — returning current states as-is")
+            return self._export_results()
+
+        free_ids = sorted([fid for fid in self._free_nodes.keys() if fid in self._initialized_nodes])
+        id_to_var: dict[int, int] = {fid: idx for idx, fid in enumerate(free_ids)}
+        n_vars = len(free_ids) * 5
+
+        if n_vars == 0:
+            logger.warning("All nodes are fixed or unreachable — nothing to optimize")
+            return self._export_results()
+
+        x0 = np.zeros(n_vars, dtype=np.float64)
+        for fid, idx in id_to_var.items():
+            x0[5 * idx : 5 * idx + 5] = self._free_nodes[fid]
+
+        valid_edges = []
+        for e in self._edges:
+            from_ok = e.from_id in id_to_var or e.from_id in self._fixed_nodes
+            to_ok = e.to_id in id_to_var or e.to_id in self._fixed_nodes
+            if from_ok and to_ok:
+                valid_edges.append(e)
+
+        if not valid_edges:
+            logger.warning("No valid edges after filtering — returning BFS results")
+            return self._export_results()
+
+        n_edges = len(valid_edges)
+        n_residuals = n_edges * 5 + len(free_ids)
+        jac_sp = self._build_jac_sparsity(valid_edges, id_to_var, n_residuals, n_vars, n_edges)
+        
+        logger.info(f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), {n_residuals} residuals, {len(self._fixed_nodes)} anchors")
+
+        result = least_squares(
+            fun=self._residuals,
+            x0=x0,
+            args=(valid_edges, id_to_var, n_edges),
+            method="lm",
+            jac="2-point",
+            max_nfev=max_iterations * n_vars,
+            ftol=tolerance, xtol=tolerance, gtol=tolerance,
+        )
+
+        logger.info(f"Optimization finished | cost={result.cost:.4f}, nfev={result.nfev}, status={result.status}, message='{result.message}'")
+
+        for fid, idx in id_to_var.items():
+            self._free_nodes[fid] = result.x[5 * idx : 5 * idx + 5].copy()
+
+        return self._export_results()
+
+    def _residuals(self, x: np.ndarray, valid_edges: list[GraphEdge], id_to_var: dict[int, int], n_edges: int) -> np.ndarray:
+        n_free = len(id_to_var)
+        residuals = np.zeros(n_edges * 5 + n_free, dtype=np.float64)
+
+        for k, edge in enumerate(valid_edges):
+            state_i = self._read_state(x, edge.from_id, id_to_var)
+            state_j = self._read_state(x, edge.to_id, id_to_var)
+
+            tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i
+            tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j
+            sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
+            w = edge.weight
+
+            c_i, s_i = np.cos(theta_i), np.sin(theta_i)
+            pred_tx_j = tx_i + c_i * sx_i * edge.dtx - self._sign * s_i * sy_i * edge.dty
+            pred_ty_j = ty_i + s_i * sx_i * edge.dtx + self._sign * c_i * sy_i * edge.dty
+
+            w_trans_x = w / sx_i
+            w_trans_y = w / sy_i
+            w_scale = w * self.cx
+            w_rot = w * self.cx
+
+            base = 5 * k
+            residuals[base + 0] = w_trans_x * (tx_j - pred_tx_j)
+            residuals[base + 1] = w_trans_y * (ty_j - pred_ty_j)
+            residuals[base + 2] = w_scale * (log_sx_j - log_sx_i - edge.log_dsx)
+            residuals[base + 3] = w_scale * (log_sy_j - log_sy_i - edge.log_dsy)
+
+            angle_diff = theta_j - theta_i - self._sign * edge.dtheta
+            residuals[base + 4] = w_rot * np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
+
+        # Square Pixel Constraint
+        w_reg = 200.0 * self.cx
+        for idx, fid in enumerate(id_to_var.keys()):
+            log_sx = x[5 * idx + 2]
+            log_sy = x[5 * idx + 3]
+            residuals[n_edges * 5 + idx] = w_reg * (log_sx - log_sy)
+
+        return residuals
+
+    def _build_jac_sparsity(self, valid_edges, id_to_var, n_residuals, n_vars, n_edges):
+        sp = lil_matrix((n_residuals, n_vars), dtype=np.int8)
+        for k, edge in enumerate(valid_edges):
+            base_r = 5 * k
+            idx_i, idx_j = id_to_var.get(edge.from_id), id_to_var.get(edge.to_id)
+
+            if idx_i is not None:
+                base_i = 5 * idx_i
+                sp[base_r+0, base_i+0] = sp[base_r+0, base_i+2] = sp[base_r+0, base_i+3] = sp[base_r+0, base_i+4] = 1
+                sp[base_r+1, base_i+1] = sp[base_r+1, base_i+2] = sp[base_r+1, base_i+3] = sp[base_r+1, base_i+4] = 1
+                sp[base_r+2, base_i+2] = 1
+                sp[base_r+3, base_i+3] = 1
+                sp[base_r+4, base_i+4] = 1
+            if idx_j is not None:
+                base_j = 5 * idx_j
+                sp[base_r+0, base_j+0] = sp[base_r+1, base_j+1] = sp[base_r+2, base_j+2] = sp[base_r+3, base_j+3] = sp[base_r+4, base_j+4] = 1
+                
+        for idx in range(len(id_to_var)):
+            row = n_edges * 5 + idx
+            base_i = 5 * idx
+            sp[row, base_i + 2] = 1
+            sp[row, base_i + 3] = 1
+            
+        return sp.tocsr()
+
+    def _get_node_state(self, frame_id: int):
+        if frame_id in self._fixed_nodes:
+            return self._fixed_nodes[frame_id]
+        return self._free_nodes.get(frame_id, np.zeros(5, dtype=np.float64))
+
+    def _read_state(self, x, frame_id, id_to_var):
+        if frame_id in self._fixed_nodes: 
+            return self._fixed_nodes[frame_id]
+        idx = id_to_var[frame_id]
+        return x[5 * idx : 5 * idx + 5]
+
+    def _export_results(self) -> dict[int, np.ndarray]:
+        results = {fid: _state_to_affine(state, self.cx, self.cy, self._sign) for fid, state in self._fixed_nodes.items()}
+        for fid, state in self._free_nodes.items():
+            if fid in self._initialized_nodes:
+                results[fid] = _state_to_affine(state, self.cx, self.cy, self._sign)
+        return results
+
+    def export_graph_geojson(self, converter, frame_w: int, frame_h: int) -> dict:
+        features = []
+        results = self._export_results()
+        cx, cy = frame_w / 2.0, frame_h / 2.0
+
+        for fid, affine in results.items():
+            pt = np.array([[cx, cy]], dtype=np.float32)
+            metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
+            try:
+                lat, lon = converter.metric_to_gps(float(metric[0]), float(metric[1]))
+            except Exception:
+                continue
+            is_fixed = fid in self._fixed_nodes
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {"frame_id": fid, "type": "anchor" if is_fixed else "frame"}
+            })
+
+        for edge in self._edges:
+            affine_from = results.get(edge.from_id)
+            affine_to = results.get(edge.to_id)
+            if affine_from is None or affine_to is None: continue
+            try:
+                pt = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
+                m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
+                m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
+                lat1, lon1 = converter.metric_to_gps(float(m_from[0]), float(m_from[1]))
+                lat2, lon2 = converter.metric_to_gps(float(m_to[0]), float(m_to[1]))
+            except Exception:
+                continue
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
+                "properties": {"from_id": edge.from_id, "to_id": edge.to_id, "edge_type": edge.edge_type}
+            })
+
+        return {"type": "FeatureCollection", "features": features}
+
+
+# ── Вільні утиліти (поза класом) ─────────────────────────────────────────────
+
+def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, float]:
+    tx, ty = float(M[0, 2]), float(M[1, 2])
+    sx = float(np.linalg.norm(M[:2, 0]))
+    sy = float(np.linalg.norm(M[:2, 1]))
+    theta = float(np.arctan2(M[1, 0], M[0, 0]))
+    return tx, ty, sx, sy, theta
+
+def _affine_to_state(affine_2x3: np.ndarray, cx: float, cy: float) -> np.ndarray:
+    tx, ty, sx, sy, angle = decompose_affine_5dof(affine_2x3)
+    c_x = affine_2x3[0, 0] * cx + affine_2x3[0, 1] * cy + tx
+    c_y = affine_2x3[1, 0] * cx + affine_2x3[1, 1] * cy + ty
+    return np.array([c_x, c_y, np.log(max(sx, 1e-9)), np.log(max(sy, 1e-9)), angle], dtype=np.float64)
+
+def _state_to_affine(state: np.ndarray, cx: float, cy: float, sign: float = 1.0) -> np.ndarray:
+    c_x, c_y, log_sx, log_sy, theta = state
+    sx, sy = float(np.clip(np.exp(log_sx), 1e-6, 1e6)), float(np.clip(np.exp(log_sy), 1e-6, 1e6))
+    c, s = np.cos(theta), np.sin(theta)
+    
+    M00, M01 = c * sx, -s * sign * sy
+    M10, M11 = s * sx, c * sign * sy
+    tx = c_x - (M00 * cx + M01 * cy)
+    ty = c_y - (M10 * cx + M11 * cy)
+    return np.array([[M00, M01, tx], [M10, M11, ty]], dtype=np.float64)
+
+def _predict_forward(state_i: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
+    tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i
+    sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
+    c_i, s_i = np.cos(theta_i), np.sin(theta_i)
+    return np.array([
+        tx_i + c_i * sx_i * edge.dtx - sign * s_i * sy_i * edge.dty,
+        ty_i + s_i * sx_i * edge.dtx + sign * c_i * sy_i * edge.dty,
+        log_sx_i + edge.log_dsx,
+        log_sy_i + edge.log_dsy,
+        theta_i + sign * edge.dtheta,
+    ], dtype=np.float64)
+
+def _predict_inverse(state_j: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
+    tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j
+    inv_dsx, inv_dsy = 1.0 / np.exp(edge.log_dsx), 1.0 / np.exp(edge.log_dsy)
+    inv_dtheta = -edge.dtheta
+    cos_inv, sin_inv = np.cos(inv_dtheta), np.sin(inv_dtheta)
+    
+    inv_dtx = inv_dsx * (cos_inv * (-edge.dtx) - sin_inv * (-edge.dty))
+    inv_dty = inv_dsy * (sin_inv * (-edge.dtx) + cos_inv * (-edge.dty))
+    
+    sx_j, sy_j = np.exp(log_sx_j), np.exp(log_sy_j)
+    c_j, s_j = np.cos(theta_j), np.sin(theta_j)
+    return np.array([
+        tx_j + c_j * sx_j * inv_dtx - sign * s_j * sy_j * inv_dty,
+        ty_j + s_j * sx_j * inv_dtx + sign * c_j * sy_j * inv_dty,
+        log_sx_j + np.log(inv_dsx),
+        log_sy_j + np.log(inv_dsy),
+        theta_j + sign * inv_dtheta,
+    ], dtype=np.float64)
+
+def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
+    """Для сумісності з воркером, що використовує назву homography_to_affine (або homography_to_similarity)"""
+    cx, cy = frame_w / 2.0, frame_h / 2.0
+    d = min(frame_w, frame_h) * 0.25
+    pts = np.array([[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]], dtype=np.float32)
+    transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
+    if transformed is None: return None
+    transformed = transformed.reshape(-1, 2).astype(np.float32)
+    
+    T, _ = cv2.estimateAffine2D(pts, transformed, method=cv2.LMEDS)
+    return T
+
+# Додаємо аліас, щоб не довелося змінювати назву у worker-і, якщо там досі викликається homography_to_similarity
+homography_to_similarity = homography_to_affine
+
+# ================================================================================
 # File: geometry\transformations.py
 # ================================================================================
 import cv2
@@ -1937,6 +2346,7 @@ class GeometryTransforms:
                 return False
 
             # 3. Check Aspect Ratio (should be close to 1.0 for drone imagery)
+            # 5-DoF дозволяє анізотропію, але в межах реалістичної геометрії камери (зазвичай між 0.5 та 2.0)
             aspect_ratio = scale_u / (scale_v + 1e-9)
             if not (0.5 < aspect_ratio < 2.0):
                 logger.debug(
@@ -1950,9 +2360,7 @@ class GeometryTransforms:
                 logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
                 return False
 
-            # 5. Check Rotation Stability (avoid 180-degree flips if not expected, though drones can rotate)
-            # For now, we allow any rotation as drones can turn, but we could cap it if we have IMU data.
-
+            # 5. Check Rotation Stability
             return True
 
         except Exception as e:
@@ -2015,9 +2423,10 @@ class GeometryTransforms:
             if fallback_to_affine:
                 logger.warning(
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
-                    f"Falling back to Partial Affine (4 DoF)."
+                    f"Falling back to Full Affine (5 DoF)."
                 )
-                return GeometryTransforms.estimate_affine_partial(
+                # ВИПРАВЛЕНО: Тепер використовуємо estimate_affine (5-DoF) замість estimate_affine_partial
+                return GeometryTransforms.estimate_affine(
                     src_pts, dst_pts, ransac_threshold
                 )
             logger.warning(
@@ -2127,7 +2536,6 @@ class GeometryTransforms:
         points_cv = points.reshape(-1, 1, 2).astype(np.float32)
         transformed_pts_cv = cv2.transform(points_cv, M)
         return transformed_pts_cv.reshape(-1, 2)
-
 
 # ================================================================================
 # File: geometry\__init__.py
@@ -3440,7 +3848,7 @@ class CalibrationMixin:
             # Рішення: при UTM-проекції завжди пробуємо estimate_affine (6-DoF) першою.
             # При WEB_MERCATOR зберігаємо стару логіку (partial як пріоритет).
 
-            is_utm = (self.calibration.converter._mode == "UTM")
+            is_utm = self.calibration.converter._mode == "UTM"
 
             best_M = None
             best_type = "unknown"
@@ -3475,9 +3883,13 @@ class CalibrationMixin:
                         f"Anchor {frame_id}: estimate_affine failed for UTM. "
                         "Falling back to affine_partial — metric accuracy will be degraded."
                     )
-                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                    M_partial, _ = GeometryTransforms.estimate_affine_partial(
+                        pts_2d_np, pts_metric_np
+                    )
                     if M_partial is not None:
-                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                        rmse_p, median_p, max_p, proj_p = calc_metrics(
+                            M_partial, pts_2d_np, pts_metric_np
+                        )
                         best_M = M_partial
                         best_type = "affine_partial (UTM fallback)"
 
@@ -3488,13 +3900,17 @@ class CalibrationMixin:
                 best_type = "affine_partial"
 
                 if M_partial is not None:
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(
+                        M_partial, pts_2d_np, pts_metric_np
+                    )
 
                 # Пробуємо повну афінну якщо точок >= 5
                 if len(pts_2d_np) >= 5:
                     M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
                     if M_full is not None:
-                        rmse_f, median_f, max_f, proj_f = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                        rmse_f, median_f, max_f, proj_f = calc_metrics(
+                            M_full, pts_2d_np, pts_metric_np
+                        )
                         if rmse_f < rmse_p * 0.85:
                             best_M = M_full
                             best_type = "affine_full"
@@ -3715,6 +4131,18 @@ class CalibrationMixin:
             f"Середній RMSE (grid): <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} м</b><br>"
             f"Середній матчинг: <b>{avg_matches:.1f} точок</b><br>"
         )
+
+        log_msg = (
+            f"Пропагація завершена. "
+            f"Валідних: {valid_count}/{num_frames} ({valid_count / num_frames * 100:.1f}%), "
+            f"RMSE: {avg_rmse:.3f}м, "
+            f"Матчинг: {avg_matches:.1f} точок"
+        )
+        if avg_dis > 0:
+            log_msg += f", Drift: {avg_dis:.3f}м"
+
+        logger.info(log_msg)
+
         if avg_dis > 0:
             report += f"Середня розбіжність (drift): <b style='color:{'red' if avg_dis > 5.0 else 'green'}'>{avg_dis:.3f} м</b><br>"
 
@@ -3926,14 +4354,15 @@ class CalibrationMixin:
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
 
+
 # ================================================================================
 # File: gui\mixins\database_mixin.py
 # ================================================================================
 from pathlib import Path
- 
+
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
- 
+
 from src.core.export_results import ResultExporter
 from src.core.project_registry import ProjectRegistry
 from src.database.database_loader import DatabaseLoader
@@ -3941,53 +4370,53 @@ from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
 from src.utils.logging_utils import get_logger
 from src.workers.database_worker import DatabaseGenerationWorker
- 
+
 logger = get_logger(__name__)
- 
- 
+
+
 class DatabaseMixin:
     # ── Реєстр проєктів (ініціалізується один раз) ───────────────────────────
- 
+
     def _get_registry(self) -> ProjectRegistry:
         if not hasattr(self, "_project_registry"):
             self._project_registry = ProjectRegistry()
         return self._project_registry
- 
+
     # ── Нова місія ────────────────────────────────────────────────────────────
- 
+
     @pyqtSlot()
     def on_new_mission(self):
         dialog = NewMissionDialog(self)
         if not dialog.exec():
             return
- 
+
         mission_data = dialog.get_mission_data()
         workspace_dir = mission_data.get("workspace_dir")
         video_path = mission_data.get("video_path")
- 
+
         if not workspace_dir or not video_path:
             return
- 
+
         # Створюємо структуру проєкту
         if not self.project_manager.create_project(workspace_dir, mission_data):
             QMessageBox.critical(self, "Помилка", "Не вдалося створити проєкт!")
             return
- 
+
         # Реєструємо в реєстрі
         self._get_registry().register(
             project_dir=str(self.project_manager.project_dir),
             name=self.project_manager.project_name,
             video_path=video_path,
         )
- 
+
         self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
         self._start_database_generation(video_path, self.project_manager.database_path)
- 
+
     # ── Генерація бази ────────────────────────────────────────────────────────
- 
+
     def _start_database_generation(self, video_path: str, save_path: str):
         from src.geometry.coordinates import CoordinateConverter
- 
+
         # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
         # UTM-конвертер буде ініціалізований автоматично після отримання першого
         # GPS-якоря у CalibrationMixin (через _on_first_gps_anchor або еквівалент),
@@ -3997,13 +4426,15 @@ class DatabaseMixin:
         # Якщо якорів ще немає, залишаємо конвертер у стані "not initialized" (UTM, без ref),
         # щоб перший GPS-якір автоматично зафіксував зону UTM.
         if not self.calibration.is_calibrated:
-            self.calibration.converter = CoordinateConverter("UTM")  # ref_gps=None → авто при першому якорі
- 
+            self.calibration.converter = CoordinateConverter(
+                "UTM"
+            )  # ref_gps=None → авто при першому якорі
+
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
         self.control_panel.update_progress(0)
         self.control_panel.set_db_generation_running(True)
- 
+
         # CRITICAL: Close and release the database file handle before overwriting/truncating it
         if hasattr(self, "database") and self.database:
             try:
@@ -4012,7 +4443,7 @@ class DatabaseMixin:
             except Exception as e:
                 logger.warning(f"Could not close database: {e}")
         self.database = None
- 
+
         self.db_worker = DatabaseGenerationWorker(
             video_path=video_path,
             output_path=save_path,
@@ -4023,30 +4454,30 @@ class DatabaseMixin:
         self.db_worker.completed.connect(self.on_db_completed)
         self.db_worker.error.connect(self.on_db_error)
         self.db_worker.cancelled.connect(self.on_db_cancelled)
- 
+
         # Connect stop button
         self.control_panel.stop_db_generation_clicked.connect(self.on_stop_db_generation)
- 
+
         self.db_worker.start()
- 
+
     @pyqtSlot()
     def on_stop_db_generation(self):
         if hasattr(self, "db_worker") and self.db_worker and self.db_worker.isRunning():
             self.control_panel.update_status("Зупинка... (чекаємо завершення кадру)")
             self.db_worker.stop()
- 
+
     @pyqtSlot(int, str)
     def on_db_progress(self, percent: int, message: str):
         self.control_panel.update_progress(percent)
         self.control_panel.update_status(message)
- 
+
     @pyqtSlot(str)
     def on_db_completed(self, db_path: str):
         self.control_panel.set_db_generation_running(False)
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.current_database_path = db_path
- 
+
         if self.database:
             self.database.close()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -4059,14 +4490,14 @@ class DatabaseMixin:
         self.status_bar.showMessage(
             f"Проєкт: {self.project_manager.project_name} | База: {db_path}"
         )
- 
+
         # Оновити реєстр та інфо-панель
         if self.project_manager.is_loaded:
             self._get_registry().refresh_status(str(self.project_manager.project_dir))
         self._update_project_info_panel()
- 
+
         QMessageBox.information(self, "Успіх", "Проєкт та базу даних успішно згенеровано!")
- 
+
     @pyqtSlot(str)
     def on_db_error(self, error_msg: str):
         self.control_panel.set_db_generation_running(False)
@@ -4075,39 +4506,37 @@ class DatabaseMixin:
         self.control_panel.update_progress(0)
         self.control_panel.update_status("Помилка генерації")
         QMessageBox.critical(self, "Помилка", f"Помилка генерації:\n{error_msg}")
- 
+
     @pyqtSlot()
     def on_db_cancelled(self):
         self.control_panel.set_db_generation_running(False)
         self.control_panel.update_status("Генерацію скасовано користувачем")
         self.control_panel.update_progress(0)
- 
+
     # ── Відкриття проєкту ─────────────────────────────────────────────────────
- 
+
     @pyqtSlot()
     def on_load_database(self):
         dialog = OpenProjectDialog(self._get_registry(), parent=self)
         if not dialog.exec():
             self.status_bar.showMessage("Вибір проєкту скасовано")
             return
- 
+
         path = dialog.get_selected_path()
         if not path:
             return
- 
+
         self._open_project(path)
- 
+
     def _open_project(self, path: str):
         """Завантажити проєкт за шляхом (використовується і для recent menu)."""
         if not self.project_manager.load_project(path):
             QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
             return
- 
- 
- 
+
         try:
             db_path = self.project_manager.database_path
- 
+
             # НОВЕ: Перевірка наявності бази даних
             if not Path(db_path).exists():
                 video_path = self.project_manager.settings.video_path
@@ -4127,17 +4556,17 @@ class DatabaseMixin:
                 else:
                     self.status_bar.showMessage("Завантаження скасовано: відсутня база даних")
                     return
- 
+
             if self.database:
                 self.database.close()
- 
+
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 self.database = DatabaseLoader(db_path)
             finally:
                 QApplication.restoreOverrideCursor()
             self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
- 
+
             # Оновити реєстр (завжди викликаємо register для збереження нових проєктів)
             registry = self._get_registry()
             registry.register(
@@ -4147,18 +4576,18 @@ class DatabaseMixin:
                 if self.project_manager.settings
                 else "",
             )
- 
+
             # Завантажити калібрацію якщо є
             calib_path = self.project_manager.calibration_path
             if calib_path and Path(calib_path).exists():
                 self.calibration.load(calib_path)
- 
+
             # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
             if self.database and self.database.converter is not None:
                 self.calibration.converter = self.database.converter
             elif self.calibration.converter and self.calibration.converter._initialized:
                 pass  # конвертер вже завантажений з calibration.json
- 
+
             if self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
@@ -4171,12 +4600,12 @@ class DatabaseMixin:
                 )
             self.control_panel.update_status("Проєкт завантажено")
             self._update_project_info_panel()
- 
+
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу проєкту:\n{e}")
- 
+
     # ── Перевірка пропагації ─────────────────────────────────────────────────
- 
+
     @pyqtSlot()
     def on_verify_propagation(self):
         if not self.database or not self.database.is_propagated:
@@ -4184,25 +4613,25 @@ class DatabaseMixin:
                 self, "Увага", "Дані пропагації відсутні або проєкт не завантажено!"
             )
             return
- 
+
         import numpy as np
- 
+
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid
         frame_affine = self.database.frame_affine
- 
+
         # Отримуємо розміри кадру з метаданих
         width = self.database.metadata.get("frame_width", 1920)
         height = self.database.metadata.get("frame_height", 1080)
- 
+
         # Центр кадру в пікселях
         center_px = np.array([[width / 2, height / 2]], dtype=np.float32)
- 
+
         points_to_show = []
- 
+
         # Збираємо тільки валідні кадри (з кроком 5 для продуктивності на карті)
         step = max(1, num_frames // 200)  # Максимум ~200 точок щоб не гальмував біндер
- 
+
         for i in range(0, num_frames, step):
             if frame_valid[i]:
                 # Приміняємо афінну матрицю (2x3)
@@ -4210,29 +4639,29 @@ class DatabaseMixin:
                 # Metric = M * [x, y, 1]^T
                 metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
                 metric_y = M[1, 0] * center_px[0, 0] + M[1, 1] * center_px[0, 1] + M[1, 2]
- 
+
                 lat, lon = self.calibration.converter.metric_to_gps(
                     float(metric_x), float(metric_y)
                 )
                 points_to_show.append({"lat": float(lat), "lon": float(lon), "label": str(i)})
- 
+
         if not points_to_show:
             QMessageBox.information(
                 self, "Інформація", "Не знайдено жодного кадру з валідними координатами."
             )
             return
- 
+
         self.map_widget.show_verification_markers(points_to_show)
         self.status_bar.showMessage(f"Відображено {len(points_to_show)} точок перевірки на карті.")
- 
+
     # ── Перегенерація бази ────────────────────────────────────────────────────
- 
+
     @pyqtSlot()
     def on_rebuild_database(self):
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Увага", "Спочатку завантажте проєкт!")
             return
- 
+
         video_path = self.project_manager.settings.video_path
         if not video_path or not Path(video_path).exists():
             QMessageBox.warning(
@@ -4242,7 +4671,7 @@ class DatabaseMixin:
                 "Перевірте шлях до відео у налаштуваннях проєкту.",
             )
             return
- 
+
         reply = QMessageBox.question(
             self,
             "Перегенерація бази",
@@ -4254,18 +4683,18 @@ class DatabaseMixin:
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
- 
+
         # Зберігаємо калібрацію перед перегенерацією
         if self.calibration.is_calibrated:
             calib_path = self.project_manager.calibration_path
             if calib_path:
                 self.calibration.save(calib_path)
                 logger.info(f"Calibration saved before rebuild: {calib_path}")
- 
+
         self._start_database_generation(video_path, self.project_manager.database_path)
- 
+
     # ── Експорт результатів ───────────────────────────────────────────────────
- 
+
     @pyqtSlot()
     def on_export_results(self):
         if not hasattr(self, "_tracking_results") or not self._tracking_results:
@@ -4273,7 +4702,7 @@ class DatabaseMixin:
                 self, "Увага", "Немає результатів для експорту!\n\nСпочатку виконайте відстеження."
             )
             return
- 
+
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Експорт результатів",
@@ -4282,7 +4711,7 @@ class DatabaseMixin:
         )
         if not path:
             return
- 
+
         try:
             if path.endswith(".csv") or "CSV" in selected_filter:
                 if not path.endswith(".csv"):
@@ -4301,34 +4730,34 @@ class DatabaseMixin:
                     else "Drone Track"
                 )
                 ResultExporter.export_kml(self._tracking_results, path, name=name)
- 
+
             self.status_bar.showMessage(f"Результати експортовано: {path}")
             QMessageBox.information(
                 self, "Успіх", f"Експортовано {len(self._tracking_results)} точок\n\n{path}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Помилка експорту:\n{e}")
- 
+
     # ── Інфо-панель ───────────────────────────────────────────────────────────
- 
+
     def _update_project_info_panel(self):
         """Оновити інформаційну панель проєкту у control_panel."""
         if not self.project_manager.is_loaded:
             self.control_panel.update_project_info()
             return
- 
+
         num_frames = self.database.get_num_frames() if self.database else None
         num_anchors = len(self.calibration.anchors) if self.calibration else None
         num_propagated = None
         db_size_mb = None
- 
+
         if self.database and self.database.is_propagated:
             num_propagated = int(self.database.frame_valid.sum())
- 
+
         db_path = self.project_manager.database_path
         if db_path and Path(db_path).exists():
             db_size_mb = Path(db_path).stat().st_size / (1024 * 1024)
- 
+
         self.control_panel.update_project_info(
             project_name=self.project_manager.project_name,
             video_path=self.project_manager.settings.video_path
@@ -4339,6 +4768,7 @@ class DatabaseMixin:
             num_propagated=num_propagated,
             db_size_mb=db_size_mb,
         )
+
 
 # ================================================================================
 # File: gui\mixins\panorama_mixin.py
@@ -5429,7 +5859,7 @@ from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
-
+from src.geometry.affine_utils import decompose_affine_5dof, compose_affine_5dof
 logger = get_logger(__name__)
 
 
@@ -5702,7 +6132,7 @@ class Localizer:
         # Оновлення Калмана (фільтрація шумів)
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
 
-        self.outlier_detector.add_position(filtered_pt)
+        self.outlier_detector.add_position(filtered_pt, dt=dt)
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
@@ -6126,6 +6556,7 @@ class FeatureMatcher:
                 exc_info=True,
             )
             return np.empty((0, 2)), np.empty((0, 2))
+
 
 # ================================================================================
 # File: localization\__init__.py
@@ -6639,6 +7070,7 @@ class CESP(nn.Module):
 # File: models\wrappers\feature_extractor.py
 # ================================================================================
 import contextlib
+
 import numpy as np
 import torch
 import torchvision.transforms as T
@@ -6677,7 +7109,7 @@ class FeatureExtractor:
             and get_cfg(self.config, "models.performance.fp16_enabled", True)
         )
         self.amp_dtype = torch.float16 if self.use_half else torch.float32
-        
+
         if self.use_half:
             logger.info("FP16 mixed precision ENABLED for inference")
 
@@ -6685,7 +7117,7 @@ class FeatureExtractor:
         logger.info(
             f"FeatureExtractor initialized with ALIKED and DINOv2 ({cesp_status}) on {device}"
         )
-        
+
         if device == "cuda":
             self.stream_global = torch.cuda.Stream()
             self.stream_local = torch.cuda.Stream()
@@ -6711,7 +7143,7 @@ class FeatureExtractor:
             global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
             # Стандартний mode: CLS token
-            with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_half):
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
                 global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
 
         return global_desc
@@ -6773,7 +7205,9 @@ class FeatureExtractor:
         return local_feats
 
     @torch.no_grad()
-    def extract_features_batch(self, images: list[np.ndarray], static_masks: list[np.ndarray]) -> list[dict]:
+    def extract_features_batch(
+        self, images: list[np.ndarray], static_masks: list[np.ndarray]
+    ) -> list[dict]:
         """
         Extracts features for a batch of images using CUDA streams for parallel execution.
         """
@@ -6805,24 +7239,28 @@ class FeatureExtractor:
         aliked_out = None
 
         # PARALLEL EXECUTION
-        context_global = torch.cuda.stream(stream_global) if stream_global else contextlib.nullcontext()
+        context_global = (
+            torch.cuda.stream(stream_global) if stream_global else contextlib.nullcontext()
+        )
         with context_global:
             if self.cesp_module is not None:
-                with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_half):
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
                     features = self.global_model.forward_features(dino_input)
                     patch_tokens = features["x_norm_patchtokens"].float()
                 h_p, w_p = self.dino_size // 14, self.dino_size // 14
                 out_global = self.cesp_module(patch_tokens, h_p, w_p)
             else:
-                with torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_half):
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
                     out_global = self.global_model(dino_input).float()
 
         out_kpts = []
         out_descs = []
-        context_local = torch.cuda.stream(stream_local) if stream_local else contextlib.nullcontext()
+        context_local = (
+            torch.cuda.stream(stream_local) if stream_local else contextlib.nullcontext()
+        )
         with context_local:
             for b in range(B):
-                single_img = aliked_batch[b:b+1]  # shape (1, 3, H, W)
+                single_img = aliked_batch[b : b + 1]  # shape (1, 3, H, W)
                 input_dict = {"image": single_img}
                 # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
                 aliked_out = self.local_model(input_dict)
@@ -6857,13 +7295,10 @@ class FeatureExtractor:
                 else:
                     kp = np.empty((0, 2), dtype=np.float32)
                     desc = np.empty((0, 128), dtype=np.float32)
-            
-            results.append({
-                "keypoints": kp,
-                "descriptors": desc,
-                "coords_2d": kp.copy(),
-                "global_desc": gd
-            })
+
+            results.append(
+                {"keypoints": kp, "descriptors": desc, "coords_2d": kp.copy(), "global_desc": gd}
+            )
 
         return results
 
@@ -7325,7 +7760,7 @@ logger = get_logger(__name__)
 
 
 class OutlierDetector:
-    """Detect anomalous measurements (outliers) based on trajectory history"""
+    """Detect anomalous measurements (outliers) based on trajectory history using speeds"""
 
     def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=1000.0, max_consecutive=5):
         self.window = deque(maxlen=window_size)
@@ -7334,37 +7769,46 @@ class OutlierDetector:
         self._consecutive_outliers = 0
         self._max_consecutive = max_consecutive
 
-        logger.info("Initializing OutlierDetector")
+        logger.info("Initializing OutlierDetector (Speed-based Z-score)")
         logger.info(
             f"Parameters: window_size={window_size}, threshold_std={threshold_std}, max_speed_mps={max_speed_mps}"
         )
 
-    def add_position(self, position: tuple):
-        self.window.append(np.array(position, dtype=np.float32))
-        self._consecutive_outliers = 0  # Скидаємо лічильник — позиція прийнята
+    def add_position(self, position: tuple, dt: float = 1.0):
+        # Тепер зберігаємо і позицію, і dt (час, за який ця позиція була досягнута)
+        self.window.append((np.array(position, dtype=np.float32), max(dt, 0.01)))
+        self._consecutive_outliers = 0
 
     def is_outlier(self, new_position: tuple, dt: float = 1.0) -> bool:
         if len(self.window) < 3:
             return False
 
         new_pos_np = np.array(new_position, dtype=np.float32)
-        last_pos = self.window[-1]
+        last_pos, _ = self.window[-1]
+        safe_dt = max(dt, 0.01)
 
         # 1. Перевірка максимально допустимої швидкості
         distance = float(np.linalg.norm(new_pos_np - last_pos))
-        instantaneous_speed = distance / max(dt, 0.01)
+        instantaneous_speed = distance / safe_dt
 
         is_speed_outlier = instantaneous_speed > self.max_speed_mps
 
-        # 2. Статистичний Z-score тест
+        # 2. Статистичний Z-score тест (тепер за ШВИДКІСТЮ, а не за відстанню!)
         history = list(self.window)
-        distances = [np.linalg.norm(history[i] - history[i - 1]) for i in range(1, len(history))]
+        speeds = []
+        for i in range(1, len(history)):
+            p1, _ = history[i - 1]
+            p2, hist_dt = history[i]
+            dist = float(np.linalg.norm(p2 - p1))
+            speeds.append(dist / hist_dt)
 
-        mean_dist = np.mean(distances)
-        std_dist = max(np.std(distances), 1.0)
+        mean_speed = np.mean(speeds)
+        std_speed = max(np.std(speeds), 1.0)
 
-        z_score = abs(distance - mean_dist) / std_dist
-        is_zscore_outlier = z_score > self.threshold_std and abs(distance - mean_dist) > 50.0
+        z_score = abs(instantaneous_speed - mean_speed) / std_speed
+        
+        # 15.0 m/s - мінімальна дельта швидкості, при якій Z-score має сенс
+        is_zscore_outlier = z_score > self.threshold_std and abs(instantaneous_speed - mean_speed) > 15.0
 
         if is_speed_outlier or is_zscore_outlier:
             self._consecutive_outliers += 1
@@ -7373,10 +7817,9 @@ class OutlierDetector:
             if self._consecutive_outliers >= self._max_consecutive:
                 logger.warning(
                     f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
-                    f"accepting new position as legitimate movement. "
+                    f"accepting new position. "
                     f"Position: ({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
-                    f"last known: ({last_pos[0]:.1f}, {last_pos[1]:.1f}), "
-                    f"distance={distance:.1f}m"
+                    f"speed={instantaneous_speed:.1f}m/s"
                 )
                 self.window.clear()
                 self._consecutive_outliers = 0
@@ -7385,22 +7828,20 @@ class OutlierDetector:
             if is_speed_outlier:
                 logger.warning(
                     f"OUTLIER DETECTED (speed): {instantaneous_speed:.1f} m/s > {self.max_speed_mps} m/s | "
-                    f"distance={distance:.1f}m, dt={dt:.3f}s, "
-                    f"position=({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"distance={distance:.1f}m, dt={safe_dt:.3f}s, "
                     f"consecutive={self._consecutive_outliers}/{self._max_consecutive}"
                 )
             else:
                 logger.warning(
                     f"OUTLIER DETECTED (z-score): z={z_score:.2f} > {self.threshold_std} | "
-                    f"distance={distance:.1f}m, mean_dist={mean_dist:.1f}m, std={std_dist:.1f}m, "
-                    f"position=({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
+                    f"speed={instantaneous_speed:.1f}m/s, mean_speed={mean_speed:.1f}m/s, std={std_speed:.1f}m/s, "
+                    f"distance={distance:.1f}m, dt={safe_dt:.3f}s, "
                     f"consecutive={self._consecutive_outliers}/{self._max_consecutive}"
                 )
             return True
 
         self._consecutive_outliers = 0
         return False
-
 
 # ================================================================================
 # File: tracking\__init__.py
@@ -7568,42 +8009,54 @@ def get_logger(name: str | None = None) -> Any:
 # ================================================================================
 # File: workers\calibration_propagation_worker.py
 # ================================================================================
+"""
+Графова пропагація калібрування координат.
+
+Замість лінійного ланцюжка гомографій, будується граф кадрів із:
+  - Часовими ребрами (sequential: frame i ↔ frame i+1)
+  - Просторовими ребрами (loop closure: DINOv2 retrieval → LightGlue matching)
+  - GPS-якорями як жорсткими вузлами
+
+Оптимізація: Levenberg-Marquardt через scipy.optimize.least_squares
+з SO(2)-safe кутовими residuals (arctan2(sin, cos)).
+"""
 
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
+import faiss
 import h5py
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from config.config import get_cfg
+from src.geometry.affine_utils import (
+    decompose_affine,
+    unwrap_angles,
+    decompose_affine_5dof,
+    compose_affine_5dof
+)
+
+from src.geometry.pose_graph_optimizer import (
+    PoseGraphOptimizer,
+    homography_to_similarity,
+)
 from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Утиліти декомпозиції/складання афінних матриць — єдине джерело: affine_utils
-# ---------------------------------------------------------------------------
-from src.geometry.affine_utils import (
-    compose_affine as _compose_affine,
-    decompose_affine as _decompose_affine,
-)
-
-
 class CalibrationPropagationWorker(QThread):
     """
-    Хвильова пропагація на основі візуального матчингу.
-    Генерує фінальну метричну афінну матрицю (2x3) для кожного кадру в базі.
+    Графова пропагація з глобальною оптимізацією.
 
-    Алгоритм:
-      - Для кожного кадру будується гомографія до кожного якоря (через saved poses або візуальний ланцюжок).
-      - Фінальна афінна матриця обчислюється через сегментний розподіл похибки замикання
-        (loop closure error distribution) між парами сусідніх GPS-якорів.
-      - Кути дрейфу коригуються через справжню delta між передбаченим та реальним кутом правого якоря.
-      - Кадри без жодної успішної гомографії отримують інтерполяцію між найближчими сусідами.
+    Фази:
+      1. Prefetch фіч → побудова часових ребер (sequential matching)
+      2. Loop closure detection (FAISS DINOv2 retrieval → LightGlue matching)
+      3. Фіксація GPS-якорів + BFS ініціалізація початкового наближення
+      4. Глобальна оптимізація (Levenberg-Marquardt)
+      5. Збереження результатів у HDF5
     """
 
     progress = pyqtSignal(int, str)
@@ -7624,15 +8077,40 @@ class CalibrationPropagationWorker(QThread):
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
 
-        # Скільки кадрів можна "перестрибнути" при побудові ланцюжка,
-        # якщо матч з безпосереднім сусідом провалився.
-        self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 5)
+        # Параметри графової оптимізації
+        self.lc_top_k = get_cfg(
+            self.config, "graph_optimization.loop_closure_top_k", 5
+        )
+        self.lc_min_sim = get_cfg(
+            self.config, "graph_optimization.loop_closure_min_similarity", 0.75
+        )
+        self.lc_min_gap = get_cfg(
+            self.config, "graph_optimization.loop_closure_min_frame_gap", 3
+        )
+        self.lc_min_inliers = get_cfg(
+            self.config, "graph_optimization.loop_closure_min_inliers", 15
+        )
+        self.temporal_base_w = get_cfg(
+            self.config, "graph_optimization.temporal_edge_base_weight", 1.0
+        )
+        self.spatial_base_w = get_cfg(
+            self.config, "graph_optimization.spatial_edge_base_weight", 2.0
+        )
+        self.max_iters = get_cfg(
+            self.config, "graph_optimization.max_iterations", 50
+        )
+        self.tolerance = get_cfg(
+            self.config, "graph_optimization.convergence_tolerance", 1e-6
+        )
+        self.use_bfs = get_cfg(
+            self.config, "graph_optimization.use_bfs_initialization", True
+        )
+        self.export_geojson = get_cfg(
+            self.config, "graph_optimization.export_geojson", True
+        )
 
-        # Базова сітка точок для точної апроксимації афінної матриці (4x4)
-        grid_x = np.linspace(0, self.frame_w, 4)
-        grid_y = np.linspace(0, self.frame_h, 4)
-        gx, gy = np.meshgrid(grid_x, grid_y)
-        self.grid_points = np.stack([gx.ravel(), gy.ravel()], axis=1).astype(np.float32)
+        # Скільки кадрів можна "перестрибнути" при побудові temporal ребер
+        self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 3)
 
     def stop(self):
         self._is_running = False
@@ -7642,497 +8120,327 @@ class CalibrationPropagationWorker(QThread):
             self._propagate()
         except Exception as e:
             logger.error(
-                f"Propagation failed: {e} | "
+                f"Graph propagation failed: {e} | "
                 f"num_anchors={len(self.calibration.anchors)}, "
                 f"db_frames={self.database.get_num_frames()}",
                 exc_info=True,
             )
             self.error.emit(str(e))
 
-    # -------------------------------------------------------------------------
-    # Головний метод
-    # -------------------------------------------------------------------------
+    # ─── Головний метод ──────────────────────────────────────────────────────
 
     def _propagate(self):
         num_frames = self.database.get_num_frames()
         all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
         anchors = [a for a in all_anchors if a.frame_id < num_frames]
 
-        if len(anchors) < len(all_anchors):
-            logger.warning(
-                f"Filtered {len(all_anchors) - len(anchors)} out-of-bounds anchors "
-                f"(DB has {num_frames} frames)."
-            )
-
         if not anchors:
             self.error.emit("Немає якорів калібрування")
-            logger.error(
-                "Propagation aborted: no valid anchors. "
-                "Add at least one GPS calibration anchor before running propagation."
-            )
             return
 
         logger.info(
-            f"Starting multi-anchor loop-closure propagation for {num_frames} frames "
+            f"Starting GRAPH propagation for {num_frames} frames "
             f"using {len(anchors)} anchors: "
             f"{[f'#{a.frame_id}' for a in anchors]}"
         )
 
-        # --- Sigma для Gaussian blending ---
-        if len(anchors) >= 2:
-            intervals = [anchors[i + 1].frame_id - anchors[i].frame_id for i in range(len(anchors) - 1)]
-            sigma = max(50.0, float(np.mean(intervals)) * 0.5)
-        else:
-            sigma = max(50.0, num_frames * 0.2)
-        logger.info(f"Gaussian sigma = {sigma:.1f} frames")
+        # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
+        self.progress.emit(0, "Передзавантаження фіч у RAM...")
+        all_features = self._prefetch_features(num_frames)
 
+        optimizer = PoseGraphOptimizer(self.frame_w, self.frame_h)
+        for i in range(num_frames):
+            if i in all_features:
+                optimizer.add_node(i)
+
+        self.progress.emit(10, "Побудова часових ребер (sequential matching)...")
+        temporal_count = self._build_temporal_edges(
+            optimizer, all_features, num_frames
+        )
+        logger.info(f"Phase 1 complete: {temporal_count} temporal edges")
+
+        # ── Phase 2: Loop closure detection ──────────────────────────────────
+        self.progress.emit(30, "Пошук просторових замикань (loop closure)...")
+        spatial_count = self._detect_loop_closures(
+            optimizer, all_features, num_frames
+        )
+        logger.info(f"Phase 2 complete: {spatial_count} spatial edges (loop closures)")
+        logger.info(
+            f"Graph: {optimizer.num_nodes} nodes, {optimizer.num_edges} edges "
+            f"({temporal_count} temporal + {spatial_count} spatial)"
+        )
+
+        # ── Phase 3: Fix anchors + BFS initialization ───────────────────────
+        self.progress.emit(60, "Фіксація GPS-якорів та ініціалізація графу...")
+        for anchor in anchors:
+            optimizer.fix_node(anchor.frame_id, anchor.affine_matrix)
+
+        if self.use_bfs:
+            bfs_count = optimizer.initialize_from_bfs()
+            logger.info(f"Phase 3 complete: {bfs_count} nodes initialized via BFS")
+        else:
+            logger.info("Phase 3 complete: BFS initialization skipped (disabled)")
+
+        # ── Phase 4: Optimize ────────────────────────────────────────────────
+        self.progress.emit(70, "Глобальна оптимізація графу (Levenberg-Marquardt)...")
+        results = optimizer.optimize(
+            max_iterations=self.max_iters,
+            tolerance=self.tolerance,
+        )
+        logger.info(f"Phase 4 complete: {len(results)} frames optimized")
+
+        # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
+        self.progress.emit(85, "Збереження результатів у HDF5...")
+        valid_count = self._save_to_hdf5(results, anchors, optimizer)
+
+        # Експорт GeoJSON для візуалізації
+        if self.export_geojson and self.calibration.converter:
+            try:
+                geojson = optimizer.export_graph_geojson(
+                    self.calibration.converter, self.frame_w, self.frame_h
+                )
+                geojson_path = str(self.database.db_path).replace(".h5", "_graph.geojson")
+                with open(geojson_path, "w", encoding="utf-8") as f:
+                    json.dump(geojson, f, indent=2, ensure_ascii=False)
+                logger.success(f"Graph exported to GeoJSON: {geojson_path}")
+            except Exception as e:
+                logger.warning(f"GeoJSON export failed: {e}")
+
+        self.progress.emit(
+            100,
+            f"Готово! {valid_count}/{num_frames} кадрів отримали координати "
+            f"({temporal_count} часових + {spatial_count} просторових ребер).",
+        )
+        self.completed.emit()
+
+    # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
+
+    def _prefetch_features(self, num_frames: int) -> dict:
+        """Завантажує всі фічі в RAM."""
+        features = {}
+        for i in range(num_frames):
+            if not self._is_running:
+                return features
+            try:
+                features[i] = self.database.get_local_features(i)
+            except Exception:
+                pass
+            if i % 500 == 0:
+                self.progress.emit(
+                    int(i / num_frames * 8),
+                    f"Prefetch: {i}/{num_frames}",
+                )
+        logger.info(f"Prefetched features for {len(features)} frames")
+        return features
+
+    def _build_temporal_edges(
+        self,
+        optimizer: PoseGraphOptimizer,
+        features: dict,
+        num_frames: int,
+    ) -> int:
+        """Побудова часових ребер між послідовними кадрами."""
+        count = 0
+        last_success_id = -1
+        last_success_feat = None
+
+        for i in range(num_frames):
+            if not self._is_running:
+                break
+
+            feat_i = features.get(i)
+            if feat_i is None:
+                continue
+
+            if last_success_feat is not None and (i - last_success_id) <= self.max_skip_frames:
+                result = self._match_and_build_edge(feat_i, last_success_feat)
+                if result is not None:
+                    H, inliers, rmse_val = result
+                    similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
+                    if similarity is not None:
+                        weight = self._compute_weight(
+                            inliers, rmse_val, self.temporal_base_w
+                        )
+                        optimizer.add_edge(
+                            from_id=last_success_id,
+                            to_id=i,
+                            relative_affine_2x3=similarity,
+                            weight=weight,
+                            edge_type="temporal",
+                            inliers=inliers,
+                            rmse=rmse_val,
+                        )
+                        count += 1
+
+            last_success_id = i
+            last_success_feat = feat_i
+
+            if i % 200 == 0:
+                self.progress.emit(
+                    10 + int(i / num_frames * 18),
+                    f"Часові ребра: {count} (кадр {i}/{num_frames})",
+                )
+
+        return count
+
+    # ─── Phase 2: Loop closure detection ─────────────────────────────────────
+
+    def _detect_loop_closures(
+        self,
+        optimizer: PoseGraphOptimizer,
+        features: dict,
+        num_frames: int,
+    ) -> int:
+        """Знаходить просторові замикання через DINOv2 + LightGlue matching."""
+        # Побудова FAISS індексу
+        global_desc = self.database.global_descriptors
+        if global_desc is None or len(global_desc) == 0:
+            logger.warning("No global descriptors — skipping loop closure detection")
+            return 0
+
+        dim = global_desc.shape[1]
+        normed = global_desc / (np.linalg.norm(global_desc, axis=1, keepdims=True) + 1e-8)
+        normed = normed.astype(np.float32)
+
+        index = faiss.IndexFlatIP(dim)
+        index.add(normed)
+        logger.info(f"FAISS index built: {index.ntotal} vectors, dim={dim}")
+
+        count = 0
+        already_matched: set[tuple[int, int]] = set()
+
+        for i in range(num_frames):
+            if not self._is_running:
+                break
+
+            feat_i = features.get(i)
+            if feat_i is None:
+                continue
+
+            # Query top-K кандидатів
+            q = normed[i : i + 1]
+            scores, ids = index.search(q, self.lc_top_k + 1)  # +1 бо сам себе знайде
+
+            for raw_j, sim_score in zip(ids[0], scores[0]):
+                j = int(raw_j)
+                if j == i or j == -1:
+                    continue
+                if abs(i - j) <= self.lc_min_gap:
+                    continue
+                if float(sim_score) < self.lc_min_sim:
+                    continue
+
+                edge_key = (min(i, j), max(i, j))
+                if edge_key in already_matched:
+                    continue
+                already_matched.add(edge_key)
+
+                feat_j = features.get(j)
+                if feat_j is None:
+                    continue
+
+                # Matching: feat_j → feat_i (H maps j pixels → i pixels)
+                result = self._match_and_build_edge(feat_j, feat_i)
+                if result is None:
+                    continue
+
+                H, inliers, rmse_val = result
+                if inliers < self.lc_min_inliers:
+                    continue
+
+                similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
+                if similarity is None:
+                    continue
+
+                weight = self._compute_weight(inliers, rmse_val, self.spatial_base_w)
+                optimizer.add_edge(
+                    from_id=i,
+                    to_id=j,
+                    relative_affine_2x3=similarity,
+                    weight=weight,
+                    edge_type="spatial",
+                    inliers=inliers,
+                    rmse=rmse_val,
+                )
+                count += 1
+
+            if i % 200 == 0:
+                self.progress.emit(
+                    30 + int(i / num_frames * 28),
+                    f"Loop closure: {count} знайдено (кадр {i}/{num_frames})",
+                )
+
+        return count
+
+    # ─── Phase 5: Save to HDF5 ───────────────────────────────────────────────
+
+    def _save_to_hdf5(
+        self,
+        results: dict[int, np.ndarray],
+        anchors,
+        optimizer: PoseGraphOptimizer,
+    ) -> int:
+        """Зберігає оптимізовані афінні матриці у HDF5.
+
+        Формат 100% сумісний з існуючим DatabaseLoader.
+        """
+        num_frames = self.database.get_num_frames()
         frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float32)
         frame_valid = np.zeros(num_frames, dtype=bool)
         frame_rmse = np.zeros(num_frames, dtype=np.float32)
         frame_disagreement = np.zeros(num_frames, dtype=np.float32)
         frame_matches = np.zeros(num_frames, dtype=np.int32)
 
-        # --- Prefetch фіч ---
-        self.progress.emit(0, "Передзавантаження фіч у RAM...")
-        self._all_features = {}
-        for i in range(num_frames):
-            if not self._is_running:
-                return
-            try:
-                self._all_features[i] = self.database.get_local_features(i)
-            except Exception:
-                pass
-            if i % 1000 == 0:
-                self.progress.emit(int(i / num_frames * 10), f"Prefetch: {i}/{num_frames}")
-        logger.info(f"Prefetched features for {len(self._all_features)} frames")
-
-        # --- Ініціалізація якорів ---
-        anchor_features = {}
-        for anchor in anchors:
-            feat = self._all_features.get(anchor.frame_id)
-            if feat is not None:
-                anchor_features[anchor.frame_id] = feat
-            frame_affine[anchor.frame_id] = anchor.affine_matrix
-            frame_valid[anchor.frame_id] = True
-            frame_rmse[anchor.frame_id] = getattr(anchor, "rmse_m", 0.0)
-            frame_matches[anchor.frame_id] = getattr(anchor, "inliers_count", 0)
-
-        # --- Будуємо гомографічні ланцюжки від кожного якоря до всіх кадрів ---
-        self.progress.emit(10, "Побудова гомографічних ланцюжків від якорів...")
-        anchor_chains = self._build_all_anchor_chains(anchors, anchor_features, num_frames)
-
-        # --- Loop-closure blending ---
-        self.progress.emit(50, "Loop-closure blending...")
-        self._blend_all_frames(
-            anchors=anchors,
-            anchor_chains=anchor_chains,
-            num_frames=num_frames,
-            sigma=sigma,
-            frame_affine=frame_affine,
-            frame_valid=frame_valid,
-            frame_rmse=frame_rmse,
-            frame_disagreement=frame_disagreement,
-            frame_matches=frame_matches,
-        )
-
-        # --- Fallback: заповнення кадрів без координат через інтерполяцію ---
-        self.progress.emit(85, "Заповнення прогалин через інтерполяцію...")
-        self._fill_gaps_by_interpolation(frame_affine, frame_valid)
-
-        valid_count = int(np.sum(frame_valid))
-        self.progress.emit(90, "Збереження результатів у HDF5...")
-        self._save_to_hdf5(
-            frame_affine, frame_valid, frame_rmse, frame_disagreement, frame_matches, anchors
-        )
-
-        self.progress.emit(100, f"Готово! {valid_count}/{num_frames} кадрів отримали координати.")
-        self.completed.emit()
-
-    # -------------------------------------------------------------------------
-    # Побудова ланцюжків від кожного якоря
-    # -------------------------------------------------------------------------
-
-    def _build_all_anchor_chains(self, anchors, anchor_features, num_frames) -> dict:
-        """
-        Для кожного якоря будує гомографічний ланцюжок до всіх кадрів бази.
-        Повертає: {anchor_frame_id: {frame_id: {"H": ndarray(3,3), "matches": int}}}
-        """
-        max_workers = get_cfg(self.config, "models.performance.propagation_max_workers", 4)
-        result = {}
-
-        def build_for_anchor(anchor):
-            anchor_id = anchor.frame_id
-            feat = anchor_features.get(anchor_id)
-            if feat is None:
-                logger.warning(
-                    f"No features for anchor #{anchor_id} — skipping chain. "
-                    f"This anchor will not contribute to propagation. "
-                    f"Cause: frame may have zero keypoints in database."
-                )
-                return anchor_id, {}
-
-            frames_left = list(range(anchor_id - 1, -1, -1))
-            frames_right = list(range(anchor_id + 1, num_frames))
-
-            chain_left = self._build_robust_chain(frames_left, anchor_id, feat)
-            chain_right = self._build_robust_chain(frames_right, anchor_id, feat)
-
-            chain = {anchor_id: {"H": np.eye(3, dtype=np.float32), "matches": 100}}
-            chain.update(chain_left)
-            chain.update(chain_right)
-            return anchor_id, chain
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(build_for_anchor, a): a for a in anchors}
-            total = len(futures)
-            for done_count, future in enumerate(as_completed(futures)):
-                if not self._is_running:
-                    break
-                anchor_id, chain = future.result()
-                result[anchor_id] = chain
-                self.progress.emit(
-                    10 + int(done_count / total * 35),
-                    f"Ланцюжок від якоря {anchor_id}: {len(chain)} кадрів",
-                )
-
-        return result
-
-    def _build_robust_chain(self, frames, anchor_id, anchor_feat) -> dict:
-        """
-        Будує гомографічний ланцюжок від anchor_id до кожного кадру у списку `frames`.
-
-        - Якщо матч з попереднім кадром провалився — намагаємось матчити з anchor напряму,
-          або з останнім успішним кадром у межах max_skip_frames.
-        """
-        result = {}
-
-        h_cache = {anchor_id: np.eye(3, dtype=np.float32)}
-        successful = [(anchor_id, np.eye(3, dtype=np.float32), anchor_feat)]
-
-        for frame_id in frames:
-            if not self._is_running:
-                break
-            curr_feat = self._all_features.get(frame_id)
-            if curr_feat is None:
-                continue
-
-            H_found = None
-            n_matches = 0
-
-            for prev_id, H_prev_to_anchor, prev_feat in reversed(successful[-self.max_skip_frames:]):
-                res = self._match_pair_with_count(curr_feat, prev_feat)
-                if res is not None:
-                    H_curr_to_prev, n = res
-                    H_found = (
-                        H_prev_to_anchor.astype(np.float64) @ H_curr_to_prev.astype(np.float64)
-                    ).astype(np.float32)
-                    n_matches = n
-                    break
-
-            if H_found is not None:
-                result[frame_id] = {"H": H_found, "matches": n_matches}
-                successful.append((frame_id, H_found, curr_feat))
-                if len(successful) > self.max_skip_frames + 2:
-                    successful.pop(0)
-
-        return result
-
-    # -------------------------------------------------------------------------
-    # Loop-closure blending між парами якорів
-    # -------------------------------------------------------------------------
-
-    def _blend_all_frames(
-        self,
-        anchors,
-        anchor_chains,
-        num_frames,
-        sigma,
-        frame_affine,
-        frame_valid,
-        frame_rmse,
-        frame_disagreement,
-        frame_matches,
-    ):
-        """
-        Обчислює афінні матриці для кожного кадру з рівномірним розподілом
-        похибки замикання (loop closure error distribution) між парами якорів.
-
-        Алгоритм (сегментний loop closure):
-          1. Для кожного сегменту між сусідніми якорями [A_left .. A_right]:
-             a. Будуємо одометричний ланцюжок від A_left до кожного кадру сегменту.
-             b. На фінальному якорі (A_right) обчислюємо дельту похибки:
-                delta = affine_right_true − affine_predicted_by_chain_from_left.
-                ВАЖЛИВО: predicted_at_right зберігає СПРАВЖНІЙ передбачений кут
-                від одометрії (не перезаписується значенням правого якоря).
-             c. Розподіляємо delta лінійно вздовж сегменту (t=0 на A_left → t=1 на A_right).
-          2. Кадри за межами першого/останнього якоря отримують матрицю
-             з найближчого якоря без корекції (екстраполяція).
-        """
-        anchor_ids = [a.frame_id for a in anchors]
-
-        # ── Сегменти між парами сусідніх якорів ────────────────────────────────
-        for seg_idx in range(len(anchors) - 1):
-            a_left = anchors[seg_idx]
-            a_right = anchors[seg_idx + 1]
-            id_left = a_left.frame_id
-            id_right = a_right.frame_id
-
-            chain_left = anchor_chains.get(id_left, {})
-            chain_right = anchor_chains.get(id_right, {})
-
-            # Декомпозиція матриць якорів
-            comp_left = np.array(_decompose_affine(a_left.affine_matrix), dtype=np.float64)
-            comp_right = np.array(_decompose_affine(a_right.affine_matrix), dtype=np.float64)
-
-            # Обчислюємо "передбачену" матрицю на правому якорі через одометрію від лівого
-            predicted_at_right = None
-            info_right_from_left = chain_left.get(id_right)
-            if info_right_from_left is not None:
-                metric_pts = self._project_to_metric(info_right_from_left["H"], a_left)
-                if metric_pts is not None:
-                    M_pred, _ = cv2.estimateAffine2D(
-                        self.grid_points, metric_pts, method=cv2.LMEDS
-                    )
-                    if M_pred is not None:
-                        predicted_at_right = np.array(
-                            _decompose_affine(M_pred), dtype=np.float64
-                        )
-
-            seg_len = id_right - id_left
-
-            for frame_id in range(id_left + 1, id_right):
-                if not self._is_running:
-                    return
-                if frame_id in anchor_ids:
-                    continue
-
-                if frame_id % 200 == 0:
-                    self.progress.emit(
-                        50 + int(frame_id / num_frames * 33),
-                        f"Loop-closure blending кадр {frame_id}/{num_frames}...",
-                    )
-
-                t = (frame_id - id_left) / seg_len  # 0..1
-
-                # --- Одометрична оцінка від лівого якоря ---
-                info_l = chain_left.get(frame_id)
-                M_from_left = None
-                if info_l is not None:
-                    metric_pts = self._project_to_metric(info_l["H"], a_left)
-                    if metric_pts is not None:
-                        M_est, _ = cv2.estimateAffine2D(
-                            self.grid_points, metric_pts, method=cv2.LMEDS
-                        )
-                        if M_est is not None:
-                            M_from_left = M_est
-
-                # --- Одометрична оцінка від правого якоря ---
-                info_r = chain_right.get(frame_id)
-                M_from_right = None
-                if info_r is not None:
-                    metric_pts = self._project_to_metric(info_r["H"], a_right)
-                    if metric_pts is not None:
-                        M_est, _ = cv2.estimateAffine2D(
-                            self.grid_points, metric_pts, method=cv2.LMEDS
-                        )
-                        if M_est is not None:
-                            M_from_right = M_est
-
-                if M_from_left is None and M_from_right is None:
-                    continue
-
-                # --- Loop-closure корекція ---
-                if M_from_left is not None and predicted_at_right is not None:
-                    comp_est = np.array(_decompose_affine(M_from_left), dtype=np.float64)
-
-                    # Розгортаємо кути ТРЬОХ точок разом:
-                    # [лівий якір, поточна одометрія, правий якір]
-                    # Це забезпечує коректний unwrap для всіх трьох значень одночасно.
-                    angles = np.unwrap([comp_left[3], comp_est[3], comp_right[3]])
-                    comp_left_uw = comp_left.copy()
-                    comp_left_uw[3] = angles[0]
-                    comp_est_uw = comp_est.copy()
-                    comp_est_uw[3] = angles[1]
-                    comp_right_uw = comp_right.copy()
-                    comp_right_uw[3] = angles[2]
-
-                    # --- ВИПРАВЛЕННЯ БАГ 1 ---
-                    # Розгортаємо кут передбаченої матриці (predicted_at_right) разом із
-                    # лівим якорем, щоб отримати коректне unwrap-значення для pred_uw.
-                    # ВИДАЛЕНО: pred_uw[3] = angles[2]
-                    # Той рядок примусово прирівнював кут pred_uw до кута правого якоря,
-                    # через що delta[3] = comp_right_uw[3] - pred_uw[3] завжди = 0.
-                    angles_pred = np.unwrap([comp_left[3], predicted_at_right[3]])
-                    pred_uw = predicted_at_right.copy()
-                    pred_uw[3] = angles_pred[1]  # справжній передбачений кут від одометрії
-
-                    # Дельта похибки замикання: різниця між ІСТИННИМ правим якорем
-                    # та тим, що одометрія ПЕРЕДБАЧИЛА для цього місця
-                    delta = comp_right_uw - pred_uw
-
-                    # Розподіляємо delta лінійно: t=0 (лівий якір) → корекція=0, t=1 → корекція=delta
-                    comp_corrected = comp_est_uw + delta * t
-
-                    scale = float(np.clip(comp_corrected[2], 1e-6, 1e6))
-                    M_final = _compose_affine(
-                        float(comp_corrected[0]),
-                        float(comp_corrected[1]),
-                        scale,
-                        float(comp_corrected[3]),
-                    )
-                elif M_from_left is not None:
-                    # Немає loop closure: використовуємо лише одометрію від лівого якоря
-                    M_final = M_from_left.astype(np.float32)
-                else:
-                    # Лише одометрія від правого якоря (зворотна)
-                    M_final = M_from_right.astype(np.float32)
-
-                # --- Disagreement між двома якорями ---
-                if M_from_left is not None and M_from_right is not None:
-                    pts_l = GeometryTransforms.apply_affine(self.grid_points, M_from_left)
-                    pts_r = GeometryTransforms.apply_affine(self.grid_points, M_from_right)
-                    frame_disagreement[frame_id] = float(
-                        np.mean(np.linalg.norm(pts_l - pts_r, axis=1))
-                    )
-
-                frame_affine[frame_id] = M_final
+        # Записуємо результати оптимізації
+        # Оскільки optimizer повертає ТІЛЬКИ досяжні вузли, 
+        # незв'язані кадри залишаться з frame_valid = False
+        for frame_id, affine in results.items():
+            if 0 <= frame_id < num_frames:
+                frame_affine[frame_id] = affine.astype(np.float32)
                 frame_valid[frame_id] = True
+        
+        filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        if filled_count > 0:
+            logger.info(f"Interpolated coordinates for {filled_count} missing frames")
 
-                # RMSE між фінальною матрицею та grid_points (внутрішня якість апроксимації)
-                proj = GeometryTransforms.apply_affine(self.grid_points, M_final)
-                ref_pts = self._project_to_metric(
-                    chain_left.get(frame_id, {}).get("H", np.eye(3)), a_left
-                )
-                if ref_pts is not None:
-                    rmse = float(np.sqrt(np.mean(np.linalg.norm(proj - ref_pts, axis=1) ** 2)))
-                    frame_rmse[frame_id] = rmse
+        # Обчислюємо QA метрики з ребер графу
+        edge_stats: dict[int, list[tuple[int, float]]] = {}
+        for edge in optimizer.edges:
+            for fid in (edge.from_id, edge.to_id):
+                if 0 <= fid < num_frames:
+                    edge_stats.setdefault(fid, []).append((edge.inliers, edge.rmse))
 
-                n_l = chain_left.get(frame_id, {}).get("matches", 0)
-                n_r = chain_right.get(frame_id, {}).get("matches", 0)
-                frame_matches[frame_id] = (n_l + n_r) // max(1, int(n_l > 0) + int(n_r > 0))
+        for fid, stats in edge_stats.items():
+            # РОБИМО РОЗРАХУНОК ТІЛЬКИ ДЛЯ ВАЛІДНИХ КАДРІВ
+            if fid < num_frames and frame_valid[fid]:
+                inliers_list = [s[0] for s in stats]
+                rmse_list = [s[1] for s in stats if s[1] > 0]
+                frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
+                frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
 
-        # ── Кадри до першого якоря (екстраполяція ліворуч) ─────────────────────
-        first_anchor = anchors[0]
-        chain_first = anchor_chains.get(first_anchor.frame_id, {})
-        for frame_id in range(0, first_anchor.frame_id):
-            if not self._is_running:
-                return
-            if frame_valid[frame_id]:
+        # Disagreement: для кадрів із ≥2 ребрами, порівнюємо predictions
+        # (simplified: використовуємо std відхилень у tx, ty)
+        for fid in range(num_frames):
+            if not frame_valid[fid]:
                 continue
-            info = chain_first.get(frame_id)
-            if info is None:
-                continue
-            metric_pts = self._project_to_metric(info["H"], first_anchor)
-            if metric_pts is None:
-                continue
-            M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts, method=cv2.LMEDS)
-            if M is not None:
-                frame_affine[frame_id] = M
-                frame_valid[frame_id] = True
-                frame_matches[frame_id] = info["matches"]
+            edges_to_fid = [
+                e for e in optimizer.edges
+                if e.to_id == fid or e.from_id == fid
+            ]
+            if len(edges_to_fid) >= 2:
+                predictions_tx = []
+                for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
+                    other_id = e.from_id if e.to_id == fid else e.to_id
+                    other_affine = results.get(other_id)
+                    
+                    # Перевіряємо, чи сусідній кадр також валідний
+                    if other_affine is not None:
+                        comp = decompose_affine(other_affine)
+                        predictions_tx.append(comp[0])  # tx
+                if len(predictions_tx) >= 2:
+                    frame_disagreement[fid] = float(np.std(predictions_tx))
 
-        # ── Кадри після останнього якоря (екстраполяція праворуч) ──────────────
-        last_anchor = anchors[-1]
-        chain_last = anchor_chains.get(last_anchor.frame_id, {})
-        for frame_id in range(last_anchor.frame_id + 1, num_frames):
-            if not self._is_running:
-                return
-            if frame_valid[frame_id]:
-                continue
-            info = chain_last.get(frame_id)
-            if info is None:
-                continue
-            metric_pts = self._project_to_metric(info["H"], last_anchor)
-            if metric_pts is None:
-                continue
-            M, _ = cv2.estimateAffine2D(self.grid_points, metric_pts, method=cv2.LMEDS)
-            if M is not None:
-                frame_affine[frame_id] = M
-                frame_valid[frame_id] = True
-                frame_matches[frame_id] = info["matches"]
-
-    # -------------------------------------------------------------------------
-    # Заповнення прогалин через лінійну інтерполяцію афінних матриць
-    # -------------------------------------------------------------------------
-
-    def _fill_gaps_by_interpolation(self, frame_affine, frame_valid):
-        """
-        Кадри, які не отримали координат через жодну гомографію,
-        заповнюються інтерполяцією між найближчими дійсними сусідами.
-
-        Використовується декомпозиція на (tx, ty, scale, angle) з подальшою лінійною
-        інтерполяцією кожного скалярного каналу і відновленням матриці.
-        """
-        num_frames = len(frame_valid)
-        valid_ids = np.where(frame_valid)[0]
-        if len(valid_ids) < 2:
-            return
-
-        filled = 0
-        for i in range(len(valid_ids) - 1):
-            left = valid_ids[i]
-            right = valid_ids[i + 1]
-            gap = right - left
-            if gap <= 1:
-                continue
-
-            comp_left = np.array(_decompose_affine(frame_affine[left]), dtype=np.float64)
-            comp_right = np.array(_decompose_affine(frame_affine[right]), dtype=np.float64)
-
-            angles = np.array([comp_left[3], comp_right[3]])
-            angles = np.unwrap(angles)
-            comp_left[3] = angles[0]
-            comp_right[3] = angles[1]
-
-            for mid in range(left + 1, right):
-                if frame_valid[mid]:
-                    continue
-                t = (mid - left) / gap
-                comp_mid = comp_left * (1.0 - t) + comp_right * t
-                tx, ty, scale, angle = comp_mid
-                scale = float(np.clip(scale, 1e-6, 1e6))
-                frame_affine[mid] = _compose_affine(float(tx), float(ty), scale, float(angle))
-                frame_valid[mid] = True
-                filled += 1
-
-        if filled > 0:
-            logger.info(f"Gap interpolation filled {filled} additional frames")
-
-    # -------------------------------------------------------------------------
-    # Допоміжні методи
-    # -------------------------------------------------------------------------
-
-    def _match_pair_with_count(self, features_a: dict, features_b: dict) -> tuple | None:
-        try:
-            mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
-            if len(mkpts_a) < self.min_matches:
-                return None
-            H, mask = GeometryTransforms.estimate_homography(
-                mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
-            )
-            if H is None:
-                return None
-            inliers = int(np.sum(mask))
-            if inliers < self.min_matches:
-                return None
-            return H, inliers
-        except Exception:
-            logger.debug(
-                f"Match failed between frame pair | features_a_kpts={len(features_a.get('keypoints', []))}, "
-                f"features_b_kpts={len(features_b.get('keypoints', []))}"
-            )
-            return None
-
-    def _project_to_metric(self, H_to_anchor, anchor):
-        pts_in_anchor = GeometryTransforms.apply_homography(self.grid_points, H_to_anchor)
-        if pts_in_anchor is None or len(pts_in_anchor) != len(self.grid_points):
-            return None
-        metric_pts = GeometryTransforms.apply_affine(pts_in_anchor, anchor.affine_matrix)
-        return metric_pts
-
-    def _save_to_hdf5(
-        self, frame_affine, frame_valid, frame_rmse, frame_disagreement, frame_matches, anchors
-    ):
+        # --- Збереження в HDF5 ---
         db_path = self.database.db_path
         self.database.close()
         try:
@@ -8141,13 +8449,20 @@ class CalibrationPropagationWorker(QThread):
                     del f["calibration"]
                 grp = f.create_group("calibration")
 
-                grp.attrs["version"] = "2.2"
+                grp.attrs["version"] = "3.0"  # Нова версія: графова оптимізація
                 grp.attrs["num_anchors"] = len(anchors)
                 grp.attrs["anchors_json"] = json.dumps(
                     [a.to_dict() for a in anchors], ensure_ascii=False
                 )
                 grp.attrs["projection_json"] = json.dumps(
                     self.calibration.converter.export_metadata()
+                )
+                grp.attrs["optimizer"] = "pose_graph_lm"
+                grp.attrs["num_temporal_edges"] = sum(
+                    1 for e in optimizer.edges if e.edge_type == "temporal"
+                )
+                grp.attrs["num_spatial_edges"] = sum(
+                    1 for e in optimizer.edges if e.edge_type == "spatial"
                 )
 
                 grp.create_dataset("frame_affine", data=frame_affine, compression="gzip")
@@ -8160,12 +8475,114 @@ class CalibrationPropagationWorker(QThread):
                 )
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
+            valid_count = int(np.sum(frame_valid))
             logger.success(
-                f"Successful propagation saved to HDF5 "
-                f"(rev 2.2, {len(anchors)} anchors, loop-closure blending)"
+                f"Graph propagation saved to HDF5 (v3.0, "
+                f"{len(anchors)} anchors, {optimizer.num_edges} edges, "
+                f"{valid_count}/{num_frames} valid frames)"
             )
         finally:
             self.database._load_hot_data()
+
+        return int(np.sum(frame_valid))
+
+    # ─── Допоміжні методи ────────────────────────────────────────────────────
+
+    def _match_and_build_edge(
+        self, features_a: dict, features_b: dict
+    ) -> tuple[np.ndarray, int, float] | None:
+        """Матчить дві фічі та повертає (H, inliers, rmse) або None.
+
+        H maps features_a (src) → features_b (dst).
+        """
+        try:
+            mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
+            if len(mkpts_a) < self.min_matches:
+                return None
+
+            H, mask = GeometryTransforms.estimate_homography(
+                mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
+            )
+            if H is None or mask is None:
+                return None
+
+            inlier_mask = mask.ravel().astype(bool)
+            inliers = int(np.sum(inlier_mask))
+            if inliers < self.min_matches:
+                return None
+
+            # RMSE
+            pts_a_in = mkpts_a[inlier_mask]
+            pts_transformed = GeometryTransforms.apply_homography(pts_a_in, H)
+            pts_b_in = mkpts_b[inlier_mask]
+            rmse = float(
+                np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1)))
+            )
+
+            return H, inliers, rmse
+        except Exception:
+            return None
+
+    @staticmethod
+    def _compute_weight(inliers: int, rmse: float, base_weight: float) -> float:
+        """Обчислює вагу ребра: w = base * √inliers / (1 + RMSE)."""
+        return base_weight * np.sqrt(max(inliers, 1)) / (1.0 + rmse)
+
+    def _fill_gaps_by_interpolation(self, frame_affine: np.ndarray, frame_valid: np.ndarray) -> int:
+        """Лінійна 5-DoF інтерполяція для кадрів, пропущених через Keyframe Selection."""
+        valid_ids = np.where(frame_valid)[0]
+        if len(valid_ids) < 1:
+            return 0
+
+        filled = 0
+        
+        # Екстраполяція на початок
+        first_valid = valid_ids[0]
+        for mid in range(0, first_valid):
+            frame_affine[mid] = frame_affine[first_valid].copy()
+            frame_valid[mid] = True
+            filled += 1
+
+        # Інтерполяція розривів всередині траєкторії
+        if len(valid_ids) >= 2:
+            for i in range(len(valid_ids) - 1):
+                left = valid_ids[i]
+                right = valid_ids[i + 1]
+                gap = right - left
+                if gap <= 1:
+                    continue
+
+                # ВИКОРИСТОВУЄМО 5-DoF ДЕКОМПОЗИЦІЮ
+                comp_left = np.array(decompose_affine_5dof(frame_affine[left]), dtype=np.float64)
+                comp_right = np.array(decompose_affine_5dof(frame_affine[right]), dtype=np.float64)
+
+                # Запобігаємо стрибкам кута (кут тепер під індексом 4)
+                angles = unwrap_angles([comp_left[4], comp_right[4]])
+                comp_left[4] = angles[0]
+                comp_right[4] = angles[1]
+
+                for mid in range(left + 1, right):
+                    t = (mid - left) / gap
+                    comp_mid = comp_left * (1.0 - t) + comp_right * t
+                    
+                    # Розпаковуємо 5 змінних
+                    tx, ty, sx, sy, angle = comp_mid
+                    sx = float(np.clip(sx, 1e-6, 1e6))
+                    sy = float(np.clip(sy, 1e-6, 1e6))
+
+                    # ВИКОРИСТОВУЄМО 5-DoF КОМПОЗИЦІЮ
+                    frame_affine[mid] = compose_affine_5dof(float(tx), float(ty), sx, sy, float(angle))
+                    frame_valid[mid] = True
+                    filled += 1
+                    
+        # Екстраполяція на кінець
+        last_valid = valid_ids[-1]
+        for mid in range(last_valid + 1, len(frame_valid)):
+            frame_affine[mid] = frame_affine[last_valid].copy()
+            frame_valid[mid] = True
+            filled += 1
+
+        return filled
 
 # ================================================================================
 # File: workers\database_worker.py
@@ -8230,7 +8647,9 @@ class DatabaseGenerationWorker(QThread):
                 self.completed.emit(self.output_path)
 
         except InterruptedError as e:
-            logger.warning(f"Database generation interrupted by user: {e} | video={self.video_path}")
+            logger.warning(
+                f"Database generation interrupted by user: {e} | video={self.video_path}"
+            )
             self.cancelled.emit()
         except Exception as e:
             logger.error(
@@ -8286,7 +8705,7 @@ class PanoramaOverlayWorker(QThread):
             loc_result = self.localizer.localize_frame(img_rgb)
 
             if not loc_result.get("success"):
-                error_reason = loc_result.get('error', 'Невідома причина')
+                error_reason = loc_result.get("error", "Невідома причина")
                 raise RuntimeError(
                     f"Не вдалося локалізувати панораму: {error_reason}. "
                     f"Переконайтесь, що база даних калібрована і панорама відповідає району бази."
@@ -8326,8 +8745,7 @@ class PanoramaOverlayWorker(QThread):
 
         except Exception as e:
             logger.error(
-                f"Panorama overlay worker failed: {e} | "
-                f"image_path={self.image_path}",
+                f"Panorama overlay worker failed: {e} | image_path={self.image_path}",
                 exc_info=True,
             )
             self.error.emit(str(e))
@@ -8477,12 +8895,12 @@ class RealtimeTrackingWorker(QThread):
 
     def run(self):
         # Fix #3: Скидаємо стан трекера при кожному новому старті сесії
-        if hasattr(self.localizer, 'trajectory_filter'):
+        if hasattr(self.localizer, "trajectory_filter"):
             self.localizer.trajectory_filter.reset()
-        if hasattr(self.localizer, 'outlier_detector'):
+        if hasattr(self.localizer, "outlier_detector"):
             self.localizer.outlier_detector.window.clear()
             self.localizer.outlier_detector._consecutive_outliers = 0
-        if hasattr(self.localizer, '_consecutive_failures'):
+        if hasattr(self.localizer, "_consecutive_failures"):
             self.localizer._consecutive_failures = 0
 
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
@@ -8527,7 +8945,9 @@ class RealtimeTrackingWorker(QThread):
 
         # Ставимо від'ємний час, щоб гарантовано обробити найперший кадр
         last_process_video_time = -process_interval_sec
-        last_localization_real_time = time.time()
+        
+        # ЗМІНА: Зберігаємо останній час локалізації саме за ВІДЕО-часом, а не за процесорним
+        last_localization_video_time = -1.0
 
         while not self._stop_event.is_set():
             loop_start = time.time()
@@ -8556,9 +8976,15 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, _ = yolo_wrapper.detect_and_mask(frame_rgb)
 
-                # Розраховуємо реальний dt для фільтра Калмана
-                current_real_time = time.time()
-                calculated_dt = current_real_time - last_localization_real_time
+                # ЗМІНА: Розраховуємо dt виключно за відеочасом. 
+                # Це гарантує, що dt завжди відповідатиме реальній фізиці польоту дрона.
+                if last_localization_video_time < 0:
+                    calculated_dt = frame_duration_sec
+                else:
+                    calculated_dt = current_video_time_sec - last_localization_video_time
+                    # Захист від збоїв метаданих кодека (стрибки назад або нульовий dt)
+                    if calculated_dt <= 0:
+                        calculated_dt = frame_duration_sec
 
                 # БЛОК TRY-EXCEPT для запобігання "зависанню на першому кадрі"
                 try:
@@ -8599,12 +9025,11 @@ class RealtimeTrackingWorker(QThread):
                         f"Втрата: {loc_result.get('error', 'Невідома помилка')}"
                     )
 
-                # Оновлюємо завжди — інакше dt накопичується і Kalman робить стрибок
-                last_localization_real_time = current_real_time
-
+                # ЗМІНА: Оновлюємо відеочас успішної/останньої спроби
+                last_localization_video_time = current_video_time_sec
                 last_process_video_time = current_video_time_sec
 
-                # Рахуємо швидкість самого алгоритму
+                # Рахуємо швидкість самого алгоритму (Тут time.time() залишається для метрик UI)
                 process_duration = time.time() - start_process
                 self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
 

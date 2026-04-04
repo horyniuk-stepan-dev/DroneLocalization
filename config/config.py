@@ -150,6 +150,31 @@ class HomographyConfig(BaseModel):
     confidence: float = 0.99
 
 
+class GraphOptimizationConfig(BaseModel):
+    """Конфігурація графової оптимізації пропагації координат."""
+
+    # Просторові ребра (loop closure detection)
+    loop_closure_top_k: int = 5
+    loop_closure_min_similarity: float = 0.75
+    loop_closure_min_frame_gap: int = 3
+    loop_closure_min_inliers: int = 15
+
+    # Вагові коефіцієнти ребер
+    temporal_edge_base_weight: float = 1.0
+    spatial_edge_base_weight: float = 2.0
+    anchor_weight: float = 1e6
+
+    # Levenberg-Marquardt оптимізатор
+    max_iterations: int = 50
+    convergence_tolerance: float = 1e-6
+
+    # BFS ініціалізація початкового наближення
+    use_bfs_initialization: bool = True
+
+    # Діагностика
+    export_geojson: bool = True
+
+
 class AppConfig(BaseModel):
     dinov2: Dinov2Config = Dinov2Config()
     database: DatabaseConfig = DatabaseConfig()
@@ -160,6 +185,7 @@ class AppConfig(BaseModel):
     models: ModelsConfig = ModelsConfig()
     projection: ProjectionConfig = ProjectionConfig()
     homography: HomographyConfig = HomographyConfig()
+    graph_optimization: GraphOptimizationConfig = GraphOptimizationConfig()
 
 
 def get_cfg(config: Any, path: str, default: Any = None) -> Any:

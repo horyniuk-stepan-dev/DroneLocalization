@@ -87,7 +87,9 @@ class RealtimeTrackingWorker(QThread):
 
         # Ставимо від'ємний час, щоб гарантовано обробити найперший кадр
         last_process_video_time = -process_interval_sec
-        last_localization_real_time = time.time()
+
+        # ЗМІНА: Зберігаємо останній час локалізації саме за ВІДЕО-часом, а не за процесорним
+        last_localization_video_time = -1.0
 
         while not self._stop_event.is_set():
             loop_start = time.time()
@@ -116,9 +118,15 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, _ = yolo_wrapper.detect_and_mask(frame_rgb)
 
-                # Розраховуємо реальний dt для фільтра Калмана
-                current_real_time = time.time()
-                calculated_dt = current_real_time - last_localization_real_time
+                # ЗМІНА: Розраховуємо dt виключно за відеочасом.
+                # Це гарантує, що dt завжди відповідатиме реальній фізиці польоту дрона.
+                if last_localization_video_time < 0:
+                    calculated_dt = frame_duration_sec
+                else:
+                    calculated_dt = current_video_time_sec - last_localization_video_time
+                    # Захист від збоїв метаданих кодека (стрибки назад або нульовий dt)
+                    if calculated_dt <= 0:
+                        calculated_dt = frame_duration_sec
 
                 # БЛОК TRY-EXCEPT для запобігання "зависанню на першому кадрі"
                 try:
@@ -159,12 +167,11 @@ class RealtimeTrackingWorker(QThread):
                         f"Втрата: {loc_result.get('error', 'Невідома помилка')}"
                     )
 
-                # Оновлюємо завжди — інакше dt накопичується і Kalman робить стрибок
-                last_localization_real_time = current_real_time
-
+                # ЗМІНА: Оновлюємо відеочас успішної/останньої спроби
+                last_localization_video_time = current_video_time_sec
                 last_process_video_time = current_video_time_sec
 
-                # Рахуємо швидкість самого алгоритму
+                # Рахуємо швидкість самого алгоритму (Тут time.time() залишається для метрик UI)
                 process_duration = time.time() - start_process
                 self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
 

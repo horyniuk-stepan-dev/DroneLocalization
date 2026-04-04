@@ -383,6 +383,18 @@ class CalibrationMixin:
             f"Середній RMSE (grid): <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} м</b><br>"
             f"Середній матчинг: <b>{avg_matches:.1f} точок</b><br>"
         )
+
+        log_msg = (
+            f"Пропагація завершена. "
+            f"Валідних: {valid_count}/{num_frames} ({valid_count / num_frames * 100:.1f}%), "
+            f"RMSE: {avg_rmse:.3f}м, "
+            f"Матчинг: {avg_matches:.1f} точок"
+        )
+        if avg_dis > 0:
+            log_msg += f", Drift: {avg_dis:.3f}м"
+
+        logger.info(log_msg)
+
         if avg_dis > 0:
             report += f"Середня розбіжність (drift): <b style='color:{'red' if avg_dis > 5.0 else 'green'}'>{avg_dis:.3f} м</b><br>"
 
@@ -443,15 +455,17 @@ class CalibrationMixin:
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
 
+                    # Центр кадру
                     mx, my = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
+                    # Низ кадру (замінено 0.75 на h для точнішої орієнтації повного низу)
                     mx_b, my_b = (
-                        affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
-                        affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
+                        affine[0, 0] * (w / 2) + affine[0, 1] * h + affine[0, 2],
+                        affine[1, 0] * (w / 2) + affine[1, 1] * h + affine[1, 2],
                     )
                     lat_b, lon_b = self.calibration.converter.metric_to_gps(
                         float(mx_b), float(my_b)
@@ -478,13 +492,12 @@ class CalibrationMixin:
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    cx_px, cy_px = w / 2, h / 2
-                    dw, dh = w * 0.1, h * 0.1
+                    # ВИПРАВЛЕННЯ: Відмальовуємо координати повного кадру замість затиснутої рамки
                     pts_px = [
-                        (cx_px - dw, cy_px - dh),
-                        (cx_px + dw, cy_px - dh),
-                        (cx_px + dw, cy_px + dh),
-                        (cx_px - dw, cy_px + dh),
+                        (0, 0),  # Лівий верхній кут
+                        (w, 0),  # Правий верхній кут
+                        (w, h),  # Правий нижній кут
+                        (0, h),  # Лівий нижній кут
                     ]
                     for idx_p, (px, py) in enumerate(pts_px):
                         mx_p, my_p = (
