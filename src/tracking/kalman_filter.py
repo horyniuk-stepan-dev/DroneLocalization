@@ -42,8 +42,18 @@ class TrajectoryFilter:
 
         q_var = Q_discrete_white_noise(dim=2, dt=dt, var=self.process_noise)
         self.kf.Q = np.zeros((4, 4))
-        self.kf.Q[0:2, 0:2] = q_var
-        self.kf.Q[2:4, 2:4] = q_var
+
+        # Блок осі X (позиція X та швидкість VX)
+        self.kf.Q[0, 0] = q_var[0, 0]  # Дисперсія позиції X
+        self.kf.Q[0, 2] = q_var[0, 1]  # Коваріація X та VX
+        self.kf.Q[2, 0] = q_var[1, 0]  # Коваріація VX та X
+        self.kf.Q[2, 2] = q_var[1, 1]  # Дисперсія швидкості VX
+
+        # Блок осі Y (позиція Y та швидкість VY)
+        self.kf.Q[1, 1] = q_var[0, 0]  # Дисперсія позиції Y
+        self.kf.Q[1, 3] = q_var[0, 1]  # Коваріація Y та VY
+        self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
+        self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
 
     def update(self, measurement: tuple, dt: float = 1.0) -> tuple:
         z = np.array([[measurement[0]], [measurement[1]]])
