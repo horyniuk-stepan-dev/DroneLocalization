@@ -25,6 +25,16 @@ class CoordinateConverter:
         elif self._reference_gps:
             self._initialize_projection(*self._reference_gps)
 
+    @property
+    def is_initialized(self) -> bool:
+        """Повертає True, якщо проєкція успішно ініціалізована."""
+        return self._initialized
+
+    @property
+    def reference_gps(self) -> tuple[float, float] | None:
+        """Повертає опорні GPS-координати, використані для UTM проєкції."""
+        return self._reference_gps
+
     def _initialize_projection(self, lat: float, lon: float) -> None:
         wgs84_crs = CRS("EPSG:4326")
 

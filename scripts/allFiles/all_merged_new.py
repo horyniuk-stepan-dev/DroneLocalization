@@ -1724,6 +1724,7 @@ def unwrap_angles(angles: np.ndarray) -> np.ndarray:
     """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
     return np.unwrap(angles)
 
+
 def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, float]:
     """
     Розкладає афінну матрицю 2x3 на 5 компонентів для збереження анізотропії:
@@ -1736,16 +1737,14 @@ def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, fl
     angle = float(np.arctan2(M[1, 0], M[0, 0]))
     return tx, ty, sx, sy, angle
 
+
 def compose_affine_5dof(tx: float, ty: float, sx: float, sy: float, angle: float) -> np.ndarray:
     """
     Збирає афінну матрицю 2x3 з незалежними масштабами X та Y.
     """
     c = np.cos(angle)
     s = np.sin(angle)
-    return np.array([
-        [c * sx, -s * sy, tx],
-        [s * sx,  c * sy, ty]
-    ], dtype=np.float64)
+    return np.array([[c * sx, -s * sy, tx], [s * sx, c * sy, ty]], dtype=np.float64)
 
 
 # ================================================================================
@@ -1895,6 +1894,7 @@ logger = get_logger(__name__)
 @dataclass
 class GraphEdge:
     """Ребро графу між кадрами з відносним перетворенням."""
+
     from_id: int
     to_id: int
     dtx: float
@@ -1917,23 +1917,32 @@ class PoseGraphOptimizer:
         self._fixed_nodes: dict[int, np.ndarray] = {}
         self._edges: list[GraphEdge] = []
         self._node_ids: set[int] = set()
-        
+
         self._initialized_nodes: set[int] = set()
         self._sign: float = 1.0
-        
+
         self.cx = frame_w / 2.0
         self.cy = frame_h / 2.0
 
     @property
-    def num_nodes(self) -> int: return len(self._node_ids)
+    def num_nodes(self) -> int:
+        return len(self._node_ids)
+
     @property
-    def num_edges(self) -> int: return len(self._edges)
+    def num_edges(self) -> int:
+        return len(self._edges)
+
     @property
-    def num_free(self) -> int: return len(self._free_nodes)
+    def num_free(self) -> int:
+        return len(self._free_nodes)
+
     @property
-    def num_fixed(self) -> int: return len(self._fixed_nodes)
+    def num_fixed(self) -> int:
+        return len(self._fixed_nodes)
+
     @property
-    def edges(self) -> list[GraphEdge]: return self._edges
+    def edges(self) -> list[GraphEdge]:
+        return self._edges
 
     def add_node(self, frame_id: int, initial_state: np.ndarray | None = None) -> None:
         self._node_ids.add(frame_id)
@@ -1944,10 +1953,10 @@ class PoseGraphOptimizer:
             self._free_nodes[frame_id] = np.zeros(5, dtype=np.float64)
 
     def fix_node(self, frame_id: int, affine_2x3: np.ndarray) -> None:
-        det = affine_2x3[0,0] * affine_2x3[1,1] - affine_2x3[0,1] * affine_2x3[1,0]
+        det = affine_2x3[0, 0] * affine_2x3[1, 1] - affine_2x3[0, 1] * affine_2x3[1, 0]
         if det < 0:
             self._sign = -1.0
-            
+
         state = _affine_to_state(affine_2x3, self.cx, self.cy)
         self._fixed_nodes[frame_id] = state
         self._node_ids.add(frame_id)
@@ -1955,21 +1964,35 @@ class PoseGraphOptimizer:
         self._free_nodes.pop(frame_id, None)
 
     def add_edge(
-        self, from_id: int, to_id: int, relative_affine_2x3: np.ndarray,
-        weight: float, edge_type: str = "temporal", inliers: int = 0, rmse: float = 0.0
+        self,
+        from_id: int,
+        to_id: int,
+        relative_affine_2x3: np.ndarray,
+        weight: float,
+        edge_type: str = "temporal",
+        inliers: int = 0,
+        rmse: float = 0.0,
     ) -> None:
         M = relative_affine_2x3
         tx, ty, sx, sy, angle = decompose_affine_5dof(M)
-        
+
         c_x_local = M[0, 0] * self.cx + M[0, 1] * self.cy + tx
         c_y_local = M[1, 0] * self.cx + M[1, 1] * self.cy + ty
         dtx = c_x_local - self.cx
         dty = c_y_local - self.cy
 
         edge = GraphEdge(
-            from_id=from_id, to_id=to_id, dtx=dtx, dty=dty,
-            log_dsx=np.log(max(sx, 1e-9)), log_dsy=np.log(max(sy, 1e-9)),
-            dtheta=angle, weight=weight, edge_type=edge_type, inliers=inliers, rmse=rmse
+            from_id=from_id,
+            to_id=to_id,
+            dtx=dtx,
+            dty=dty,
+            log_dsx=np.log(max(sx, 1e-9)),
+            log_dsy=np.log(max(sy, 1e-9)),
+            dtheta=angle,
+            weight=weight,
+            edge_type=edge_type,
+            inliers=inliers,
+            rmse=rmse,
         )
         self._edges.append(edge)
         self._node_ids.add(from_id)
@@ -1987,7 +2010,7 @@ class PoseGraphOptimizer:
 
         queue: deque[int] = deque(self._fixed_nodes.keys())
         count = 0
-        
+
         while queue:
             current = queue.popleft()
             current_state = self._get_node_state(current)
@@ -2006,7 +2029,9 @@ class PoseGraphOptimizer:
                 queue.append(neighbor_id)
                 count += 1
 
-        logger.info(f"BFS initialization: {count} nodes initialized from {len(self._fixed_nodes)} anchors")
+        logger.info(
+            f"BFS initialization: {count} nodes initialized from {len(self._fixed_nodes)} anchors"
+        )
         return count
 
     def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6) -> dict[int, np.ndarray]:
@@ -2014,7 +2039,9 @@ class PoseGraphOptimizer:
             logger.warning("No edges — returning current states as-is")
             return self._export_results()
 
-        free_ids = sorted([fid for fid in self._free_nodes.keys() if fid in self._initialized_nodes])
+        free_ids = sorted(
+            [fid for fid in self._free_nodes.keys() if fid in self._initialized_nodes]
+        )
         id_to_var: dict[int, int] = {fid: idx for idx, fid in enumerate(free_ids)}
         n_vars = len(free_ids) * 5
 
@@ -2040,8 +2067,10 @@ class PoseGraphOptimizer:
         n_edges = len(valid_edges)
         n_residuals = n_edges * 5 + len(free_ids)
         jac_sp = self._build_jac_sparsity(valid_edges, id_to_var, n_residuals, n_vars, n_edges)
-        
-        logger.info(f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), {n_residuals} residuals, {len(self._fixed_nodes)} anchors")
+
+        logger.info(
+            f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), {n_residuals} residuals, {len(self._fixed_nodes)} anchors"
+        )
 
         result = least_squares(
             fun=self._residuals,
@@ -2050,17 +2079,23 @@ class PoseGraphOptimizer:
             method="lm",
             jac="2-point",
             max_nfev=max_iterations * n_vars,
-            ftol=tolerance, xtol=tolerance, gtol=tolerance,
+            ftol=tolerance,
+            xtol=tolerance,
+            gtol=tolerance,
         )
 
-        logger.info(f"Optimization finished | cost={result.cost:.4f}, nfev={result.nfev}, status={result.status}, message='{result.message}'")
+        logger.info(
+            f"Optimization finished | cost={result.cost:.4f}, nfev={result.nfev}, status={result.status}, message='{result.message}'"
+        )
 
         for fid, idx in id_to_var.items():
             self._free_nodes[fid] = result.x[5 * idx : 5 * idx + 5].copy()
 
         return self._export_results()
 
-    def _residuals(self, x: np.ndarray, valid_edges: list[GraphEdge], id_to_var: dict[int, int], n_edges: int) -> np.ndarray:
+    def _residuals(
+        self, x: np.ndarray, valid_edges: list[GraphEdge], id_to_var: dict[int, int], n_edges: int
+    ) -> np.ndarray:
         n_free = len(id_to_var)
         residuals = np.zeros(n_edges * 5 + n_free, dtype=np.float64)
 
@@ -2108,21 +2143,27 @@ class PoseGraphOptimizer:
 
             if idx_i is not None:
                 base_i = 5 * idx_i
-                sp[base_r+0, base_i+0] = sp[base_r+0, base_i+2] = sp[base_r+0, base_i+3] = sp[base_r+0, base_i+4] = 1
-                sp[base_r+1, base_i+1] = sp[base_r+1, base_i+2] = sp[base_r+1, base_i+3] = sp[base_r+1, base_i+4] = 1
-                sp[base_r+2, base_i+2] = 1
-                sp[base_r+3, base_i+3] = 1
-                sp[base_r+4, base_i+4] = 1
+                sp[base_r + 0, base_i + 0] = sp[base_r + 0, base_i + 2] = sp[
+                    base_r + 0, base_i + 3
+                ] = sp[base_r + 0, base_i + 4] = 1
+                sp[base_r + 1, base_i + 1] = sp[base_r + 1, base_i + 2] = sp[
+                    base_r + 1, base_i + 3
+                ] = sp[base_r + 1, base_i + 4] = 1
+                sp[base_r + 2, base_i + 2] = 1
+                sp[base_r + 3, base_i + 3] = 1
+                sp[base_r + 4, base_i + 4] = 1
             if idx_j is not None:
                 base_j = 5 * idx_j
-                sp[base_r+0, base_j+0] = sp[base_r+1, base_j+1] = sp[base_r+2, base_j+2] = sp[base_r+3, base_j+3] = sp[base_r+4, base_j+4] = 1
-                
+                sp[base_r + 0, base_j + 0] = sp[base_r + 1, base_j + 1] = sp[
+                    base_r + 2, base_j + 2
+                ] = sp[base_r + 3, base_j + 3] = sp[base_r + 4, base_j + 4] = 1
+
         for idx in range(len(id_to_var)):
             row = n_edges * 5 + idx
             base_i = 5 * idx
             sp[row, base_i + 2] = 1
             sp[row, base_i + 3] = 1
-            
+
         return sp.tocsr()
 
     def _get_node_state(self, frame_id: int):
@@ -2131,13 +2172,16 @@ class PoseGraphOptimizer:
         return self._free_nodes.get(frame_id, np.zeros(5, dtype=np.float64))
 
     def _read_state(self, x, frame_id, id_to_var):
-        if frame_id in self._fixed_nodes: 
+        if frame_id in self._fixed_nodes:
             return self._fixed_nodes[frame_id]
         idx = id_to_var[frame_id]
         return x[5 * idx : 5 * idx + 5]
 
     def _export_results(self) -> dict[int, np.ndarray]:
-        results = {fid: _state_to_affine(state, self.cx, self.cy, self._sign) for fid, state in self._fixed_nodes.items()}
+        results = {
+            fid: _state_to_affine(state, self.cx, self.cy, self._sign)
+            for fid, state in self._fixed_nodes.items()
+        }
         for fid, state in self._free_nodes.items():
             if fid in self._initialized_nodes:
                 results[fid] = _state_to_affine(state, self.cx, self.cy, self._sign)
@@ -2156,16 +2200,19 @@ class PoseGraphOptimizer:
             except Exception:
                 continue
             is_fixed = fid in self._fixed_nodes
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                "properties": {"frame_id": fid, "type": "anchor" if is_fixed else "frame"}
-            })
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                    "properties": {"frame_id": fid, "type": "anchor" if is_fixed else "frame"},
+                }
+            )
 
         for edge in self._edges:
             affine_from = results.get(edge.from_id)
             affine_to = results.get(edge.to_id)
-            if affine_from is None or affine_to is None: continue
+            if affine_from is None or affine_to is None:
+                continue
             try:
                 pt = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
                 m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
@@ -2174,16 +2221,23 @@ class PoseGraphOptimizer:
                 lat2, lon2 = converter.metric_to_gps(float(m_to[0]), float(m_to[1]))
             except Exception:
                 continue
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
-                "properties": {"from_id": edge.from_id, "to_id": edge.to_id, "edge_type": edge.edge_type}
-            })
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
+                    "properties": {
+                        "from_id": edge.from_id,
+                        "to_id": edge.to_id,
+                        "edge_type": edge.edge_type,
+                    },
+                }
+            )
 
         return {"type": "FeatureCollection", "features": features}
 
 
 # ── Вільні утиліти (поза класом) ─────────────────────────────────────────────
+
 
 def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, float]:
     tx, ty = float(M[0, 2]), float(M[1, 2])
@@ -2192,68 +2246,87 @@ def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, fl
     theta = float(np.arctan2(M[1, 0], M[0, 0]))
     return tx, ty, sx, sy, theta
 
+
 def _affine_to_state(affine_2x3: np.ndarray, cx: float, cy: float) -> np.ndarray:
     tx, ty, sx, sy, angle = decompose_affine_5dof(affine_2x3)
     c_x = affine_2x3[0, 0] * cx + affine_2x3[0, 1] * cy + tx
     c_y = affine_2x3[1, 0] * cx + affine_2x3[1, 1] * cy + ty
-    return np.array([c_x, c_y, np.log(max(sx, 1e-9)), np.log(max(sy, 1e-9)), angle], dtype=np.float64)
+    return np.array(
+        [c_x, c_y, np.log(max(sx, 1e-9)), np.log(max(sy, 1e-9)), angle], dtype=np.float64
+    )
+
 
 def _state_to_affine(state: np.ndarray, cx: float, cy: float, sign: float = 1.0) -> np.ndarray:
     c_x, c_y, log_sx, log_sy, theta = state
     sx, sy = float(np.clip(np.exp(log_sx), 1e-6, 1e6)), float(np.clip(np.exp(log_sy), 1e-6, 1e6))
     c, s = np.cos(theta), np.sin(theta)
-    
+
     M00, M01 = c * sx, -s * sign * sy
     M10, M11 = s * sx, c * sign * sy
     tx = c_x - (M00 * cx + M01 * cy)
     ty = c_y - (M10 * cx + M11 * cy)
     return np.array([[M00, M01, tx], [M10, M11, ty]], dtype=np.float64)
 
+
 def _predict_forward(state_i: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
     tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i
     sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
     c_i, s_i = np.cos(theta_i), np.sin(theta_i)
-    return np.array([
-        tx_i + c_i * sx_i * edge.dtx - sign * s_i * sy_i * edge.dty,
-        ty_i + s_i * sx_i * edge.dtx + sign * c_i * sy_i * edge.dty,
-        log_sx_i + edge.log_dsx,
-        log_sy_i + edge.log_dsy,
-        theta_i + sign * edge.dtheta,
-    ], dtype=np.float64)
+    return np.array(
+        [
+            tx_i + c_i * sx_i * edge.dtx - sign * s_i * sy_i * edge.dty,
+            ty_i + s_i * sx_i * edge.dtx + sign * c_i * sy_i * edge.dty,
+            log_sx_i + edge.log_dsx,
+            log_sy_i + edge.log_dsy,
+            theta_i + sign * edge.dtheta,
+        ],
+        dtype=np.float64,
+    )
+
 
 def _predict_inverse(state_j: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
     tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j
     inv_dsx, inv_dsy = 1.0 / np.exp(edge.log_dsx), 1.0 / np.exp(edge.log_dsy)
     inv_dtheta = -edge.dtheta
     cos_inv, sin_inv = np.cos(inv_dtheta), np.sin(inv_dtheta)
-    
+
     inv_dtx = inv_dsx * (cos_inv * (-edge.dtx) - sin_inv * (-edge.dty))
     inv_dty = inv_dsy * (sin_inv * (-edge.dtx) + cos_inv * (-edge.dty))
-    
+
     sx_j, sy_j = np.exp(log_sx_j), np.exp(log_sy_j)
     c_j, s_j = np.cos(theta_j), np.sin(theta_j)
-    return np.array([
-        tx_j + c_j * sx_j * inv_dtx - sign * s_j * sy_j * inv_dty,
-        ty_j + s_j * sx_j * inv_dtx + sign * c_j * sy_j * inv_dty,
-        log_sx_j + np.log(inv_dsx),
-        log_sy_j + np.log(inv_dsy),
-        theta_j + sign * inv_dtheta,
-    ], dtype=np.float64)
+    return np.array(
+        [
+            tx_j + c_j * sx_j * inv_dtx - sign * s_j * sy_j * inv_dty,
+            ty_j + s_j * sx_j * inv_dtx + sign * c_j * sy_j * inv_dty,
+            log_sx_j + np.log(inv_dsx),
+            log_sy_j + np.log(inv_dsy),
+            theta_j + sign * inv_dtheta,
+        ],
+        dtype=np.float64,
+    )
+
 
 def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
     """Для сумісності з воркером, що використовує назву homography_to_affine (або homography_to_similarity)"""
     cx, cy = frame_w / 2.0, frame_h / 2.0
     d = min(frame_w, frame_h) * 0.25
-    pts = np.array([[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]], dtype=np.float32)
+    pts = np.array(
+        [[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]],
+        dtype=np.float32,
+    )
     transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
-    if transformed is None: return None
+    if transformed is None:
+        return None
     transformed = transformed.reshape(-1, 2).astype(np.float32)
-    
+
     T, _ = cv2.estimateAffine2D(pts, transformed, method=cv2.LMEDS)
     return T
 
+
 # Додаємо аліас, щоб не довелося змінювати назву у worker-і, якщо там досі викликається homography_to_similarity
 homography_to_similarity = homography_to_affine
+
 
 # ================================================================================
 # File: geometry\transformations.py
@@ -2426,9 +2499,7 @@ class GeometryTransforms:
                     f"Falling back to Full Affine (5 DoF)."
                 )
                 # ВИПРАВЛЕНО: Тепер використовуємо estimate_affine (5-DoF) замість estimate_affine_partial
-                return GeometryTransforms.estimate_affine(
-                    src_pts, dst_pts, ransac_threshold
-                )
+                return GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
             logger.warning(
                 f"Homography invalid/degenerate and no fallback enabled | "
                 f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
@@ -2536,6 +2607,7 @@ class GeometryTransforms:
         points_cv = points.reshape(-1, 1, 2).astype(np.float32)
         transformed_pts_cv = cv2.transform(points_cv, M)
         return transformed_pts_cv.reshape(-1, 2)
+
 
 # ================================================================================
 # File: geometry\__init__.py
@@ -4203,15 +4275,17 @@ class CalibrationMixin:
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
 
+                    # Центр кадру
                     mx, my = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
+                    # Низ кадру (замінено 0.75 на h для точнішої орієнтації повного низу)
                     mx_b, my_b = (
-                        affine[0, 0] * (w / 2) + affine[0, 1] * (h * 0.75) + affine[0, 2],
-                        affine[1, 0] * (w / 2) + affine[1, 1] * (h * 0.75) + affine[1, 2],
+                        affine[0, 0] * (w / 2) + affine[0, 1] * h + affine[0, 2],
+                        affine[1, 0] * (w / 2) + affine[1, 1] * h + affine[1, 2],
                     )
                     lat_b, lon_b = self.calibration.converter.metric_to_gps(
                         float(mx_b), float(my_b)
@@ -4238,13 +4312,12 @@ class CalibrationMixin:
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    cx_px, cy_px = w / 2, h / 2
-                    dw, dh = w * 0.1, h * 0.1
+                    # ВИПРАВЛЕННЯ: Відмальовуємо координати повного кадру замість затиснутої рамки
                     pts_px = [
-                        (cx_px - dw, cy_px - dh),
-                        (cx_px + dw, cy_px - dh),
-                        (cx_px + dw, cy_px + dh),
-                        (cx_px - dw, cy_px + dh),
+                        (0, 0),  # Лівий верхній кут
+                        (w, 0),  # Правий верхній кут
+                        (w, h),  # Правий нижній кут
+                        (0, h),  # Лівий нижній кут
                     ]
                     for idx_p, (px, py) in enumerate(pts_px):
                         mx_p, my_p = (
@@ -5859,7 +5932,7 @@ from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
-from src.geometry.affine_utils import decompose_affine_5dof, compose_affine_5dof
+
 logger = get_logger(__name__)
 
 
@@ -7712,8 +7785,18 @@ class TrajectoryFilter:
 
         q_var = Q_discrete_white_noise(dim=2, dt=dt, var=self.process_noise)
         self.kf.Q = np.zeros((4, 4))
-        self.kf.Q[0:2, 0:2] = q_var
-        self.kf.Q[2:4, 2:4] = q_var
+
+        # Блок осі X (позиція X та швидкість VX)
+        self.kf.Q[0, 0] = q_var[0, 0]  # Дисперсія позиції X
+        self.kf.Q[0, 2] = q_var[0, 1]  # Коваріація X та VX
+        self.kf.Q[2, 0] = q_var[1, 0]  # Коваріація VX та X
+        self.kf.Q[2, 2] = q_var[1, 1]  # Дисперсія швидкості VX
+
+        # Блок осі Y (позиція Y та швидкість VY)
+        self.kf.Q[1, 1] = q_var[0, 0]  # Дисперсія позиції Y
+        self.kf.Q[1, 3] = q_var[0, 1]  # Коваріація Y та VY
+        self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
+        self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
 
     def update(self, measurement: tuple, dt: float = 1.0) -> tuple:
         z = np.array([[measurement[0]], [measurement[1]]])
@@ -7806,9 +7889,11 @@ class OutlierDetector:
         std_speed = max(np.std(speeds), 1.0)
 
         z_score = abs(instantaneous_speed - mean_speed) / std_speed
-        
+
         # 15.0 m/s - мінімальна дельта швидкості, при якій Z-score має сенс
-        is_zscore_outlier = z_score > self.threshold_std and abs(instantaneous_speed - mean_speed) > 15.0
+        is_zscore_outlier = (
+            z_score > self.threshold_std and abs(instantaneous_speed - mean_speed) > 15.0
+        )
 
         if is_speed_outlier or is_zscore_outlier:
             self._consecutive_outliers += 1
@@ -7842,6 +7927,7 @@ class OutlierDetector:
 
         self._consecutive_outliers = 0
         return False
+
 
 # ================================================================================
 # File: tracking\__init__.py
@@ -8023,7 +8109,6 @@ def get_logger(name: str | None = None) -> Any:
 
 import json
 
-import cv2
 import faiss
 import h5py
 import numpy as np
@@ -8031,12 +8116,11 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from config.config import get_cfg
 from src.geometry.affine_utils import (
+    compose_affine_5dof,
     decompose_affine,
-    unwrap_angles,
     decompose_affine_5dof,
-    compose_affine_5dof
+    unwrap_angles,
 )
-
 from src.geometry.pose_graph_optimizer import (
     PoseGraphOptimizer,
     homography_to_similarity,
@@ -8078,15 +8162,11 @@ class CalibrationPropagationWorker(QThread):
         self.frame_h = self.database.metadata.get("frame_height", 1080)
 
         # Параметри графової оптимізації
-        self.lc_top_k = get_cfg(
-            self.config, "graph_optimization.loop_closure_top_k", 5
-        )
+        self.lc_top_k = get_cfg(self.config, "graph_optimization.loop_closure_top_k", 5)
         self.lc_min_sim = get_cfg(
             self.config, "graph_optimization.loop_closure_min_similarity", 0.75
         )
-        self.lc_min_gap = get_cfg(
-            self.config, "graph_optimization.loop_closure_min_frame_gap", 3
-        )
+        self.lc_min_gap = get_cfg(self.config, "graph_optimization.loop_closure_min_frame_gap", 3)
         self.lc_min_inliers = get_cfg(
             self.config, "graph_optimization.loop_closure_min_inliers", 15
         )
@@ -8096,18 +8176,10 @@ class CalibrationPropagationWorker(QThread):
         self.spatial_base_w = get_cfg(
             self.config, "graph_optimization.spatial_edge_base_weight", 2.0
         )
-        self.max_iters = get_cfg(
-            self.config, "graph_optimization.max_iterations", 50
-        )
-        self.tolerance = get_cfg(
-            self.config, "graph_optimization.convergence_tolerance", 1e-6
-        )
-        self.use_bfs = get_cfg(
-            self.config, "graph_optimization.use_bfs_initialization", True
-        )
-        self.export_geojson = get_cfg(
-            self.config, "graph_optimization.export_geojson", True
-        )
+        self.max_iters = get_cfg(self.config, "graph_optimization.max_iterations", 50)
+        self.tolerance = get_cfg(self.config, "graph_optimization.convergence_tolerance", 1e-6)
+        self.use_bfs = get_cfg(self.config, "graph_optimization.use_bfs_initialization", True)
+        self.export_geojson = get_cfg(self.config, "graph_optimization.export_geojson", True)
 
         # Скільки кадрів можна "перестрибнути" при побудові temporal ребер
         self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 3)
@@ -8154,16 +8226,12 @@ class CalibrationPropagationWorker(QThread):
                 optimizer.add_node(i)
 
         self.progress.emit(10, "Побудова часових ребер (sequential matching)...")
-        temporal_count = self._build_temporal_edges(
-            optimizer, all_features, num_frames
-        )
+        temporal_count = self._build_temporal_edges(optimizer, all_features, num_frames)
         logger.info(f"Phase 1 complete: {temporal_count} temporal edges")
 
         # ── Phase 2: Loop closure detection ──────────────────────────────────
         self.progress.emit(30, "Пошук просторових замикань (loop closure)...")
-        spatial_count = self._detect_loop_closures(
-            optimizer, all_features, num_frames
-        )
+        spatial_count = self._detect_loop_closures(optimizer, all_features, num_frames)
         logger.info(f"Phase 2 complete: {spatial_count} spatial edges (loop closures)")
         logger.info(
             f"Graph: {optimizer.num_nodes} nodes, {optimizer.num_edges} edges "
@@ -8258,9 +8326,7 @@ class CalibrationPropagationWorker(QThread):
                     H, inliers, rmse_val = result
                     similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
                     if similarity is not None:
-                        weight = self._compute_weight(
-                            inliers, rmse_val, self.temporal_base_w
-                        )
+                        weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
                         optimizer.add_edge(
                             from_id=last_success_id,
                             to_id=i,
@@ -8392,13 +8458,13 @@ class CalibrationPropagationWorker(QThread):
         frame_matches = np.zeros(num_frames, dtype=np.int32)
 
         # Записуємо результати оптимізації
-        # Оскільки optimizer повертає ТІЛЬКИ досяжні вузли, 
+        # Оскільки optimizer повертає ТІЛЬКИ досяжні вузли,
         # незв'язані кадри залишаться з frame_valid = False
         for frame_id, affine in results.items():
             if 0 <= frame_id < num_frames:
                 frame_affine[frame_id] = affine.astype(np.float32)
                 frame_valid[frame_id] = True
-        
+
         filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)
         if filled_count > 0:
             logger.info(f"Interpolated coordinates for {filled_count} missing frames")
@@ -8423,16 +8489,13 @@ class CalibrationPropagationWorker(QThread):
         for fid in range(num_frames):
             if not frame_valid[fid]:
                 continue
-            edges_to_fid = [
-                e for e in optimizer.edges
-                if e.to_id == fid or e.from_id == fid
-            ]
+            edges_to_fid = [e for e in optimizer.edges if e.to_id == fid or e.from_id == fid]
             if len(edges_to_fid) >= 2:
                 predictions_tx = []
                 for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
                     other_id = e.from_id if e.to_id == fid else e.to_id
                     other_affine = results.get(other_id)
-                    
+
                     # Перевіряємо, чи сусідній кадр також валідний
                     if other_affine is not None:
                         comp = decompose_affine(other_affine)
@@ -8515,9 +8578,7 @@ class CalibrationPropagationWorker(QThread):
             pts_a_in = mkpts_a[inlier_mask]
             pts_transformed = GeometryTransforms.apply_homography(pts_a_in, H)
             pts_b_in = mkpts_b[inlier_mask]
-            rmse = float(
-                np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1)))
-            )
+            rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
 
             return H, inliers, rmse
         except Exception:
@@ -8535,7 +8596,7 @@ class CalibrationPropagationWorker(QThread):
             return 0
 
         filled = 0
-        
+
         # Екстраполяція на початок
         first_valid = valid_ids[0]
         for mid in range(0, first_valid):
@@ -8564,17 +8625,19 @@ class CalibrationPropagationWorker(QThread):
                 for mid in range(left + 1, right):
                     t = (mid - left) / gap
                     comp_mid = comp_left * (1.0 - t) + comp_right * t
-                    
+
                     # Розпаковуємо 5 змінних
                     tx, ty, sx, sy, angle = comp_mid
                     sx = float(np.clip(sx, 1e-6, 1e6))
                     sy = float(np.clip(sy, 1e-6, 1e6))
 
                     # ВИКОРИСТОВУЄМО 5-DoF КОМПОЗИЦІЮ
-                    frame_affine[mid] = compose_affine_5dof(float(tx), float(ty), sx, sy, float(angle))
+                    frame_affine[mid] = compose_affine_5dof(
+                        float(tx), float(ty), sx, sy, float(angle)
+                    )
                     frame_valid[mid] = True
                     filled += 1
-                    
+
         # Екстраполяція на кінець
         last_valid = valid_ids[-1]
         for mid in range(last_valid + 1, len(frame_valid)):
@@ -8583,6 +8646,7 @@ class CalibrationPropagationWorker(QThread):
             filled += 1
 
         return filled
+
 
 # ================================================================================
 # File: workers\database_worker.py
@@ -8945,7 +9009,7 @@ class RealtimeTrackingWorker(QThread):
 
         # Ставимо від'ємний час, щоб гарантовано обробити найперший кадр
         last_process_video_time = -process_interval_sec
-        
+
         # ЗМІНА: Зберігаємо останній час локалізації саме за ВІДЕО-часом, а не за процесорним
         last_localization_video_time = -1.0
 
@@ -8976,7 +9040,7 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, _ = yolo_wrapper.detect_and_mask(frame_rgb)
 
-                # ЗМІНА: Розраховуємо dt виключно за відеочасом. 
+                # ЗМІНА: Розраховуємо dt виключно за відеочасом.
                 # Це гарантує, що dt завжди відповідатиме реальній фізиці польоту дрона.
                 if last_localization_video_time < 0:
                     calculated_dt = frame_duration_sec
@@ -9078,3 +9142,308 @@ class RealtimeTrackingWorker(QThread):
 # File: workers\__init__.py
 # ================================================================================
 """Worker threads module"""
+
+
+# config/config.py
+#
+# Єдиний конфіг для всього застосунку з валідацією через Pydantic.
+
+from typing import Any
+
+from pydantic import BaseModel
+
+
+class Dinov2Config(BaseModel):
+    descriptor_dim: int = 1024
+    input_size: int = 336
+
+
+class DatabaseConfig(BaseModel):
+    frame_step: int = 3
+    prefetch_queue_size: int = 32
+    keypoint_video_scale: float = 0.5
+    inter_frame_min_matches: int = 15
+    inter_frame_ransac_thresh: float = 3.0
+    keyframe_min_translation_px: float = 15.0
+    keyframe_min_rotation_deg: float = 1.5
+    keyframe_always_save_first: bool = True
+
+
+class ConfidenceConfig(BaseModel):
+    inlier_weight: float = 0.7
+    stability_weight: float = 0.3
+    rmse_norm_m: float = 10.0
+    disagreement_norm_m: float = 5.0
+    confidence_max_inliers: int = 80
+
+
+class LocalizationConfig(BaseModel):
+    min_matches: int = 12
+    min_inliers_accept: int = 10
+    ratio_threshold: float = 0.85
+    ransac_threshold: float = 3.0
+    retrieval_top_k: int = 12
+    early_stop_inliers: int = 40
+    retrieval_only_min_score: float = 0.90
+    auto_rotation: bool = True
+    enable_lightglue_fallback: bool = True
+    fallback_extractor: str = "aliked"
+    confidence: ConfidenceConfig = ConfidenceConfig()
+
+
+class TrackingConfig(BaseModel):
+    kalman_process_noise: float = 2.0
+    kalman_measurement_noise: float = 5.0
+    outlier_window: int = 10
+    outlier_threshold_std: float = 25.0
+    max_speed_mps: float = 1000.0
+    max_consecutive_outliers: int = 5
+    process_fps: float = 1.0
+
+
+class PreprocessingConfig(BaseModel):
+    clahe_clip_limit: float = 3.0
+    clahe_tile_grid: list[int] = [8, 8]
+    histogram_matching: bool = True
+    reference_image_path: str = "config/reference_style.png"
+    masking_strategy: str = "yolo"  # "yolo" | "none" (підготовка до EfficientViT-SAM)
+
+
+class GuiConfig(BaseModel):
+    video_fps: int = 30
+    verify_display_mode: str = "center"  # "center" | "center_corners" | "full"
+    verify_label_mode: str = "number"  # "number" | "number_rmse" | "full"
+
+
+class YoloConfig(BaseModel):
+    model_path: str = "yolo11n-seg.pt"
+    vram_required_mb: float = 200.0
+    description: str = "YOLOv11n-seg (Nano) for dynamic object masking"
+
+
+class ModelSettings(BaseModel):
+    hub_repo: str | None = ""
+    hub_model: str | None = ""
+    top_k: int = 2048
+    vram_required_mb: float = 500.0
+    model_path: str | None = ""
+    max_keypoints: int = 4096
+    nms_radius: int = 4
+    depth_confidence: float = -1.0
+    width_confidence: float = -1.0
+    detection_threshold: float = 0.001
+
+
+class CespConfig(BaseModel):
+    enabled: bool = False
+    weights_path: str | None = None
+    scales: list[int] = [1, 2, 4]
+
+
+class VramManagementConfig(BaseModel):
+    max_vram_ratio: float = 0.8
+    default_required_mb: float = 2000.0
+
+
+class ModelsCacheConfig(BaseModel):
+    engine_cache_dir: str = "models/engines/"
+    auto_compile: bool = False
+
+
+class PerformanceConfig(BaseModel):
+    propagation_max_workers: int = 4
+    fp16_enabled: bool = True
+
+
+class ModelsConfig(BaseModel):
+    use_cuda: bool = True
+    yolo: YoloConfig = YoloConfig()
+    xfeat: ModelSettings = ModelSettings(
+        hub_repo="verlab/accelerated_features",
+        hub_model="XFeat",
+        top_k=2048,
+        vram_required_mb=300.0,
+    )
+    aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
+    superpoint: ModelSettings = ModelSettings(
+        nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
+    )
+    lightglue: ModelSettings = ModelSettings(vram_required_mb=1000.0)
+    dinov2: ModelSettings = ModelSettings(
+        hub_repo="facebookresearch/dinov2", hub_model="dinov2_vitl14", vram_required_mb=1600.0
+    )
+    cesp: CespConfig = CespConfig()
+    vram_management: VramManagementConfig = VramManagementConfig()
+    performance: PerformanceConfig = PerformanceConfig()
+    engines_cache: ModelsCacheConfig = ModelsCacheConfig()
+
+
+class ProjectionConfig(BaseModel):
+    default_mode: str = "WEB_MERCATOR"
+    strict_projection: bool = True
+    fallback_to_webmercator: bool = True
+    anchor_rmse_threshold_m: float = 3.0
+    anchor_max_error_m: float = 5.0
+    propagation_disagreement_threshold_m: float = 2.0
+    localizer_sample_points: int = 9
+    localizer_expected_spread_m: float = 150.0
+
+
+class HomographyConfig(BaseModel):
+    backend: str = "opencv"  # "poselib" | "opencv"
+    ransac_threshold: float = 3.0
+    max_iters: int = 2000
+    confidence: float = 0.99
+
+
+class GraphOptimizationConfig(BaseModel):
+    """Конфігурація графової оптимізації пропагації координат."""
+
+    # Просторові ребра (loop closure detection)
+    loop_closure_top_k: int = 5
+    loop_closure_min_similarity: float = 0.75
+    loop_closure_min_frame_gap: int = 3
+    loop_closure_min_inliers: int = 15
+
+    # Вагові коефіцієнти ребер
+    temporal_edge_base_weight: float = 1.0
+    spatial_edge_base_weight: float = 2.0
+    anchor_weight: float = 1e6
+
+    # Levenberg-Marquardt оптимізатор
+    max_iterations: int = 50
+    convergence_tolerance: float = 1e-6
+
+    # BFS ініціалізація початкового наближення
+    use_bfs_initialization: bool = True
+
+    # Діагностика
+    export_geojson: bool = True
+
+
+class AppConfig(BaseModel):
+    dinov2: Dinov2Config = Dinov2Config()
+    database: DatabaseConfig = DatabaseConfig()
+    localization: LocalizationConfig = LocalizationConfig()
+    tracking: TrackingConfig = TrackingConfig()
+    preprocessing: PreprocessingConfig = PreprocessingConfig()
+    gui: GuiConfig = GuiConfig()
+    models: ModelsConfig = ModelsConfig()
+    projection: ProjectionConfig = ProjectionConfig()
+    homography: HomographyConfig = HomographyConfig()
+    graph_optimization: GraphOptimizationConfig = GraphOptimizationConfig()
+
+
+def get_cfg(config: Any, path: str, default: Any = None) -> Any:
+    """Централізований доступ до конфігу з dot-path.
+    Працює як зі словниками, так і з Pydantic-моделями.
+    """
+    keys = path.split(".")
+    current = config
+
+    for key in keys:
+        if isinstance(current, dict):
+            if key not in current:
+                return default
+            current = current[key]
+        elif hasattr(current, key):
+            current = getattr(current, key)
+        else:
+            return default
+    return current
+
+
+# Екземпляр конфігу за замовчуванням
+APP_SETTINGS = AppConfig()
+# Також надаємо доступ як до словника для зворотньої сумісності
+APP_CONFIG = APP_SETTINGS.model_dump()
+
+
+#!/usr/bin/env python3
+"""Drone Topometric Localization System — application entry point."""
+
+import sys
+import warnings
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Suppress only known noisy third-party warnings, not everything
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
+
+import torch
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
+
+from src.gui.main_window import MainWindow
+from src.utils.logging_utils import get_logger, setup_logging
+
+
+def _build_exception_hook(log):
+    """Return sys.excepthook that logs unhandled exceptions before exit."""
+
+    def hook(exctype, value, tb):
+        log.critical(
+            "Unhandled exception caught — application will exit",
+            exc_info=(exctype, value, tb),
+        )
+        sys.exit(1)
+
+    return hook
+
+
+def main() -> None:
+    # Logging must be initialized before anything else — including Qt
+    setup_logging(log_level="INFO", log_file="logs/app.log")
+    logger = get_logger(__name__)
+
+    # Route unhandled exceptions to loguru instead of silent PyQt6 crash
+    sys.excepthook = _build_exception_hook(logger)
+
+    logger.info("=" * 70)
+    logger.info("DRONE TOPOMETRIC LOCALIZATION SYSTEM STARTING")
+    logger.info("=" * 70)
+
+    # System diagnostics for debugging
+    logger.info(f"Python: {sys.version}")
+    logger.info(f"PyTorch: {torch.__version__}")
+    try:
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            logger.info(f"CUDA: {torch.version.cuda} | GPU: {gpu_name} | VRAM: {vram_total:.1f} GB")
+        else:
+            logger.warning(
+                "CUDA not available — running on CPU. Performance will be significantly reduced."
+            )
+    except Exception as e:
+        logger.warning(f"CUDA diagnostics failed: {e}. Continuing without GPU info.")
+
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+        app = QApplication(sys.argv)
+        app.setApplicationName("Drone Localization")
+        app.setOrganizationName("UAV Systems")
+        logger.info("Qt application initialized")
+
+        window = MainWindow()
+        window.show()
+        logger.success("Application startup complete")
+
+        exit_code = app.exec()
+
+    except Exception as e:
+        logger.critical(f"Fatal error during startup: {e}", exc_info=True)
+        sys.exit(1)
+
+    logger.info(f"Application exiting | code={exit_code}")
+    logger.info("=" * 70)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

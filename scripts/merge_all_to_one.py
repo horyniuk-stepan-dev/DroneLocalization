@@ -48,4 +48,6 @@ if __name__ == "__main__":
     # OUTPUT = "D:/My Projects/DroneLocalization/scripts/allFiles/all_merged_old.py"
     SOURCE = "E:/Dip/gsdfg/New/DroneLocalization/src"
     OUTPUT = "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFiles/all_merged_new.py"
+    # SOURCE = "E:/Dip/gsdfg/New/DroneLocalization/tests"
+    # OUTPUT = "E:/Dip/gsdfg/New/DroneLocalization/scripts/allFiles/all_merged_tests.py"
     merge_files(SOURCE, OUTPUT)

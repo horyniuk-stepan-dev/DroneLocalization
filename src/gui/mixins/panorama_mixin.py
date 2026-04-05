@@ -211,7 +211,7 @@ class PanoramaMixin:
                 self.repaint()
 
                 res = localizer.localize_frame(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                if not res.get("success") or "fov_polygon" in res is False:
+                if not res.get("success") or "fov_polygon" not in res:
                     continue
 
                 ch, cw = crop.shape[:2]

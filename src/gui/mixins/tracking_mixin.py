@@ -43,13 +43,12 @@ class TrackingMixin:
     def _ensure_utm_initialized(self) -> bool:
         """Перевіряє чи ініціалізована проєкція UTM, якщо ні - пробує ініціалізувати з калібрування."""
 
-        if self.calibration.converter._initialized:
+        if self.calibration.converter.is_initialized:
             return True
 
-        if self.calibration and self.calibration.reference_gps:
-            self.calibration.converter.gps_to_metric(
-                self.calibration.reference_gps[0], self.calibration.reference_gps[1]
-            )
+        ref_gps = self.calibration.converter.reference_gps
+        if self.calibration and ref_gps:
+            self.calibration.converter.gps_to_metric(ref_gps[0], ref_gps[1])
             return True
 
         QMessageBox.warning(
@@ -239,9 +238,9 @@ class TrackingMixin:
             self.status_bar.showMessage("Помилка обробки")
 
     @pyqtSlot(np.ndarray)
-    def on_frame_ready(self, frame_rgb: np.ndarray):
+    def on_frame_ready(self, frame_bgr: np.ndarray):
         if hasattr(self.video_widget, "display_frame"):
-            self.video_widget.display_frame(opencv_to_qpixmap(frame_rgb))
+            self.video_widget.display_frame(opencv_to_qpixmap(frame_bgr))
 
     @pyqtSlot(float, float, float, int)
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):

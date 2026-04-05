@@ -63,23 +63,11 @@ class YOLOWrapper:
                 boxes = result.boxes.data.cpu().numpy()
                 classes = result.boxes.cls.cpu().numpy().astype(int)
                 confidences = result.boxes.conf.cpu().numpy()
-            if result.masks is not None:
-                masks = result.masks.data.cpu().numpy()
-                boxes = result.boxes.data.cpu().numpy()
-                classes = result.boxes.cls.cpu().numpy().astype(int)
-                confidences = result.boxes.conf.cpu().numpy()
 
                 dynamic_mask_indices = [
                     i for i, cls in enumerate(classes) if cls in self.dynamic_classes
                 ]
-                dynamic_mask_indices = [
-                    i for i, cls in enumerate(classes) if cls in self.dynamic_classes
-                ]
 
-                for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
-                    detections.append(
-                        {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
-                    )
                 for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
                     detections.append(
                         {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
@@ -100,9 +88,6 @@ class YOLOWrapper:
                     if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
                         static_mask[combined_dynamic > 0.5] = 0
                     else:
-                        from src.utils.logging_utils import get_logger
-
-                        logger = get_logger(__name__)
                         logger.warning(
                             f"YOLO OVER-MASKING DETECTED ({combined_area / total_pixels:.2%}). "
                             "Frame preserved."

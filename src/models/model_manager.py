@@ -197,8 +197,8 @@ class ModelManager:
                 model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
                 vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
 
-            logger.info(f"Loading DINOv2 ({model_name}) model...")
-            self._ensure_vram_available(vram_req)
+                logger.info(f"Loading DINOv2 ({model_name}) model...")
+                self._ensure_vram_available(vram_req)
 
             # Спроба завантажити TensorRT engine (якщо скомпільований)
             trt_loaded = False

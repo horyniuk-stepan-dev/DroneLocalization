@@ -106,13 +106,14 @@ class RealtimeTrackingWorker(QThread):
             if current_video_time_sec <= 0:
                 current_video_time_sec = cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
 
-            # 1. Завжди відправляємо кадр в GUI для плавного відтворення
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self.frame_ready.emit(frame_rgb)
+            # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
+            self.frame_ready.emit(frame)
 
             # 2. Локалізація (спрацьовує тільки якщо відео пройшло заданий інтервал)
             if current_video_time_sec - last_process_video_time >= process_interval_sec:
                 start_process = time.time()
+                # Для обробки YOLO та анізотропних дескрипторів потрібен RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 static_mask = None
                 if yolo_wrapper:
