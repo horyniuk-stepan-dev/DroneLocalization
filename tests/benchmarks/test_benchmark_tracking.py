@@ -7,11 +7,7 @@ from src.localization.localizer import Localizer
 # Dummy classes to mock dependencies for pure Localizer benchmarking
 class DummyDatabase:
     def __init__(self):
-        class DummyDesc:
-            def __len__(self):
-                return 100
-
-        self.global_descriptors = DummyDesc()
+        self.global_descriptors = np.random.randn(100, 1024).astype(np.float32)
 
     def get_local_features(self, candidate_id):
         return {

@@ -131,8 +131,9 @@ class ModelManager:
         name = "yolo"
         with self._model_lock:
             if name not in self.models:
-                model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11x-seg.pt")
+                model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11n-seg.pt")
                 vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
+                use_trt = get_cfg(self.config, "models.performance.use_tensorrt_for_yolo", True)
 
                 logger.info(f"Loading YOLO model: {model_path}...")
                 self._ensure_vram_available(vram_req)
@@ -140,10 +141,42 @@ class ModelManager:
                     if YOLO is None:
                         raise ImportError("ultralytics.YOLO not found")
 
-                    model = YOLO(model_path)
-                    model.to(self.device)
+                    engine_path = str(model_path).replace(".pt", ".engine")
+                    import os
+
+                    if use_trt and self.device == "cuda":
+                        if os.path.exists(engine_path):
+                            logger.info(f"Found YOLO TRT engine: {engine_path}. Loading...")
+                            model = YOLO(engine_path)
+                            # TRT inference sets device automatically when used via YOLO API
+                        else:
+                            logger.info(
+                                "YOLO TRT engine not found. Loading PyTorch model for export..."
+                            )
+                            model = YOLO(model_path)
+                            model.to(self.device)
+                            logger.info(
+                                "Exporting YOLO to TensorRT format (this may take a while)..."
+                            )
+                            try:
+                                # ultralytics automatically places the exported file next to the original
+                                exported_path = model.export(
+                                    format="engine", half=True, dynamic=False
+                                )
+                                logger.success(f"YOLO TRT export complete: {exported_path}")
+                                if os.path.exists(exported_path):
+                                    model = YOLO(exported_path)
+                                    logger.info("YOLO TensorRT engine loaded successfully.")
+                            except Exception as ex:
+                                logger.warning(
+                                    f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
+                                )
+                    else:
+                        model = YOLO(model_path)
+                        model.to(self.device)
+
                     self.models[name] = model
-                    logger.success(f"YOLO model {model_path} loaded successfully on {self.device}")
+                    logger.success(f"YOLO model loaded successfully on {self.device}")
                 except Exception as e:
                     logger.error(
                         f"Failed to load YOLO model: {e} | "

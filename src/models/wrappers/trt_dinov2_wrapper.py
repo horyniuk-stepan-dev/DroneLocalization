@@ -109,6 +109,11 @@ class TensorRTDINOv2Wrapper:
 
         return self.h_output.reshape(-1).copy()  # (1024,)
 
+    @property
+    def output_dim(self) -> int:
+        """Повертає розмірність вихідного дескриптора."""
+        return self.output_shape[-1]
+
     def __del__(self):
         """Звільнює GPU ресурси."""
         try:
