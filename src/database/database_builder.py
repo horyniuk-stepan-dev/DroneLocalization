@@ -56,18 +56,48 @@ class DatabaseBuilder:
         if frame_step < 1:
             frame_step = 1
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            logger.error(
-                f"Failed to open video: {video_path}. "
-                f"Check that the file exists and uses a supported codec (H.264/H.265 recommended)."
-            )
-            raise ValueError(f"Не вдалося відкрити відео: {video_path}")
+        use_decord = get_cfg(self.config, "database.use_decord", True)
+        vr = None
+        cap = None
 
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        if use_decord:
+            try:
+                import decord
+
+                decord.bridge.set_bridge("numpy")
+                # FFMPEG multi-threaded CPU decode is usually the most stable fallback
+                # GPU decode requires custom decord builds on Windows
+                vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+                logger.info("Decord VideoReader initialized successfully.")
+            except ImportError:
+                logger.warning("decord not installed, falling back to cv2.VideoCapture")
+                use_decord = False
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize decord VideoReader: {e}. Falling back to cv2.VideoCapture"
+                )
+                use_decord = False
+
+        if not use_decord:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                logger.error(
+                    f"Failed to open video: {video_path}. "
+                    f"Check that the file exists and uses a supported codec (H.264/H.265 recommended)."
+                )
+                raise ValueError(f"Не вдалося відкрити відео: {video_path}")
+
+        if use_decord:
+            total_frames = len(vr)
+            # Sample first frame to get dims
+            h, w, c = vr.get_batch([0]).shape[1:]
+            width, height = int(w), int(h)
+            original_fps = vr.get_avg_fps()
+        else:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            original_fps = cap.get(cv2.CAP_PROP_FPS)
 
         # Обчислюємо скільки кадрів РЕАЛЬНО буде оброблено
         num_frames = (total_frames + frame_step - 1) // frame_step
@@ -236,19 +266,36 @@ class DatabaseBuilder:
         frame_queue = Queue(maxsize=self.prefetch_size)
 
         def prefetch_frames():
-            for i in range(total_frames):
-                with Telemetry.profile("video_read"):
-                    ret, frame = cap.read()
-                if not ret:
-                    break
+            if use_decord:
+                # Decord provides batched read
+                batch_size = get_cfg(self.config, "database.decode_batch_size", 32)
+                indices = list(range(0, total_frames, frame_step))
+                for chunk_start in range(0, len(indices), batch_size):
+                    chunk_indices = indices[chunk_start : chunk_start + batch_size]
 
-                if i % frame_step != 0:
-                    continue
+                    with Telemetry.profile("video_read"):
+                        # Decord returns RGB (B, H, W, C)
+                        frames_rgb = vr.get_batch(chunk_indices).asnumpy()
 
-                with Telemetry.profile("bgr_to_rgb"):
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                orig_frame_idx = i // frame_step
-                frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
+                    for i, frame_rgb in enumerate(frames_rgb):
+                        orig_frame_idx = chunk_indices[i] // frame_step
+                        with Telemetry.profile("rgb_to_bgr"):
+                            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        frame_queue.put((orig_frame_idx, (frame_bgr, frame_rgb)))
+            else:
+                for i in range(total_frames):
+                    with Telemetry.profile("video_read"):
+                        ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    if i % frame_step != 0:
+                        continue
+
+                    with Telemetry.profile("bgr_to_rgb"):
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    orig_frame_idx = i // frame_step
+                    frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
 
             frame_queue.put((-1, None))
 
@@ -406,7 +453,8 @@ class DatabaseBuilder:
                 kp_writer.release()
             if self.db_file:
                 self.db_file.close()
-            cap.release()
+            if cap is not None:
+                cap.release()
 
         logger.success(f"Database build completed successfully: {self.output_path}")
 
@@ -548,6 +596,7 @@ class DatabaseBuilder:
             g1.create_dataset(
                 "descriptors",
                 shape=(num_frames, self.descriptor_dim),
+                maxshape=(None, self.descriptor_dim),
                 dtype="float32",
                 compression=compression,
                 chunks=(min(256, num_frames), self.descriptor_dim),
@@ -555,6 +604,7 @@ class DatabaseBuilder:
             g1.create_dataset(
                 "frame_poses",
                 shape=(num_frames, 3, 3),
+                maxshape=(None, 3, 3),
                 dtype="float64",
                 compression=compression,
                 chunks=(min(256, num_frames), 3, 3),
@@ -565,6 +615,7 @@ class DatabaseBuilder:
             lf.create_dataset(
                 "keypoints",
                 shape=(num_frames, max_kps, 2),
+                maxshape=(None, max_kps, 2),
                 dtype="float32",
                 compression=compression,
                 chunks=(min(chunk_f, num_frames), max_kps, 2),
@@ -573,6 +624,7 @@ class DatabaseBuilder:
             lf.create_dataset(
                 "descriptors",
                 shape=(num_frames, max_kps, local_desc_dim),
+                maxshape=(None, max_kps, local_desc_dim),
                 dtype="float16",  # float16: -50% розміру (П2)
                 compression=compression,
                 chunks=(min(chunk_f, num_frames), max_kps, local_desc_dim),
@@ -581,6 +633,7 @@ class DatabaseBuilder:
             lf.create_dataset(
                 "coords_2d",
                 shape=(num_frames, max_kps, 2),
+                maxshape=(None, max_kps, 2),
                 dtype="float32",
                 compression=compression,
                 chunks=(min(chunk_f, num_frames), max_kps, 2),
@@ -589,6 +642,7 @@ class DatabaseBuilder:
             lf.create_dataset(
                 "kp_counts",  # скільки keypoints у кожному кадрі
                 shape=(num_frames,),
+                maxshape=(None,),
                 dtype="int16",
                 compression=compression,
                 chunks=(min(num_frames, 4096),),

@@ -43,7 +43,7 @@ class Localizer:
         )
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
-            threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 25.0),
+            threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 150.0),
             max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 1000.0),
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )

@@ -29,11 +29,13 @@ class FastRetrieval:
         self.dim = global_descriptors.shape[1]
 
         # Inner Product index (для косинусної схожості нормалізованих векторів)
-        self.index = faiss.IndexFlatIP(self.dim)
+        base_index = faiss.IndexFlatIP(self.dim)
+        self.index = faiss.IndexIDMap(base_index)
 
         # Нормалізуємо і додаємо в індекс
         normed = self.normalize_vectors(global_descriptors)
-        self.index.add(normed.astype(np.float32))
+        ids = np.arange(len(global_descriptors), dtype=np.int64)
+        self.index.add_with_ids(normed.astype(np.float32), ids)
 
         logger.success(f"FAISS index built with {self.index.ntotal} vectors")
 
@@ -41,6 +43,14 @@ class FastRetrieval:
     def normalize_vectors(vectors: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         return vectors / (norms + 1e-8)
+
+    def add_descriptor(self, query_desc: np.ndarray, frame_id: int):
+        """Інкрементально додає новий дескриптор до FAISS індексу."""
+        normed = self.normalize_vectors(query_desc)
+        if normed.ndim == 1:
+            normed = normed[None]
+        self.index.add_with_ids(normed.astype(np.float32), np.array([frame_id], dtype=np.int64))
+        logger.debug(f"Added descriptor for frame {frame_id} to FAISS. Total: {self.index.ntotal}")
 
     def find_similar_frames(self, query_desc: np.ndarray, top_k: int = 5) -> list:
         q = query_desc / (np.linalg.norm(query_desc) + 1e-8)

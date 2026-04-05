@@ -21,6 +21,8 @@ class DatabaseConfig(BaseModel):
     keyframe_min_translation_px: float = 15.0
     keyframe_min_rotation_deg: float = 1.5
     keyframe_always_save_first: bool = True
+    use_decord: bool = True
+    decode_batch_size: int = 32
 
 
 class ConfidenceConfig(BaseModel):
@@ -49,7 +51,7 @@ class TrackingConfig(BaseModel):
     kalman_process_noise: float = 2.0
     kalman_measurement_noise: float = 5.0
     outlier_window: int = 10
-    outlier_threshold_std: float = 25.0
+    outlier_threshold_std: float = 150.0
     max_speed_mps: float = 1000.0
     max_consecutive_outliers: int = 5
     process_fps: float = 1.0
