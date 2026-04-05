@@ -168,13 +168,22 @@ class ModelManager:
                 logger.info(f"Loading XFeat model ({repo}/{model_name})...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
+                    preset = get_cfg(self.config, "models.xfeat.xfeat_preset", "fast")
+                    try:
+                        # Attempt to pass quality_preset if supported by User's XFeat fork
+                        model = torch.hub.load(
+                            repo, model_name, pretrained=True, top_k=top_k, quality_preset=preset
+                        )
+                    except TypeError:
+                        # Fallback to standard XFeat
+                        model = torch.hub.load(repo, model_name, pretrained=True, top_k=top_k)
+
                     # FIX: XFeat hardcodes self.dev='cuda' if available, causing crashes if we move to CPU
                     if hasattr(model, "dev"):
                         model.dev = torch.device(self.device)
                     model = model.eval().to(self.device)
                     self.models[name] = model
-                    logger.success(f"XFeat loaded successfully on {self.device}")
+                    logger.success(f"XFeat loaded successfully on {self.device} (preset: {preset})")
                 except Exception as e:
                     logger.error(
                         f"Failed to load XFeat: {e} | "
@@ -283,8 +292,23 @@ class ModelManager:
                 # Fallback: стандартний PyTorch hub
                 if not trt_loaded:
                     try:
-                        model = torch.hub.load(repo, model_name)
-                        model = model.eval().to(self.device)
+                        model = torch.hub.load(repo, model_name).to(self.device)
+
+                        use_compile = get_cfg(self.config, "models.performance.torch_compile", True)
+                        if (
+                            use_compile
+                            and torch.cuda.is_available()
+                            and getattr(torch, "compile", None)
+                        ):
+                            try:
+                                # Mode 'default' allows variable batch size gracefully
+                                model = torch.compile(model, mode="default")
+                                logger.info(
+                                    "DINOv2 compiled successfully using torch.compile(mode='default')"
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to torch.compile DINOv2: {e}")
+
                         self.models[name] = model
                         logger.success(f"DINOv2 model {model_name} loaded successfully (PyTorch)")
                     except Exception as e:
@@ -308,6 +332,21 @@ class ModelManager:
                         raise ImportError("lightglue.ALIKED not found")
 
                     model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
+
+                    use_compile = get_cfg(self.config, "models.performance.torch_compile", True)
+                    if (
+                        use_compile
+                        and torch.cuda.is_available()
+                        and getattr(torch, "compile", None)
+                    ):
+                        try:
+                            model = torch.compile(model, mode="default")
+                            logger.info(
+                                "ALIKED compiled successfully using torch.compile(mode='default')"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to torch.compile ALIKED: {e}")
+
                     self.models[name] = model
                     logger.success(f"ALIKED loaded successfully on {self.device}")
                 except Exception as e:

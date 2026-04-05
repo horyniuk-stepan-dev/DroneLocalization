@@ -693,8 +693,22 @@ class CalibrationDialog(QDialog):
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
 
+    def _cleanup_worker(self):
+        if hasattr(self, "video_worker") and self.video_worker.isRunning():
+            self.video_worker.stop()
+            self.video_worker.wait(1000)
+
     def closeEvent(self, event):
-        self.video_worker.stop()
-        self.video_worker.wait(2000)
+        self._cleanup_worker()
         self._frame_cache.clear()
         super().closeEvent(event)
+
+    def accept(self):
+        self._cleanup_worker()
+        self._frame_cache.clear()
+        super().accept()
+
+    def reject(self):
+        self._cleanup_worker()
+        self._frame_cache.clear()
+        super().reject()

@@ -265,6 +265,15 @@ class Localizer:
             return {"success": False, "error": "Failed to compute transform"}
 
         # 5. Трансформуємо центральну точку: Query -> Reference (через Homography) -> Metric (через Affine)
+        # Збережемо стан для наступних викликів Optical Flow
+        self._last_state = {
+            "H": M_query_to_ref,
+            "affine": affine_ref,
+            "candidate_id": best_candidate_id,
+            "inliers": best_inliers,
+            "global_angle": best_global_angle,
+        }
+
         center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float32)
         pts_in_ref = GeometryTransforms.apply_homography(center_query, M_query_to_ref)
         if pts_in_ref is None or len(pts_in_ref) == 0:
@@ -416,6 +425,64 @@ class Localizer:
             "inliers": int(best_inliers),
             "fov_polygon": gps_corners,
             "sample_spread_m": 0.0,
+        }
+
+    def localize_optical_flow(
+        self, dx_px: float, dy_px: float, dt: float, rot_width: int, rot_height: int
+    ) -> dict:
+        """
+        Локалізація базуючись на піксельному зсуві (dx, dy) від Optical Flow,
+        використовуючи матриці з останнього успішного кадру (Keyframe).
+        """
+        if (
+            not hasattr(self, "_last_state")
+            or self._last_state["H"] is None
+            or self._last_state["affine"] is None
+        ):
+            return {"success": False, "error": "No previous state to apply OF"}
+
+        # Якщо точки змістилися на dx, dy в поточному кадрі відносно попереднього,
+        # то центр поточного дрона фізично знаходився в точці (center - dx, center - dy) у КООРДИНАТАХ ПОПЕРЕДНЬОГО КАДРУ.
+        center_query_shifted = np.array(
+            [[rot_width / 2.0 - dx_px, rot_height / 2.0 - dy_px]], dtype=np.float32
+        )
+
+        pts_in_ref = GeometryTransforms.apply_homography(
+            center_query_shifted, self._last_state["H"]
+        )
+        if pts_in_ref is None or len(pts_in_ref) == 0:
+            return {"success": False, "error": "OF homography failed"}
+
+        pts_metric = GeometryTransforms.apply_affine(pts_in_ref, self._last_state["affine"])
+        if pts_metric is None or len(pts_metric) == 0:
+            return {"success": False, "error": "OF affine failed"}
+
+        mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
+        metric_pt = np.array([mx, my], dtype=np.float32)
+
+        # Оновлення Калмана
+        filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
+        self.outlier_detector.add_position(filtered_pt, dt=dt)
+
+        lat, lon = self.calibration.converter.metric_to_gps(
+            float(filtered_pt[0]), float(filtered_pt[1])
+        )
+
+        # Для спрощення, OF не розраховує повний FOV-полігон, повертає None або оцінку
+        # Зберігаємо "уявний" inliers для сумісності з UI (беремо половину від останнього)
+        of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
+
+        confidence = 0.8  # OF confidence is generally high since it's frame-to-frame
+
+        return {
+            "success": True,
+            "lat": lat,
+            "lon": lon,
+            "confidence": confidence,
+            "matched_frame": int(self._last_state.get("candidate_id", -1)),
+            "inliers": of_inliers,
+            "fov_polygon": None,
+            "is_of": True,  # Прапорець для логів
         }
 
     def _compute_confidence(

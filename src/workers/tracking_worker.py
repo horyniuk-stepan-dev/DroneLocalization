@@ -30,10 +30,12 @@ class RealtimeTrackingWorker(QThread):
         self.config = config or {}
         self._stop_event = threading.Event()
 
-        # Скільки кадрів розпізнавати за одну секунду ВІДЕО.
-        # 1.0 = 1 кадр в секунду; 2.0 = кожні 0.5 секунд; 0.5 = кожні 2 секунди відео.
-        # Ти можеш змінити це число прямо тут для тестів:
-        self.process_fps = get_cfg(self.config, "tracking.process_fps", 1.0)
+        # S3-3: Інтервал ключових кадрів для локалізації
+        self.keyframe_interval = get_cfg(self.config, "tracking.keyframe_interval", 5)
+        # Зберігаємо process_fps для метрик UI, але логіка базується на кадрах
+        self.process_fps = get_cfg(
+            self.config, "tracking.process_fps", 30.0 / self.keyframe_interval
+        )
 
     def run(self):
         # Fix #3: Скидаємо стан трекера при кожному новому старті сесії
@@ -85,13 +87,12 @@ class RealtimeTrackingWorker(QThread):
             video_fps = 30.0
         frame_duration_sec = 1.0 / video_fps
 
-        # Інтервал обробки у секундах відео (наприклад, 1.0 / 2.0 = 0.5 секунд)
-        process_interval_sec = 1.0 / self.process_fps if self.process_fps > 0 else 1.0
+        # Замість time-based інтервалу використовуємо frame-based:
+        frame_idx = 0
+        prev_gray_for_of = None
+        prev_pts_for_of = None
 
-        # Ставимо від'ємний час, щоб гарантовано обробити найперший кадр
-        last_process_video_time = -process_interval_sec
-
-        # ЗМІНА: Зберігаємо останній час локалізації саме за ВІДЕО-часом, а не за процесорним
+        # Зберігаємо останній час локалізації саме за ВІДЕО-часом, а не за процесорним
         last_localization_video_time = -1.0
 
         while not self._stop_event.is_set():
@@ -112,9 +113,23 @@ class RealtimeTrackingWorker(QThread):
             # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
             self.frame_ready.emit(frame)
 
-            # 2. Локалізація (спрацьовує тільки якщо відео пройшло заданий інтервал)
-            if current_video_time_sec - last_process_video_time >= process_interval_sec:
-                start_process = time.time()
+            # S3-3: Optical Flow Pipeline
+            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            is_keyframe = frame_idx % self.keyframe_interval == 0
+
+            # Розрахунок dt
+            if last_localization_video_time < 0:
+                calculated_dt = frame_duration_sec
+            else:
+                calculated_dt = current_video_time_sec - last_localization_video_time
+                if calculated_dt <= 0:
+                    calculated_dt = frame_duration_sec
+
+            loc_result = {"success": False, "error": "Not processed"}
+            start_process = time.time()
+
+            if is_keyframe or prev_pts_for_of is None:
+                # ====== HEAVY KEYFRAME LOCALIZATION ======
                 # Для обробки YOLO та анізотропних дескрипторів потрібен RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -122,62 +137,88 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, _ = yolo_wrapper.detect_and_mask(frame_rgb)
 
-                # ЗМІНА: Розраховуємо dt виключно за відеочасом.
-                # Це гарантує, що dt завжди відповідатиме реальній фізиці польоту дрона.
-                if last_localization_video_time < 0:
-                    calculated_dt = frame_duration_sec
-                else:
-                    calculated_dt = current_video_time_sec - last_localization_video_time
-                    # Захист від збоїв метаданих кодека (стрибки назад або нульовий dt)
-                    if calculated_dt <= 0:
-                        calculated_dt = frame_duration_sec
-
-                # БЛОК TRY-EXCEPT для запобігання "зависанню на першому кадрі"
                 try:
                     loc_result = self.localizer.localize_frame(
                         frame_rgb, static_mask=static_mask, dt=calculated_dt
                     )
                 except Exception as e:
-                    logger.error(
-                        f"Localization exception on video frame: {e} | "
-                        f"video_time={current_video_time_sec:.2f}s, "
-                        f"frame_shape={frame_rgb.shape}, "
-                        f"has_mask={static_mask is not None}, "
-                        f"dt={calculated_dt:.3f}s",
-                        exc_info=True,
-                    )
+                    logger.error(f"Localization exception on keyframe: {e}", exc_info=True)
                     loc_result = {"success": False, "error": str(e)}
 
                 if loc_result.get("success"):
-                    self.location_found.emit(
-                        loc_result["lat"],
-                        loc_result["lon"],
-                        loc_result["confidence"],
-                        loc_result["inliers"],
+                    # Зберігаємо стан для OF на наступні кадри
+                    prev_gray_for_of = curr_gray
+                    # Трекаємо гарні точки (corners) для стабільного OF
+                    prev_pts_for_of = cv2.goodFeaturesToTrack(
+                        curr_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
                     )
-                    if "fov_polygon" in loc_result and loc_result["fov_polygon"] is not None:
-                        self.fov_found.emit(loc_result["fov_polygon"])
+            else:
+                # ====== OPTICAL FLOW TRACKING ======
+                if prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
+                    curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                        prev_gray_for_of,
+                        curr_gray,
+                        prev_pts_for_of,
+                        None,
+                        winSize=(15, 15),
+                        maxLevel=2,
+                    )
+                    good_new = curr_pts[status == 1]
+                    good_old = prev_pts_for_of[status == 1]
 
-                    if loc_result.get("fallback_mode") == "retrieval_only":
-                        self.status_update.emit(
-                            f"Приблизно (Схожість: {loc_result.get('global_score', 0):.2f}, Кадр: {loc_result['matched_frame']})"
-                        )
+                    if len(good_new) > 10:
+                        # Зсув у пікселях
+                        flow_vectors = good_new - good_old
+                        dx_px, dy_px = np.median(flow_vectors, axis=0)
+
+                        try:
+                            loc_result = self.localizer.localize_optical_flow(
+                                dx_px,
+                                dy_px,
+                                dt=calculated_dt,
+                                rot_width=frame.shape[1],
+                                rot_height=frame.shape[0],
+                            )
+                        except Exception as e:
+                            logger.error(f"OF Localization error: {e}")
+                            loc_result = {"success": False, "error": str(e)}
+
+                        # Оновлюємо стан так, щоб OF завжди рахувався ВІД КЛЮЧОВОГО КАДРУ,
+                        # Це усуває проблему накопичення помилок (drift).
+                        # Тому prev_gray_for_of та prev_pts_for_of не оновлюються тут!
                     else:
-                        self.status_update.emit(
-                            f"Знайдено (Inliers: {loc_result['inliers']}, Кадр: {loc_result['matched_frame']})"
-                        )
+                        prev_pts_for_of = None  # Втрата точок — наступний кадр стане ключовим
                 else:
-                    self.status_update.emit(
-                        f"Втрата: {loc_result.get('error', 'Невідома помилка')}"
-                    )
+                    prev_pts_for_of = None
 
-                # ЗМІНА: Оновлюємо відеочас успішної/останньої спроби
+            if loc_result.get("success") and loc_result.get("matched_frame", -1) != -1:
+                self.location_found.emit(
+                    loc_result["lat"],
+                    loc_result["lon"],
+                    loc_result["confidence"],
+                    loc_result["inliers"],
+                )
+                if loc_result.get("fov_polygon"):
+                    self.fov_found.emit(loc_result["fov_polygon"])
+
+                track_type = "OF" if loc_result.get("is_of") else "KF"
+                method_txt = (
+                    "Схожість" if loc_result.get("fallback_mode") == "retrieval_only" else "Inliers"
+                )
+                score = loc_result.get("global_score", loc_result["inliers"])
+
+                self.status_update.emit(
+                    f"[{track_type}] Знайдено ({method_txt}: {score:.2f}, Кадр: {loc_result['matched_frame']})"
+                )
+
                 last_localization_video_time = current_video_time_sec
-                last_process_video_time = current_video_time_sec
+            elif not loc_result.get("success") and loc_result.get("error") != "Not processed":
+                self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 
-                # Рахуємо швидкість самого алгоритму (Тут time.time() залишається для метрик UI)
-                process_duration = time.time() - start_process
-                self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
+            process_duration = time.time() - start_process
+            self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
+
+            frame_idx += 1
 
             # 3. Синхронізація відтворення: щоб відео не "пролітало" за секунду,
             # змушуємо потік почекати, імітуючи реальну швидкість відео (1x)

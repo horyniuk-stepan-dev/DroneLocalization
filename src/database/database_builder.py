@@ -134,7 +134,12 @@ class DatabaseBuilder:
             masking_strategy_name, model_manager, model_manager.device
         )
 
-        local_model = model_manager.load_aliked()
+        local_ext_type = get_cfg(self.config, "localization.fallback_extractor", "aliked")
+        if local_ext_type == "xfeat":
+            local_model = model_manager.load_xfeat()
+        else:
+            local_model = model_manager.load_aliked()
+
         nv_model = model_manager.load_dinov2()
 
         cesp = None
@@ -183,6 +188,21 @@ class DatabaseBuilder:
                 f"Falling back to configured default: {self.descriptor_dim}"
             )
             logger.warning(f"Using default dimension: {self.descriptor_dim}")
+
+        # Detect local descriptor dimension
+        try:
+            with torch.no_grad():
+                dummy_img = np.zeros((320, 320, 3), dtype=np.uint8)
+                dummy_feats = feature_extractor.extract_features(dummy_img)
+                if len(dummy_feats["descriptors"]) > 0:
+                    self.local_descriptor_dim = dummy_feats["descriptors"].shape[-1]
+                else:
+                    # Fallback default dims
+                    self.local_descriptor_dim = 64 if local_ext_type == "xfeat" else 128
+            logger.info(f"Detected local descriptor dimension: {self.local_descriptor_dim}")
+        except Exception as e:
+            logger.warning(f"Failed to detect local feature dimension: {e}. Using 128 as fallback.")
+            self.local_descriptor_dim = 128
 
         # Create empty database structure
         logger.info("Creating HDF5 database structure...")
@@ -515,14 +535,14 @@ class DatabaseBuilder:
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
         chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
         max_kps = get_cfg(self.config, "database.max_keypoints_stored", 2048)
-        local_desc_dim = 128  # ALIKED descriptor dim
+        local_desc_dim = getattr(self, "local_descriptor_dim", 128)
 
         logger.info(
             f"Creating HDF5 v2 structure for {num_frames} frames "
             f"(compression={compression}, chunks={chunk_f}, max_kps={max_kps})"
         )
 
-        with h5py.File(self.output_path, "w") as f:
+        with h5py.File(self.output_path, "w", libver="latest") as f:
             # --- global_descriptors: chunked ---
             g1 = f.create_group("global_descriptors")
             g1.create_dataset(
@@ -587,7 +607,10 @@ class DatabaseBuilder:
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
 
-        logger.success("HDF5 v2 structure created successfully")
+            # Enable SWMR mode for parallel reading while writing
+            f.swmr_mode = True
+
+        logger.success("HDF5 v2 structure created successfully in SWMR mode")
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
         """Save extracted data for a single frame via slice assignment (schema v2)"""

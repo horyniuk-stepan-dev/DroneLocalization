@@ -152,19 +152,23 @@ class FeatureExtractor:
         # 1. Prepare DINOv2 Tensor
         dino_tensors = []
         for img in images:
-            rgb = torch.from_numpy(img).float().div_(255.0)
+            rgb = torch.tensor(img, pin_memory=True).float().div_(255.0)
             dino_tensors.append(rgb.permute(2, 0, 1))
         dino_batch = torch.stack(dino_tensors).to(self.device, non_blocking=True)
         dino_input = self.dinov2_transform(dino_batch)
 
-        # 2. Prepare ALIKED Tensor
+        # 2. Prepare Local Tensor
         prep_images = [self.preprocessor.preprocess(img) for img in images]
-        aliked_tensors = []
+        local_tensors = []
         for p_img in prep_images:
-            rgb = torch.from_numpy(p_img).float().div_(255.0)
-            aliked_tensors.append(rgb.permute(2, 0, 1))
-        aliked_batch = torch.stack(aliked_tensors).to(self.device, non_blocking=True)
-        input_dict = {"image": aliked_batch}
+            rgb = torch.tensor(p_img, pin_memory=True).float().div_(255.0)
+            local_tensors.append(rgb.permute(2, 0, 1))
+        local_batch = torch.stack(local_tensors).to(self.device, non_blocking=True)
+        is_xfeat = (
+            hasattr(self.local_model, "__class__")
+            and "XFeat" in self.local_model.__class__.__name__
+        )
+        input_dict = {"image": local_batch} if not is_xfeat else local_batch
 
         stream_global = self.stream_global if self.device == "cuda" else None
         stream_local = self.stream_local if self.device == "cuda" else None
@@ -194,14 +198,23 @@ class FeatureExtractor:
             torch.cuda.stream(stream_local) if stream_local else contextlib.nullcontext()
         )
         with context_local:
-            with Telemetry.profile("aliked"):
-                for b in range(B):
-                    single_img = aliked_batch[b : b + 1]  # shape (1, 3, H, W)
-                    input_dict = {"image": single_img}
-                    # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
-                    aliked_out = self.local_model(input_dict)
-                    out_kpts.append(aliked_out["keypoints"][0].float())
-                    out_descs.append(aliked_out["descriptors"][0].float())
+            with Telemetry.profile("local_extractor"):
+                if is_xfeat:
+                    # S3-1: Native True Batching for XFeat
+                    xfeat_out = self.local_model.detectAndCompute(
+                        input_dict, top_k=get_cfg(self.config, "models.xfeat.top_k", 2048)
+                    )
+                    for res in xfeat_out:
+                        out_kpts.append(res["keypoints"].float())
+                        out_descs.append(res["descriptors"].float())
+                else:
+                    # S3-1: ALIKED fallback. Unstable inside true batch, iterating frames natively.
+                    for b in range(B):
+                        single_img = local_batch[b : b + 1]  # shape (1, 3, H, W)
+                        aliked_in = {"image": single_img}
+                        aliked_out = self.local_model(aliked_in)
+                        out_kpts.append(aliked_out["keypoints"][0].float())
+                        out_descs.append(aliked_out["descriptors"][0].float())
 
         if self.device == "cuda":
             torch.cuda.synchronize()
