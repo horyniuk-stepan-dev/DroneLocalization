@@ -13,11 +13,25 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 
 import torch
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
+
+
+class StartupWorker(QThread):
+    def __init__(self, model_manager):
+        super().__init__()
+        self.model_manager = model_manager
+
+    def run(self):
+        try:
+            self.model_manager.prewarm()
+        except Exception as e:
+            # We don't crash here since some models could be missing locally.
+            # Localizer will fallback gracefully later.
+            pass
 
 
 def _build_exception_hook(log):
@@ -71,6 +85,12 @@ def main() -> None:
 
         window = MainWindow()
         window.show()
+
+        # Запускаємо prewarm у фоновому потоці
+        if hasattr(window, "model_manager") and window.model_manager:
+            app._startup_worker = StartupWorker(window.model_manager)
+            app._startup_worker.start()
+
         logger.success("Application startup complete")
 
         exit_code = app.exec()

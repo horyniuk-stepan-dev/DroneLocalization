@@ -130,6 +130,8 @@ class TrackingMixin:
     def _on_tracking_finished(self):
         """Викликається коли воркер завершує роботу (сам або через зупинку)."""
         logger.info("Tracking worker finished.")
+        if self.model_manager:
+            self.model_manager.unpin_all()
         self.control_panel.set_tracking_enabled(True)
         self.status_bar.showMessage("Відстеження зупинено")
         self.control_panel.update_status("Очікування")

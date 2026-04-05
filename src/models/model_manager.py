@@ -57,6 +57,8 @@ class ModelManager:
         # Fix #4: Захист від race condition при паралельному завантаженні моделей (prewarm + main thread)
         self._model_lock = threading.Lock()
 
+        self._pinned_models: set[str] = set()
+
         # Конфігурація VRAM
         self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
         self.default_vram_required = get_cfg(
@@ -77,6 +79,28 @@ class ModelManager:
         available_mb = free_mem / (1024 * 1024)
         return available_mb
 
+    def pin(self, models: list[str]):
+        """Закріплює моделі в пам'яті (запобігає вивантаженню при нестачі VRAM)"""
+        with self._model_lock:
+            for m in models:
+                self._pinned_models.add(m)
+            logger.info(f"Pinned models: {self._pinned_models}")
+
+    def unpin_all(self):
+        """Знімає закріплення з усіх моделей"""
+        with self._model_lock:
+            self._pinned_models.clear()
+            logger.info("Unpinned all models")
+
+    def _unload_model_unsafe(self, name: str):
+        if name in self.models:
+            logger.info(f"Unloading model to free VRAM: {name}")
+            del self.models[name]
+            del self.model_usage[name]
+            if self.device != "cpu":
+                torch.cuda.empty_cache()
+                gc.collect()
+
     def _ensure_vram_available(self, required_mb: float | None = None):
         if self.device == "cpu":
             return
@@ -84,16 +108,24 @@ class ModelManager:
         req = required_mb if required_mb is not None else self.default_vram_required
 
         while self.get_available_vram_mb() < req and self.models:
-            available = self.get_available_vram_mb()
-            least_used = min(self.model_usage.items(), key=lambda x: x[1])[0]
-            logger.warning(
-                f"VRAM insufficient: need {req:.0f} MB, have {available:.0f} MB. "
-                f"Unloading least-recently-used model: '{least_used}'"
-            )
-            self.unload_model(least_used)
+            non_pinned = {k: v for k, v in self.model_usage.items() if k not in self._pinned_models}
+            if not non_pinned:
+                logger.warning("All models pinned, cannot free VRAM. Risk of OOM.")
+                return
+            least = min(non_pinned, key=non_pinned.get)
+            self._unload_model_unsafe(least)
 
     def _register_model_usage(self, name: str):
         self.model_usage[name] = time.time()
+
+    def prewarm(self):
+        """Centralized model prewarming, usually called at startup in parallel"""
+        logger.info("Starting centralized model prewarm sequence...")
+        self.load_dinov2()
+        self.load_aliked()
+        self.load_lightglue_aliked()
+        self.load_yolo()
+        logger.success("Centralized model prewarm complete")
 
     def load_yolo(self):
         name = "yolo"
@@ -232,34 +264,34 @@ class ModelManager:
                 logger.info(f"Loading DINOv2 ({model_name}) model...")
                 self._ensure_vram_available(vram_req)
 
-            # Спроба завантажити TensorRT engine (якщо скомпільований)
-            trt_loaded = False
-            engine_dir = get_cfg(
-                self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
-            )
-            try:
-                if TensorRTDINOv2Wrapper is not None and is_trt_available():
-                    engine_path = os.path.join(engine_dir, "dinov2_vitl14_fp16.engine")
-                    if os.path.exists(engine_path):
-                        model = TensorRTDINOv2Wrapper(engine_path)
-                        self.models[name] = model
-                        trt_loaded = True
-                        logger.success(f"DINOv2 TensorRT FP16 engine loaded: {engine_path}")
-            except Exception as e:
-                logger.debug(f"TensorRT DINOv2 not available, using PyTorch: {e}")
-
-            # Fallback: стандартний PyTorch hub
-            if not trt_loaded:
+                # Спроба завантажити TensorRT engine (якщо скомпільований)
+                trt_loaded = False
+                engine_dir = get_cfg(
+                    self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
+                )
                 try:
-                    model = torch.hub.load(repo, model_name)
-                    model = model.eval().to(self.device)
-                    self.models[name] = model
-                    logger.success(f"DINOv2 model {model_name} loaded successfully (PyTorch)")
+                    if TensorRTDINOv2Wrapper is not None and is_trt_available():
+                        engine_path = os.path.join(engine_dir, "dinov2_vitl14_fp16.engine")
+                        if os.path.exists(engine_path):
+                            model = TensorRTDINOv2Wrapper(engine_path)
+                            self.models[name] = model
+                            trt_loaded = True
+                            logger.success(f"DINOv2 TensorRT FP16 engine loaded: {engine_path}")
                 except Exception as e:
-                    logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
-                    raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    logger.debug(f"TensorRT DINOv2 not available, using PyTorch: {e}")
+
+                # Fallback: стандартний PyTorch hub
+                if not trt_loaded:
+                    try:
+                        model = torch.hub.load(repo, model_name)
+                        model = model.eval().to(self.device)
+                        self.models[name] = model
+                        logger.success(f"DINOv2 model {model_name} loaded successfully (PyTorch)")
+                    except Exception as e:
+                        logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
+                        raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_aliked(self):
         """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
@@ -365,13 +397,7 @@ class ModelManager:
 
     def unload_model(self, model_name: str):
         with self._model_lock:
-            if model_name in self.models:
-                logger.info(f"Unloading model: {model_name}")
-                del self.models[model_name]
-                del self.model_usage[model_name]
-                if self.device != "cpu":
-                    torch.cuda.empty_cache()
-                    gc.collect()
+            self._unload_model_unsafe(model_name)
 
     @contextmanager
     def inference_context(self):

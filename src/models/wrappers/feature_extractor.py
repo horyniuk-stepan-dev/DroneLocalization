@@ -7,6 +7,7 @@ import torchvision.transforms as T
 from config.config import get_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
 
@@ -56,10 +57,13 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
-        logger.debug("Extracting global descriptor with DINOv2...")
-        dino_tensor = torch.from_numpy(image).float().div_(255.0)
-        dino_tensor = dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
-        dino_input = self.dinov2_transform(dino_tensor)
+        with Telemetry.profile("dinov2"):
+            logger.debug("Extracting global descriptor with DINOv2...")
+            dino_tensor = torch.from_numpy(image).float().div_(255.0)
+            dino_tensor = (
+                dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+            )
+            dino_input = self.dinov2_transform(dino_tensor)
 
         if self.cesp_module is not None:
             # CESP mode: отримуємо patch tokens замість CLS
@@ -91,8 +95,9 @@ class FeatureExtractor:
         input_dict = {"image": rgb_tensor}
 
         # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
-        with contextlib.nullcontext():
-            aliked_out = self.local_model(input_dict)
+        with Telemetry.profile("aliked"):
+            with contextlib.nullcontext():
+                aliked_out = self.local_model(input_dict)
 
         # LightGlue ALIKED wrapper повертає батч: (1, N, 2) та (1, N, 128)
         keypoints = aliked_out["keypoints"][0].cpu().numpy()
@@ -172,15 +177,16 @@ class FeatureExtractor:
             torch.cuda.stream(stream_global) if stream_global else contextlib.nullcontext()
         )
         with context_global:
-            if self.cesp_module is not None:
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
-                    features = self.global_model.forward_features(dino_input)
+            with Telemetry.profile("dinov2"):
+                if self.cesp_module is not None:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                        features = self.global_model.forward_features(dino_input)
                     patch_tokens = features["x_norm_patchtokens"].float()
-                h_p, w_p = self.dino_size // 14, self.dino_size // 14
-                out_global = self.cesp_module(patch_tokens, h_p, w_p)
-            else:
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
-                    out_global = self.global_model(dino_input).float()
+                    h_p, w_p = self.dino_size // 14, self.dino_size // 14
+                    out_global = self.cesp_module(patch_tokens, h_p, w_p)
+                else:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                        out_global = self.global_model(dino_input).float()
 
         out_kpts = []
         out_descs = []
@@ -188,13 +194,14 @@ class FeatureExtractor:
             torch.cuda.stream(stream_local) if stream_local else contextlib.nullcontext()
         )
         with context_local:
-            for b in range(B):
-                single_img = aliked_batch[b : b + 1]  # shape (1, 3, H, W)
-                input_dict = {"image": single_img}
-                # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
-                aliked_out = self.local_model(input_dict)
-                out_kpts.append(aliked_out["keypoints"][0].float())
-                out_descs.append(aliked_out["descriptors"][0].float())
+            with Telemetry.profile("aliked"):
+                for b in range(B):
+                    single_img = aliked_batch[b : b + 1]  # shape (1, 3, H, W)
+                    input_dict = {"image": single_img}
+                    # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
+                    aliked_out = self.local_model(input_dict)
+                    out_kpts.append(aliked_out["keypoints"][0].float())
+                    out_descs.append(aliked_out["descriptors"][0].float())
 
         if self.device == "cuda":
             torch.cuda.synchronize()

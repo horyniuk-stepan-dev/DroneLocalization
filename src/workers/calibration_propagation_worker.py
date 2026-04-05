@@ -389,10 +389,19 @@ class CalibrationPropagationWorker(QThread):
 
         # Disagreement: для кадрів із ≥2 ребрами, порівнюємо predictions
         # (simplified: використовуємо std відхилень у tx, ty)
+
+        # O(E) Optical optimization
+        from collections import defaultdict
+
+        adj = defaultdict(list)
+        for e in optimizer.edges:
+            adj[e.from_id].append(e)
+            adj[e.to_id].append(e)
+
         for fid in range(num_frames):
             if not frame_valid[fid]:
                 continue
-            edges_to_fid = [e for e in optimizer.edges if e.to_id == fid or e.from_id == fid]
+            edges_to_fid = adj[fid]
             if len(edges_to_fid) >= 2:
                 predictions_tx = []
                 for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії

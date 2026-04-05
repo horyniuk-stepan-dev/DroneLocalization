@@ -1,3 +1,6 @@
+import os
+import time
+
 import numpy as np
 
 from config.config import get_cfg
@@ -6,8 +9,18 @@ from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
+
+FAILURE_TYPES = {
+    "out_of_coverage": "out_of_coverage",
+    "No candidates": "no_retrieval_candidates",
+    "Not enough valid inliers": "insufficient_inliers",
+    "No propagated calibration": "no_propagated_affine",
+    "Outlier detected": "trajectory_outlier",
+    "Coordinate transformation": "transform_error",
+}
 
 
 class Localizer:
@@ -55,6 +68,9 @@ class Localizer:
         # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
         if self._consecutive_failures >= self._max_failures:
             self._consecutive_failures = 0
+            self._log_failure(
+                FAILURE_TYPES["out_of_coverage"], details=f"Exceeded {self._max_failures} failures"
+            )
             logger.warning(
                 f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
                 f"Resetting counter. The drone may be outside the database coverage area."
@@ -85,7 +101,8 @@ class Localizer:
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
 
             # Шукаємо кандидатів за допомогою DINOv2
-            candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
+            with Telemetry.profile("retrieval"):
+                candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
 
             if candidates:
                 # Оцінкою ракурсу вважаємо скор найкращого кандидата
@@ -97,6 +114,7 @@ class Localizer:
 
         if not best_global_candidates:
             self._consecutive_failures += 1
+            self._log_failure(FAILURE_TYPES["No candidates"])
             return {
                 "success": False,
                 "error": (
@@ -135,13 +153,15 @@ class Localizer:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = self.database.get_local_features(candidate_id)
 
-            mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
+            with Telemetry.profile("match"):
+                mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
 
             if len(mkpts_q) >= self.min_matches:
                 # Використовуємо Homography (8 DoF)
-                H_eval, mask = GeometryTransforms.estimate_homography(
-                    mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
-                )
+                with Telemetry.profile("ransac_homography"):
+                    H_eval, mask = GeometryTransforms.estimate_homography(
+                        mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
+                    )
 
                 if H_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
@@ -199,6 +219,7 @@ class Localizer:
                 f"query_kpts={len(best_query_features.get('keypoints', []))}"
             )
             self._consecutive_failures += 1
+            self._log_failure(FAILURE_TYPES["Not enough valid inliers"], inliers=best_inliers)
             return {
                 "success": False,
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
@@ -218,6 +239,7 @@ class Localizer:
                     f"Using retrieval-only fallback."
                 )
                 return fallback_res
+            self._log_failure(FAILURE_TYPES["No propagated calibration"])
             return {
                 "success": False,
                 "error": (
@@ -237,6 +259,9 @@ class Localizer:
         # Використовуємо знайдену Homography
         M_query_to_ref = best_H_query_to_ref
         if M_query_to_ref is None:
+            self._log_failure(
+                FAILURE_TYPES["Coordinate transformation"], details="Failed to compute transform"
+            )
             return {"success": False, "error": "Failed to compute transform"}
 
         # 5. Трансформуємо центральну точку: Query -> Reference (через Homography) -> Metric (через Affine)
@@ -252,6 +277,7 @@ class Localizer:
                     f"Homography transform failure, using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})"
                 )
                 return fallback_res
+            self._log_failure(FAILURE_TYPES["Coordinate transformation"])
             return {
                 "success": False,
                 "error": "Coordinate transformation error (homography failed)",
@@ -271,6 +297,7 @@ class Localizer:
                 f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
                 f"Position jump was too large relative to recent trajectory."
             )
+            self._log_failure(FAILURE_TYPES["Outlier detected"], inliers=best_inliers)
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
         # Успішна локалізація — скидаємо лічильник невдач
@@ -475,3 +502,18 @@ class Localizer:
             "global_score": score,
             "fov_polygon": None,
         }
+
+    def _log_failure(self, error_type: str, inliers: int = 0, details: str = ""):
+        try:
+            csv_path = "logs/localization_failures.csv"
+            write_header = not os.path.exists(csv_path)
+            os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+            with open(csv_path, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write("timestamp,error_type,inliers,details\n")
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                # Quote details to prevent CSV breakage
+                safe_details = details.replace('"', '""')
+                f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
+        except Exception as e:
+            logger.error(f"Failed to log to localization_failures.csv: {e}")

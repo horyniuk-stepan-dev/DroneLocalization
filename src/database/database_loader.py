@@ -1,4 +1,5 @@
 import json
+from collections import OrderedDict
 from typing import Any
 
 import h5py
@@ -30,7 +31,7 @@ class DatabaseLoader:
 
         # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
-        self._feature_cache: dict[int, dict[str, np.ndarray]] = {}
+        self._feature_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
 
         logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
@@ -221,6 +222,7 @@ class DatabaseLoader:
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
         """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         if frame_id in self._feature_cache:
+            self._feature_cache.move_to_end(frame_id)
             return self._feature_cache[frame_id]
 
         if self.db_file is None:
@@ -250,8 +252,8 @@ class DatabaseLoader:
             }
 
         # LRU-витіснення
-        if len(self._feature_cache) > 200:
-            self._feature_cache.pop(next(iter(self._feature_cache)))
+        if len(self._feature_cache) >= 200:
+            self._feature_cache.popitem(last=False)
 
         self._feature_cache[frame_id] = res
         return res

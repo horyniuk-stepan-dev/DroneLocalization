@@ -16,6 +16,7 @@ from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
 
@@ -216,14 +217,16 @@ class DatabaseBuilder:
 
         def prefetch_frames():
             for i in range(total_frames):
-                ret, frame = cap.read()
+                with Telemetry.profile("video_read"):
+                    ret, frame = cap.read()
                 if not ret:
                     break
 
                 if i % frame_step != 0:
                     continue
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                with Telemetry.profile("bgr_to_rgb"):
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 orig_frame_idx = i // frame_step
                 frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
 
@@ -245,7 +248,8 @@ class DatabaseBuilder:
             def _flush_mask_batch(batch: list) -> list:
                 """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
                 images_rgb = [b[2] for b in batch]
-                masks_list = masking_strategy.get_mask_batch(images_rgb)
+                with Telemetry.profile("yolo"):
+                    masks_list = masking_strategy.get_mask_batch(images_rgb)
                 return [(b[0], b[1], b[2], m) for b, m in zip(batch, masks_list)]
 
             def _process_single_frame(
@@ -587,20 +591,21 @@ class DatabaseBuilder:
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
         """Save extracted data for a single frame via slice assignment (schema v2)"""
-        # global — без змін
-        self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
-        self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
+        with Telemetry.profile("hdf5_write"):
+            # global — без змін
+            self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+            self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
-        # local — slice assignment замість create_group + create_dataset
-        kps = features["keypoints"]
-        descs = features["descriptors"]
-        c2d = features["coords_2d"]
+            # local — slice assignment замість create_group + create_dataset
+            kps = features["keypoints"]
+            descs = features["descriptors"]
+            c2d = features["coords_2d"]
 
-        max_kps = self.db_file["local_features"]["keypoints"].shape[1]
-        n = min(len(kps), max_kps)
+            max_kps = self.db_file["local_features"]["keypoints"].shape[1]
+            n = min(len(kps), max_kps)
 
-        lf = self.db_file["local_features"]
-        lf["keypoints"][frame_id, :n] = kps[:n]
-        lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
-        lf["coords_2d"][frame_id, :n] = c2d[:n]
-        lf["kp_counts"][frame_id] = n
+            lf = self.db_file["local_features"]
+            lf["keypoints"][frame_id, :n] = kps[:n]
+            lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
+            lf["coords_2d"][frame_id, :n] = c2d[:n]
+            lf["kp_counts"][frame_id] = n

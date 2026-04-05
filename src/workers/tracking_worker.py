@@ -45,6 +45,9 @@ class RealtimeTrackingWorker(QThread):
         if hasattr(self.localizer, "_consecutive_failures"):
             self.localizer._consecutive_failures = 0
 
+        if self.model_manager:
+            self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
+
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
 
@@ -187,26 +190,16 @@ class RealtimeTrackingWorker(QThread):
         logger.info("Tracking worker thread finished cleanly.")
 
     def _prewarm_fallback_models(self):
-        """Завантажує важкі моделі фоллбеку заздалегідь."""
+        """Завантажує моделі заздалегідь, делегуючи у ModelManager."""
         try:
             if not self.model_manager:
                 return
-
-            fallback = get_cfg(self.config, "localization.fallback_extractor", "aliked")
-            logger.info(f"Pre-warming fallback models ({fallback})...")
-
-            if fallback == "aliked":
-                self.model_manager.load_aliked()
-                self.model_manager.load_lightglue_aliked()
-            else:
-                self.model_manager.load_superpoint()
-                self.model_manager.load_lightglue()
-
-            logger.success("Fallback models pre-warmed successfully")
+            logger.info("Tracking pre-warming centralized models...")
+            self.model_manager.prewarm()
+            logger.success("Tracking pre-warming successful")
         except Exception as e:
             logger.warning(
-                f"Fallback model pre-warming failed: {e} | "
-                f"fallback_type={fallback}. "
+                f"Model pre-warming failed: {e}. "
                 f"Models will be loaded on first use (slower first localization).",
                 exc_info=True,
             )
