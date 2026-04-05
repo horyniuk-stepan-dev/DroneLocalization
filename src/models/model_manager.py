@@ -1,4 +1,5 @@
 import gc
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -7,6 +8,34 @@ import torch
 
 from config.config import get_cfg
 from src.utils.logging_utils import get_logger
+
+# Lazy imports moved to top level as requested
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
+try:
+    from lightglue import ALIKED, LightGlue, SuperPoint
+except ImportError:
+    ALIKED = LightGlue = SuperPoint = None
+
+try:
+    from src.models.wrappers.trt_dinov2_wrapper import (
+        TensorRTDINOv2Wrapper,
+        is_trt_available,
+    )
+except ImportError:
+    TensorRTDINOv2Wrapper = None
+
+    def is_trt_available():
+        return False
+
+
+try:
+    from src.models.wrappers.cesp_module import CESP
+except ImportError:
+    CESP = None
 
 logger = get_logger(__name__)
 
@@ -76,7 +105,8 @@ class ModelManager:
                 logger.info(f"Loading YOLO model: {model_path}...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from ultralytics import YOLO
+                    if YOLO is None:
+                        raise ImportError("ultralytics.YOLO not found")
 
                     model = YOLO(model_path)
                     model.to(self.device)
@@ -134,7 +164,8 @@ class ModelManager:
                 logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import SuperPoint
+                    if SuperPoint is None:
+                        raise ImportError("lightglue.SuperPoint not found")
 
                     sp_config = {
                         "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
@@ -165,7 +196,8 @@ class ModelManager:
                 logger.info("Loading LightGlue model...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import LightGlue
+                    if LightGlue is None:
+                        raise ImportError("lightglue.LightGlue not found")
 
                     lg_config = {
                         "depth_confidence": get_cfg(
@@ -206,14 +238,7 @@ class ModelManager:
                 self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
             )
             try:
-                from src.models.wrappers.trt_dinov2_wrapper import (
-                    TensorRTDINOv2Wrapper,
-                    is_trt_available,
-                )
-
-                if is_trt_available():
-                    import os
-
+                if TensorRTDINOv2Wrapper is not None and is_trt_available():
                     engine_path = os.path.join(engine_dir, "dinov2_vitl14_fp16.engine")
                     if os.path.exists(engine_path):
                         model = TensorRTDINOv2Wrapper(engine_path)
@@ -247,7 +272,8 @@ class ModelManager:
                 logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import ALIKED
+                    if ALIKED is None:
+                        raise ImportError("lightglue.ALIKED not found")
 
                     model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
                     self.models[name] = model
@@ -274,7 +300,8 @@ class ModelManager:
                 logger.info("Loading LightGlue (ALIKED weights)...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import LightGlue
+                    if LightGlue is None:
+                        raise ImportError("lightglue.LightGlue not found")
 
                     model = (
                         LightGlue(
@@ -308,7 +335,8 @@ class ModelManager:
             if name not in self.models:
                 logger.info("Loading CESP module...")
                 try:
-                    from src.models.wrappers.cesp_module import CESP
+                    if CESP is None:
+                        raise ImportError("CESP not found")
 
                     scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
                     cesp = CESP(dim=1024, scales=tuple(scales))

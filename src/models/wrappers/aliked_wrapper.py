@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from lightglue.utils import numpy_image_to_torch
 
 from src.utils.logging_utils import get_logger
 
@@ -29,8 +30,6 @@ class ALIKEDWrapper:
         Returns:
             dict з ключами: keypoints (1, K, 2), descriptors (1, K, 128)
         """
-        from lightglue.utils import numpy_image_to_torch
-
         tensor = numpy_image_to_torch(image_rgb).to(self.device)
         features = self.model.extract(tensor)
 

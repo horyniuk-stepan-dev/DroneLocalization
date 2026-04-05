@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -97,7 +98,6 @@ def create_masking_strategy(
     if strategy_name == "yolo":
         if model_manager is None:
             raise ValueError("model_manager is required for YOLO masking strategy")
-        from src.models.wrappers.yolo_wrapper import YOLOWrapper
 
         yolo_model = model_manager.load_yolo()
         yolo_wrapper = YOLOWrapper(yolo_model, device)

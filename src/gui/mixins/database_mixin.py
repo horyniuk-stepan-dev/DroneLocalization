@@ -1,11 +1,13 @@
 from pathlib import Path
 
+import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from src.core.export_results import ResultExporter
 from src.core.project_registry import ProjectRegistry
 from src.database.database_loader import DatabaseLoader
+from src.geometry.coordinates import CoordinateConverter
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
 from src.utils.logging_utils import get_logger
@@ -55,8 +57,6 @@ class DatabaseMixin:
     # ── Генерація бази ────────────────────────────────────────────────────────
 
     def _start_database_generation(self, video_path: str, save_path: str):
-        from src.geometry.coordinates import CoordinateConverter
-
         # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
         # UTM-конвертер буде ініціалізований автоматично після отримання першого
         # GPS-якоря у CalibrationMixin (через _on_first_gps_anchor або еквівалент),
@@ -253,8 +253,6 @@ class DatabaseMixin:
                 self, "Увага", "Дані пропагації відсутні або проєкт не завантажено!"
             )
             return
-
-        import numpy as np
 
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid

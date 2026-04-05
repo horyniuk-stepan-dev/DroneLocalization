@@ -1777,6 +1777,16 @@ class CoordinateConverter:
         elif self._reference_gps:
             self._initialize_projection(*self._reference_gps)
 
+    @property
+    def is_initialized(self) -> bool:
+        """Повертає True, якщо проєкція успішно ініціалізована."""
+        return self._initialized
+
+    @property
+    def reference_gps(self) -> tuple[float, float] | None:
+        """Повертає опорні GPS-координати, використані для UTM проєкції."""
+        return self._reference_gps
+
     def _initialize_projection(self, lat: float, lon: float) -> None:
         wgs84_crs = CRS("EPSG:4326")
 
@@ -5059,7 +5069,7 @@ class PanoramaMixin:
                 self.repaint()
 
                 res = localizer.localize_frame(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                if not res.get("success") or "fov_polygon" in res is False:
+                if not res.get("success") or "fov_polygon" not in res:
                     continue
 
                 ch, cw = crop.shape[:2]
@@ -5139,13 +5149,12 @@ class TrackingMixin:
     def _ensure_utm_initialized(self) -> bool:
         """Перевіряє чи ініціалізована проєкція UTM, якщо ні - пробує ініціалізувати з калібрування."""
 
-        if self.calibration.converter._initialized:
+        if self.calibration.converter.is_initialized:
             return True
 
-        if self.calibration and self.calibration.reference_gps:
-            self.calibration.converter.gps_to_metric(
-                self.calibration.reference_gps[0], self.calibration.reference_gps[1]
-            )
+        ref_gps = self.calibration.converter.reference_gps
+        if self.calibration and ref_gps:
+            self.calibration.converter.gps_to_metric(ref_gps[0], ref_gps[1])
             return True
 
         QMessageBox.warning(
@@ -5335,9 +5344,9 @@ class TrackingMixin:
             self.status_bar.showMessage("Помилка обробки")
 
     @pyqtSlot(np.ndarray)
-    def on_frame_ready(self, frame_rgb: np.ndarray):
+    def on_frame_ready(self, frame_bgr: np.ndarray):
         if hasattr(self.video_widget, "display_frame"):
-            self.video_widget.display_frame(opencv_to_qpixmap(frame_rgb))
+            self.video_widget.display_frame(opencv_to_qpixmap(frame_bgr))
 
     @pyqtSlot(float, float, float, int)
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
@@ -6839,8 +6848,8 @@ class ModelManager:
                 model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
                 vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
 
-            logger.info(f"Loading DINOv2 ({model_name}) model...")
-            self._ensure_vram_available(vram_req)
+                logger.info(f"Loading DINOv2 ({model_name}) model...")
+                self._ensure_vram_available(vram_req)
 
             # Спроба завантажити TensorRT engine (якщо скомпільований)
             trt_loaded = False
@@ -7683,23 +7692,11 @@ class YOLOWrapper:
                 boxes = result.boxes.data.cpu().numpy()
                 classes = result.boxes.cls.cpu().numpy().astype(int)
                 confidences = result.boxes.conf.cpu().numpy()
-            if result.masks is not None:
-                masks = result.masks.data.cpu().numpy()
-                boxes = result.boxes.data.cpu().numpy()
-                classes = result.boxes.cls.cpu().numpy().astype(int)
-                confidences = result.boxes.conf.cpu().numpy()
 
                 dynamic_mask_indices = [
                     i for i, cls in enumerate(classes) if cls in self.dynamic_classes
                 ]
-                dynamic_mask_indices = [
-                    i for i, cls in enumerate(classes) if cls in self.dynamic_classes
-                ]
 
-                for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
-                    detections.append(
-                        {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
-                    )
                 for i, (cls, conf, box) in enumerate(zip(classes, confidences, boxes)):
                     detections.append(
                         {"class_id": int(cls), "confidence": float(conf), "bbox": box[:4].tolist()}
@@ -7720,9 +7717,6 @@ class YOLOWrapper:
                     if combined_area / total_pixels < MAX_COMBINED_MASK_RATIO:
                         static_mask[combined_dynamic > 0.5] = 0
                     else:
-                        from src.utils.logging_utils import get_logger
-
-                        logger = get_logger(__name__)
                         logger.warning(
                             f"YOLO OVER-MASKING DETECTED ({combined_area / total_pixels:.2%}). "
                             "Frame preserved."
@@ -9028,13 +9022,14 @@ class RealtimeTrackingWorker(QThread):
             if current_video_time_sec <= 0:
                 current_video_time_sec = cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
 
-            # 1. Завжди відправляємо кадр в GUI для плавного відтворення
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self.frame_ready.emit(frame_rgb)
+            # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
+            self.frame_ready.emit(frame)
 
             # 2. Локалізація (спрацьовує тільки якщо відео пройшло заданий інтервал)
             if current_video_time_sec - last_process_video_time >= process_interval_sec:
                 start_process = time.time()
+                # Для обробки YOLO та анізотропних дескрипторів потрібен RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 static_mask = None
                 if yolo_wrapper:
@@ -9142,6 +9137,7 @@ class RealtimeTrackingWorker(QThread):
 # File: workers\__init__.py
 # ================================================================================
 """Worker threads module"""
+
 
 
 # config/config.py

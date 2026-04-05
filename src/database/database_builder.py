@@ -1,3 +1,5 @@
+import gc
+import traceback
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
@@ -9,6 +11,8 @@ import numpy as np
 import torch
 
 from config.config import get_cfg
+from src.geometry.transformations import GeometryTransforms
+from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.utils.logging_utils import get_logger
@@ -148,8 +152,6 @@ class DatabaseBuilder:
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                import gc
-
                 gc.collect()
                 free_mb, total_mb = torch.cuda.mem_get_info()
                 logger.info(f"VRAM before dimension detection: {free_mb / (1024**2):.1f}MB free")
@@ -175,8 +177,6 @@ class DatabaseBuilder:
 
             logger.info(f"Detected global descriptor dimension: {self.descriptor_dim}")
         except Exception as e:
-            import traceback
-
             logger.warning(
                 f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}"
                 f"Falling back to configured default: {self.descriptor_dim}"
@@ -463,16 +463,12 @@ class DatabaseBuilder:
         ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
 
         if self.matcher is None:
-            from src.localization.matcher import FeatureMatcher
-
             self.matcher = FeatureMatcher(config=self.config)
 
         mkpts_a, mkpts_b = self.matcher.match(fa, fb)
 
         if len(mkpts_a) < min_matches:
             return None
-
-        from src.geometry.transformations import GeometryTransforms
 
         H, mask = GeometryTransforms.estimate_homography(
             mkpts_a, mkpts_b, ransac_threshold=ransac_thresh

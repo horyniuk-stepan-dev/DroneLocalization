@@ -16,6 +16,8 @@ calibration_mixin.py — ВИПРАВЛЕНА ВЕРСІЯ
   3. Якщо точок < 4 або estimate_affine повернула None — fallback до partial.
 """
 
+from datetime import datetime
+
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
@@ -182,8 +184,6 @@ class CalibrationMixin:
             # ── Перевірка порогів якості ────────────────────────────────────────
             rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
             max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
-
-            from datetime import datetime
 
             severity_color = "green"
             if rmse_p > rmse_threshold:

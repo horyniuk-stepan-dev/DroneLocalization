@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QGroupBox,
@@ -218,8 +220,6 @@ class ControlPanel(QWidget):
             self.lbl_project_info.setStyleSheet("font-size: 11px; color: #222;")
             self.btn_rebuild_db.setEnabled(False)
             return
-
-        from pathlib import Path
 
         lines = [f"▶ <b>{project_name}</b>"]
         if video_path:
