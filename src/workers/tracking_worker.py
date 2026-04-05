@@ -207,4 +207,7 @@ class RealtimeTrackingWorker(QThread):
     def stop(self):
         logger.info("Stopping tracking worker...")
         self._stop_event.set()
-        self.wait(5000)  # чекаємо максимум 5 секунд
+        if not self.wait(5000):  # чекаємо максимум 5 секунд
+            logger.warning("Tracking worker did not finish within 5 seconds.")
+        else:
+            logger.info("Tracking worker successfully stopped.")

@@ -109,7 +109,7 @@ class VideoWidget(QGraphicsView):
             actual_x = int(item_pos.x() * scale_x * pm_dpr)
             actual_y = int(item_pos.y() * scale_y * pm_dpr)
 
-            logger.warning(
+            logger.debug(
                 f"CLICK DIAG: "
                 f"event=({event.pos().x()},{event.pos().y()}) "
                 f"scene=({scene_pos.x():.0f},{scene_pos.y():.0f}) "

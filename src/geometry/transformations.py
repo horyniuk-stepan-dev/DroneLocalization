@@ -165,8 +165,11 @@ class GeometryTransforms:
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
                     f"Falling back to Full Affine (5 DoF)."
                 )
-                # ВИПРАВЛЕНО: Тепер використовуємо estimate_affine (5-DoF) замість estimate_affine_partial
-                return GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
+                M, mask = GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
+                if M is not None:
+                    H_fallback = np.vstack([M, [0, 0, 1]])
+                    return H_fallback, mask
+                return None, None
             logger.warning(
                 f"Homography invalid/degenerate and no fallback enabled | "
                 f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
@@ -271,6 +274,8 @@ class GeometryTransforms:
     def apply_affine(points: np.ndarray, M: np.ndarray) -> np.ndarray:
         if M is None or len(points) == 0:
             return points
+        if M.shape == (3, 3):
+            M = M[:2, :]
         points_cv = points.reshape(-1, 1, 2).astype(np.float32)
         transformed_pts_cv = cv2.transform(points_cv, M)
         return transformed_pts_cv.reshape(-1, 2)

@@ -106,3 +106,5 @@ models/engines/dinov2_vitl14.onnx
 tests/fixtures/dummy_video.mp4
 .gitignore
 tests/fixtures/long_dummy_video.mp4
+implementation_plan copy.md
+implementation_plan.md

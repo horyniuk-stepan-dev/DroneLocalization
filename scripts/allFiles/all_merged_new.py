@@ -781,6 +781,8 @@ class ProjectRegistry:
 # ================================================================================
 # File: database\database_builder.py
 # ================================================================================
+import gc
+import traceback
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
@@ -792,9 +794,12 @@ import numpy as np
 import torch
 
 from config.config import get_cfg
+from src.geometry.transformations import GeometryTransforms
+from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
 
@@ -931,8 +936,6 @@ class DatabaseBuilder:
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                import gc
-
                 gc.collect()
                 free_mb, total_mb = torch.cuda.mem_get_info()
                 logger.info(f"VRAM before dimension detection: {free_mb / (1024**2):.1f}MB free")
@@ -958,8 +961,6 @@ class DatabaseBuilder:
 
             logger.info(f"Detected global descriptor dimension: {self.descriptor_dim}")
         except Exception as e:
-            import traceback
-
             logger.warning(
                 f"Failed to detect descriptor dimension: {e}\n{traceback.format_exc()}"
                 f"Falling back to configured default: {self.descriptor_dim}"
@@ -999,14 +1000,16 @@ class DatabaseBuilder:
 
         def prefetch_frames():
             for i in range(total_frames):
-                ret, frame = cap.read()
+                with Telemetry.profile("video_read"):
+                    ret, frame = cap.read()
                 if not ret:
                     break
 
                 if i % frame_step != 0:
                     continue
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                with Telemetry.profile("bgr_to_rgb"):
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 orig_frame_idx = i // frame_step
                 frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
 
@@ -1028,7 +1031,8 @@ class DatabaseBuilder:
             def _flush_mask_batch(batch: list) -> list:
                 """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
                 images_rgb = [b[2] for b in batch]
-                masks_list = masking_strategy.get_mask_batch(images_rgb)
+                with Telemetry.profile("yolo"):
+                    masks_list = masking_strategy.get_mask_batch(images_rgb)
                 return [(b[0], b[1], b[2], m) for b, m in zip(batch, masks_list)]
 
             def _process_single_frame(
@@ -1246,16 +1250,12 @@ class DatabaseBuilder:
         ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
 
         if self.matcher is None:
-            from src.localization.matcher import FeatureMatcher
-
             self.matcher = FeatureMatcher(config=self.config)
 
         mkpts_a, mkpts_b = self.matcher.match(fa, fb)
 
         if len(mkpts_a) < min_matches:
             return None
-
-        from src.geometry.transformations import GeometryTransforms
 
         H, mask = GeometryTransforms.estimate_homography(
             mkpts_a, mkpts_b, ransac_threshold=ransac_thresh
@@ -1374,29 +1374,31 @@ class DatabaseBuilder:
 
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
         """Save extracted data for a single frame via slice assignment (schema v2)"""
-        # global — без змін
-        self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
-        self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
+        with Telemetry.profile("hdf5_write"):
+            # global — без змін
+            self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+            self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
-        # local — slice assignment замість create_group + create_dataset
-        kps = features["keypoints"]
-        descs = features["descriptors"]
-        c2d = features["coords_2d"]
+            # local — slice assignment замість create_group + create_dataset
+            kps = features["keypoints"]
+            descs = features["descriptors"]
+            c2d = features["coords_2d"]
 
-        max_kps = self.db_file["local_features"]["keypoints"].shape[1]
-        n = min(len(kps), max_kps)
+            max_kps = self.db_file["local_features"]["keypoints"].shape[1]
+            n = min(len(kps), max_kps)
 
-        lf = self.db_file["local_features"]
-        lf["keypoints"][frame_id, :n] = kps[:n]
-        lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
-        lf["coords_2d"][frame_id, :n] = c2d[:n]
-        lf["kp_counts"][frame_id] = n
+            lf = self.db_file["local_features"]
+            lf["keypoints"][frame_id, :n] = kps[:n]
+            lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
+            lf["coords_2d"][frame_id, :n] = c2d[:n]
+            lf["kp_counts"][frame_id] = n
 
 
 # ================================================================================
 # File: database\database_loader.py
 # ================================================================================
 import json
+from collections import OrderedDict
 from typing import Any
 
 import h5py
@@ -1428,7 +1430,7 @@ class DatabaseLoader:
 
         # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
-        self._feature_cache: dict[int, dict[str, np.ndarray]] = {}
+        self._feature_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
 
         logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
@@ -1619,6 +1621,7 @@ class DatabaseLoader:
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
         """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         if frame_id in self._feature_cache:
+            self._feature_cache.move_to_end(frame_id)
             return self._feature_cache[frame_id]
 
         if self.db_file is None:
@@ -1648,8 +1651,8 @@ class DatabaseLoader:
             }
 
         # LRU-витіснення
-        if len(self._feature_cache) > 200:
-            self._feature_cache.pop(next(iter(self._feature_cache)))
+        if len(self._feature_cache) >= 200:
+            self._feature_cache.popitem(last=False)
 
         self._feature_cache[frame_id] = res
         return res
@@ -3846,6 +3849,8 @@ calibration_mixin.py — ВИПРАВЛЕНА ВЕРСІЯ
   3. Якщо точок < 4 або estimate_affine повернула None — fallback до partial.
 """
 
+from datetime import datetime
+
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
@@ -4012,8 +4017,6 @@ class CalibrationMixin:
             # ── Перевірка порогів якості ────────────────────────────────────────
             rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
             max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
-
-            from datetime import datetime
 
             severity_color = "green"
             if rmse_p > rmse_threshold:
@@ -4443,12 +4446,14 @@ class CalibrationMixin:
 # ================================================================================
 from pathlib import Path
 
+import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from src.core.export_results import ResultExporter
 from src.core.project_registry import ProjectRegistry
 from src.database.database_loader import DatabaseLoader
+from src.geometry.coordinates import CoordinateConverter
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
 from src.utils.logging_utils import get_logger
@@ -4498,8 +4503,6 @@ class DatabaseMixin:
     # ── Генерація бази ────────────────────────────────────────────────────────
 
     def _start_database_generation(self, video_path: str, save_path: str):
-        from src.geometry.coordinates import CoordinateConverter
-
         # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
         # UTM-конвертер буде ініціалізований автоматично після отримання першого
         # GPS-якоря у CalibrationMixin (через _on_first_gps_anchor або еквівалент),
@@ -4696,8 +4699,6 @@ class DatabaseMixin:
                 self, "Увага", "Дані пропагації відсутні або проєкт не завантажено!"
             )
             return
-
-        import numpy as np
 
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid
@@ -5236,6 +5237,8 @@ class TrackingMixin:
     def _on_tracking_finished(self):
         """Викликається коли воркер завершує роботу (сам або через зупинку)."""
         logger.info("Tracking worker finished.")
+        if self.model_manager:
+            self.model_manager.unpin_all()
         self.control_panel.set_tracking_enabled(True)
         self.status_bar.showMessage("Відстеження зупинено")
         self.control_panel.update_status("Очікування")
@@ -5386,6 +5389,8 @@ __all__ = ["CalibrationMixin", "DatabaseMixin", "TrackingMixin", "PanoramaMixin"
 # ================================================================================
 # File: gui\widgets\control_panel.py
 # ================================================================================
+from pathlib import Path
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QGroupBox,
@@ -5606,8 +5611,6 @@ class ControlPanel(QWidget):
             self.lbl_project_info.setStyleSheet("font-size: 11px; color: #222;")
             self.btn_rebuild_db.setEnabled(False)
             return
-
-        from pathlib import Path
 
         lines = [f"▶ <b>{project_name}</b>"]
         if video_path:
@@ -5933,6 +5936,9 @@ class VideoWidget(QGraphicsView):
 # ================================================================================
 # File: localization\localizer.py
 # ================================================================================
+import os
+import time
+
 import numpy as np
 
 from config.config import get_cfg
@@ -5941,8 +5947,18 @@ from src.localization.matcher import FastRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
+
+FAILURE_TYPES = {
+    "out_of_coverage": "out_of_coverage",
+    "No candidates": "no_retrieval_candidates",
+    "Not enough valid inliers": "insufficient_inliers",
+    "No propagated calibration": "no_propagated_affine",
+    "Outlier detected": "trajectory_outlier",
+    "Coordinate transformation": "transform_error",
+}
 
 
 class Localizer:
@@ -5990,6 +6006,9 @@ class Localizer:
         # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
         if self._consecutive_failures >= self._max_failures:
             self._consecutive_failures = 0
+            self._log_failure(
+                FAILURE_TYPES["out_of_coverage"], details=f"Exceeded {self._max_failures} failures"
+            )
             logger.warning(
                 f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
                 f"Resetting counter. The drone may be outside the database coverage area."
@@ -6020,7 +6039,8 @@ class Localizer:
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
 
             # Шукаємо кандидатів за допомогою DINOv2
-            candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
+            with Telemetry.profile("retrieval"):
+                candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
 
             if candidates:
                 # Оцінкою ракурсу вважаємо скор найкращого кандидата
@@ -6032,6 +6052,7 @@ class Localizer:
 
         if not best_global_candidates:
             self._consecutive_failures += 1
+            self._log_failure(FAILURE_TYPES["No candidates"])
             return {
                 "success": False,
                 "error": (
@@ -6070,13 +6091,15 @@ class Localizer:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = self.database.get_local_features(candidate_id)
 
-            mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
+            with Telemetry.profile("match"):
+                mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
 
             if len(mkpts_q) >= self.min_matches:
                 # Використовуємо Homography (8 DoF)
-                H_eval, mask = GeometryTransforms.estimate_homography(
-                    mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
-                )
+                with Telemetry.profile("ransac_homography"):
+                    H_eval, mask = GeometryTransforms.estimate_homography(
+                        mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
+                    )
 
                 if H_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
@@ -6134,6 +6157,7 @@ class Localizer:
                 f"query_kpts={len(best_query_features.get('keypoints', []))}"
             )
             self._consecutive_failures += 1
+            self._log_failure(FAILURE_TYPES["Not enough valid inliers"], inliers=best_inliers)
             return {
                 "success": False,
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
@@ -6153,6 +6177,7 @@ class Localizer:
                     f"Using retrieval-only fallback."
                 )
                 return fallback_res
+            self._log_failure(FAILURE_TYPES["No propagated calibration"])
             return {
                 "success": False,
                 "error": (
@@ -6172,6 +6197,9 @@ class Localizer:
         # Використовуємо знайдену Homography
         M_query_to_ref = best_H_query_to_ref
         if M_query_to_ref is None:
+            self._log_failure(
+                FAILURE_TYPES["Coordinate transformation"], details="Failed to compute transform"
+            )
             return {"success": False, "error": "Failed to compute transform"}
 
         # 5. Трансформуємо центральну точку: Query -> Reference (через Homography) -> Metric (через Affine)
@@ -6187,6 +6215,7 @@ class Localizer:
                     f"Homography transform failure, using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})"
                 )
                 return fallback_res
+            self._log_failure(FAILURE_TYPES["Coordinate transformation"])
             return {
                 "success": False,
                 "error": "Coordinate transformation error (homography failed)",
@@ -6206,6 +6235,7 @@ class Localizer:
                 f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
                 f"Position jump was too large relative to recent trajectory."
             )
+            self._log_failure(FAILURE_TYPES["Outlier detected"], inliers=best_inliers)
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
         # Успішна локалізація — скидаємо лічильник невдач
@@ -6410,6 +6440,21 @@ class Localizer:
             "global_score": score,
             "fov_polygon": None,
         }
+
+    def _log_failure(self, error_type: str, inliers: int = 0, details: str = ""):
+        try:
+            csv_path = "logs/localization_failures.csv"
+            write_header = not os.path.exists(csv_path)
+            os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+            with open(csv_path, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write("timestamp,error_type,inliers,details\n")
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                # Quote details to prevent CSV breakage
+                safe_details = details.replace('"', '""')
+                f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
+        except Exception as e:
+            logger.error(f"Failed to log to localization_failures.csv: {e}")
 
 
 # ================================================================================
@@ -6650,6 +6695,7 @@ class FeatureMatcher:
 # File: models\model_manager.py
 # ================================================================================
 import gc
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -6658,6 +6704,34 @@ import torch
 
 from config.config import get_cfg
 from src.utils.logging_utils import get_logger
+
+# Lazy imports moved to top level as requested
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
+try:
+    from lightglue import ALIKED, LightGlue, SuperPoint
+except ImportError:
+    ALIKED = LightGlue = SuperPoint = None
+
+try:
+    from src.models.wrappers.trt_dinov2_wrapper import (
+        TensorRTDINOv2Wrapper,
+        is_trt_available,
+    )
+except ImportError:
+    TensorRTDINOv2Wrapper = None
+
+    def is_trt_available():
+        return False
+
+
+try:
+    from src.models.wrappers.cesp_module import CESP
+except ImportError:
+    CESP = None
 
 logger = get_logger(__name__)
 
@@ -6679,6 +6753,8 @@ class ModelManager:
         # Fix #4: Захист від race condition при паралельному завантаженні моделей (prewarm + main thread)
         self._model_lock = threading.Lock()
 
+        self._pinned_models: set[str] = set()
+
         # Конфігурація VRAM
         self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
         self.default_vram_required = get_cfg(
@@ -6699,6 +6775,28 @@ class ModelManager:
         available_mb = free_mem / (1024 * 1024)
         return available_mb
 
+    def pin(self, models: list[str]):
+        """Закріплює моделі в пам'яті (запобігає вивантаженню при нестачі VRAM)"""
+        with self._model_lock:
+            for m in models:
+                self._pinned_models.add(m)
+            logger.info(f"Pinned models: {self._pinned_models}")
+
+    def unpin_all(self):
+        """Знімає закріплення з усіх моделей"""
+        with self._model_lock:
+            self._pinned_models.clear()
+            logger.info("Unpinned all models")
+
+    def _unload_model_unsafe(self, name: str):
+        if name in self.models:
+            logger.info(f"Unloading model to free VRAM: {name}")
+            del self.models[name]
+            del self.model_usage[name]
+            if self.device != "cpu":
+                torch.cuda.empty_cache()
+                gc.collect()
+
     def _ensure_vram_available(self, required_mb: float | None = None):
         if self.device == "cpu":
             return
@@ -6706,16 +6804,24 @@ class ModelManager:
         req = required_mb if required_mb is not None else self.default_vram_required
 
         while self.get_available_vram_mb() < req and self.models:
-            available = self.get_available_vram_mb()
-            least_used = min(self.model_usage.items(), key=lambda x: x[1])[0]
-            logger.warning(
-                f"VRAM insufficient: need {req:.0f} MB, have {available:.0f} MB. "
-                f"Unloading least-recently-used model: '{least_used}'"
-            )
-            self.unload_model(least_used)
+            non_pinned = {k: v for k, v in self.model_usage.items() if k not in self._pinned_models}
+            if not non_pinned:
+                logger.warning("All models pinned, cannot free VRAM. Risk of OOM.")
+                return
+            least = min(non_pinned, key=non_pinned.get)
+            self._unload_model_unsafe(least)
 
     def _register_model_usage(self, name: str):
         self.model_usage[name] = time.time()
+
+    def prewarm(self):
+        """Centralized model prewarming, usually called at startup in parallel"""
+        logger.info("Starting centralized model prewarm sequence...")
+        self.load_dinov2()
+        self.load_aliked()
+        self.load_lightglue_aliked()
+        self.load_yolo()
+        logger.success("Centralized model prewarm complete")
 
     def load_yolo(self):
         name = "yolo"
@@ -6727,7 +6833,8 @@ class ModelManager:
                 logger.info(f"Loading YOLO model: {model_path}...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from ultralytics import YOLO
+                    if YOLO is None:
+                        raise ImportError("ultralytics.YOLO not found")
 
                     model = YOLO(model_path)
                     model.to(self.device)
@@ -6785,7 +6892,8 @@ class ModelManager:
                 logger.info("Loading SuperPoint model (for LightGlue compatibility)...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import SuperPoint
+                    if SuperPoint is None:
+                        raise ImportError("lightglue.SuperPoint not found")
 
                     sp_config = {
                         "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
@@ -6816,7 +6924,8 @@ class ModelManager:
                 logger.info("Loading LightGlue model...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import LightGlue
+                    if LightGlue is None:
+                        raise ImportError("lightglue.LightGlue not found")
 
                     lg_config = {
                         "depth_confidence": get_cfg(
@@ -6851,41 +6960,34 @@ class ModelManager:
                 logger.info(f"Loading DINOv2 ({model_name}) model...")
                 self._ensure_vram_available(vram_req)
 
-            # Спроба завантажити TensorRT engine (якщо скомпільований)
-            trt_loaded = False
-            engine_dir = get_cfg(
-                self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
-            )
-            try:
-                from src.models.wrappers.trt_dinov2_wrapper import (
-                    TensorRTDINOv2Wrapper,
-                    is_trt_available,
+                # Спроба завантажити TensorRT engine (якщо скомпільований)
+                trt_loaded = False
+                engine_dir = get_cfg(
+                    self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
                 )
-
-                if is_trt_available():
-                    import os
-
-                    engine_path = os.path.join(engine_dir, "dinov2_vitl14_fp16.engine")
-                    if os.path.exists(engine_path):
-                        model = TensorRTDINOv2Wrapper(engine_path)
-                        self.models[name] = model
-                        trt_loaded = True
-                        logger.success(f"DINOv2 TensorRT FP16 engine loaded: {engine_path}")
-            except Exception as e:
-                logger.debug(f"TensorRT DINOv2 not available, using PyTorch: {e}")
-
-            # Fallback: стандартний PyTorch hub
-            if not trt_loaded:
                 try:
-                    model = torch.hub.load(repo, model_name)
-                    model = model.eval().to(self.device)
-                    self.models[name] = model
-                    logger.success(f"DINOv2 model {model_name} loaded successfully (PyTorch)")
+                    if TensorRTDINOv2Wrapper is not None and is_trt_available():
+                        engine_path = os.path.join(engine_dir, "dinov2_vitl14_fp16.engine")
+                        if os.path.exists(engine_path):
+                            model = TensorRTDINOv2Wrapper(engine_path)
+                            self.models[name] = model
+                            trt_loaded = True
+                            logger.success(f"DINOv2 TensorRT FP16 engine loaded: {engine_path}")
                 except Exception as e:
-                    logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
-                    raise
-        self._register_model_usage(name)
-        return self.models[name]
+                    logger.debug(f"TensorRT DINOv2 not available, using PyTorch: {e}")
+
+                # Fallback: стандартний PyTorch hub
+                if not trt_loaded:
+                    try:
+                        model = torch.hub.load(repo, model_name)
+                        model = model.eval().to(self.device)
+                        self.models[name] = model
+                        logger.success(f"DINOv2 model {model_name} loaded successfully (PyTorch)")
+                    except Exception as e:
+                        logger.error(f"Failed to load DINOv2: {e}", exc_info=True)
+                        raise
+            self._register_model_usage(name)
+            return self.models[name]
 
     def load_aliked(self):
         """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
@@ -6898,7 +7000,8 @@ class ModelManager:
                 logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import ALIKED
+                    if ALIKED is None:
+                        raise ImportError("lightglue.ALIKED not found")
 
                     model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
                     self.models[name] = model
@@ -6925,7 +7028,8 @@ class ModelManager:
                 logger.info("Loading LightGlue (ALIKED weights)...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    from lightglue import LightGlue
+                    if LightGlue is None:
+                        raise ImportError("lightglue.LightGlue not found")
 
                     model = (
                         LightGlue(
@@ -6959,7 +7063,8 @@ class ModelManager:
             if name not in self.models:
                 logger.info("Loading CESP module...")
                 try:
-                    from src.models.wrappers.cesp_module import CESP
+                    if CESP is None:
+                        raise ImportError("CESP not found")
 
                     scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
                     cesp = CESP(dim=1024, scales=tuple(scales))
@@ -6988,13 +7093,7 @@ class ModelManager:
 
     def unload_model(self, model_name: str):
         with self._model_lock:
-            if model_name in self.models:
-                logger.info(f"Unloading model: {model_name}")
-                del self.models[model_name]
-                del self.model_usage[model_name]
-                if self.device != "cpu":
-                    torch.cuda.empty_cache()
-                    gc.collect()
+            self._unload_model_unsafe(model_name)
 
     @contextmanager
     def inference_context(self):
@@ -7017,6 +7116,7 @@ class ModelManager:
 # ================================================================================
 import numpy as np
 import torch
+from lightglue.utils import numpy_image_to_torch
 
 from src.utils.logging_utils import get_logger
 
@@ -7046,8 +7146,6 @@ class ALIKEDWrapper:
         Returns:
             dict з ключами: keypoints (1, K, 2), descriptors (1, K, 128)
         """
-        from lightglue.utils import numpy_image_to_torch
-
         tensor = numpy_image_to_torch(image_rgb).to(self.device)
         features = self.model.extract(tensor)
 
@@ -7160,6 +7258,7 @@ import torchvision.transforms as T
 from config.config import get_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
 
@@ -7209,10 +7308,13 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
-        logger.debug("Extracting global descriptor with DINOv2...")
-        dino_tensor = torch.from_numpy(image).float().div_(255.0)
-        dino_tensor = dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
-        dino_input = self.dinov2_transform(dino_tensor)
+        with Telemetry.profile("dinov2"):
+            logger.debug("Extracting global descriptor with DINOv2...")
+            dino_tensor = torch.from_numpy(image).float().div_(255.0)
+            dino_tensor = (
+                dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+            )
+            dino_input = self.dinov2_transform(dino_tensor)
 
         if self.cesp_module is not None:
             # CESP mode: отримуємо patch tokens замість CLS
@@ -7244,8 +7346,9 @@ class FeatureExtractor:
         input_dict = {"image": rgb_tensor}
 
         # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
-        with contextlib.nullcontext():
-            aliked_out = self.local_model(input_dict)
+        with Telemetry.profile("aliked"):
+            with contextlib.nullcontext():
+                aliked_out = self.local_model(input_dict)
 
         # LightGlue ALIKED wrapper повертає батч: (1, N, 2) та (1, N, 128)
         keypoints = aliked_out["keypoints"][0].cpu().numpy()
@@ -7325,15 +7428,16 @@ class FeatureExtractor:
             torch.cuda.stream(stream_global) if stream_global else contextlib.nullcontext()
         )
         with context_global:
-            if self.cesp_module is not None:
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
-                    features = self.global_model.forward_features(dino_input)
+            with Telemetry.profile("dinov2"):
+                if self.cesp_module is not None:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                        features = self.global_model.forward_features(dino_input)
                     patch_tokens = features["x_norm_patchtokens"].float()
-                h_p, w_p = self.dino_size // 14, self.dino_size // 14
-                out_global = self.cesp_module(patch_tokens, h_p, w_p)
-            else:
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
-                    out_global = self.global_model(dino_input).float()
+                    h_p, w_p = self.dino_size // 14, self.dino_size // 14
+                    out_global = self.cesp_module(patch_tokens, h_p, w_p)
+                else:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                        out_global = self.global_model(dino_input).float()
 
         out_kpts = []
         out_descs = []
@@ -7341,13 +7445,14 @@ class FeatureExtractor:
             torch.cuda.stream(stream_local) if stream_local else contextlib.nullcontext()
         )
         with context_local:
-            for b in range(B):
-                single_img = aliked_batch[b : b + 1]  # shape (1, 3, H, W)
-                input_dict = {"image": single_img}
-                # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
-                aliked_out = self.local_model(input_dict)
-                out_kpts.append(aliked_out["keypoints"][0].float())
-                out_descs.append(aliked_out["descriptors"][0].float())
+            with Telemetry.profile("aliked"):
+                for b in range(B):
+                    single_img = aliked_batch[b : b + 1]  # shape (1, 3, H, W)
+                    input_dict = {"image": single_img}
+                    # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
+                    aliked_out = self.local_model(input_dict)
+                    out_kpts.append(aliked_out["keypoints"][0].float())
+                    out_descs.append(aliked_out["descriptors"][0].float())
 
         if self.device == "cuda":
             torch.cuda.synchronize()
@@ -7397,6 +7502,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -7487,7 +7593,6 @@ def create_masking_strategy(
     if strategy_name == "yolo":
         if model_manager is None:
             raise ValueError("model_manager is required for YOLO masking strategy")
-        from src.models.wrappers.yolo_wrapper import YOLOWrapper
 
         yolo_model = model_manager.load_yolo()
         yolo_wrapper = YOLOWrapper(yolo_model, device)
@@ -8081,6 +8186,109 @@ def get_logger(name: str | None = None) -> Any:
 
 
 # ================================================================================
+# File: utils\telemetry.py
+# ================================================================================
+import atexit
+import json
+import os
+import time
+from collections import defaultdict
+from collections.abc import Callable
+from functools import wraps
+from typing import Any
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class _TelemetryTracker:
+    def __init__(self):
+        self.stats = defaultdict(
+            lambda: {"calls": 0, "total_time": 0.0, "min_time": float("inf"), "max_time": 0.0}
+        )
+
+    class ProfilerContext:
+        def __init__(self, tracker: "_TelemetryTracker", stage_name: str):
+            self.tracker = tracker
+            self.stage_name = stage_name
+            self.start_time = 0.0
+
+        def __enter__(self):
+            self.start_time = time.perf_counter()
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            elapsed = time.perf_counter() - self.start_time
+            st = self.tracker.stats[self.stage_name]
+            st["calls"] += 1
+            st["total_time"] += elapsed
+            if elapsed < st["min_time"]:
+                st["min_time"] = elapsed
+            if elapsed > st["max_time"]:
+                st["max_time"] = elapsed
+
+        def __call__(self, func: Callable) -> Callable:
+            """Allows using the context manager as a decorator."""
+
+            @wraps(func)
+            def wrapper(*args, **kwargs) -> Any:
+                with self:
+                    return func(*args, **kwargs)
+
+            return wrapper
+
+    def profile(self, stage_name: str):
+        """
+        Returns a context manager / decorator for profiling a stage.
+        Usage:
+            with Telemetry.profile("yolo"):
+                do_something()
+
+            @Telemetry.profile("feature_extraction")
+            def do_something_else():
+                pass
+        """
+        return self.ProfilerContext(self, stage_name)
+
+    def get_summary(self) -> dict:
+        summary = {}
+        for stage, st in self.stats.items():
+            if st["calls"] == 0:
+                continue
+            avg = st["total_time"] / st["calls"]
+            summary[stage] = {
+                "calls": st["calls"],
+                "total_time_s": round(st["total_time"], 4),
+                "avg_time_s": round(avg, 4),
+                "min_time_s": round(st["min_time"], 4),
+                "max_time_s": round(st["max_time"], 4),
+            }
+        return summary
+
+    def dump_report(self, path="logs/telemetry_report.json"):
+        if not self.stats:
+            return
+
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.get_summary(), f, indent=4)
+            logger.info(f"Telemetry report saved to {path} ({len(self.stats)} stages profiled)")
+        except Exception as e:
+            logger.error(f"Failed to save telemetry report: {e}")
+
+
+# Singleton instance
+Telemetry = _TelemetryTracker()
+
+
+@atexit.register
+def _save_telemetry_on_exit():
+    Telemetry.dump_report()
+
+
+# ================================================================================
 # File: utils\__init__.py
 # ================================================================================
 """Utilities module"""
@@ -8121,7 +8329,7 @@ from src.geometry.pose_graph_optimizer import (
 )
 from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
-
+from collections import defaultdict
 logger = get_logger(__name__)
 
 
@@ -8480,10 +8688,18 @@ class CalibrationPropagationWorker(QThread):
 
         # Disagreement: для кадрів із ≥2 ребрами, порівнюємо predictions
         # (simplified: використовуємо std відхилень у tx, ty)
+
+        # O(E) Optical optimization
+
+        adj = defaultdict(list)
+        for e in optimizer.edges:
+            adj[e.from_id].append(e)
+            adj[e.to_id].append(e)
+
         for fid in range(num_frames):
             if not frame_valid[fid]:
                 continue
-            edges_to_fid = [e for e in optimizer.edges if e.to_id == fid or e.from_id == fid]
+            edges_to_fid = adj[fid]
             if len(edges_to_fid) >= 2:
                 predictions_tx = []
                 for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
@@ -8961,6 +9177,9 @@ class RealtimeTrackingWorker(QThread):
         if hasattr(self.localizer, "_consecutive_failures"):
             self.localizer._consecutive_failures = 0
 
+        if self.model_manager:
+            self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
+
         # Fix 6: Pre-warm fallback моделей при старті трекінгу
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
 
@@ -9103,26 +9322,16 @@ class RealtimeTrackingWorker(QThread):
         logger.info("Tracking worker thread finished cleanly.")
 
     def _prewarm_fallback_models(self):
-        """Завантажує важкі моделі фоллбеку заздалегідь."""
+        """Завантажує моделі заздалегідь, делегуючи у ModelManager."""
         try:
             if not self.model_manager:
                 return
-
-            fallback = get_cfg(self.config, "localization.fallback_extractor", "aliked")
-            logger.info(f"Pre-warming fallback models ({fallback})...")
-
-            if fallback == "aliked":
-                self.model_manager.load_aliked()
-                self.model_manager.load_lightglue_aliked()
-            else:
-                self.model_manager.load_superpoint()
-                self.model_manager.load_lightglue()
-
-            logger.success("Fallback models pre-warmed successfully")
+            logger.info("Tracking pre-warming centralized models...")
+            self.model_manager.prewarm()
+            logger.success("Tracking pre-warming successful")
         except Exception as e:
             logger.warning(
-                f"Fallback model pre-warming failed: {e} | "
-                f"fallback_type={fallback}. "
+                f"Model pre-warming failed: {e}. "
                 f"Models will be loaded on first use (slower first localization).",
                 exc_info=True,
             )
@@ -9130,16 +9339,16 @@ class RealtimeTrackingWorker(QThread):
     def stop(self):
         logger.info("Stopping tracking worker...")
         self._stop_event.set()
-        self.wait(5000)  # чекаємо максимум 5 секунд
+        if not self.wait(5000):  # чекаємо максимум 5 секунд
+            logger.warning("Tracking worker did not finish within 5 seconds.")
+        else:
+            logger.info("Tracking worker successfully stopped.")
 
 
 # ================================================================================
 # File: workers\__init__.py
 # ================================================================================
 """Worker threads module"""
-
-
-
 # config/config.py
 #
 # Єдиний конфіг для всього застосунку з валідацією через Pydantic.
@@ -9353,8 +9562,6 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
 APP_SETTINGS = AppConfig()
 # Також надаємо доступ як до словника для зворотньої сумісності
 APP_CONFIG = APP_SETTINGS.model_dump()
-
-
 #!/usr/bin/env python3
 """Drone Topometric Localization System — application entry point."""
 
@@ -9370,11 +9577,24 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 
 import torch
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
+
+
+class StartupWorker(QThread):
+    def __init__(self, model_manager):
+        super().__init__()
+        self.model_manager = model_manager
+
+    def run(self):
+        try:
+            self.model_manager.prewarm()
+        except Exception as e:
+            logger = get_logger(__name__)
+            logger.warning(f"Startup prewarm failed: {e}. Models will load on first use.")
 
 
 def _build_exception_hook(log):
@@ -9428,6 +9648,12 @@ def main() -> None:
 
         window = MainWindow()
         window.show()
+
+        # Запускаємо prewarm у фоновому потоці
+        if hasattr(window, "model_manager") and window.model_manager:
+            app._startup_worker = StartupWorker(window.model_manager)
+            app._startup_worker.start()
+
         logger.success("Application startup complete")
 
         exit_code = app.exec()

@@ -1,8 +1,9 @@
 import re
+from collections import OrderedDict
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QDialog,
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
 
 from src.gui.widgets.video_widget import VideoWidget
 from src.utils.image_utils import opencv_to_qpixmap
+from src.workers.video_decode_worker import VideoDecodeWorker
 
 _UNKNOWN_FRAME_COUNT = 99999  # fallback when codec doesn't report frame count
 
@@ -53,13 +55,21 @@ class CalibrationDialog(QDialog):
         self.points_2d = []
         self.points_gps = []
         self.current_2d_point = None
-        self.cap = None
         self.last_slider_value = 0
         self._is_video = False
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.play_next_frame)
+        # Новий worker для декодування відео у фоні
+        self.video_worker = VideoDecodeWorker(self)
+        self.video_worker.frame_ready.connect(self.on_frame_decoded)
+        self.video_worker.video_loaded.connect(self.on_video_loaded)
+        self.video_worker.playback_stopped.connect(self.on_playback_stopped)
+        self.video_worker.start()
+
         self.is_playing = False
+
+        # LRU Кеш для QPixmap кадрів (maxsize=32)
+        self._frame_cache = OrderedDict()
+        self._MAX_CACHE_SIZE = 32
 
         self.setWindowTitle("GPS Калібрування — Мульти-якірний режим")
         self.resize(1200, 800)
@@ -84,7 +94,8 @@ class CalibrationDialog(QDialog):
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
-        self.slider.valueChanged.connect(self.on_slider_changed)
+        self.slider.valueChanged.connect(self.on_slider_dragged)  # Debounce: preview from cache
+        self.slider.sliderReleased.connect(self.on_slider_released)  # Full decode
 
         player_row = QHBoxLayout()
         self.btn_step_back = QPushButton("◀◀")
@@ -308,7 +319,7 @@ class CalibrationDialog(QDialog):
             self.slider.blockSignals(True)
             self.slider.setValue(frame_id)
             self.slider.blockSignals(False)
-            self._jump_to_frame(frame_id)
+            self.video_worker.seek(frame_id)
 
         # Завантаження точок
         self.clear_current_points()
@@ -354,16 +365,7 @@ class CalibrationDialog(QDialog):
         # Сигнал у MainWindow
         self.anchor_removed.emit(frame_id)
 
-    def _jump_to_frame(self, frame_id: int):
-        if not self.cap:
-            return
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
-        ret, frame = self.cap.read()
-        if ret and frame is not None:
-            self.last_slider_value = frame_id
-            self.spinbox_frame_id.setValue(frame_id)
-            self.video_widget.display_frame(opencv_to_qpixmap(frame))
-            self.lbl_frame_info.setText(f"Кадр: {frame_id} / {self.slider.maximum()}")
+    # _jump_to_frame замінено сигналами від VideoDecodeWorker
 
     def on_anchor_confirmed(self, frame_id: int):
         """Called by MainWindow after affine matrix is successfully computed."""
@@ -425,21 +427,16 @@ class CalibrationDialog(QDialog):
 
     def _load_video(self, path: str):
         self._is_video = True
-        if self.cap:
-            self.cap.release()
+        self.slider.blockSignals(True)
+        self.slider.setEnabled(False)
+        self._frame_cache.clear()
 
-        cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            cap.release()
-            QMessageBox.critical(self, "Помилка", f"Не вдалося відкрити:\n{path}")
-            return
+        # Воркер зробить все інше, емітуючи video_loaded
+        self.video_worker.load(path)
 
-        self.cap = cap
-        total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    def on_video_loaded(self, total: int, fps: float):
         if total <= 0:
-            total = _UNKNOWN_FRAME_COUNT  # unknown length codec
+            total = _UNKNOWN_FRAME_COUNT
 
         self.slider.blockSignals(True)
         self.slider.setEnabled(True)
@@ -454,13 +451,12 @@ class CalibrationDialog(QDialog):
         self.spinbox_frame_id.setValue(0)
         self.lbl_frame_id_warning.setText("")
         self.last_slider_value = 0
-        self.on_slider_changed(0)
+        self.video_worker.seek(0)
 
     def _load_image(self, path: str):
         self._is_video = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        self.video_worker.stop()
+        self._frame_cache.clear()
 
         self.slider.setEnabled(False)
         for btn in [self.btn_play, self.btn_step_back, self.btn_step]:
@@ -482,63 +478,89 @@ class CalibrationDialog(QDialog):
     # ── Playback ─────────────────────────────────────────────────────────────
 
     def toggle_playback(self):
-        if not self.cap or not self.cap.isOpened():
+        if not self._is_video:
             return
         if self.is_playing:
-            self.timer.stop()
+            self.video_worker.pause()
             self.btn_play.setText("▶")
             self.is_playing = False
         else:
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.timer.start(int(1000 / fps) if fps > 0 else 33)
+            self.video_worker.play(30.0)  # або передавати реальний FPS
             self.btn_play.setText("⏸")
             self.is_playing = True
 
+    def on_playback_stopped(self):
+        self.is_playing = False
+        self.btn_play.setText("▶")
+
     def play_next_frame(self):
-        if not (self.cap and self.cap.isOpened()):
-            return
-        ret, frame = self.cap.read()
-        if not ret:
-            self.toggle_playback()
-            return
-        cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        self.last_slider_value = cur
-        self.slider.blockSignals(True)
-        self.slider.setValue(cur)
-        self.slider.blockSignals(False)
-        self.spinbox_frame_id.setValue(cur)
-        self.video_widget.display_frame(opencv_to_qpixmap(frame))
-        self.lbl_frame_info.setText(f"Кадр: {cur} / {self.slider.maximum()}")
+        # Делеговано у воркер
+        pass
 
     def step_forward(self):
+        if not self._is_video:
+            return
         if self.is_playing:
             self.toggle_playback()
-        self.play_next_frame()
+        self.video_worker.seek(self.last_slider_value + 1)
 
     def step_backward(self):
+        if not self._is_video:
+            return
         if self.is_playing:
             self.toggle_playback()
-        if not (self.cap and self.cap.isOpened()):
-            return
-        cur = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, cur - 2))
-        self.play_next_frame()
+        self.video_worker.seek(max(0, self.last_slider_value - 1))
 
-    def on_slider_changed(self, value: int):
+    # --- Cache and Display from Worker ---
+
+    def on_frame_decoded(self, frame_id: int, frame_bgr: np.ndarray):
+        pixmap = opencv_to_qpixmap(frame_bgr)
+
+        # LRU кешування
+        self._frame_cache[frame_id] = pixmap
+        if len(self._frame_cache) > self._MAX_CACHE_SIZE:
+            self._frame_cache.popitem(last=False)
+
+        self._display_cached_frame(frame_id)
+
+    def _display_cached_frame(self, frame_id: int):
+        pixmap = self._frame_cache.get(frame_id)
+        if pixmap:
+            self.last_slider_value = frame_id
+            self.slider.blockSignals(True)
+            self.slider.setValue(frame_id)
+            self.slider.blockSignals(False)
+
+            self.spinbox_frame_id.setValue(frame_id)
+            self.video_widget.display_frame(pixmap)
+            self.lbl_frame_info.setText(f"Кадр: {frame_id} / {self.slider.maximum()}")
+
+    # --- Slider Debounce ---
+
+    def on_slider_dragged(self, value: int):
         if self.is_playing:
+            self.toggle_playback()
+
+        if not self._is_video:
             return
 
-        if not (self.cap and self.cap.isOpened()):
+        # Preview під час drag (якщо є в кеші) - миттєва реакція
+        if value in self._frame_cache:
+            self._display_cached_frame(value)
+        else:
+            self.spinbox_frame_id.setValue(value)
+            self.lbl_frame_info.setText(f"Кадр: {value} / {self.slider.maximum()}")
+
+    def on_slider_released(self):
+        if not self._is_video:
             return
 
+        value = self.slider.value()
         if value == self.last_slider_value:
             return
 
         if self.points_2d or self.current_2d_point:
-            self.slider.blockSignals(True)
-            self.slider.setValue(self.last_slider_value)
-            self.slider.blockSignals(False)
-
+            # Зміна кадру може стерти незбережені точки, питаємо підтвердження
             reply = QMessageBox.question(
                 self,
                 "Увага",
@@ -546,28 +568,18 @@ class CalibrationDialog(QDialog):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.No:
+                self.slider.blockSignals(True)
+                self.slider.setValue(self.last_slider_value)
+                self.slider.blockSignals(False)
                 return
 
             self.clear_current_points()
 
-            self.slider.blockSignals(True)
-            self.slider.setValue(value)
-            self.slider.blockSignals(False)
-
-        self.last_slider_value = value
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, value)
-        ret, frame = self.cap.read()
-
-        if not ret:
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            if fps > 0:
-                self.cap.set(cv2.CAP_PROP_POS_MSEC, (value / fps) * 1000.0)
-                ret, frame = self.cap.read()
-
-        if ret and frame is not None:
-            self.spinbox_frame_id.setValue(value)
-            self.video_widget.display_frame(opencv_to_qpixmap(frame))
-            self.lbl_frame_info.setText(f"Кадр: {value} / {self.slider.maximum()}")
+        # Повноцінний decode
+        if value in self._frame_cache:
+            self._display_cached_frame(value)
+        else:
+            self.video_worker.seek(value)
 
     # ── Points ───────────────────────────────────────────────────────────────
 
@@ -682,9 +694,7 @@ class CalibrationDialog(QDialog):
     # ── Cleanup ──────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
-        if self.is_playing:
-            self.timer.stop()
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        self.video_worker.stop()
+        self.video_worker.wait(2000)
+        self._frame_cache.clear()
         super().closeEvent(event)

@@ -29,9 +29,8 @@ class StartupWorker(QThread):
         try:
             self.model_manager.prewarm()
         except Exception as e:
-            # We don't crash here since some models could be missing locally.
-            # Localizer will fallback gracefully later.
-            pass
+            logger = get_logger(__name__)
+            logger.warning(f"Startup prewarm failed: {e}. Models will load on first use.")
 
 
 def _build_exception_hook(log):

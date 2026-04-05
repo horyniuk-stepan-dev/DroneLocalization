@@ -11,6 +11,7 @@
 """
 
 import json
+from collections import defaultdict
 
 import faiss
 import h5py
@@ -391,7 +392,6 @@ class CalibrationPropagationWorker(QThread):
         # (simplified: використовуємо std відхилень у tx, ty)
 
         # O(E) Optical optimization
-        from collections import defaultdict
 
         adj = defaultdict(list)
         for e in optimizer.edges:
