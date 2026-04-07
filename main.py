@@ -16,6 +16,7 @@ import torch
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
+from config.config import APP_SETTINGS
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
 
@@ -48,7 +49,14 @@ def _build_exception_hook(log):
 
 def main() -> None:
     # Logging must be initialized before anything else — including Qt
-    setup_logging(log_level="INFO", log_file="logs/app.log")
+    try:
+        from config.config import APP_SETTINGS
+        debug_mode = APP_SETTINGS.models.performance.debug_mode
+    except Exception:
+        debug_mode = True # Safe default
+
+    log_level = "INFO" if debug_mode else "CRITICAL"
+    setup_logging(log_level=log_level, log_file="logs/app.log")
     logger = get_logger(__name__)
 
     # Route unhandled exceptions to loguru instead of silent PyQt6 crash

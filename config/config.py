@@ -109,6 +109,8 @@ class ModelsCacheConfig(BaseModel):
 class PerformanceConfig(BaseModel):
     propagation_max_workers: int = 4
     fp16_enabled: bool = True
+    torch_compile: bool = False
+    debug_mode: bool = False
 
 
 class ModelsConfig(BaseModel):

@@ -79,6 +79,37 @@ class ModelManager:
         available_mb = free_mem / (1024 * 1024)
         return available_mb
 
+    def _is_torch_compile_supported(self) -> bool:
+        """Checks if torch.compile is safe to use in the current environment."""
+        if not getattr(torch, "compile", None):
+            return False
+
+        use_compile = get_cfg(self.config, "models.performance.torch_compile", False)
+        if not use_compile:
+            return False
+
+        if self.device == "cpu":
+            return False
+
+        # Windows-specific safety check: inductor (default) requires Triton
+        if os.name == "nt":
+            try:
+                # inductor doesn't necessarily need triton imported,
+                # but it needs it available in the environment.
+                import triton  # noqa: F401
+
+                return True
+            except ImportError:
+                # If Triton is missing on Windows, torch.compile(backend='inductor')
+                # will likely crash with internal errors in dev/nightly PyTorch.
+                logger.warning(
+                    "torch.compile is requested but Triton is not installed on Windows. "
+                    "Compilation disabled to prevent 'inductor' backend crashes."
+                )
+                return False
+
+        return True
+
     def pin(self, models: list[str]):
         """Закріплює моделі в пам'яті (запобігає вивантаженню при нестачі VRAM)"""
         with self._model_lock:
@@ -327,12 +358,7 @@ class ModelManager:
                     try:
                         model = torch.hub.load(repo, model_name).to(self.device)
 
-                        use_compile = get_cfg(self.config, "models.performance.torch_compile", True)
-                        if (
-                            use_compile
-                            and torch.cuda.is_available()
-                            and getattr(torch, "compile", None)
-                        ):
+                        if self._is_torch_compile_supported():
                             try:
                                 # Mode 'default' allows variable batch size gracefully
                                 model = torch.compile(model, mode="default")
@@ -366,12 +392,7 @@ class ModelManager:
 
                     model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
 
-                    use_compile = get_cfg(self.config, "models.performance.torch_compile", True)
-                    if (
-                        use_compile
-                        and torch.cuda.is_available()
-                        and getattr(torch, "compile", None)
-                    ):
+                    if self._is_torch_compile_supported():
                         try:
                             model = torch.compile(model, mode="default")
                             logger.info(
