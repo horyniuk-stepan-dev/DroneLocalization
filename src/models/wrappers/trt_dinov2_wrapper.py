@@ -55,7 +55,7 @@ class TensorRTDINOv2Wrapper:
 
     def _load_engine(self, engine_path: str):
         """Завантажує TensorRT engine та виділяє GPU пам'ять."""
-        trt_logger = trt.Logger(trt.Logger.WARNING)
+        trt_logger = trt.Logger(trt.Logger.SEVERE)
         runtime = trt.Runtime(trt_logger)
 
         with open(engine_path, "rb") as f:

@@ -7,7 +7,7 @@ from contextlib import contextmanager
 import torch
 
 from config.config import get_cfg
-from src.utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger, silent_output
 
 # Lazy imports moved to top level as requested
 try:
@@ -178,13 +178,12 @@ class ModelManager:
                     if use_trt and self.device == "cuda":
                         if os.path.exists(engine_path):
                             logger.info(f"Found YOLO TRT engine: {engine_path}. Loading...")
-                            model = YOLO(engine_path)
-                            # TRT inference sets device automatically when used via YOLO API
+                            model = YOLO(engine_path, verbose=False)
                         else:
                             logger.info(
                                 "YOLO TRT engine not found. Loading PyTorch model for export..."
                             )
-                            model = YOLO(model_path)
+                            model = YOLO(model_path, verbose=False)
                             model.to(self.device)
                             logger.info(
                                 "Exporting YOLO to TensorRT format (this may take a while)..."
@@ -192,18 +191,19 @@ class ModelManager:
                             try:
                                 # ultralytics automatically places the exported file next to the original
                                 exported_path = model.export(
-                                    format="engine", half=True, dynamic=False
+                                    format="engine", half=True, dynamic=True, batch=2,
+                                    verbose=False,
                                 )
                                 logger.success(f"YOLO TRT export complete: {exported_path}")
                                 if os.path.exists(exported_path):
-                                    model = YOLO(exported_path)
+                                    model = YOLO(exported_path, verbose=False)
                                     logger.info("YOLO TensorRT engine loaded successfully.")
                             except Exception as ex:
                                 logger.warning(
                                     f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
                                 )
                     else:
-                        model = YOLO(model_path)
+                        model = YOLO(model_path, verbose=False)
                         model.to(self.device)
 
                     self.models[name] = model
@@ -356,7 +356,7 @@ class ModelManager:
                 # Fallback: стандартний PyTorch hub
                 if not trt_loaded:
                     try:
-                        model = torch.hub.load(repo, model_name).to(self.device)
+                        model = torch.hub.load(repo, model_name, verbose=False).to(self.device)
 
                         if self._is_torch_compile_supported():
                             try:

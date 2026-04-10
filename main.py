@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """Drone Topometric Localization System — application entry point."""
 
+import os
 import sys
 import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Suppress only known noisy third-party warnings, not everything
+# ── Suppress only the most annoying third-party noise ──────────────────────────
+os.environ["YOLO_VERBOSE"] = "False"              # ultralytics: suppress banner & per-frame logs
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"           # OpenCV: suppress INFO/WARNING logs
+os.environ["TRT_LOGGER_SEVERITY"] = "3"            # TensorRT: ERROR only
+
+# Suppress known noisy Python warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", category=UserWarning, message="xFormers is not available")
 
 import torch
 from PyQt6.QtCore import Qt, QThread
@@ -19,7 +26,7 @@ from PyQt6.QtWidgets import QApplication
 from config.config import APP_SETTINGS
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
-
+import traceback
 
 class StartupWorker(QThread):
     def __init__(self, model_manager):
@@ -42,6 +49,9 @@ def _build_exception_hook(log):
             "Unhandled exception caught — application will exit",
             exc_info=(exctype, value, tb),
         )
+        # Also print to stderr so the traceback is visible in the terminal
+
+        traceback.print_exception(exctype, value, tb)
         sys.exit(1)
 
     return hook
@@ -50,12 +60,9 @@ def _build_exception_hook(log):
 def main() -> None:
     # Logging must be initialized before anything else — including Qt
     try:
-        from config.config import APP_SETTINGS
-        debug_mode = APP_SETTINGS.models.performance.debug_mode
+        log_level = APP_SETTINGS.models.performance.log_level
     except Exception:
-        debug_mode = True # Safe default
-
-    log_level = "INFO" if debug_mode else "CRITICAL"
+        log_level = "INFO" # Safe default
     setup_logging(log_level=log_level, log_file="logs/app.log")
     logger = get_logger(__name__)
 

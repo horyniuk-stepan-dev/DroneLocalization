@@ -61,6 +61,7 @@ class CalibrationPropagationWorker(QThread):
 
         self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
+        self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
 
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
@@ -476,7 +477,9 @@ class CalibrationPropagationWorker(QThread):
                 return None
 
             H, mask = GeometryTransforms.estimate_homography(
-                mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
+                mkpts_a, mkpts_b,
+                ransac_threshold=self.ransac_thresh,
+                backend=self.homography_backend,
             )
             if H is None or mask is None:
                 return None

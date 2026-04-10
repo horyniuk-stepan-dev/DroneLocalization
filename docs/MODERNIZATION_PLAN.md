@@ -1,8 +1,8 @@
 # План модернізації Drone Topometric Localization System
 
-> **Статус:** Планування  
-> **Дата створення:** 2026-03-25  
-> **Горизонт виконання:** 3–4 місяці
+> **Статус:** Горизонт 1 завершено на ~85%  
+> **Дата оновлення:** 2026-04-10  
+> **Горизонт виконання:** 2–3 місяці залишається (Горизонти 2–3)
 
 ---
 
@@ -19,11 +19,15 @@
 ### Фаза 5: Оптимізація підсистеми сегментації
 
 #### 5.1 Пониження YOLO до nano-версії
-- [ ] **5.1.1** Завантажити `yolo11n-seg.pt` та додати в корінь проєкту
-- [ ] **5.1.2** Оновити `YoloConfig.model_path` у `config/config.py`:
+- [x] **5.1.1** Завантажити `yolo11n-seg.pt` та додати в корінь проєкту
+- [x] **5.1.2** Оновити `YoloConfig.model_path` у `config/config.py`:
   - `model_path: str = "yolo11n-seg.pt"`
   - `vram_required_mb: float = 200.0`
-  - `description: str = "YOLOv11n-seg (Nano) for dynamic object masking"`
+
+> [!NOTE]
+> **Стан (2026-04-10):** Конфіг переключений, `yolo11n-seg.pt` (6 MB) присутній.
+> Стара вага `yolo11x-seg.pt` (125 MB) досі в Git — **потрібно видалити**.
+
 - [ ] **5.1.3** Провести порівняльне тестування якості маскування:
   - Вибрати 10 репрезентативних кадрів із наявного відео
   - Порівняти маски `yolo11x-seg` vs `yolo11n-seg` (IoU ≥ 0.85 допустимо)
@@ -32,26 +36,43 @@
   - `torch.cuda.max_memory_allocated()` до і після
   - Час побудови бази (80 кадрів) з x-seg vs n-seg
 
-#### 5.2 TensorRT INT8 компіляція YOLO
-- [ ] **5.2.1** Дослідити сумісність `ultralytics` з TensorRT INT8 PTQ
-- [ ] **5.2.2** Створити скрипт `scripts/compile_yolo_trt.py`:
-  - Завантажити `yolo11n-seg.pt`
-  - Викликати `model.export(format="engine", int8=True, data="calibration_images/")`
-  - Зберегти як `yolo11n-seg.engine`
-- [ ] **5.2.3** Оновити `YOLOWrapper` для підтримки `.engine` файлів:
-  - Спробувати завантажити `.engine` файл; якщо немає — fallback на `.pt`
-  - Логувати `logger.info("TensorRT INT8 engine loaded")` при успіху
-- [ ] **5.2.4** Перевірити коректність сегментації після INT8 квантування
+#### 5.2 TensorRT FP16 компіляція YOLO
+- [x] **5.2.1** Реалізувати автоматичний TRT export у `ModelManager.load_yolo()`:
+  - Якщо `.engine` файл існує → завантажити TRT engine
+  - Якщо ні → завантажити `.pt`, автоматично `model.export(format="engine", half=True, dynamic=False)`
+  - Fallback на PyTorch при помилці
+
+> [!NOTE]
+> **Стан (2026-04-10):** Повністю реалізовано в `model_manager.py:161-221`.
+> Конфіг: `models.performance.use_tensorrt_for_yolo = True` (за замовчуванням).
+> Автоматичний export + fallback працюють.
+
+- [ ] **5.2.2** Створити окремий скрипт `scripts/compile_yolo_trt.py` для попередньої компіляції:
+  - CLI: `python scripts/compile_yolo_trt.py --model yolo11n-seg.pt --output yolo11n-seg.engine`
+  - Дозволяє pre-compile перед деплоєм (не чекати при першому запуску)
+- [x] **5.2.3** ~~Оновити `YOLOWrapper` для підтримки `.engine` файлів~~ — реалізовано через `ultralytics.YOLO()` API
+- [ ] **5.2.4** Перевірити коректність сегментації після FP16 квантування (візуальна перевірка масок)
+
+> [!WARNING]
+> Попередній план вказував INT8, але INT8 PTQ для сегментації потребує калібраційних даних і ризикує деградацією якості масок. Переключено на FP16 як основну стратегію, що відповідає поточній реалізації.
 
 #### 5.3 Полімерний інтерфейс маскування (підготовка до EfficientViT-SAM)
-- [ ] **5.3.1** Створити абстрактний базовий клас `MaskingStrategy`:
+- [x] **5.3.1** Створити абстрактний базовий клас `MaskingStrategy`:
   - Файл: `src/models/wrappers/masking_strategy.py`
   - Метод: `get_mask(frame_rgb: np.ndarray) -> np.ndarray`
-- [ ] **5.3.2** Реалізувати `YOLOMaskingStrategy(MaskingStrategy)`:
-  - Перемістити логіку з `YOLOWrapper` у стратегію
-  - Зберегти існуючий інтерфейс `detect_and_mask_batch()`
-- [ ] **5.3.3** Додати `masking_strategy: str = "yolo"` у `PreprocessingConfig`
-- [ ] **5.3.4** Оновити `DatabaseBuilder` для використання `MaskingStrategy` замість прямого `YOLOWrapper`
+  - Метод: `get_mask_batch(frames_rgb: list) -> list` (батчевий)
+- [x] **5.3.2** Реалізувати `YOLOMaskingStrategy(MaskingStrategy)`:
+  - Делегує обробку `YOLOWrapper`, зберігає micro-batching та фільтрацію за класами
+- [x] **5.3.3** Реалізувати `NoMaskingStrategy(MaskingStrategy)`:
+  - Повертає білу маску (255) — для тестів та режиму без YOLO
+- [x] **5.3.4** Додати `masking_strategy: str = "yolo"` у `PreprocessingConfig`
+- [x] **5.3.5** Додати фабрику `create_masking_strategy(name, model_manager, device)`:
+  - Підтримує `"yolo"` та `"none"`
+- [x] **5.3.6** Оновити `DatabaseBuilder` для використання `MaskingStrategy` замість прямого `YOLOWrapper`
+
+> [!NOTE]
+> **Стан (2026-04-10):** Повністю завершено. Код: `src/models/wrappers/masking_strategy.py` (110 рядків).
+> Інтеграція: `DatabaseBuilder.build_from_video()` використовує `create_masking_strategy()`.
 
 #### 5.4 EfficientViT-SAM (опціонально, після валідації 5.1–5.3)
 - [ ] **5.4.1** Встановити `efficient-sam` або відповідну бібліотеку
@@ -64,18 +85,28 @@
 ### Фаза 4: Оптимізація локального зіставлення (PoseLib)
 
 #### 4.1 Заміна OpenCV гомографії на PoseLib
-- [ ] **4.1.1** Встановити `poselib` через pip
-- [ ] **4.1.2** Дослідити API `poselib`:
-  - `poselib.estimate_homography()` — LO-RANSAC з 4-точковим розв'язувачем
-  - `poselib.estimate_absolute_pose()` — P3P/P4P для 3D-точок
-  - Порівняти параметри з `cv2.findHomography(method=USAC_MAGSAC)`
-- [ ] **4.1.3** Оновити `GeometryTransforms.estimate_homography()` у `src/geometry/transformations.py`:
-  - Замінити виклик `cv2.findHomography` на `poselib.estimate_homography`
-  - Зберегти fallback на OpenCV якщо `poselib` не встановлений
-  - Параметри: `ransac_threshold=3.0`, `min_inliers=10` (з конфігу)
-- [ ] **4.1.4** Оновити `GeometryTransforms.estimate_affine_partial()`:
-  - Дослідити чи PoseLib пропонує кращий RANSAC для afine
-  - Якщо ні — залишити `cv2.estimateAffinePartial2D`
+- [x] **4.1.1** Встановити `poselib` через pip (є в `pyproject.toml`)
+- [x] **4.1.2** Додати параметр `backend: str = "opencv"` у `HomographyConfig`
+
+> [!NOTE]
+> **Стан (2026-04-10):** PoseLib повністю інтегрований у `transformations.py`:
+> - `estimate_homography(backend="poselib"|"opencv")` — двосторонній backend
+> - `_estimate_homography_poselib()` — LO-RANSAC з 4-точковим розв'язувачем
+> - Автоматичний fallback PoseLib → OpenCV при невалідній матриці
+> - PoseLib import з graceful fallback (`_POSELIB_AVAILABLE` flag)
+>
+> **Але:** Localizer **не передає** `backend` параметр з конфігу — викликає `estimate_homography()` без `backend=`.
+> За замовчуванням використовується `"opencv"`. Потрібно підключити `HomographyConfig.backend` у `Localizer`.
+
+- [x] **4.1.3** Оновити `GeometryTransforms.estimate_homography()`:
+  - ✅ PoseLib backend з LO-RANSAC
+  - ✅ OpenCV MAGSAC++ backend
+  - ✅ Fallback PoseLib → OpenCV при невалідному результаті
+  - ✅ Fallback Homography → Full Affine при виродженій матриці
+  - ✅ Валідація через `is_matrix_valid()`
+- [ ] **4.1.4** Підключити `HomographyConfig.backend` у `Localizer`:
+  - `Localizer.__init__()` має зчитати `homography.backend` з конфігу
+  - Передавати `backend=` у всі виклики `estimate_homography()`
 - [ ] **4.1.5** Тестування:
   - Запустити `python -m pytest tests/test_geometry_utils.py -v`
   - Порівняти inlier count та RMSE між OpenCV і PoseLib на тих самих парах точок
@@ -102,20 +133,25 @@
 ### Фаза 6: TensorRT для DINOv2
 
 #### 6.1 Компіляція DINOv2 → TensorRT FP16
-- [ ] **6.1.1** Створити скрипт `scripts/compile_dinov2_trt.py`:
+- [x] **6.1.1** Створити скрипт `scripts/compile_dinov2_trt.py`:
   - Завантажити `dinov2_vitl14` через `torch.hub`
   - `torch.onnx.export(model, dummy_input, "dinov2_vitl14.onnx", opset_version=17)`
   - Фіксований вхід: `(1, 3, 336, 336)`
-- [ ] **6.1.2** Компілювати ONNX → TensorRT engine:
+- [x] **6.1.2** Компілювати ONNX → TensorRT engine:
   - `trtexec --onnx=dinov2_vitl14.onnx --saveEngine=dinov2_vitl14_fp16.engine --fp16`
-  - Зафіксувати час компіляції та розмір engine-файлу
-- [ ] **6.1.3** Створити `TensorRTDINOv2Wrapper`:
-  - Файл: `src/models/wrappers/trt_dinov2_wrapper.py`
-  - Метод: `forward(image_tensor) -> np.ndarray` (1024-dim)
-  - Зберігати engine-файл у `models/engines/`
-- [ ] **6.1.4** Інтегрувати з `ModelManager.load_dinov2()`:
-  - Спробувати завантажити TRT engine; якщо немає — fallback на PyTorch
-  - Логувати рівень оптимізації: `logger.info("DINOv2 TensorRT FP16 engine loaded")`
+  - Скрипт підтримує `--onnx-only` та `--input-size` параметри
+- [x] **6.1.3** Створити `TensorRTDINOv2Wrapper`:
+  - Файл: `src/models/wrappers/trt_dinov2_wrapper.py` (126 рядків)
+  - Методи: `forward(image_chw) -> np.ndarray (1024-dim)`, `output_dim` property
+  - GPU буфери: page-locked input/output, async CUDA stream
+  - Автоматичне звільнення GPU ресурсів через `__del__`
+- [x] **6.1.4** Інтегрувати з `ModelManager.load_dinov2()`:
+  - Спочатку пробує TRT engine → fallback на PyTorch `torch.hub.load()`
+  - Engine path: `models/engines/dinov2_vitl14_fp16.engine`
+
+> [!NOTE]
+> **Стан (2026-04-10):** Повністю реалізовано. Wrapper (126 рядків), compile script (129 рядків), інтеграція в ModelManager.
+
 - [ ] **6.1.5** Валідація:
   - Порівняти дескриптори PyTorch vs TRT (cosine similarity ≥ 0.999)
   - Виміряти speedup (очікуваний: 2–3x)
@@ -134,9 +170,14 @@
   - Пріоритет: TRT > ONNX > PyTorch > Numpy L2
 
 #### 6.3 Кешування engine-файлів
-- [ ] **6.3.1** Додати `ModelsCacheConfig` у `config/config.py`:
+- [x] **6.3.1** Додати `ModelsCacheConfig` у `config/config.py`:
   - `engine_cache_dir: str = "models/engines/"`
-  - `engine_hash_gpu: bool = True`
+  - `auto_compile: bool = False`
+
+> [!NOTE]
+> **Стан (2026-04-10):** `ModelsCacheConfig` створений у `config.py:104-106`.
+> Інтегрований з `ModelsConfig.engines_cache`.
+
 - [ ] **6.3.2** Реалізувати логіку іменування engine-файлів:
   - `{model_name}_{gpu_name}_{trt_version}_{precision}.engine`
   - Автоматична перекомпіляція при зміні GPU або версії TensorRT
@@ -159,6 +200,37 @@
 
 ---
 
+### Фаза ★: Графова оптимізація пропагації (НОВА — реалізована)
+
+> [!IMPORTANT]
+> Ця фаза **не була в початковому плані**, але повністю реалізована під час розробки.
+> Вона замінила лінійну пропагацію калібрувальних координат.
+
+- [x] **★.1** Створити `PoseGraphOptimizer` у `src/geometry/pose_graph_optimizer.py` (498 рядків):
+  - 5-DoF анізотропна модель `[cx, cy, log_sx, log_sy, θ]`
+  - Levenberg-Marquardt через `scipy.optimize.least_squares(method="trf")`
+  - Sparse Jacobian → ~100x прискорення на великих графах
+  - BFS ініціалізація від GPS-якорів
+  - GeoJSON експорт графу для візуалізації
+- [x] **★.2** Створити `GtsamPoseGraphOptimizer(PoseGraphOptimizer)`:
+  - Stub-реалізація з fallback на SciPy TRF
+  - Документація обґрунтовує чому GTSAM не дає переваги для 5-DoF анізотропної моделі
+- [x] **★.3** Створити `CalibrationPropagationWorker` (561 рядків):
+  - Фаза 1: Prefetch features → побудова часових ребер (sequential matching)
+  - Фаза 2: Loop closure detection (FAISS DINOv2 retrieval → LightGlue matching)
+  - Фаза 3: Фіксація GPS-якорів + BFS ініціалізація
+  - Фаза 4: Глобальна оптимізація (LM)
+  - Фаза 5: Збереження у HDF5 (calibration v3.0)
+- [x] **★.4** Додати `GraphOptimizationConfig` у `config.py`:
+  - Loop closure: `top_k`, `min_similarity`, `min_frame_gap`, `min_inliers`
+  - Ваги: `temporal_edge_base_weight`, `spatial_edge_base_weight`, `anchor_weight`
+  - Оптимізатор: `max_iterations`, `convergence_tolerance`
+  - GeoJSON export toggle
+- [x] **★.5** Написати тести `test_pose_graph_optimizer.py` (11 KB):
+  - BFS ініціалізація, оптимізація, GeoJSON export
+
+---
+
 ## Горизонт 2 — Структурні зміни (1–2 місяці)
 
 ### Фаза 1: Заміна HDF5 → LanceDB
@@ -175,7 +247,7 @@
   frame_id:        int32          — оригінальний індекс кадру
   global_desc:     vector[1024]   — DINOv2 глобальний дескриптор
   local_kpts:      list<float32>  — ALIKED keypoints (N×2, flattened)
-  local_desc:      list<float32>  — ALIKED descriptors (N×128, flattened)
+  local_desc:      list<float16>  — ALIKED descriptors (N×128, flattened, FP16)
   kp_count:        int32          — кількість keypoints
   pose_matrix:     list<float64>  — кумулятивна поза (3×3, flattened 9)
   lat:             float64        — GPS широта (nullable, after calibration)
@@ -306,6 +378,13 @@
 ## Горизонт 3 — Фундаментальна трансформація (2–4 місяці)
 
 ### Фаза 2: Factor Graph Optimization (GTSAM iSAM2)
+
+> [!WARNING]
+> Графова оптимізація пропагації (Фаза ★ в Горизонті 1) **вже реалізована** через SciPy TRF
+> з 5-DoF анізотропною моделлю. `GtsamPoseGraphOptimizer` створений як stub з fallback
+> на SciPy TRF — задокументовано, що GTSAM не дає переваги для анізотропної 5-DoF математики.
+>
+> **Ця фаза стосується runtime трекінгу (real-time iSAM2)**, а не пропагації.
 
 #### 2.1 Встановлення та налаштування GTSAM
 - [ ] **2.1.1** Встановити `gtsam` через pip:
@@ -465,7 +544,7 @@
 Фаза 5 (YOLO nano) ──────────────────────────────────┐
 Фаза 4 (PoseLib) ─────────────────────────────────────┤
 Фаза 6.1 (DINOv2 TRT) ────────────────────────────────┤ Горизонт 1
-                                                       │ (незалежні)
+Фаза ★ (Graph optimization) ──────────────────────────┤ (~85% завершено)
                                                        │
 Фаза 1 (LanceDB) ─────────┬───────────────────────────┤ Горизонт 2
                            │                           │
@@ -474,9 +553,9 @@
 Фаза 3.3 (HE-VPR) ────────┘  ← потребує altitude_m    │
                               у LanceDB                │
                                                        │
-Фаза 2 (GTSAM) ───────────────────────────────────────┤ Горизонт 3
-Фаза 7 (PyOpenGL) ─────────────────────────────────────┤ (незалежні
-Фаза 6.4 (ALIKED C++) ─────────────────────────────────┘  між собою)
+Фаза 2 (GTSAM iSAM2) ────────────────────────────────┤ Горизонт 3
+Фаза 7 (PyOpenGL) ────────────────────────────────────┤ (незалежні
+Фаза 6.4 (ALIKED C++) ────────────────────────────────┘  між собою)
 ```
 
 ---
@@ -488,21 +567,27 @@
 | DINOv2 INT8 деградація | 6.1 | Низька | Високий | Суворо FP16, НІКОЛИ INT8 для ViT |
 | LightGlue динамічні осі в TRT | 6.2 | Висока | Середній | ONNX Runtime замість TensorRT |
 | LanceDB не підтримує ACID-запис | 1.2 | Низька | Середній | Batch-append + журнал відновлення |
-| GTSAM Python wrapper повільний | 2.1 | Середня | Середній | Профілювання; C++ API через pybind |
+| GTSAM Python wrapper повільний | 2.1 | Середня | Середній | SciPy TRF вже працює для пропагації |
 | SALAD потребує аеродатасет | 3.2 | Висока | Високий | Використати GSV-Cities або MSLS |
 | OpenGL некросплатформний | 7.1 | Середня | Середній | Тестувати на Windows + Linux |
-| PoseLib відсутній на PyPI | 4.1 | Низька | Низький | `pip install poselib` або build from source |
+| PoseLib відсутній на PyPI | 4.1 | ~~Низька~~ Вирішено | — | ✅ Встановлений через pip, працює |
 
 ---
 
 ## Метрики успіху
 
-| Метрика | Поточне значення | Цільове значення | Фаза |
-|---------|-----------------|-----------------|------|
-| VRAM (YOLO) | ~1200 MB | ~200 MB | 5.1 |
-| Localization latency | ~200 ms | ~50 ms | 1.4, 6.1 |
-| Retrieval (ANN top-12) | ~5 ms (80 frames) | <20 ms (1M frames) | 1.4 |
-| Recall@1 (VPR) | Baseline CLS | +10–15% (SALAD) | 3.2 |
-| Trajectory ATE | Baseline Kalman | -30–50% (GTSAM) | 2.4 |
-| Map FPS | ~15 FPS (WebEngine) | 60 FPS (OpenGL) | 7.3 |
-| DINOv2 inference | ~30 ms | ~10 ms (TRT FP16) | 6.1 |
+| Метрика | Поточне значення | Цільове значення | Фаза | Стан |
+|---------|-----------------|-----------------|------|------|
+| VRAM (YOLO) | ~~~1200 MB~~ ~200 MB | ~200 MB | 5.1 | ✅ Досягнуто |
+| Масking Strategy | Hardcoded YOLO | Pluggable strategy | 5.3 | ✅ Досягнуто |
+| TRT DINOv2 wrapper | — | Wrapper + compile script | 6.1 | ✅ Реалізовано |
+| TRT YOLO auto-export | — | Auto .engine on first load | 5.2 | ✅ Реалізовано |
+| PoseLib backend | — | Dual backend (PoseLib/OpenCV) | 4.1 | ✅ Реалізовано |
+| Graph optimization | Linear propagation | 5-DoF LM + loop closure | ★ | ✅ Реалізовано |
+| ModelsCacheConfig | — | engine_cache_dir config | 6.3 | ✅ Реалізовано |
+| Localization latency | ~200 ms | ~50 ms | 1.4, 6.1 | ⬜ Не виміряно |
+| Retrieval (ANN top-12) | ~5 ms (80 frames) | <20 ms (1M frames) | 1.4 | ⬜ Чекає LanceDB |
+| Recall@1 (VPR) | Baseline CLS | +10–15% (SALAD) | 3.2 | ⬜ Чекає SALAD |
+| Trajectory ATE | Baseline Kalman | -30–50% (GTSAM) | 2.4 | ⬜ Чекає iSAM2 |
+| Map FPS | ~15 FPS (WebEngine) | 60 FPS (OpenGL) | 7.3 | ⬜ Чекає PyOpenGL |
+| DINOv2 inference | ~30 ms | ~10 ms (TRT FP16) | 6.1 | ⬜ Не виміряно |

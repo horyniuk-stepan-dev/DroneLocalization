@@ -22,7 +22,7 @@
 | GUI | PyQt6, PyQt6-WebEngine (карта) |
 | Deep Learning | PyTorch 2.2+, CUDA |
 | Computer Vision | OpenCV 4.9+, Kornia |
-| Neural Networks | ALIKED, DINOv2 (ViT-L/14), LightGlue, YOLOv11x-seg |
+| Neural Networks | ALIKED, DINOv2 (ViT-L/14), LightGlue, YOLOv11n-seg |
 | База даних | HDF5 (h5py) |
 | Геопроекція | pyproj (WGS84 → UTM / Web Mercator) |
 | Конфігурація | Pydantic v2 |
@@ -87,7 +87,9 @@ DroneLocalization/
 │   │   └── database_loader.py   # Читання HDF5 бази (v1 + v2)
 │   ├── geometry/
 │   │   ├── coordinates.py       # Конвертер GPS ↔ метрична система
-│   │   └── transformations.py   # Гомографії, афінні трансформації (MAGSAC++)
+│   │   ├── transformations.py   # Гомографії, афінні трансформації (MAGSAC++)
+│   │   ├── affine_utils.py      # Decompose/compose афінних матриць
+│   │   └── pose_graph_optimizer.py # Оптимізація траєкторії (iSAM2/GTSAM)
 │   ├── gui/
 │   │   ├── main_window.py       # Головне вікно (QMainWindow + mixins)
 │   │   ├── dialogs/
@@ -111,8 +113,10 @@ DroneLocalization/
 │   │   └── wrappers/
 │   │       ├── aliked_wrapper.py      # Обгортка ALIKED
 │   │       ├── feature_extractor.py   # Єдиний екстрактор (ALIKED + DINOv2)
-│   │       ├── yolo_wrapper.py        # YOLOv11x-seg з micro-batching
-│   │       └── cesp_module.py         # CESP для покращення DINOv2 (opt.)
+│   │       ├── yolo_wrapper.py        # YOLOv11n-seg з micro-batching
+│   │       ├── cesp_module.py         # CESP для покращення DINOv2 (opt.)
+│   │       ├── masking_strategy.py    # Стратегії маскування (YOLO/SAM)
+│   │       └── trt_dinov2_wrapper.py  # TensorRT прискорення для DINOv2
 │   ├── tracking/
 │   │   ├── kalman_filter.py     # Фільтр Калмана для GPS-траєкторії
 │   │   └── outlier_detector.py  # Детектор аномалій (стрибки координат)
@@ -144,7 +148,7 @@ DroneLocalization/
     ├── [1] Декодування кадрів (OpenCV, кожен N-й кадр)
     │        └── frame_step=3 (конфігурується)
     │
-    ├── [2] YOLO v11x-seg (сегментація динамічних об'єктів)
+    ├── [2] YOLO v11n-seg (сегментація динамічних об'єктів)
     │        └── Генерація бінарної маски (авто, людей, тварин)
     │        └── Micro-batching (yolo_batch_size=2)
     │

@@ -1,4 +1,6 @@
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -45,3 +47,9 @@ def get_logger(name: str | None = None) -> Any:
     if name:
         return logger.bind(name=name)
     return logger
+
+
+@contextmanager
+def silent_output():
+    """Deprecated: too risky on Windows. Does nothing now."""
+    yield

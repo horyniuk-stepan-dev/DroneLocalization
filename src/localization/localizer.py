@@ -35,6 +35,7 @@ class Localizer:
         self.min_matches = get_cfg(self.config, "localization.min_matches", 12)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
         self.enable_auto_rotation = get_cfg(self.config, "localization.auto_rotation", True)
+        self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
 
         self.trajectory_filter = TrajectoryFilter(
             process_noise=get_cfg(self.config, "tracking.kalman_process_noise", 2.0),
@@ -160,7 +161,9 @@ class Localizer:
                 # Використовуємо Homography (8 DoF)
                 with Telemetry.profile("ransac_homography"):
                     H_eval, mask = GeometryTransforms.estimate_homography(
-                        mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
+                        mkpts_q, mkpts_r,
+                        ransac_threshold=self.ransac_thresh,
+                        backend=self.homography_backend,
                     )
 
                 if H_eval is not None:

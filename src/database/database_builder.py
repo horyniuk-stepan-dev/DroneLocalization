@@ -15,7 +15,7 @@ from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
-from src.utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger, silent_output
 from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
@@ -533,6 +533,7 @@ class DatabaseBuilder:
         """
         min_matches = get_cfg(self.config, "database.inter_frame_min_matches", 15)
         ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
+        homography_backend = get_cfg(self.config, "homography.backend", "opencv")
 
         if self.matcher is None:
             self.matcher = FeatureMatcher(config=self.config)
@@ -543,7 +544,9 @@ class DatabaseBuilder:
             return None
 
         H, mask = GeometryTransforms.estimate_homography(
-            mkpts_a, mkpts_b, ransac_threshold=ransac_thresh
+            mkpts_a, mkpts_b,
+            ransac_threshold=ransac_thresh,
+            backend=homography_backend,
         )
 
         if H is None or int(np.sum(mask)) < min_matches:

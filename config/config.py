@@ -110,6 +110,8 @@ class PerformanceConfig(BaseModel):
     propagation_max_workers: int = 4
     fp16_enabled: bool = True
     torch_compile: bool = False
+    use_tensorrt_for_yolo: bool = True
+    log_level: str = "INFO"
     debug_mode: bool = False
 
 
