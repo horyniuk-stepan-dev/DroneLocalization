@@ -152,10 +152,11 @@ class ModelManager:
     def prewarm(self):
         """Centralized model prewarming, usually called at startup in parallel"""
         logger.info("Starting centralized model prewarm sequence...")
-        self.load_dinov2()
-        self.load_aliked()
-        self.load_lightglue_aliked()
-        self.load_yolo()
+        with silent_output():
+            self.load_dinov2()
+            self.load_aliked()
+            self.load_lightglue_aliked()
+            self.load_yolo()
         logger.success("Centralized model prewarm complete")
 
     def load_yolo(self):
@@ -178,7 +179,8 @@ class ModelManager:
                     if use_trt and self.device == "cuda":
                         if os.path.exists(engine_path):
                             logger.info(f"Found YOLO TRT engine: {engine_path}. Loading...")
-                            model = YOLO(engine_path, verbose=False)
+                            with silent_output():
+                                model = YOLO(engine_path, verbose=False)
                         else:
                             logger.info(
                                 "YOLO TRT engine not found. Loading PyTorch model for export..."
@@ -196,14 +198,16 @@ class ModelManager:
                                 )
                                 logger.success(f"YOLO TRT export complete: {exported_path}")
                                 if os.path.exists(exported_path):
-                                    model = YOLO(exported_path, verbose=False)
+                                    with silent_output():
+                                        model = YOLO(exported_path, verbose=False)
                                     logger.info("YOLO TensorRT engine loaded successfully.")
                             except Exception as ex:
                                 logger.warning(
                                     f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
                                 )
                     else:
-                        model = YOLO(model_path, verbose=False)
+                        with silent_output():
+                            model = YOLO(model_path, verbose=False)
                         model.to(self.device)
 
                     self.models[name] = model

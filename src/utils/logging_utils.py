@@ -50,6 +50,52 @@ def get_logger(name: str | None = None) -> Any:
 
 
 @contextmanager
-def silent_output():
-    """Deprecated: too risky on Windows. Does nothing now."""
-    yield
+def silent_output(force: bool = False):
+    """
+    Context manager to suppress output (stdout/stderr).
+    By default, it uses a safe Python-level override.
+    If debug_mode is False (via APP_SETTINGS) or force is True, 
+    it attempts a more aggressive FD-level redirection which catches C++ logs.
+    """
+    from config.config import APP_SETTINGS
+    import io
+
+    # Determine if we should be truly silent (FD-level) or just Python-silent
+    # We use FD-level only if debug_mode is False to avoid the previous "permanent silence" issues
+    # or if explicitly forced.
+    is_debug = getattr(getattr(APP_SETTINGS, "models", None), "performance", None).debug_mode if APP_SETTINGS else True
+    aggressive = not is_debug or force
+
+    if not aggressive:
+        # Safe mode: Only catch Python prints
+        save_stdout = sys.stdout
+        save_stderr = sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        try:
+            yield
+        finally:
+            sys.stdout = save_stdout
+            sys.stderr = save_stderr
+        return
+
+    # Aggressive mode: FD-level redirection (os.dup2)
+    # catches C++ output from OpenCV, TensorRT, etc.
+    null_fd = os.open(os.devnull, os.O_RDWR)
+    save_stdout_fd = os.dup(1)
+    save_stderr_fd = os.dup(2)
+
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(null_fd, 1)
+        os.dup2(null_fd, 2)
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(save_stdout_fd, 1)
+        os.dup2(save_stderr_fd, 2)
+        os.close(null_fd)
+        os.close(save_stdout_fd)
+        os.close(save_stderr_fd)

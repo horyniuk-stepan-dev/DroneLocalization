@@ -112,7 +112,7 @@ class PerformanceConfig(BaseModel):
     torch_compile: bool = False
     use_tensorrt_for_yolo: bool = True
     log_level: str = "INFO"
-    debug_mode: bool = False
+    debug_mode: bool = True
 
 
 class ModelsConfig(BaseModel):

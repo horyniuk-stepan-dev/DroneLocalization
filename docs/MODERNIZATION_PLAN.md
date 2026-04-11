@@ -1,7 +1,7 @@
 # План модернізації Drone Topometric Localization System
 
-> **Статус:** Горизонт 1 завершено на ~85%  
-> **Дата оновлення:** 2026-04-10  
+> **Статус:** Горизонт 1 завершено на ~90%  
+> **Дата оновлення:** 2026-04-11  
 > **Горизонт виконання:** 2–3 місяці залишається (Горизонти 2–3)
 
 ---
@@ -95,8 +95,9 @@
 > - Автоматичний fallback PoseLib → OpenCV при невалідній матриці
 > - PoseLib import з graceful fallback (`_POSELIB_AVAILABLE` flag)
 >
-> **Але:** Localizer **не передає** `backend` параметр з конфігу — викликає `estimate_homography()` без `backend=`.
-> За замовчуванням використовується `"opencv"`. Потрібно підключити `HomographyConfig.backend` у `Localizer`.
+> **Стан (2026-04-11):** Localizer **передає** `backend` параметр з конфігу — `localizer.py:38`:
+> `self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")`
+> та використовує його у всіх викликах `estimate_homography(backend=self.homography_backend)`.
 
 - [x] **4.1.3** Оновити `GeometryTransforms.estimate_homography()`:
   - ✅ PoseLib backend з LO-RANSAC
@@ -104,9 +105,12 @@
   - ✅ Fallback PoseLib → OpenCV при невалідному результаті
   - ✅ Fallback Homography → Full Affine при виродженій матриці
   - ✅ Валідація через `is_matrix_valid()`
-- [ ] **4.1.4** Підключити `HomographyConfig.backend` у `Localizer`:
-  - `Localizer.__init__()` має зчитати `homography.backend` з конфігу
-  - Передавати `backend=` у всі виклики `estimate_homography()`
+- [x] **4.1.4** Підключити `HomographyConfig.backend` у `Localizer`:
+  - `Localizer.__init__()` зчитує `homography.backend` з конфігу
+  - Передає `backend=` у всі виклики `estimate_homography()`
+
+> [!NOTE]
+> **Стан (2026-04-11):** Реалізовано у `localizer.py:38` та `localizer.py:163-167`.
 - [ ] **4.1.5** Тестування:
   - Запустити `python -m pytest tests/test_geometry_utils.py -v`
   - Порівняти inlier count та RMSE між OpenCV і PoseLib на тих самих парах точок

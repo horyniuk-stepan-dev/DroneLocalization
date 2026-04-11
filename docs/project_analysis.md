@@ -1,6 +1,6 @@
 # Аналіз проєкту — Drone Topometric Localization System
 
-> **Дата аналізу:** 2026-04-10
+> **Дата аналізу:** 2026-04-11
 > **Версія проєкту:** 1.0.0
 > **Ліцензія:** MIT
 
@@ -15,8 +15,8 @@
 | Мова | Python 3.11 |
 | Файлів у `src/` | 56 (`.py`) |
 | Рядків коду (src) | ~8 000 |
-| Тестових файлів | 23 |
-| Залежностей (runtime) | 20 |
+| Тестових файлів | 21 |
+| Залежностей (runtime) | 22 |
 | Моделі NN | 6 (ALIKED, DINOv2, LightGlue, YOLO, SuperPoint, CESP) |
 | GUI | PyQt6 + PyQt6-WebEngine (Leaflet карта) |
 | База даних | HDF5 v2 (pre-allocated, LZF, float16) |
@@ -348,11 +348,11 @@ database.h5
 
 3. **README застарів** — згадує XFeat/384-dim як основний метод, фактично ALIKED/1024-dim; інструкція pip install некоректна
 4. **Коментарі-анахронізми** — docstrings у `database_builder.py` ("using XFeat"), легенда відео ("XFeat keypoint"), `matcher.py` ("XFeat or SuperPoint")
-5. **`omegaconf` у залежностях** — не використовується, конфігурація на Pydantic
+5. ~~**`omegaconf` у залежностях** — не використовується, конфігурація на Pydantic~~ — ✅ **Вирішено**: видалено з залежностей
 6. **`filterpy`** — бібліотека не підтримується (остання версія 2018), рекомендовано замінити
-7. **`poselib` у залежностях** — `HomographyConfig.backend` має поле "poselib", але реальна інтеграція відсутня
+7. ~~**`poselib` у залежностях** — `HomographyConfig.backend` має поле "poselib", але реальна інтеграція відсутня~~ — ✅ **Вирішено**: PoseLib повністю інтегрований у `transformations.py` та `localizer.py`
 8. **Тести-заглушки** — `test_pipeline.py` (151 bytes) та `test_gtsam_optimizer.py` (240 bytes)
-9. **Подвійний імпорт** `APP_SETTINGS` у `main.py` (рядки 19 і 53)
+9. ~~**Подвійний імпорт** `APP_SETTINGS` у `main.py`~~ — ✅ **Вирішено**: залишився один імпорт (рядок 26)
 
 ### Незначні
 

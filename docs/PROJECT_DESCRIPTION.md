@@ -61,7 +61,7 @@
 │ PropagWorker  │  │ Localizer      │  │   ├── ALIKED (keypoints)    │
 │ PanoramaWorker│  │ Matcher        │  │   ├── DINOv2 (global desc)  │
 │               │  │ Calibration    │  │   ├── LightGlue (matching)  │
-│               │  │ Coordinates    │  │   ├── SuperPoint (fallback) │
+│               │  │ Coordinates    │  │   ├── XFeat (fallback)      │
 │               │  │ Transformations│  │   └── CESP (optional)       │
 └───────────────┘  └────────────────┘  └─────────────────────────────┘
 ```
@@ -605,8 +605,9 @@ confidence = (stability_score × 0.3) + (inlier_score × 0.4) + (match_score × 
 | **ALIKED** | Keypoint Extractor | 128-dim descriptors | Локальні ознаки для точного matching | ~400 MB |
 | **DINOv2 ViT-L/14** | Vision Transformer | 1024-dim descriptor | Глобальне place recognition (retrieval) | ~1600 MB |
 | **LightGlue** | Matcher | — | Точний matching ALIKED keypoints | ~1000 MB |
-| **YOLOv11x-seg** | Segmentation | — | Маскування динамічних об'єктів (авто, люди) | ~1200 MB |
-| **SuperPoint** | Keypoint Extractor | 256-dim | Fallback extractor | ~500 MB |
+| **YOLOv11n-seg** | Segmentation | — | Маскування динамічних об'єктів (авто, люди) | ~200 MB |
+| **XFeat** | Keypoint Extractor | 64-dim | Fallback extractor | ~300 MB |
+| **SuperPoint** | Keypoint Extractor | 256-dim | Legacy extractor (LightGlue compatibility) | ~500 MB |
 | **CESP** | Feature Enhancement | 1024-dim | Покращення DINOv2 descriptors (опціонально) | Мінімум |
 
 ### Управління VRAM
@@ -679,17 +680,20 @@ AppConfig
 
 ## 9. Тестування
 
-- **52 тести** (pytest + pytest-qt)
-- Структура: `tests/unit/`, `tests/integration/`, `tests/` (верхній рівень)
+- **21 тестовий файл** (pytest + pytest-qt + pytest-benchmark)
+- Структура: `tests/unit/`, `tests/integration/`, `tests/benchmarks/`, `tests/` (верхній рівень)
 - Покриття:
-  - Конфігурація (структура, типи, ключі)
+  - Конфігурація (структура, типи, ключі, синхронізація)
   - Геометрія (гомографії, афінні, валідація матриць)
-  - Координати (UTM, Web Mercator, Haversine)
+  - Координати (UTM, Web Mercator, Haversine, проєкції)
+  - Графова оптимізація (PoseGraphOptimizer: BFS, LM, GeoJSON)
   - База даних (створення, запит)
-  - GUI (MainWindow, VideoWidget)
-  - Моделі (YOLO wrapper, Feature extractor)
+  - GUI (MainWindow)
+  - Моделі (YOLO wrapper, MaskingStrategy, Feature extractor)
   - Калібрування (pixel-to-metric round trip, інтерполяція)
+  - Локалізація (пайплайн)
   - Повний pipeline (integration)
+  - Бенчмарки (побудова БД, трекінг)
 
 ---
 

@@ -133,16 +133,18 @@ class DatabaseBuilder:
 
                 # Attempt H.264 (avc1)
                 fourcc = cv2.VideoWriter_fourcc(*"avc1")
-                kp_writer = cv2.VideoWriter(
-                    kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
-                )
+                with silent_output():
+                    kp_writer = cv2.VideoWriter(
+                        kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                    )
 
                 if not kp_writer or not kp_writer.isOpened():
                     logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    kp_writer = cv2.VideoWriter(
-                        kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
-                    )
+                    with silent_output():
+                        kp_writer = cv2.VideoWriter(
+                            kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                        )
 
                 if kp_writer and kp_writer.isOpened():
                     logger.info(
