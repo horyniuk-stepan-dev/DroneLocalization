@@ -798,7 +798,7 @@ from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
-from src.utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger, silent_output
 from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
@@ -832,6 +832,7 @@ class DatabaseBuilder:
         """
         Process video and build database.
         """
+        self._temp_model_manager = model_manager
         logger.info(f"Starting database build from video: {video_path}")
 
         # Читаємо налаштування з конфігу (з дефолтом)
@@ -916,16 +917,18 @@ class DatabaseBuilder:
 
                 # Attempt H.264 (avc1)
                 fourcc = cv2.VideoWriter_fourcc(*"avc1")
-                kp_writer = cv2.VideoWriter(
-                    kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
-                )
+                with silent_output():
+                    kp_writer = cv2.VideoWriter(
+                        kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                    )
 
                 if not kp_writer or not kp_writer.isOpened():
                     logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    kp_writer = cv2.VideoWriter(
-                        kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
-                    )
+                    with silent_output():
+                        kp_writer = cv2.VideoWriter(
+                            kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                        )
 
                 if kp_writer and kp_writer.isOpened():
                     logger.info(
@@ -1316,9 +1319,12 @@ class DatabaseBuilder:
         """
         min_matches = get_cfg(self.config, "database.inter_frame_min_matches", 15)
         ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
+        homography_backend = get_cfg(self.config, "homography.backend", "opencv")
 
         if self.matcher is None:
-            self.matcher = FeatureMatcher(config=self.config)
+            # Спробуємо отримати model_manager з контексту, якщо він є
+            mm = getattr(self, "_temp_model_manager", None)
+            self.matcher = FeatureMatcher(model_manager=mm, config=self.config)
 
         mkpts_a, mkpts_b = self.matcher.match(fa, fb)
 
@@ -1326,7 +1332,9 @@ class DatabaseBuilder:
             return None
 
         H, mask = GeometryTransforms.estimate_homography(
-            mkpts_a, mkpts_b, ransac_threshold=ransac_thresh
+            mkpts_a, mkpts_b,
+            ransac_threshold=ransac_thresh,
+            backend=homography_backend,
         )
 
         if H is None or int(np.sum(mask)) < min_matches:
@@ -6123,6 +6131,7 @@ class Localizer:
         self.min_matches = get_cfg(self.config, "localization.min_matches", 12)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
         self.enable_auto_rotation = get_cfg(self.config, "localization.auto_rotation", True)
+        self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
 
         self.trajectory_filter = TrajectoryFilter(
             process_noise=get_cfg(self.config, "tracking.kalman_process_noise", 2.0),
@@ -6248,7 +6257,9 @@ class Localizer:
                 # Використовуємо Homography (8 DoF)
                 with Telemetry.profile("ransac_homography"):
                     H_eval, mask = GeometryTransforms.estimate_homography(
-                        mkpts_q, mkpts_r, ransac_threshold=self.ransac_thresh
+                        mkpts_q, mkpts_r,
+                        ransac_threshold=self.ransac_thresh,
+                        backend=self.homography_backend,
                     )
 
                 if H_eval is not None:
@@ -6757,21 +6768,24 @@ class FeatureMatcher:
         # 0.75 — стандартне значення Lowe's ratio test для нормалізованих L2-дескрипторів.
         self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.75)
 
-        # Завантажуємо LightGlue (ALIKED) через ModelManager
-        self.lightglue = None
+        # Базовий екземпляр LightGlue за замовчуванням (ALIKED)
+        self.lightglue_aliked = None
+        self.lightglue_superpoint = None
+        
         if self.model_manager:
             try:
-                self.lightglue = self.model_manager.load_lightglue_aliked()
-                logger.info("FeatureMatcher configured to use LightGlue (ALIKED)")
+                # Початкове завантаження залежатиме від бажаного екстрактора в конфігу
+                main_extractor = get_cfg(self.config, "localization.fallback_extractor", "aliked")
+                if main_extractor == "aliked":
+                    self.lightglue_aliked = self.model_manager.load_lightglue(features="aliked")
+                    logger.info("FeatureMatcher: LightGlue (ALIKED) pre-loaded")
+                elif main_extractor == "superpoint":
+                    self.lightglue_superpoint = self.model_manager.load_lightglue(features="superpoint")
+                    logger.info("FeatureMatcher: LightGlue (SuperPoint) pre-loaded")
             except Exception as e:
-                logger.warning(
-                    f"Failed to load LightGlue ALIKED: {e}. "
-                    f"Cause: model files may be missing or VRAM insufficient. "
-                    f"Falling back to Numpy L2 matching.",
-                    exc_info=True,
-                )
+                logger.warning(f"FeatureMatcher: Failed to pre-load LightGlue: {e}")
         else:
-            logger.info("FeatureMatcher configured to use fast Numpy L2 matching")
+            logger.info("FeatureMatcher: Using fast Numpy L2 matching")
 
         logger.info(f"FeatureMatcher ratio_threshold = {self.ratio_threshold:.2f}")
 
@@ -6784,17 +6798,27 @@ class FeatureMatcher:
             query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
         )
 
-        # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED)
-        if self.lightglue is not None and desc_dim == 128:
-            return self._lightglue_match(query_features, ref_features)
+        # Вибір матчера за розмірністю дескриптора
+        matcher = None
+        if desc_dim == 128:  # ALIKED
+            if self.lightglue_aliked is None and self.model_manager:
+                try:
+                    self.lightglue_aliked = self.model_manager.load_lightglue(features="aliked")
+                except Exception:
+                    pass
+            matcher = self.lightglue_aliked
+        elif desc_dim == 256:  # SuperPoint
+            if self.lightglue_superpoint is None and self.model_manager:
+                try:
+                    self.lightglue_superpoint = self.model_manager.load_lightglue(features="superpoint")
+                except Exception:
+                    pass
+            matcher = self.lightglue_superpoint
 
-        if self.lightglue is not None and desc_dim != 128:
-            logger.debug(
-                f"LightGlue available but descriptor dim={desc_dim} != 128 (ALIKED). "
-                f"Using Numpy L2 matching instead."
-            )
+        if matcher is not None:
+            return self._lightglue_match(matcher, query_features, ref_features)
 
-        # Fallback (якщо немає LightGlue або інші ознаки)
+        # Fallback (якщо немає LightGlue або інші ознаки як XFeat 64-dim)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def _fast_numpy_match(
@@ -6850,43 +6874,44 @@ class FeatureMatcher:
 
         return mkpts_q, mkpts_r
 
-    def _lightglue_match(self, query_features: dict, ref_features: dict) -> tuple:
+    def _lightglue_match(self, matcher, query_features: dict, ref_features: dict) -> tuple:
         """Matches features using Neural LightGlue Matcher"""
         try:
             if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
-                logger.warning(
-                    f"Empty keypoints provided to LightGlue | "
-                    f"query_kpts={len(query_features['keypoints'])}, "
-                    f"ref_kpts={len(ref_features['keypoints'])}. "
-                    f"Cannot match without keypoints."
-                )
                 return np.empty((0, 2)), np.empty((0, 2))
 
-            device = next(self.lightglue.parameters()).device
+            # Визначаємо девайс
+            if hasattr(matcher, "parameters"):
+                device = next(matcher.parameters()).device
+            else:
+                # Для JIT/ONNX моделей використовуємо девайс менеджера або за замовчуванням
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
             data = {
                 "image0": {
-                    "keypoints": torch.from_numpy(query_features["keypoints"])
-                    .float()[None]
-                    .to(device),
-                    "descriptors": torch.from_numpy(query_features["descriptors"])
-                    .float()[None]
-                    .to(device),
+                    "keypoints": torch.from_numpy(query_features["keypoints"]).float()[None].to(device),
+                    "descriptors": torch.from_numpy(query_features["descriptors"]).float()[None].to(device),
                 },
                 "image1": {
-                    "keypoints": torch.from_numpy(ref_features["keypoints"])
-                    .float()[None]
-                    .to(device),
-                    "descriptors": torch.from_numpy(ref_features["descriptors"])
-                    .float()[None]
-                    .to(device),
+                    "keypoints": torch.from_numpy(ref_features["keypoints"]).float()[None].to(device),
+                    "descriptors": torch.from_numpy(ref_features["descriptors"]).float()[None].to(device),
                 },
             }
 
             with torch.no_grad():
-                res = self.lightglue(data)
+                res = matcher(data)
 
-            matches = res["matches"][0].cpu().numpy()
+            if isinstance(res, dict):
+                # Формат оригінальної бібліотеки
+                matches = res["matches"][0].cpu().numpy()
+            elif isinstance(res, (list, tuple)) and len(res) >= 2:
+                # Формат нашого LightGlueExportWrapper: (matches0, matches1, scores0)
+                m0 = res[0][0].cpu().numpy()  # [Batch=0, N]
+                valid = m0 != -1
+                matches = np.stack([np.where(valid)[0], m0[valid]], axis=-1)
+            else:
+                # Прямий тензор або інший формат
+                matches = res[0].cpu().numpy() if hasattr(res, "cpu") else res[0]
 
             if len(matches) == 0:
                 return np.empty((0, 2)), np.empty((0, 2))
@@ -6925,12 +6950,13 @@ import gc
 import os
 import threading
 import time
+from pathlib import Path
 from contextlib import contextmanager
 
 import torch
 
 from config.config import get_cfg
-from src.utils.logging_utils import get_logger
+from src.utils.logging_utils import get_logger, silent_output
 
 # Lazy imports moved to top level as requested
 try:
@@ -6942,6 +6968,21 @@ try:
     from lightglue import ALIKED, LightGlue, SuperPoint
 except ImportError:
     ALIKED = LightGlue = SuperPoint = None
+
+class LightGlueExportWrapper(torch.nn.Module):
+    """
+    Велика частина логіки LightGlue повертає словники зі змішаними типами (Tensors, int),
+    що ламає torch.jit.trace. Ця обгортка повертає лише основні тензори матчів.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, data):
+        res = self.model(data)
+        # Повертаємо matches0 та matches1 (тензори індексів)
+        # Це найбільш стабільний формат для експорту
+        return res["matches0"], res["matches1"], res["matching_scores0"]
 
 try:
     from src.models.wrappers.trt_dinov2_wrapper import (
@@ -7075,10 +7116,11 @@ class ModelManager:
     def prewarm(self):
         """Centralized model prewarming, usually called at startup in parallel"""
         logger.info("Starting centralized model prewarm sequence...")
-        self.load_dinov2()
-        self.load_aliked()
-        self.load_lightglue_aliked()
-        self.load_yolo()
+        with silent_output():
+            self.load_dinov2()
+            self.load_aliked()
+            self.load_lightglue_aliked()
+            self.load_yolo()
         logger.success("Centralized model prewarm complete")
 
     def load_yolo(self):
@@ -7101,13 +7143,13 @@ class ModelManager:
                     if use_trt and self.device == "cuda":
                         if os.path.exists(engine_path):
                             logger.info(f"Found YOLO TRT engine: {engine_path}. Loading...")
-                            model = YOLO(engine_path)
-                            # TRT inference sets device automatically when used via YOLO API
+                            with silent_output():
+                                model = YOLO(engine_path, verbose=False)
                         else:
                             logger.info(
                                 "YOLO TRT engine not found. Loading PyTorch model for export..."
                             )
-                            model = YOLO(model_path)
+                            model = YOLO(model_path, verbose=False)
                             model.to(self.device)
                             logger.info(
                                 "Exporting YOLO to TensorRT format (this may take a while)..."
@@ -7115,18 +7157,21 @@ class ModelManager:
                             try:
                                 # ultralytics automatically places the exported file next to the original
                                 exported_path = model.export(
-                                    format="engine", half=True, dynamic=False
+                                    format="engine", half=True, dynamic=True, batch=2,
+                                    verbose=False,
                                 )
                                 logger.success(f"YOLO TRT export complete: {exported_path}")
                                 if os.path.exists(exported_path):
-                                    model = YOLO(exported_path)
+                                    with silent_output():
+                                        model = YOLO(exported_path, verbose=False)
                                     logger.info("YOLO TensorRT engine loaded successfully.")
                             except Exception as ex:
                                 logger.warning(
                                     f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
                                 )
                     else:
-                        model = YOLO(model_path)
+                        with silent_output():
+                            model = YOLO(model_path, verbose=False)
                         model.to(self.device)
 
                     self.models[name] = model
@@ -7215,39 +7260,135 @@ class ModelManager:
             self._register_model_usage(name)
             return self.models[name]
 
-    def load_lightglue(self):
-        name = "lightglue"
+    def load_lightglue(self, features: str = "superpoint"):
+        """
+        Уніфікований метод завантаження LightGlue з підтримкою різних бекендів.
+        features: "aliked" або "superpoint"
+        """
+        name = f"lightglue_{features}"
         with self._model_lock:
             if name not in self.models:
-                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
-
-                logger.info("Loading LightGlue model...")
+                # Визначаємо який конфіг використовувати
+                config_key = "models.lightglue" if features == "aliked" else "models.lightglue_superpoint"
+                config = get_cfg(self.config, config_key)
+                
+                backend = get_cfg(config, "backend", "git")
+                model_path = get_cfg(config, "model_path", None)
+                vram_req = get_cfg(config, "vram_required_mb", 800.0)
+                auto_convert = get_cfg(config, "auto_convert", True)
+                
+                logger.info(f"Loading LightGlue ({features}) using backend: {backend}...")
                 self._ensure_vram_available(vram_req)
-                try:
-                    if LightGlue is None:
-                        raise ImportError("lightglue.LightGlue not found")
+                
+                model = None
+                
+                # 1. Спроба завантажити як TensorRT або ONNX
+                if backend == "tensorrt" and model_path and os.path.exists(model_path):
+                    try:
+                        if model_path.endswith(".engine"):
+                            logger.info(f"Loading LightGlue TensorRT: {model_path}")
+                            # Для справжнього TRT engine потрібен wrapper. 
+                            # Якщо він не передбачений, попереджаємо.
+                            logger.warning("TensorRT engine loading requires specialized wrapper. Falling back.")
+                        elif model_path.endswith(".onnx"):
+                            logger.info(f"Loading LightGlue ONNX: {model_path}")
+                            try:
+                                import onnxruntime as ort
+                                providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+                                # Створюємо сесію
+                                model = ort.InferenceSession(model_path, providers=providers)
+                                logger.success(f"LightGlue ONNX loaded with providers: {model.get_providers()}")
+                            except ImportError:
+                                logger.warning("onnxruntime not installed. Falling back.")
+                    except Exception as e:
+                        logger.warning(f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git.")
+                
+                # 2. Спроба завантажити як TorchScript
+                if model is None and (backend == "torchscript" or backend == "tensorrt"):
+                    if model_path and os.path.exists(model_path) and model_path.endswith(".pth"):
+                        try:
+                            logger.info(f"Loading LightGlue TorchScript: {model_path}")
+                            model = torch.jit.load(model_path, map_location=self.device)
+                            model.eval()
+                        except Exception as e:
+                            logger.warning(f"Failed to load LightGlue TorchScript: {e}. Falling back to Git.")
+                    elif auto_convert:
+                        logger.info(f"TorchScript model not found at {model_path}. Attempting auto-conversion from Git...")
+                    else:
+                        logger.warning(f"TorchScript model not found at {model_path} and auto_convert is disabled.")
 
-                    lg_config = {
-                        "depth_confidence": get_cfg(
-                            self.config, "models.lightglue.depth_confidence", -1
-                        ),
-                        "width_confidence": get_cfg(
-                            self.config, "models.lightglue.width_confidence", -1
-                        ),
-                    }
-                    model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
-                    self.models[name] = model
-                    logger.success("LightGlue model loaded successfully")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to load LightGlue: {e} | device={self.device}, "
-                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
-                        f"Check that 'lightglue' package is installed and VRAM is sufficient.",
-                        exc_info=True,
-                    )
-                    raise
+                # 3. Fallback до Git (бібліотеки) або Auto-conversion
+                if model is None:
+                    try:
+                        if LightGlue is None:
+                            raise ImportError("lightglue.LightGlue library not found")
+                        
+                        logger.info(f"Loading LightGlue ({features}) from library (Git backend)...")
+                        model = LightGlue(features=features).eval().to(self.device)
+                        
+                        if auto_convert and model_path:
+                            self._auto_export_lightglue(model, features, model_path, backend)
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to load LightGlue from library: {e}")
+                        raise
+
+                self.models[name] = model
+                logger.success(f"LightGlue ({features}) loaded successfully")
+                
             self._register_model_usage(name)
             return self.models[name]
+
+    def _auto_export_lightglue(self, model, features, model_path, target_backend):
+        """Автоматичний експорт моделі у TorchScript."""
+        try:
+            path = Path(model_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            if target_backend in ["torchscript", "tensorrt"] and not path.exists():
+                logger.info(f"Exporting LightGlue ({features}) to TorchScript: {model_path}")
+                model.eval()
+                dim = 128 if features == "aliked" else 256
+                dummy_data = {
+                    "image0": {
+                        "keypoints": torch.zeros((1, 10, 2), device=self.device),
+                        "descriptors": torch.zeros((1, 10, dim), device=self.device),
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
+                    },
+                    "image1": {
+                        "keypoints": torch.zeros((1, 10, 2), device=self.device),
+                        "descriptors": torch.zeros((1, 10, dim), device=self.device),
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
+                    }
+                }
+                
+                try:
+                    # Використовуємо обгортку для стабільного трасування
+                    wrapper = LightGlueExportWrapper(model)
+                    
+                    # strict=False для підтримки динамічних форм у LightGlue
+                    traced_model = torch.jit.trace(wrapper, (dummy_data,), strict=False)
+                    traced_model.save(str(path))
+                    logger.success(f"Successfully exported LightGlue ({features}) to {model_path} via wrapper")
+                except Exception as e:
+                    logger.warning(f"TorchScript tracing failed for {features}: {e}. Model will run from Git library.")
+        except Exception as e:
+            logger.warning(f"Auto-exporting LightGlue failed: {e}")
+
+    def validate_lightglue(self, features: str = "aliked") -> bool:
+        """Перевірка сумісності та наявності VRAM для LightGlue."""
+        config_key = "models.lightglue" if features == "aliked" else "models.lightglue_superpoint"
+        config = get_cfg(self.config, config_key)
+        vram_req = get_cfg(config, "vram_required_mb", 800.0)
+        vram_available = self.get_available_vram_mb()
+        
+        if vram_req > vram_available:
+            logger.warning(
+                f"VRAM insufficient for LightGlue ({features}). "
+                f"Required: {vram_req}MB, Available: {vram_available:.0f}MB"
+            )
+            return False
+        return True
 
     def load_dinov2(self):
         name = "dinov2"
@@ -7279,7 +7420,7 @@ class ModelManager:
                 # Fallback: стандартний PyTorch hub
                 if not trt_loaded:
                     try:
-                        model = torch.hub.load(repo, model_name).to(self.device)
+                        model = torch.hub.load(repo, model_name, verbose=False).to(self.device)
 
                         if self._is_torch_compile_supported():
                             try:
@@ -7340,41 +7481,7 @@ class ModelManager:
 
     def load_lightglue_aliked(self):
         """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
-        name = "lightglue_aliked"
-        with self._model_lock:
-            if name not in self.models:
-                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
-
-                logger.info("Loading LightGlue (ALIKED weights)...")
-                self._ensure_vram_available(vram_req)
-                try:
-                    if LightGlue is None:
-                        raise ImportError("lightglue.LightGlue not found")
-
-                    model = (
-                        LightGlue(
-                            features="aliked",
-                            depth_confidence=get_cfg(
-                                self.config, "models.lightglue.depth_confidence", -1
-                            ),
-                            width_confidence=get_cfg(
-                                self.config, "models.lightglue.width_confidence", -1
-                            ),
-                        )
-                        .eval()
-                        .to(self.device)
-                    )
-                    self.models[name] = model
-                    logger.success("LightGlue (ALIKED) loaded successfully")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to load LightGlue (ALIKED): {e} | device={self.device}, "
-                        f"available_vram={self.get_available_vram_mb():.0f} MB",
-                        exc_info=True,
-                    )
-                    raise
-            self._register_model_usage(name)
-            return self.models[name]
+        return self.load_lightglue(features="aliked")
 
     def load_cesp(self):
         """Завантажує CESP модуль для покращення DINOv2 global descriptors"""
@@ -7997,7 +8104,7 @@ class TensorRTDINOv2Wrapper:
 
     def _load_engine(self, engine_path: str):
         """Завантажує TensorRT engine та виділяє GPU пам'ять."""
-        trt_logger = trt.Logger(trt.Logger.WARNING)
+        trt_logger = trt.Logger(trt.Logger.SEVERE)
         runtime = trt.Runtime(trt_logger)
 
         with open(engine_path, "rb") as f:
@@ -8474,7 +8581,9 @@ def qpixmap_to_opencv(pixmap: QPixmap) -> np.ndarray:
 # ================================================================================
 # File: utils\logging_utils.py
 # ================================================================================
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -8521,6 +8630,58 @@ def get_logger(name: str | None = None) -> Any:
     if name:
         return logger.bind(name=name)
     return logger
+
+
+@contextmanager
+def silent_output(force: bool = False):
+    """
+    Context manager to suppress output (stdout/stderr).
+    By default, it uses a safe Python-level override.
+    If debug_mode is False (via APP_SETTINGS) or force is True, 
+    it attempts a more aggressive FD-level redirection which catches C++ logs.
+    """
+    from config.config import APP_SETTINGS
+    import io
+
+    # Determine if we should be truly silent (FD-level) or just Python-silent
+    # We use FD-level only if debug_mode is False to avoid the previous "permanent silence" issues
+    # or if explicitly forced.
+    is_debug = getattr(getattr(APP_SETTINGS, "models", None), "performance", None).debug_mode if APP_SETTINGS else True
+    aggressive = not is_debug or force
+
+    if not aggressive:
+        # Safe mode: Only catch Python prints
+        save_stdout = sys.stdout
+        save_stderr = sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        try:
+            yield
+        finally:
+            sys.stdout = save_stdout
+            sys.stderr = save_stderr
+        return
+
+    # Aggressive mode: FD-level redirection (os.dup2)
+    # catches C++ output from OpenCV, TensorRT, etc.
+    null_fd = os.open(os.devnull, os.O_RDWR)
+    save_stdout_fd = os.dup(1)
+    save_stderr_fd = os.dup(2)
+
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(null_fd, 1)
+        os.dup2(null_fd, 2)
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(save_stdout_fd, 1)
+        os.dup2(save_stderr_fd, 2)
+        os.close(null_fd)
+        os.close(save_stdout_fd)
+        os.close(save_stderr_fd)
 
 
 # ================================================================================
@@ -8698,6 +8859,7 @@ class CalibrationPropagationWorker(QThread):
 
         self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
+        self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
 
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
@@ -9113,7 +9275,9 @@ class CalibrationPropagationWorker(QThread):
                 return None
 
             H, mask = GeometryTransforms.estimate_homography(
-                mkpts_a, mkpts_b, ransac_threshold=self.ransac_thresh
+                mkpts_a, mkpts_b,
+                ransac_threshold=self.ransac_thresh,
+                backend=self.homography_backend,
             )
             if H is None or mask is None:
                 return None
@@ -9899,9 +10063,6 @@ class VideoDecodeWorker(QThread):
 # File: workers\__init__.py
 # ================================================================================
 """Worker threads module"""
-
-
-
 # config/config.py
 #
 # Єдиний конфіг для всього застосунку з валідацією через Pydantic.
@@ -9987,6 +10148,9 @@ class ModelSettings(BaseModel):
     top_k: int = 2048
     vram_required_mb: float = 500.0
     model_path: str | None = ""
+    backend: str = "git"  # "git" | "torchscript" | "tensorrt"
+    auto_convert: bool = True
+    dtype: str = "float16"  # "float16" | "float32"
     max_keypoints: int = 4096
     nms_radius: int = 4
     depth_confidence: float = -1.0
@@ -10014,7 +10178,9 @@ class PerformanceConfig(BaseModel):
     propagation_max_workers: int = 4
     fp16_enabled: bool = True
     torch_compile: bool = False
-    debug_mode: bool = False
+    use_tensorrt_for_yolo: bool = True
+    log_level: str = "INFO"
+    debug_mode: bool = True
 
 
 class ModelsConfig(BaseModel):
@@ -10030,7 +10196,18 @@ class ModelsConfig(BaseModel):
     superpoint: ModelSettings = ModelSettings(
         nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
     )
-    lightglue: ModelSettings = ModelSettings(vram_required_mb=1000.0)
+    lightglue: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="torchscript",
+        model_path="models/lightglue_aliked.pth",
+        auto_convert=True,
+    )
+    lightglue_superpoint: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="torchscript",
+        model_path="models/lightglue_superpoint.pth",
+        auto_convert=True,
+    )
     dinov2: ModelSettings = ModelSettings(
         hub_repo="facebookresearch/dinov2", hub_model="dinov2_vitl14", vram_required_mb=1600.0
     )
@@ -10123,18 +10300,22 @@ APP_CONFIG = APP_SETTINGS.model_dump()
 
 
 #!/usr/bin/env python3
-"""Drone Topometric Localization System — application entry point."""
 
+import os
 import sys
 import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Suppress only known noisy third-party warnings, not everything
+os.environ["YOLO_VERBOSE"] = "False"             
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"           
+os.environ["TRT_LOGGER_SEVERITY"] = "3"           
+
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", category=UserWarning, message="xFormers is not available")
 
 import torch
 from PyQt6.QtCore import Qt, QThread
@@ -10143,7 +10324,7 @@ from PyQt6.QtWidgets import QApplication
 from config.config import APP_SETTINGS
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
-
+import traceback
 
 class StartupWorker(QThread):
     def __init__(self, model_manager):
@@ -10166,31 +10347,27 @@ def _build_exception_hook(log):
             "Unhandled exception caught — application will exit",
             exc_info=(exctype, value, tb),
         )
+
+        traceback.print_exception(exctype, value, tb)
         sys.exit(1)
 
     return hook
 
 
 def main() -> None:
-    # Logging must be initialized before anything else — including Qt
     try:
-        from config.config import APP_SETTINGS
-        debug_mode = APP_SETTINGS.models.performance.debug_mode
+        log_level = APP_SETTINGS.models.performance.log_level
     except Exception:
-        debug_mode = True # Safe default
-
-    log_level = "INFO" if debug_mode else "CRITICAL"
+        log_level = "INFO" # Safe default
     setup_logging(log_level=log_level, log_file="logs/app.log")
     logger = get_logger(__name__)
 
-    # Route unhandled exceptions to loguru instead of silent PyQt6 crash
     sys.excepthook = _build_exception_hook(logger)
 
     logger.info("=" * 70)
     logger.info("DRONE TOPOMETRIC LOCALIZATION SYSTEM STARTING")
     logger.info("=" * 70)
 
-    # System diagnostics for debugging
     logger.info(f"Python: {sys.version}")
     logger.info(f"PyTorch: {torch.__version__}")
     try:

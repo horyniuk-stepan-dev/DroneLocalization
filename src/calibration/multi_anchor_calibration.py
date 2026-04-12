@@ -176,8 +176,8 @@ class MultiAnchorCalibration:
         if existing:
             existing.affine_matrix = affine_matrix
             if qa_data:
+                qa_data["updated_at"] = datetime.now().isoformat()
                 existing.update_qa(qa_data)
-                existing.updated_at = datetime.now().isoformat()
             logger.info(f"Updated anchor for frame {frame_id}")
         else:
             self.anchors.append(AnchorCalibration(frame_id, affine_matrix, qa_data))

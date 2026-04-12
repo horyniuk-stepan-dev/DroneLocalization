@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Drone Topometric Localization System — application entry point."""
 
 import os
 import sys
@@ -8,12 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-# ── Suppress only the most annoying third-party noise ──────────────────────────
-os.environ["YOLO_VERBOSE"] = "False"              # ultralytics: suppress banner & per-frame logs
-os.environ["OPENCV_LOG_LEVEL"] = "ERROR"           # OpenCV: suppress INFO/WARNING logs
-os.environ["TRT_LOGGER_SEVERITY"] = "3"            # TensorRT: ERROR only
+os.environ["YOLO_VERBOSE"] = "False"             
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"           
+os.environ["TRT_LOGGER_SEVERITY"] = "3"           
 
-# Suppress known noisy Python warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
@@ -49,7 +46,6 @@ def _build_exception_hook(log):
             "Unhandled exception caught — application will exit",
             exc_info=(exctype, value, tb),
         )
-        # Also print to stderr so the traceback is visible in the terminal
 
         traceback.print_exception(exctype, value, tb)
         sys.exit(1)
@@ -58,7 +54,6 @@ def _build_exception_hook(log):
 
 
 def main() -> None:
-    # Logging must be initialized before anything else — including Qt
     try:
         log_level = APP_SETTINGS.models.performance.log_level
     except Exception:
@@ -66,14 +61,12 @@ def main() -> None:
     setup_logging(log_level=log_level, log_file="logs/app.log")
     logger = get_logger(__name__)
 
-    # Route unhandled exceptions to loguru instead of silent PyQt6 crash
     sys.excepthook = _build_exception_hook(logger)
 
     logger.info("=" * 70)
     logger.info("DRONE TOPOMETRIC LOCALIZATION SYSTEM STARTING")
     logger.info("=" * 70)
 
-    # System diagnostics for debugging
     logger.info(f"Python: {sys.version}")
     logger.info(f"PyTorch: {torch.__version__}")
     try:

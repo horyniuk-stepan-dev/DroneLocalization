@@ -2,6 +2,7 @@ import gc
 import os
 import threading
 import time
+from pathlib import Path
 from contextlib import contextmanager
 
 import torch
@@ -19,6 +20,21 @@ try:
     from lightglue import ALIKED, LightGlue, SuperPoint
 except ImportError:
     ALIKED = LightGlue = SuperPoint = None
+
+class LightGlueExportWrapper(torch.nn.Module):
+    """
+    Велика частина логіки LightGlue повертає словники зі змішаними типами (Tensors, int),
+    що ламає torch.jit.trace. Ця обгортка повертає лише основні тензори матчів.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, data):
+        res = self.model(data)
+        # Повертаємо matches0 та matches1 (тензори індексів)
+        # Це найбільш стабільний формат для експорту
+        return res["matches0"], res["matches1"], res["matching_scores0"]
 
 try:
     from src.models.wrappers.trt_dinov2_wrapper import (
@@ -296,39 +312,135 @@ class ModelManager:
             self._register_model_usage(name)
             return self.models[name]
 
-    def load_lightglue(self):
-        name = "lightglue"
+    def load_lightglue(self, features: str = "superpoint"):
+        """
+        Уніфікований метод завантаження LightGlue з підтримкою різних бекендів.
+        features: "aliked" або "superpoint"
+        """
+        name = f"lightglue_{features}"
         with self._model_lock:
             if name not in self.models:
-                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
-
-                logger.info("Loading LightGlue model...")
+                # Визначаємо який конфіг використовувати
+                config_key = "models.lightglue" if features == "aliked" else "models.lightglue_superpoint"
+                config = get_cfg(self.config, config_key)
+                
+                backend = get_cfg(config, "backend", "git")
+                model_path = get_cfg(config, "model_path", None)
+                vram_req = get_cfg(config, "vram_required_mb", 800.0)
+                auto_convert = get_cfg(config, "auto_convert", True)
+                
+                logger.info(f"Loading LightGlue ({features}) using backend: {backend}...")
                 self._ensure_vram_available(vram_req)
-                try:
-                    if LightGlue is None:
-                        raise ImportError("lightglue.LightGlue not found")
+                
+                model = None
+                
+                # 1. Спроба завантажити як TensorRT або ONNX
+                if backend == "tensorrt" and model_path and os.path.exists(model_path):
+                    try:
+                        if model_path.endswith(".engine"):
+                            logger.info(f"Loading LightGlue TensorRT: {model_path}")
+                            # Для справжнього TRT engine потрібен wrapper. 
+                            # Якщо він не передбачений, попереджаємо.
+                            logger.warning("TensorRT engine loading requires specialized wrapper. Falling back.")
+                        elif model_path.endswith(".onnx"):
+                            logger.info(f"Loading LightGlue ONNX: {model_path}")
+                            try:
+                                import onnxruntime as ort
+                                providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+                                # Створюємо сесію
+                                model = ort.InferenceSession(model_path, providers=providers)
+                                logger.success(f"LightGlue ONNX loaded with providers: {model.get_providers()}")
+                            except ImportError:
+                                logger.warning("onnxruntime not installed. Falling back.")
+                    except Exception as e:
+                        logger.warning(f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git.")
+                
+                # 2. Спроба завантажити як TorchScript
+                if model is None and (backend == "torchscript" or backend == "tensorrt"):
+                    if model_path and os.path.exists(model_path) and model_path.endswith(".pth"):
+                        try:
+                            logger.info(f"Loading LightGlue TorchScript: {model_path}")
+                            model = torch.jit.load(model_path, map_location=self.device)
+                            model.eval()
+                        except Exception as e:
+                            logger.warning(f"Failed to load LightGlue TorchScript: {e}. Falling back to Git.")
+                    elif auto_convert:
+                        logger.info(f"TorchScript model not found at {model_path}. Attempting auto-conversion from Git...")
+                    else:
+                        logger.warning(f"TorchScript model not found at {model_path} and auto_convert is disabled.")
 
-                    lg_config = {
-                        "depth_confidence": get_cfg(
-                            self.config, "models.lightglue.depth_confidence", -1
-                        ),
-                        "width_confidence": get_cfg(
-                            self.config, "models.lightglue.width_confidence", -1
-                        ),
-                    }
-                    model = LightGlue(features="superpoint", **lg_config).eval().to(self.device)
-                    self.models[name] = model
-                    logger.success("LightGlue model loaded successfully")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to load LightGlue: {e} | device={self.device}, "
-                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
-                        f"Check that 'lightglue' package is installed and VRAM is sufficient.",
-                        exc_info=True,
-                    )
-                    raise
+                # 3. Fallback до Git (бібліотеки) або Auto-conversion
+                if model is None:
+                    try:
+                        if LightGlue is None:
+                            raise ImportError("lightglue.LightGlue library not found")
+                        
+                        logger.info(f"Loading LightGlue ({features}) from library (Git backend)...")
+                        model = LightGlue(features=features).eval().to(self.device)
+                        
+                        if auto_convert and model_path:
+                            self._auto_export_lightglue(model, features, model_path, backend)
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to load LightGlue from library: {e}")
+                        raise
+
+                self.models[name] = model
+                logger.success(f"LightGlue ({features}) loaded successfully")
+                
             self._register_model_usage(name)
             return self.models[name]
+
+    def _auto_export_lightglue(self, model, features, model_path, target_backend):
+        """Автоматичний експорт моделі у TorchScript."""
+        try:
+            path = Path(model_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            if target_backend in ["torchscript", "tensorrt"] and not path.exists():
+                logger.info(f"Exporting LightGlue ({features}) to TorchScript: {model_path}")
+                model.eval()
+                dim = 128 if features == "aliked" else 256
+                dummy_data = {
+                    "image0": {
+                        "keypoints": torch.zeros((1, 10, 2), device=self.device),
+                        "descriptors": torch.zeros((1, 10, dim), device=self.device),
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
+                    },
+                    "image1": {
+                        "keypoints": torch.zeros((1, 10, 2), device=self.device),
+                        "descriptors": torch.zeros((1, 10, dim), device=self.device),
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
+                    }
+                }
+                
+                try:
+                    # Використовуємо обгортку для стабільного трасування
+                    wrapper = LightGlueExportWrapper(model)
+                    
+                    # strict=False для підтримки динамічних форм у LightGlue
+                    traced_model = torch.jit.trace(wrapper, (dummy_data,), strict=False)
+                    traced_model.save(str(path))
+                    logger.success(f"Successfully exported LightGlue ({features}) to {model_path} via wrapper")
+                except Exception as e:
+                    logger.warning(f"TorchScript tracing failed for {features}: {e}. Model will run from Git library.")
+        except Exception as e:
+            logger.warning(f"Auto-exporting LightGlue failed: {e}")
+
+    def validate_lightglue(self, features: str = "aliked") -> bool:
+        """Перевірка сумісності та наявності VRAM для LightGlue."""
+        config_key = "models.lightglue" if features == "aliked" else "models.lightglue_superpoint"
+        config = get_cfg(self.config, config_key)
+        vram_req = get_cfg(config, "vram_required_mb", 800.0)
+        vram_available = self.get_available_vram_mb()
+        
+        if vram_req > vram_available:
+            logger.warning(
+                f"VRAM insufficient for LightGlue ({features}). "
+                f"Required: {vram_req}MB, Available: {vram_available:.0f}MB"
+            )
+            return False
+        return True
 
     def load_dinov2(self):
         name = "dinov2"
@@ -421,41 +533,7 @@ class ModelManager:
 
     def load_lightglue_aliked(self):
         """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
-        name = "lightglue_aliked"
-        with self._model_lock:
-            if name not in self.models:
-                vram_req = get_cfg(self.config, "models.lightglue.vram_required_mb", 1000.0)
-
-                logger.info("Loading LightGlue (ALIKED weights)...")
-                self._ensure_vram_available(vram_req)
-                try:
-                    if LightGlue is None:
-                        raise ImportError("lightglue.LightGlue not found")
-
-                    model = (
-                        LightGlue(
-                            features="aliked",
-                            depth_confidence=get_cfg(
-                                self.config, "models.lightglue.depth_confidence", -1
-                            ),
-                            width_confidence=get_cfg(
-                                self.config, "models.lightglue.width_confidence", -1
-                            ),
-                        )
-                        .eval()
-                        .to(self.device)
-                    )
-                    self.models[name] = model
-                    logger.success("LightGlue (ALIKED) loaded successfully")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to load LightGlue (ALIKED): {e} | device={self.device}, "
-                        f"available_vram={self.get_available_vram_mb():.0f} MB",
-                        exc_info=True,
-                    )
-                    raise
-            self._register_model_usage(name)
-            return self.models[name]
+        return self.load_lightglue(features="aliked")
 
     def load_cesp(self):
         """Завантажує CESP модуль для покращення DINOv2 global descriptors"""

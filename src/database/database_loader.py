@@ -1,8 +1,10 @@
 import json
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 import h5py
+import lancedb
 import numpy as np
 
 from src.geometry.coordinates import CoordinateConverter
@@ -18,6 +20,7 @@ class DatabaseLoader:
         self.db_path = db_path
         self.db_file: h5py.File | None = None
         self.global_descriptors: np.ndarray | None = None
+        self.lance_table = None
         self.frame_poses: np.ndarray | None = None
         self.metadata: dict[str, Any] = {}
         self.converter: CoordinateConverter | None = None
@@ -51,14 +54,26 @@ class DatabaseLoader:
                     f"The database file may be corrupted or was created with an incompatible version."
                 )
 
-            self.global_descriptors = self.db_file["global_descriptors"]["descriptors"][:]
+            lance_path = Path(self.db_path).parent / "vectors.lance"
+            if lance_path.exists():
+                logger.info(f"LanceDB index found at {lance_path}. Loading...")
+                db = lancedb.connect(str(lance_path))
+                self.lance_table = db.open_table("global_vectors")
+                self.global_descriptors = None
+            else:
+                logger.info("LanceDB index not found. Falling back to HDF5 global descriptors.")
+                self.global_descriptors = self.db_file["global_descriptors"]["descriptors"][:]
+
             self.frame_poses = self.db_file["global_descriptors"]["frame_poses"][:]
 
-            logger.info(
-                f"Loaded global descriptors: shape={self.global_descriptors.shape}, "
-                f"dtype={self.global_descriptors.dtype}, "
-                f"mem={self.global_descriptors.nbytes / 1024**2:.1f} MB"
-            )
+            if self.lance_table is not None:
+                logger.info(f"Loaded LanceDB table with {self.lance_table.count_rows()} vectors.")
+            else:
+                logger.info(
+                    f"Loaded global descriptors: shape={self.global_descriptors.shape}, "
+                    f"dtype={self.global_descriptors.dtype}, "
+                    f"mem={self.global_descriptors.nbytes / 1024**2:.1f} MB"
+                )
             logger.info(f"Loaded frame poses: shape={self.frame_poses.shape}")
 
             for key, value in self.db_file["metadata"].attrs.items():
@@ -67,7 +82,7 @@ class DatabaseLoader:
 
             if "actual_num_frames" in self.metadata:
                 actual_num = int(self.metadata["actual_num_frames"])
-                total_slots = len(self.global_descriptors)
+                total_slots = len(self.frame_poses)
                 logger.info(
                     f"Database contains {actual_num} actual frames in {total_slots} pre-allocated slots"
                 )
@@ -78,7 +93,8 @@ class DatabaseLoader:
                 self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
                 logger.debug(f"Frame index map loaded: {len(self.frame_index_map)} entries")
             else:
-                self.frame_index_map = np.arange(len(self.global_descriptors))
+                total_len = len(self.frame_poses)
+                self.frame_index_map = np.arange(total_len)
                 logger.debug("No frame_index_map found — using sequential indices")
 
             # Завантажуємо дані пропагації якщо є
@@ -86,9 +102,7 @@ class DatabaseLoader:
 
             logger.success(
                 f"Hot data loaded successfully | "
-                f"{len(self.global_descriptors)} frames, "
-                f"descriptor_dim={self.global_descriptors.shape[1]}, "
-                f"propagated={'yes' if self.is_propagated else 'no'}"
+                f"{len(self.frame_poses)} frames"
             )
 
         except KeyError as e:

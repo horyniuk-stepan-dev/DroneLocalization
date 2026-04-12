@@ -62,6 +62,36 @@ class FastRetrieval:
         scores, ids = self.index.search(q, top_k)
         results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
+class LanceDBRetrieval:
+    """Fast candidate search using LanceDB for vector similarity."""
+
+    def __init__(self, lance_table):
+        logger.info("Initializing LanceDBRetrieval using LanceDB table natively")
+        self.lance_table = lance_table
+
+    def add_descriptor(self, query_desc: np.ndarray, frame_id: int):
+        # LanceDB insertion is usually handled batch-wise in DatabaseLoader.
+        pass
+
+    def find_similar_frames(self, query_desc: np.ndarray, top_k: int = 5) -> list:
+        if self.lance_table is None:
+            return []
+
+        q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
+        
+        try:
+            res = (
+                self.lance_table.search(q.astype(np.float32).flatten())
+                .metric("cosine")
+                .limit(top_k)
+                .select(["frame_id", "_distance"])
+                .to_list()
+            )
+            # повертає [(frame_id, similarity)]
+            return [(int(r["frame_id"]), float(max(0.0, 1.0 - r["_distance"]))) for r in res]
+        except Exception as e:
+            logger.error(f"LanceDB query failed: {e}")
+            return []
 
 
 class FeatureMatcher:

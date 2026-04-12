@@ -23,6 +23,9 @@ class DatabaseConfig(BaseModel):
     keyframe_always_save_first: bool = True
     use_decord: bool = True
     decode_batch_size: int = 32
+    use_lancedb: bool = True
+    lancedb_batch_size: int = 64
+    lancedb_index_min_frames: int = 256
 
 
 class ConfidenceConfig(BaseModel):
@@ -83,6 +86,9 @@ class ModelSettings(BaseModel):
     top_k: int = 2048
     vram_required_mb: float = 500.0
     model_path: str | None = ""
+    backend: str = "git"  # "git" | "torchscript" | "tensorrt"
+    auto_convert: bool = True
+    dtype: str = "float16"  # "float16" | "float32"
     max_keypoints: int = 4096
     nms_radius: int = 4
     depth_confidence: float = -1.0
@@ -128,7 +134,18 @@ class ModelsConfig(BaseModel):
     superpoint: ModelSettings = ModelSettings(
         nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
     )
-    lightglue: ModelSettings = ModelSettings(vram_required_mb=1000.0)
+    lightglue: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        model_path="models/lightglue_aliked.pth",
+        auto_convert=False,
+    )
+    lightglue_superpoint: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        model_path="models/lightglue_superpoint.pth",
+        auto_convert=False,
+    )
     dinov2: ModelSettings = ModelSettings(
         hub_repo="facebookresearch/dinov2", hub_model="dinov2_vitl14", vram_required_mb=1600.0
     )

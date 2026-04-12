@@ -148,30 +148,32 @@ class CalibrationMixin:
                         best_type = "affine_partial (UTM fallback)"
 
             else:
-                # WEB_MERCATOR або інші проекції: стара логіка
-                M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
-                best_M = M_partial
-                best_type = "affine_partial"
-
-                if M_partial is not None:
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(
-                        M_partial, pts_2d_np, pts_metric_np
-                    )
-
-                # Пробуємо повну афінну якщо точок >= 5
-                if len(pts_2d_np) >= 5:
-                    M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
-                    if M_full is not None:
-                        rmse_f, median_f, max_f, proj_f = calc_metrics(
-                            M_full, pts_2d_np, pts_metric_np
+                # WEB_MERCATOR: ТАКОЖ потребує від'ємного детермінанта (Y-flip)
+                # Причина: pixel Y ↓ але metric Y (EPSG:3857) ↑
+                M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
+                if M_full is not None:
+                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
+                    if det > 0:
+                        logger.warning(
+                            f"Anchor {frame_id}: full affine det is POSITIVE ({det:.4f}). "
+                            "WEB_MERCATOR pixel→metric should have negative det (Y-flip). "
+                            "Check point ordering or projection setup."
                         )
-                        if rmse_f < rmse_p * 0.85:
-                            best_M = M_full
-                            best_type = "affine_full"
-                            rmse_p, median_p, max_p, proj_p = rmse_f, median_f, max_f, proj_f
-                            logger.info(
-                                f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)"
-                            )
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                    best_M = M_full
+                    best_type = "affine_full"
+
+                # Fallback до partial тільки якщо full не вийшла
+                if best_M is None:
+                    logger.warning(
+                        f"Anchor {frame_id}: estimate_affine failed for WEB_MERCATOR. "
+                        "Falling back to affine_partial — Y-flip will NOT be modeled correctly!"
+                    )
+                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                    if M_partial is not None:
+                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                        best_M = M_partial
+                        best_type = "affine_partial (WEB_MERCATOR fallback — degraded)"
 
             if best_M is None:
                 QMessageBox.critical(

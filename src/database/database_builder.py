@@ -7,7 +7,10 @@ from threading import Thread
 
 import cv2
 import h5py
+import lancedb
 import numpy as np
+import pyarrow as pa
+import shutil
 import torch
 
 from config.config import get_cfg
@@ -33,6 +36,11 @@ class DatabaseBuilder:
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
+        self.use_lancedb = get_cfg(self.config, "database.use_lancedb", True)
+        self.lance_batch_size = get_cfg(self.config, "database.lancedb_batch_size", 64)
+        self.lance_index_min_frames = get_cfg(self.config, "database.lancedb_index_min_frames", 256)
+        self.lance_table = None
+        self.lance_batch = []
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
         if self.matcher:
@@ -49,6 +57,7 @@ class DatabaseBuilder:
         """
         Process video and build database.
         """
+        self._temp_model_manager = model_manager
         logger.info(f"Starting database build from video: {video_path}")
 
         # Читаємо налаштування з конфігу (з дефолтом)
@@ -432,6 +441,18 @@ class DatabaseBuilder:
             )
             raise
         finally:
+            if self.use_lancedb and self.lance_table is not None:
+                if self.lance_batch:
+                    self.lance_table.add(self.lance_batch)
+                    self.lance_batch = []
+                if saved_count >= self.lance_index_min_frames:
+                    logger.info("Building LanceDB IVF-PQ index...")
+                    self.lance_table.create_index(
+                        metric="cosine",
+                        num_partitions=min(256, saved_count // 8),
+                        num_sub_vectors=32
+                    )
+
             # Зберігаємо frame_index_map і actual_num_frames у metadata
             if self.db_file and saved_count > 0:
                 try:
@@ -538,7 +559,9 @@ class DatabaseBuilder:
         homography_backend = get_cfg(self.config, "homography.backend", "opencv")
 
         if self.matcher is None:
-            self.matcher = FeatureMatcher(config=self.config)
+            # Спробуємо отримати model_manager з контексту, якщо він є
+            mm = getattr(self, "_temp_model_manager", None)
+            self.matcher = FeatureMatcher(model_manager=mm, config=self.config)
 
         mkpts_a, mkpts_b = self.matcher.match(fa, fb)
 
@@ -595,17 +618,31 @@ class DatabaseBuilder:
             f"(compression={compression}, chunks={chunk_f}, max_kps={max_kps})"
         )
 
+        if self.use_lancedb:
+            lance_path = Path(self.output_path).parent / "vectors.lance"
+            if lance_path.exists():
+                shutil.rmtree(lance_path)
+            db = lancedb.connect(str(lance_path))
+            schema = pa.schema([
+                pa.field("frame_id", pa.int32()),
+                pa.field("vector", pa.list_(pa.float32(), self.descriptor_dim))
+            ])
+            self.lance_table = db.create_table("global_vectors", schema=schema, mode="create")
+            self.lance_batch = []
+            logger.info(f"LanceDB table created at {lance_path}")
+
         with h5py.File(self.output_path, "w", libver="latest") as f:
             # --- global_descriptors: chunked ---
             g1 = f.create_group("global_descriptors")
-            g1.create_dataset(
-                "descriptors",
-                shape=(num_frames, self.descriptor_dim),
-                maxshape=(None, self.descriptor_dim),
-                dtype="float32",
-                compression=compression,
-                chunks=(min(256, num_frames), self.descriptor_dim),
-            )
+            if not self.use_lancedb:
+                g1.create_dataset(
+                    "descriptors",
+                    shape=(num_frames, self.descriptor_dim),
+                    maxshape=(None, self.descriptor_dim),
+                    dtype="float32",
+                    compression=compression,
+                    chunks=(min(256, num_frames), self.descriptor_dim),
+                )
             g1.create_dataset(
                 "frame_poses",
                 shape=(num_frames, 3, 3),
@@ -674,8 +711,17 @@ class DatabaseBuilder:
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
         """Save extracted data for a single frame via slice assignment (schema v2)"""
         with Telemetry.profile("hdf5_write"):
-            # global — без змін
-            self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+            if self.use_lancedb:
+                self.lance_batch.append({
+                    "frame_id": frame_id,
+                    "vector": features["global_desc"]
+                })
+                if len(self.lance_batch) >= self.lance_batch_size:
+                    self.lance_table.add(self.lance_batch)
+                    self.lance_batch = []
+            else:
+                self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+            
             self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
             # local — slice assignment замість create_group + create_dataset

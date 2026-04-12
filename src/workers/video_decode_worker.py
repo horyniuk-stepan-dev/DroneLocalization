@@ -33,6 +33,7 @@ class VideoDecodeWorker(QThread):
         last_play_time = 0.0
 
         while self._is_running:
+            cmd_from_queue = False
             try:
                 # Читаємо команди блокуючи чергу (з таймаутом для плейбеку)
                 if is_playing:
@@ -42,11 +43,13 @@ class VideoDecodeWorker(QThread):
 
                     try:
                         cmd, arg = self.cmd_queue.get(timeout=delay)
+                        cmd_from_queue = True
                     except queue.Empty:
                         # Час грати наступний кадр
                         cmd, arg = "next_frame", None
                 else:
                     cmd, arg = self.cmd_queue.get(timeout=0.5)
+                    cmd_from_queue = True
             except queue.Empty:
                 continue
 
@@ -78,7 +81,8 @@ class VideoDecodeWorker(QThread):
                             is_playing = False
                             self.playback_stopped.emit()
 
-                self.cmd_queue.task_done()
+                if cmd_from_queue:
+                    self.cmd_queue.task_done()
             except Exception as e:
                 logger.error(f"VideoDecodeWorker error handling command {cmd}: {e}")
                 self.error.emit(str(e))

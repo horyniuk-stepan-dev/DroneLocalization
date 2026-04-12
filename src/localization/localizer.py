@@ -5,7 +5,7 @@ import numpy as np
 
 from config.config import get_cfg
 from src.geometry.transformations import GeometryTransforms
-from src.localization.matcher import FastRetrieval
+from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
@@ -49,8 +49,11 @@ class Localizer:
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
-        # Створюємо FastRetrieval один раз — нормалізація дескрипторів відбувається лише тут
-        self.retriever = FastRetrieval(self.database.global_descriptors)
+        # Choose correct vector retrieval backend based on database config
+        if hasattr(self.database, "lance_table") and self.database.lance_table is not None:
+            self.retriever = LanceDBRetrieval(self.database.lance_table)
+        else:
+            self.retriever = FastRetrieval(self.database.global_descriptors)
 
         # Fallback: SuperPoint+LightGlue для складних сцен
         self.model_manager = self.config.get("_model_manager", None)

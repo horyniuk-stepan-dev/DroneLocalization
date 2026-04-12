@@ -109,3 +109,4 @@ tests/fixtures/long_dummy_video.mp4
 implementation_plan copy.md
 implementation_plan.md
 yolo11n-seg.onnx
+models/lightglue_aliked.pth

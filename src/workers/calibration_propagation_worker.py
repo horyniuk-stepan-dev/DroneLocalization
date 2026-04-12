@@ -262,20 +262,52 @@ class CalibrationPropagationWorker(QThread):
         features: dict,
         num_frames: int,
     ) -> int:
-        """Знаходить просторові замикання через DINOv2 + LightGlue matching."""
-        # Побудова FAISS індексу
-        global_desc = self.database.global_descriptors
-        if global_desc is None or len(global_desc) == 0:
-            logger.warning("No global descriptors — skipping loop closure detection")
+        """Знаходить просторові замикання через DINOv2 (LanceDB/FAISS) + LightGlue matching."""
+        
+        has_lancedb = hasattr(self.database, "lance_table") and self.database.lance_table is not None
+        lance_table = self.database.lance_table if has_lancedb else None
+        
+        # Завантажуємо вектори для швидкого пошуку
+        global_desc_dict = {}
+        
+        if has_lancedb:
+            logger.info("Extracting global descriptors from LanceDB for loop closures...")
+            try:
+                df = lance_table.to_pandas()
+                for _, row in df.iterrows():
+                    fid = int(row["frame_id"])
+                    global_desc_dict[fid] = np.array(row["vector"], dtype=np.float32)
+            except Exception as e:
+                logger.warning(f"Failed to load vectors from LanceDB: {e}")
+        else:
+            global_desc = self.database.global_descriptors
+            if global_desc is not None and len(global_desc) > 0:
+                for i in range(len(global_desc)):
+                    if np.any(global_desc[i]):
+                        global_desc_dict[i] = global_desc[i]
+
+        if not global_desc_dict:
+            logger.warning("No global descriptors available — skipping loop closure detection")
             return 0
 
-        dim = global_desc.shape[1]
-        normed = global_desc / (np.linalg.norm(global_desc, axis=1, keepdims=True) + 1e-8)
-        normed = normed.astype(np.float32)
+        # Нормалізація векторів
+        normed_dict = {}
+        for fid, vec in global_desc_dict.items():
+            norm = np.linalg.norm(vec)
+            normed_dict[fid] = vec / (norm + 1e-8) if norm > 0 else vec
 
-        index = faiss.IndexFlatIP(dim)
-        index.add(normed)
-        logger.info(f"FAISS index built: {index.ntotal} vectors, dim={dim}")
+        # Побудова FAISS індексу якщо немає LanceDB
+        faiss_index = None
+        faiss_id_map = []
+        if not has_lancedb:
+            dim = next(iter(normed_dict.values())).shape[0]
+            faiss_index = faiss.IndexFlatIP(dim)
+            mat = []
+            for fid, vec in normed_dict.items():
+                mat.append(vec)
+                faiss_id_map.append(fid)
+            faiss_index.add(np.array(mat, dtype=np.float32))
+            logger.info(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
 
         count = 0
         already_matched: set[tuple[int, int]] = set()
@@ -285,15 +317,34 @@ class CalibrationPropagationWorker(QThread):
                 break
 
             feat_i = features.get(i)
-            if feat_i is None:
+            if feat_i is None or i not in normed_dict:
                 continue
 
-            # Query top-K кандидатів
-            q = normed[i : i + 1]
-            scores, ids = index.search(q, self.lc_top_k + 1)  # +1 бо сам себе знайде
+            q = normed_dict[i]
+            
+            candidates = []
+            if has_lancedb:
+                try:
+                    res = (
+                        lance_table.search(q.astype(np.float32))
+                        .metric("cosine")
+                        .limit(self.lc_top_k + 1)
+                        .select(["frame_id", "_distance"])
+                        .to_list()
+                    )
+                    for r in res:
+                        candidates.append((r["frame_id"], max(0.0, 1.0 - r["_distance"])))
+                except Exception:
+                    pass
+            else:
+                q_batch = np.array([q], dtype=np.float32)
+                scores, ids = faiss_index.search(q_batch, self.lc_top_k + 1)
+                for raw_idx, sim_score in zip(ids[0], scores[0]):
+                    if raw_idx != -1:
+                        candidates.append((faiss_id_map[raw_idx], float(sim_score)))
 
-            for raw_j, sim_score in zip(ids[0], scores[0]):
-                j = int(raw_j)
+            for j, sim_score in candidates:
+                j = int(j)
                 if j == i or j == -1:
                     continue
                 if abs(i - j) <= self.lc_min_gap:
