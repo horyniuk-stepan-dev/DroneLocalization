@@ -11,6 +11,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 
+from src.geometry.affine_utils import decompose_affine_5dof
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -320,7 +321,7 @@ class PoseGraphOptimizer:
         cx, cy = frame_w / 2.0, frame_h / 2.0
 
         for fid, affine in results.items():
-            pt = np.array([[cx, cy]], dtype=np.float32)
+            pt = np.array([[cx, cy]], dtype=np.float64)
             metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
             try:
                 lat, lon = converter.metric_to_gps(float(metric[0]), float(metric[1]))
@@ -341,7 +342,7 @@ class PoseGraphOptimizer:
             if affine_from is None or affine_to is None:
                 continue
             try:
-                pt = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
+                pt = np.array([[cx, cy]], dtype=np.float64).reshape(-1, 1, 2)
                 m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
                 m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
                 lat1, lon1 = converter.metric_to_gps(float(m_from[0]), float(m_from[1]))
@@ -366,12 +367,7 @@ class PoseGraphOptimizer:
 # ── Вільні утиліти (поза класом) ─────────────────────────────────────────────
 
 
-def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, float]:
-    tx, ty = float(M[0, 2]), float(M[1, 2])
-    sx = float(np.linalg.norm(M[:2, 0]))
-    sy = float(np.linalg.norm(M[:2, 1]))
-    theta = float(np.arctan2(M[1, 0], M[0, 0]))
-    return tx, ty, sx, sy, theta
+# decompose_affine_5dof is imported from src.geometry.affine_utils (single source of truth)
 
 
 def _affine_to_state(affine_2x3: np.ndarray, cx: float, cy: float) -> np.ndarray:
@@ -440,12 +436,12 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
     d = min(frame_w, frame_h) * 0.25
     pts = np.array(
         [[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]],
-        dtype=np.float32,
+        dtype=np.float64,
     )
     transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
     if transformed is None:
         return None
-    transformed = transformed.reshape(-1, 2).astype(np.float32)
+    transformed = transformed.reshape(-1, 2).astype(np.float64)
 
     T, _ = cv2.estimateAffine2D(pts, transformed, method=cv2.LMEDS)
     return T

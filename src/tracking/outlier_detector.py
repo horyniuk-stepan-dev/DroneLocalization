@@ -24,14 +24,14 @@ class OutlierDetector:
 
     def add_position(self, position: tuple, dt: float = 1.0):
         # Тепер зберігаємо і позицію, і dt (час, за який ця позиція була досягнута)
-        self.window.append((np.array(position, dtype=np.float32), max(dt, 0.01)))
+        self.window.append((np.array(position, dtype=np.float64), max(dt, 0.01)))
         self._consecutive_outliers = 0
 
     def is_outlier(self, new_position: tuple, dt: float = 1.0) -> bool:
         if len(self.window) < 3:
             return False
 
-        new_pos_np = np.array(new_position, dtype=np.float32)
+        new_pos_np = np.array(new_position, dtype=np.float64)
         last_pos, _ = self.window[-1]
         safe_dt = max(dt, 0.01)
 

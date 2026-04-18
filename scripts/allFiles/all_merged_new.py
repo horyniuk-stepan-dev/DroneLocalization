@@ -81,7 +81,7 @@ class AnchorCalibration:
         self.quality_flag = self.qa_data.get("quality_flag", "normal")  # 'normal', 'warning', 'bad'
 
     def pixel_to_metric(self, x: float, y: float) -> tuple[float, float]:
-        pt = np.array([[x, y]], dtype=np.float32)
+        pt = np.array([[x, y]], dtype=np.float64)
         result = GeometryTransforms.apply_affine(pt, self.affine_matrix)[0]
         return float(result[0]), float(result[1])
 
@@ -123,7 +123,7 @@ class AnchorCalibration:
 
         return AnchorCalibration(
             frame_id=int(data["frame_id"]),
-            affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
+            affine_matrix=np.array(data["affine_matrix"], dtype=np.float64),
             qa_data=qa,
         )
 
@@ -190,8 +190,8 @@ class MultiAnchorCalibration:
         if existing:
             existing.affine_matrix = affine_matrix
             if qa_data:
+                qa_data["updated_at"] = datetime.now().isoformat()
                 existing.update_qa(qa_data)
-                existing.updated_at = datetime.now().isoformat()
             logger.info(f"Updated anchor for frame {frame_id}")
         else:
             self.anchors.append(AnchorCalibration(frame_id, affine_matrix, qa_data))
@@ -225,7 +225,7 @@ class MultiAnchorCalibration:
         if self._interp is not None:
             M = self._get_interpolated_matrix(float(frame_id))
             if M is not None:
-                pt = np.array([[x, y]], dtype=np.float32)
+                pt = np.array([[x, y]], dtype=np.float64)
                 result = GeometryTransforms.apply_affine(pt, M)[0]
                 return float(result[0]), float(result[1])
 
@@ -297,7 +297,7 @@ class MultiAnchorCalibration:
             # Старий формат (один якір)
             anchor = AnchorCalibration(
                 frame_id=int(data.get("calib_frame_id", 0)),
-                affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
+                affine_matrix=np.array(data["affine_matrix"], dtype=np.float64),
             )
             self.anchors.append(anchor)
         elif "anchors" in data:
@@ -790,7 +790,10 @@ from threading import Thread
 
 import cv2
 import h5py
+import lancedb
 import numpy as np
+import pyarrow as pa
+import shutil
 import torch
 
 from config.config import get_cfg
@@ -816,6 +819,11 @@ class DatabaseBuilder:
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
+        self.use_lancedb = get_cfg(self.config, "database.use_lancedb", True)
+        self.lance_batch_size = get_cfg(self.config, "database.lancedb_batch_size", 64)
+        self.lance_index_min_frames = get_cfg(self.config, "database.lancedb_index_min_frames", 256)
+        self.lance_table = None
+        self.lance_batch = []
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
         if self.matcher:
@@ -1216,6 +1224,18 @@ class DatabaseBuilder:
             )
             raise
         finally:
+            if self.use_lancedb and self.lance_table is not None:
+                if self.lance_batch:
+                    self.lance_table.add(self.lance_batch)
+                    self.lance_batch = []
+                if saved_count >= self.lance_index_min_frames:
+                    logger.info("Building LanceDB IVF-PQ index...")
+                    self.lance_table.create_index(
+                        metric="cosine",
+                        num_partitions=min(256, saved_count // 8),
+                        num_sub_vectors=32
+                    )
+
             # Зберігаємо frame_index_map і actual_num_frames у metadata
             if self.db_file and saved_count > 0:
                 try:
@@ -1381,17 +1401,31 @@ class DatabaseBuilder:
             f"(compression={compression}, chunks={chunk_f}, max_kps={max_kps})"
         )
 
+        if self.use_lancedb:
+            lance_path = Path(self.output_path).parent / "vectors.lance"
+            if lance_path.exists():
+                shutil.rmtree(lance_path)
+            db = lancedb.connect(str(lance_path))
+            schema = pa.schema([
+                pa.field("frame_id", pa.int32()),
+                pa.field("vector", pa.list_(pa.float32(), self.descriptor_dim))
+            ])
+            self.lance_table = db.create_table("global_vectors", schema=schema, mode="create")
+            self.lance_batch = []
+            logger.info(f"LanceDB table created at {lance_path}")
+
         with h5py.File(self.output_path, "w", libver="latest") as f:
             # --- global_descriptors: chunked ---
             g1 = f.create_group("global_descriptors")
-            g1.create_dataset(
-                "descriptors",
-                shape=(num_frames, self.descriptor_dim),
-                maxshape=(None, self.descriptor_dim),
-                dtype="float32",
-                compression=compression,
-                chunks=(min(256, num_frames), self.descriptor_dim),
-            )
+            if not self.use_lancedb:
+                g1.create_dataset(
+                    "descriptors",
+                    shape=(num_frames, self.descriptor_dim),
+                    maxshape=(None, self.descriptor_dim),
+                    dtype="float32",
+                    compression=compression,
+                    chunks=(min(256, num_frames), self.descriptor_dim),
+                )
             g1.create_dataset(
                 "frame_poses",
                 shape=(num_frames, 3, 3),
@@ -1460,8 +1494,17 @@ class DatabaseBuilder:
     def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
         """Save extracted data for a single frame via slice assignment (schema v2)"""
         with Telemetry.profile("hdf5_write"):
-            # global — без змін
-            self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+            if self.use_lancedb:
+                self.lance_batch.append({
+                    "frame_id": frame_id,
+                    "vector": features["global_desc"]
+                })
+                if len(self.lance_batch) >= self.lance_batch_size:
+                    self.lance_table.add(self.lance_batch)
+                    self.lance_batch = []
+            else:
+                self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+            
             self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
             # local — slice assignment замість create_group + create_dataset
@@ -1484,9 +1527,11 @@ class DatabaseBuilder:
 # ================================================================================
 import json
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 import h5py
+import lancedb
 import numpy as np
 
 from src.geometry.coordinates import CoordinateConverter
@@ -1502,6 +1547,7 @@ class DatabaseLoader:
         self.db_path = db_path
         self.db_file: h5py.File | None = None
         self.global_descriptors: np.ndarray | None = None
+        self.lance_table = None
         self.frame_poses: np.ndarray | None = None
         self.metadata: dict[str, Any] = {}
         self.converter: CoordinateConverter | None = None
@@ -1535,14 +1581,26 @@ class DatabaseLoader:
                     f"The database file may be corrupted or was created with an incompatible version."
                 )
 
-            self.global_descriptors = self.db_file["global_descriptors"]["descriptors"][:]
+            lance_path = Path(self.db_path).parent / "vectors.lance"
+            if lance_path.exists():
+                logger.info(f"LanceDB index found at {lance_path}. Loading...")
+                db = lancedb.connect(str(lance_path))
+                self.lance_table = db.open_table("global_vectors")
+                self.global_descriptors = None
+            else:
+                logger.info("LanceDB index not found. Falling back to HDF5 global descriptors.")
+                self.global_descriptors = self.db_file["global_descriptors"]["descriptors"][:]
+
             self.frame_poses = self.db_file["global_descriptors"]["frame_poses"][:]
 
-            logger.info(
-                f"Loaded global descriptors: shape={self.global_descriptors.shape}, "
-                f"dtype={self.global_descriptors.dtype}, "
-                f"mem={self.global_descriptors.nbytes / 1024**2:.1f} MB"
-            )
+            if self.lance_table is not None:
+                logger.info(f"Loaded LanceDB table with {self.lance_table.count_rows()} vectors.")
+            else:
+                logger.info(
+                    f"Loaded global descriptors: shape={self.global_descriptors.shape}, "
+                    f"dtype={self.global_descriptors.dtype}, "
+                    f"mem={self.global_descriptors.nbytes / 1024**2:.1f} MB"
+                )
             logger.info(f"Loaded frame poses: shape={self.frame_poses.shape}")
 
             for key, value in self.db_file["metadata"].attrs.items():
@@ -1551,7 +1609,7 @@ class DatabaseLoader:
 
             if "actual_num_frames" in self.metadata:
                 actual_num = int(self.metadata["actual_num_frames"])
-                total_slots = len(self.global_descriptors)
+                total_slots = len(self.frame_poses)
                 logger.info(
                     f"Database contains {actual_num} actual frames in {total_slots} pre-allocated slots"
                 )
@@ -1562,7 +1620,8 @@ class DatabaseLoader:
                 self.frame_index_map = self.db_file["metadata"]["frame_index_map"][:]
                 logger.debug(f"Frame index map loaded: {len(self.frame_index_map)} entries")
             else:
-                self.frame_index_map = np.arange(len(self.global_descriptors))
+                total_len = len(self.frame_poses)
+                self.frame_index_map = np.arange(total_len)
                 logger.debug("No frame_index_map found — using sequential indices")
 
             # Завантажуємо дані пропагації якщо є
@@ -1570,9 +1629,7 @@ class DatabaseLoader:
 
             logger.success(
                 f"Hot data loaded successfully | "
-                f"{len(self.global_descriptors)} frames, "
-                f"descriptor_dim={self.global_descriptors.shape[1]}, "
-                f"propagated={'yes' if self.is_propagated else 'no'}"
+                f"{len(self.frame_poses)} frames"
             )
 
         except KeyError as e:
@@ -1805,7 +1862,7 @@ def compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarr
     """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
     c = np.cos(angle) * scale
     s = np.sin(angle) * scale
-    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float32)
+    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float64)
 
 
 def unwrap_angles(angles: np.ndarray) -> np.ndarray:
@@ -2293,7 +2350,7 @@ class PoseGraphOptimizer:
         cx, cy = frame_w / 2.0, frame_h / 2.0
 
         for fid, affine in results.items():
-            pt = np.array([[cx, cy]], dtype=np.float32)
+            pt = np.array([[cx, cy]], dtype=np.float64)
             metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
             try:
                 lat, lon = converter.metric_to_gps(float(metric[0]), float(metric[1]))
@@ -2314,7 +2371,7 @@ class PoseGraphOptimizer:
             if affine_from is None or affine_to is None:
                 continue
             try:
-                pt = np.array([[cx, cy]], dtype=np.float32).reshape(-1, 1, 2)
+                pt = np.array([[cx, cy]], dtype=np.float64).reshape(-1, 1, 2)
                 m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
                 m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
                 lat1, lon1 = converter.metric_to_gps(float(m_from[0]), float(m_from[1]))
@@ -2413,12 +2470,12 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
     d = min(frame_w, frame_h) * 0.25
     pts = np.array(
         [[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]],
-        dtype=np.float32,
+        dtype=np.float64,
     )
     transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
     if transformed is None:
         return None
-    transformed = transformed.reshape(-1, 2).astype(np.float32)
+    transformed = transformed.reshape(-1, 2).astype(np.float64)
 
     T, _ = cv2.estimateAffine2D(pts, transformed, method=cv2.LMEDS)
     return T
@@ -2621,8 +2678,8 @@ class GeometryTransforms:
             logger.debug("PoseLib homography invalid, falling back to OpenCV")
 
         # OpenCV backend (USAC_MAGSAC)
-        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
-        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float64)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float64)
 
         H, mask = cv2.findHomography(
             src_pts_cv,
@@ -2693,8 +2750,8 @@ class GeometryTransforms:
     def apply_homography(points: np.ndarray, H: np.ndarray) -> np.ndarray:
         if H is None or len(points) == 0:
             return points
-        points_cv = points.reshape(-1, 1, 2).astype(np.float32)
-        transformed_pts_cv = cv2.perspectiveTransform(points_cv, H)
+        points_cv = points.reshape(-1, 1, 2).astype(np.float64)
+        transformed_pts_cv = cv2.perspectiveTransform(points_cv, H.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)
 
     @staticmethod
@@ -2704,8 +2761,8 @@ class GeometryTransforms:
             logger.debug(f"Cannot estimate affine: need ≥3 points, got {len(src_pts)}")
             return None, None
 
-        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
-        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float64)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float64)
 
         M, mask = cv2.estimateAffine2D(
             src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
@@ -2729,8 +2786,8 @@ class GeometryTransforms:
             logger.debug(f"Cannot estimate partial affine: need ≥2 points, got {len(src_pts)}")
             return None, None
 
-        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
-        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float64)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float64)
 
         M, mask = cv2.estimateAffinePartial2D(
             src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
@@ -2751,8 +2808,8 @@ class GeometryTransforms:
             return points
         if M.shape == (3, 3):
             M = M[:2, :]
-        points_cv = points.reshape(-1, 1, 2).astype(np.float32)
-        transformed_pts_cv = cv2.transform(points_cv, M)
+        points_cv = points.reshape(-1, 1, 2).astype(np.float64)
+        transformed_pts_cv = cv2.transform(points_cv, M.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)
 
 
@@ -3210,7 +3267,7 @@ class CalibrationDialog(QDialog):
             self.points_gps = [tuple(p) for p in pts_gps]
             for i, (p2d, pgps) in enumerate(zip(self.points_2d, self.points_gps)):
                 self.points_list.addItem(
-                    f"  {i + 1}. ({p2d[0]}, {p2d[1]}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
+                    f"  {i + 1}. ({p2d[0]:.1f}, {p2d[1]:.1f}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
                 )
             self._redraw_points()
         else:
@@ -3461,9 +3518,9 @@ class CalibrationDialog(QDialog):
 
     # ── Points ───────────────────────────────────────────────────────────────
 
-    def on_video_clicked(self, x: int, y: int):
+    def on_video_clicked(self, x: float, y: float):
         self.current_2d_point = (x, y)
-        self.lbl_selected_px.setText(f"✔ Обрано піксель: ({x}, {y})")
+        self.lbl_selected_px.setText(f"✔ Обрано піксель: ({x:.1f}, {y:.1f})")
         self._redraw_points()
 
     def add_point_pair(self):
@@ -3481,7 +3538,7 @@ class CalibrationDialog(QDialog):
         self.points_gps.append((lat, lon))
         n = len(self.points_2d)
         self.points_list.addItem(
-            f"  {n}. ({self.current_2d_point[0]}, {self.current_2d_point[1]})"
+            f"  {n}. ({self.current_2d_point[0]:.1f}, {self.current_2d_point[1]:.1f})"
             f"  →  {lat:.5f}, {lon:.5f}"
         )
         self.current_2d_point = None
@@ -4064,11 +4121,11 @@ class CalibrationMixin:
                 reference_gps = points_gps[0] if mode == "UTM" else None
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
 
-            pts_2d_np = np.array(points_2d, dtype=np.float32)
+            pts_2d_np = np.array(points_2d, dtype=np.float64)
             pts_metric = [
                 self.calibration.converter.gps_to_metric(lat, lon) for lat, lon in points_gps
             ]
-            pts_metric_np = np.array(pts_metric, dtype=np.float32)
+            pts_metric_np = np.array(pts_metric, dtype=np.float64)
 
             def calc_metrics(M, src, dst):
                 proj = GeometryTransforms.apply_affine(src, M)
@@ -4139,30 +4196,32 @@ class CalibrationMixin:
                         best_type = "affine_partial (UTM fallback)"
 
             else:
-                # WEB_MERCATOR або інші проекції: стара логіка
-                M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
-                best_M = M_partial
-                best_type = "affine_partial"
-
-                if M_partial is not None:
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(
-                        M_partial, pts_2d_np, pts_metric_np
-                    )
-
-                # Пробуємо повну афінну якщо точок >= 5
-                if len(pts_2d_np) >= 5:
-                    M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
-                    if M_full is not None:
-                        rmse_f, median_f, max_f, proj_f = calc_metrics(
-                            M_full, pts_2d_np, pts_metric_np
+                # WEB_MERCATOR: ТАКОЖ потребує від'ємного детермінанта (Y-flip)
+                # Причина: pixel Y ↓ але metric Y (EPSG:3857) ↑
+                M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
+                if M_full is not None:
+                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
+                    if det > 0:
+                        logger.warning(
+                            f"Anchor {frame_id}: full affine det is POSITIVE ({det:.4f}). "
+                            "WEB_MERCATOR pixel→metric should have negative det (Y-flip). "
+                            "Check point ordering or projection setup."
                         )
-                        if rmse_f < rmse_p * 0.85:
-                            best_M = M_full
-                            best_type = "affine_full"
-                            rmse_p, median_p, max_p, proj_p = rmse_f, median_f, max_f, proj_f
-                            logger.info(
-                                f"Selected full affine for anchor {frame_id} (RMSE: {rmse_f:.2f}m)"
-                            )
+                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
+                    best_M = M_full
+                    best_type = "affine_full"
+
+                # Fallback до partial тільки якщо full не вийшла
+                if best_M is None:
+                    logger.warning(
+                        f"Anchor {frame_id}: estimate_affine failed for WEB_MERCATOR. "
+                        "Falling back to affine_partial — Y-flip will NOT be modeled correctly!"
+                    )
+                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
+                    if M_partial is not None:
+                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
+                        best_M = M_partial
+                        best_type = "affine_partial (WEB_MERCATOR fallback — degraded)"
 
             if best_M is None:
                 QMessageBox.critical(
@@ -5964,7 +6023,7 @@ logger = get_logger(__name__)
 class VideoWidget(QGraphicsView):
     """Displays video frames with optional overlay annotations (calibration points)."""
 
-    frame_clicked = pyqtSignal(int, int)  # pixel coords in image space
+    frame_clicked = pyqtSignal(float, float)  # pixel coords in image space (sub-pixel)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -5996,7 +6055,7 @@ class VideoWidget(QGraphicsView):
         pm = self._video_item.pixmap()
         return pm.devicePixelRatio() if pm and not pm.isNull() else 1.0
 
-    def draw_numbered_point(self, x: int, y: int, label: str, color: QColor):
+    def draw_numbered_point(self, x: float, y: float, label: str, color: QColor):
         """Draw a filled circle with a label at (x, y) in ACTUAL image pixel coordinates."""
         # Конвертуємо з фактичних пікселів у логічні координати сцени
         dpr = self._dpr()
@@ -6060,15 +6119,15 @@ class VideoWidget(QGraphicsView):
             # Множимо на pm_dpr (Device Pixel Ratio), оскільки Qt на High-DPI
             # повертає "логічні" координати (напр. 1280 замість 1920).
             # Нам потрібні ФІЗИЧНІ пікселі зображення для метчингу бази даних.
-            actual_x = int(item_pos.x() * scale_x * pm_dpr)
-            actual_y = int(item_pos.y() * scale_y * pm_dpr)
+            actual_x = (item_pos.x() * scale_x * pm_dpr) + 0.5
+            actual_y = (item_pos.y() * scale_y * pm_dpr) + 0.5
 
             logger.debug(
                 f"CLICK DIAG: "
                 f"event=({event.pos().x()},{event.pos().y()}) "
                 f"scene=({scene_pos.x():.0f},{scene_pos.y():.0f}) "
                 f"item=({item_pos.x():.0f},{item_pos.y():.0f}) "
-                f"actual=({actual_x},{actual_y}) "
+                f"actual=({actual_x:.1f},{actual_y:.1f}) "
                 f"pm_dpr={pm_dpr} screen_dpr={screen_dpr} "
                 f"pixmap={pm.width()}x{pm.height()} "
                 f"bRect={br.width():.0f}x{br.height():.0f} "
@@ -6101,7 +6160,7 @@ import numpy as np
 
 from config.config import get_cfg
 from src.geometry.transformations import GeometryTransforms
-from src.localization.matcher import FastRetrieval
+from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
@@ -6145,8 +6204,11 @@ class Localizer:
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
-        # Створюємо FastRetrieval один раз — нормалізація дескрипторів відбувається лише тут
-        self.retriever = FastRetrieval(self.database.global_descriptors)
+        # Choose correct vector retrieval backend based on database config
+        if hasattr(self.database, "lance_table") and self.database.lance_table is not None:
+            self.retriever = LanceDBRetrieval(self.database.lance_table)
+        else:
+            self.retriever = FastRetrieval(self.database.global_descriptors)
 
         # Fallback: SuperPoint+LightGlue для складних сцен
         self.model_manager = self.config.get("_model_manager", None)
@@ -6752,6 +6814,36 @@ class FastRetrieval:
         scores, ids = self.index.search(q, top_k)
         results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
+class LanceDBRetrieval:
+    """Fast candidate search using LanceDB for vector similarity."""
+
+    def __init__(self, lance_table):
+        logger.info("Initializing LanceDBRetrieval using LanceDB table natively")
+        self.lance_table = lance_table
+
+    def add_descriptor(self, query_desc: np.ndarray, frame_id: int):
+        # LanceDB insertion is usually handled batch-wise in DatabaseLoader.
+        pass
+
+    def find_similar_frames(self, query_desc: np.ndarray, top_k: int = 5) -> list:
+        if self.lance_table is None:
+            return []
+
+        q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
+        
+        try:
+            res = (
+                self.lance_table.search(q.astype(np.float32).flatten())
+                .metric("cosine")
+                .limit(top_k)
+                .select(["frame_id", "_distance"])
+                .to_list()
+            )
+            # повертає [(frame_id, similarity)]
+            return [(int(r["frame_id"]), float(max(0.0, 1.0 - r["_distance"]))) for r in res]
+        except Exception as e:
+            logger.error(f"LanceDB query failed: {e}")
+            return []
 
 
 class FeatureMatcher:
@@ -6768,24 +6860,21 @@ class FeatureMatcher:
         # 0.75 — стандартне значення Lowe's ratio test для нормалізованих L2-дескрипторів.
         self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.75)
 
-        # Базовий екземпляр LightGlue за замовчуванням (ALIKED)
-        self.lightglue_aliked = None
-        self.lightglue_superpoint = None
-        
+        # Завантажуємо LightGlue (ALIKED) через ModelManager
+        self.lightglue = None
         if self.model_manager:
             try:
-                # Початкове завантаження залежатиме від бажаного екстрактора в конфігу
-                main_extractor = get_cfg(self.config, "localization.fallback_extractor", "aliked")
-                if main_extractor == "aliked":
-                    self.lightglue_aliked = self.model_manager.load_lightglue(features="aliked")
-                    logger.info("FeatureMatcher: LightGlue (ALIKED) pre-loaded")
-                elif main_extractor == "superpoint":
-                    self.lightglue_superpoint = self.model_manager.load_lightglue(features="superpoint")
-                    logger.info("FeatureMatcher: LightGlue (SuperPoint) pre-loaded")
+                self.lightglue = self.model_manager.load_lightglue_aliked()
+                logger.info("FeatureMatcher configured to use LightGlue (ALIKED)")
             except Exception as e:
-                logger.warning(f"FeatureMatcher: Failed to pre-load LightGlue: {e}")
+                logger.warning(
+                    f"Failed to load LightGlue ALIKED: {e}. "
+                    f"Cause: model files may be missing or VRAM insufficient. "
+                    f"Falling back to Numpy L2 matching.",
+                    exc_info=True,
+                )
         else:
-            logger.info("FeatureMatcher: Using fast Numpy L2 matching")
+            logger.info("FeatureMatcher configured to use fast Numpy L2 matching")
 
         logger.info(f"FeatureMatcher ratio_threshold = {self.ratio_threshold:.2f}")
 
@@ -6798,27 +6887,17 @@ class FeatureMatcher:
             query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
         )
 
-        # Вибір матчера за розмірністю дескриптора
-        matcher = None
-        if desc_dim == 128:  # ALIKED
-            if self.lightglue_aliked is None and self.model_manager:
-                try:
-                    self.lightglue_aliked = self.model_manager.load_lightglue(features="aliked")
-                except Exception:
-                    pass
-            matcher = self.lightglue_aliked
-        elif desc_dim == 256:  # SuperPoint
-            if self.lightglue_superpoint is None and self.model_manager:
-                try:
-                    self.lightglue_superpoint = self.model_manager.load_lightglue(features="superpoint")
-                except Exception:
-                    pass
-            matcher = self.lightglue_superpoint
+        # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED)
+        if self.lightglue is not None and desc_dim == 128:
+            return self._lightglue_match(query_features, ref_features)
 
-        if matcher is not None:
-            return self._lightglue_match(matcher, query_features, ref_features)
+        if self.lightglue is not None and desc_dim != 128:
+            logger.debug(
+                f"LightGlue available but descriptor dim={desc_dim} != 128 (ALIKED). "
+                f"Using Numpy L2 matching instead."
+            )
 
-        # Fallback (якщо немає LightGlue або інші ознаки як XFeat 64-dim)
+        # Fallback (якщо немає LightGlue або інші ознаки)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def _fast_numpy_match(
@@ -6874,44 +6953,43 @@ class FeatureMatcher:
 
         return mkpts_q, mkpts_r
 
-    def _lightglue_match(self, matcher, query_features: dict, ref_features: dict) -> tuple:
+    def _lightglue_match(self, query_features: dict, ref_features: dict) -> tuple:
         """Matches features using Neural LightGlue Matcher"""
         try:
             if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
+                logger.warning(
+                    f"Empty keypoints provided to LightGlue | "
+                    f"query_kpts={len(query_features['keypoints'])}, "
+                    f"ref_kpts={len(ref_features['keypoints'])}. "
+                    f"Cannot match without keypoints."
+                )
                 return np.empty((0, 2)), np.empty((0, 2))
 
-            # Визначаємо девайс
-            if hasattr(matcher, "parameters"):
-                device = next(matcher.parameters()).device
-            else:
-                # Для JIT/ONNX моделей використовуємо девайс менеджера або за замовчуванням
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = next(self.lightglue.parameters()).device
 
             data = {
                 "image0": {
-                    "keypoints": torch.from_numpy(query_features["keypoints"]).float()[None].to(device),
-                    "descriptors": torch.from_numpy(query_features["descriptors"]).float()[None].to(device),
+                    "keypoints": torch.from_numpy(query_features["keypoints"])
+                    .float()[None]
+                    .to(device),
+                    "descriptors": torch.from_numpy(query_features["descriptors"])
+                    .float()[None]
+                    .to(device),
                 },
                 "image1": {
-                    "keypoints": torch.from_numpy(ref_features["keypoints"]).float()[None].to(device),
-                    "descriptors": torch.from_numpy(ref_features["descriptors"]).float()[None].to(device),
+                    "keypoints": torch.from_numpy(ref_features["keypoints"])
+                    .float()[None]
+                    .to(device),
+                    "descriptors": torch.from_numpy(ref_features["descriptors"])
+                    .float()[None]
+                    .to(device),
                 },
             }
 
             with torch.no_grad():
-                res = matcher(data)
+                res = self.lightglue(data)
 
-            if isinstance(res, dict):
-                # Формат оригінальної бібліотеки
-                matches = res["matches"][0].cpu().numpy()
-            elif isinstance(res, (list, tuple)) and len(res) >= 2:
-                # Формат нашого LightGlueExportWrapper: (matches0, matches1, scores0)
-                m0 = res[0][0].cpu().numpy()  # [Batch=0, N]
-                valid = m0 != -1
-                matches = np.stack([np.where(valid)[0], m0[valid]], axis=-1)
-            else:
-                # Прямий тензор або інший формат
-                matches = res[0].cpu().numpy() if hasattr(res, "cpu") else res[0]
+            matches = res["matches"][0].cpu().numpy()
 
             if len(matches) == 0:
                 return np.empty((0, 2)), np.empty((0, 2))
@@ -8941,10 +9019,22 @@ class CalibrationPropagationWorker(QThread):
             f"({temporal_count} temporal + {spatial_count} spatial)"
         )
 
-        # ── Phase 3: Fix anchors + BFS initialization ───────────────────────
-        self.progress.emit(60, "Фіксація GPS-якорів та ініціалізація графу...")
+        # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
+        self.progress.emit(60, "Фіксація GPS-якорів (Local Origin)...")
+        
+        # Визначаємо локальну опорну точку для математичної стабільності (Local Center)
+        # Використовуємо метричну трансляцію першого якоря
+        ref_anchor = anchors[0]
+        origin_tx = float(ref_anchor.affine_matrix[0, 2])
+        origin_ty = float(ref_anchor.affine_matrix[1, 2])
+        logger.info(f"Local Origin established at: ({origin_tx:.2f}, {origin_ty:.2f})")
+
         for anchor in anchors:
-            optimizer.fix_node(anchor.frame_id, anchor.affine_matrix)
+            # Створюємо копію матриці з відносною трансляцією
+            local_affine = anchor.affine_matrix.copy().astype(np.float64)
+            local_affine[0, 2] -= origin_tx
+            local_affine[1, 2] -= origin_ty
+            optimizer.fix_node(anchor.frame_id, local_affine)
 
         if self.use_bfs:
             bfs_count = optimizer.initialize_from_bfs()
@@ -8959,6 +9049,11 @@ class CalibrationPropagationWorker(QThread):
             tolerance=self.tolerance,
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
+
+        # Відновлюємо абсолютні координати (додаємо Local Origin назад)
+        for fid in results:
+            results[fid][0, 2] += origin_tx
+            results[fid][1, 2] += origin_ty
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
         self.progress.emit(85, "Збереження результатів у HDF5...")
@@ -9060,20 +9155,52 @@ class CalibrationPropagationWorker(QThread):
         features: dict,
         num_frames: int,
     ) -> int:
-        """Знаходить просторові замикання через DINOv2 + LightGlue matching."""
-        # Побудова FAISS індексу
-        global_desc = self.database.global_descriptors
-        if global_desc is None or len(global_desc) == 0:
-            logger.warning("No global descriptors — skipping loop closure detection")
+        """Знаходить просторові замикання через DINOv2 (LanceDB/FAISS) + LightGlue matching."""
+        
+        has_lancedb = hasattr(self.database, "lance_table") and self.database.lance_table is not None
+        lance_table = self.database.lance_table if has_lancedb else None
+        
+        # Завантажуємо вектори для швидкого пошуку
+        global_desc_dict = {}
+        
+        if has_lancedb:
+            logger.info("Extracting global descriptors from LanceDB for loop closures...")
+            try:
+                df = lance_table.to_pandas()
+                for _, row in df.iterrows():
+                    fid = int(row["frame_id"])
+                    global_desc_dict[fid] = np.array(row["vector"], dtype=np.float32)
+            except Exception as e:
+                logger.warning(f"Failed to load vectors from LanceDB: {e}")
+        else:
+            global_desc = self.database.global_descriptors
+            if global_desc is not None and len(global_desc) > 0:
+                for i in range(len(global_desc)):
+                    if np.any(global_desc[i]):
+                        global_desc_dict[i] = global_desc[i]
+
+        if not global_desc_dict:
+            logger.warning("No global descriptors available — skipping loop closure detection")
             return 0
 
-        dim = global_desc.shape[1]
-        normed = global_desc / (np.linalg.norm(global_desc, axis=1, keepdims=True) + 1e-8)
-        normed = normed.astype(np.float32)
+        # Нормалізація векторів
+        normed_dict = {}
+        for fid, vec in global_desc_dict.items():
+            norm = np.linalg.norm(vec)
+            normed_dict[fid] = vec / (norm + 1e-8) if norm > 0 else vec
 
-        index = faiss.IndexFlatIP(dim)
-        index.add(normed)
-        logger.info(f"FAISS index built: {index.ntotal} vectors, dim={dim}")
+        # Побудова FAISS індексу якщо немає LanceDB
+        faiss_index = None
+        faiss_id_map = []
+        if not has_lancedb:
+            dim = next(iter(normed_dict.values())).shape[0]
+            faiss_index = faiss.IndexFlatIP(dim)
+            mat = []
+            for fid, vec in normed_dict.items():
+                mat.append(vec)
+                faiss_id_map.append(fid)
+            faiss_index.add(np.array(mat, dtype=np.float32))
+            logger.info(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
 
         count = 0
         already_matched: set[tuple[int, int]] = set()
@@ -9083,15 +9210,34 @@ class CalibrationPropagationWorker(QThread):
                 break
 
             feat_i = features.get(i)
-            if feat_i is None:
+            if feat_i is None or i not in normed_dict:
                 continue
 
-            # Query top-K кандидатів
-            q = normed[i : i + 1]
-            scores, ids = index.search(q, self.lc_top_k + 1)  # +1 бо сам себе знайде
+            q = normed_dict[i]
+            
+            candidates = []
+            if has_lancedb:
+                try:
+                    res = (
+                        lance_table.search(q.astype(np.float32))
+                        .metric("cosine")
+                        .limit(self.lc_top_k + 1)
+                        .select(["frame_id", "_distance"])
+                        .to_list()
+                    )
+                    for r in res:
+                        candidates.append((r["frame_id"], max(0.0, 1.0 - r["_distance"])))
+                except Exception:
+                    pass
+            else:
+                q_batch = np.array([q], dtype=np.float32)
+                scores, ids = faiss_index.search(q_batch, self.lc_top_k + 1)
+                for raw_idx, sim_score in zip(ids[0], scores[0]):
+                    if raw_idx != -1:
+                        candidates.append((faiss_id_map[raw_idx], float(sim_score)))
 
-            for raw_j, sim_score in zip(ids[0], scores[0]):
-                j = int(raw_j)
+            for j, sim_score in candidates:
+                j = int(j)
                 if j == i or j == -1:
                     continue
                 if abs(i - j) <= self.lc_min_gap:
@@ -9154,10 +9300,10 @@ class CalibrationPropagationWorker(QThread):
         Формат 100% сумісний з існуючим DatabaseLoader.
         """
         num_frames = self.database.get_num_frames()
-        frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float32)
+        frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float64)
         frame_valid = np.zeros(num_frames, dtype=bool)
-        frame_rmse = np.zeros(num_frames, dtype=np.float32)
-        frame_disagreement = np.zeros(num_frames, dtype=np.float32)
+        frame_rmse = np.zeros(num_frames, dtype=np.float64)
+        frame_disagreement = np.zeros(num_frames, dtype=np.float64)
         frame_matches = np.zeros(num_frames, dtype=np.int32)
 
         # Записуємо результати оптимізації
@@ -9927,6 +10073,7 @@ class VideoDecodeWorker(QThread):
         last_play_time = 0.0
 
         while self._is_running:
+            cmd_from_queue = False
             try:
                 # Читаємо команди блокуючи чергу (з таймаутом для плейбеку)
                 if is_playing:
@@ -9936,11 +10083,13 @@ class VideoDecodeWorker(QThread):
 
                     try:
                         cmd, arg = self.cmd_queue.get(timeout=delay)
+                        cmd_from_queue = True
                     except queue.Empty:
                         # Час грати наступний кадр
                         cmd, arg = "next_frame", None
                 else:
                     cmd, arg = self.cmd_queue.get(timeout=0.5)
+                    cmd_from_queue = True
             except queue.Empty:
                 continue
 
@@ -9972,7 +10121,8 @@ class VideoDecodeWorker(QThread):
                             is_playing = False
                             self.playback_stopped.emit()
 
-                self.cmd_queue.task_done()
+                if cmd_from_queue:
+                    self.cmd_queue.task_done()
             except Exception as e:
                 logger.error(f"VideoDecodeWorker error handling command {cmd}: {e}")
                 self.error.emit(str(e))
@@ -10063,6 +10213,8 @@ class VideoDecodeWorker(QThread):
 # File: workers\__init__.py
 # ================================================================================
 """Worker threads module"""
+
+
 # config/config.py
 #
 # Єдиний конфіг для всього застосунку з валідацією через Pydantic.
@@ -10088,6 +10240,9 @@ class DatabaseConfig(BaseModel):
     keyframe_always_save_first: bool = True
     use_decord: bool = True
     decode_batch_size: int = 32
+    use_lancedb: bool = True
+    lancedb_batch_size: int = 64
+    lancedb_index_min_frames: int = 256
 
 
 class ConfidenceConfig(BaseModel):
@@ -10198,15 +10353,15 @@ class ModelsConfig(BaseModel):
     )
     lightglue: ModelSettings = ModelSettings(
         vram_required_mb=800.0,
-        backend="torchscript",
+        backend="git",
         model_path="models/lightglue_aliked.pth",
-        auto_convert=True,
+        auto_convert=False,
     )
     lightglue_superpoint: ModelSettings = ModelSettings(
         vram_required_mb=800.0,
-        backend="torchscript",
+        backend="git",
         model_path="models/lightglue_superpoint.pth",
-        auto_convert=True,
+        auto_convert=False,
     )
     dinov2: ModelSettings = ModelSettings(
         hub_repo="facebookresearch/dinov2", hub_model="dinov2_vitl14", vram_required_mb=1600.0

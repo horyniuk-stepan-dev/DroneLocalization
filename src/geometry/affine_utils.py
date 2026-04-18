@@ -37,7 +37,7 @@ def compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarr
     """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
     c = np.cos(angle) * scale
     s = np.sin(angle) * scale
-    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float32)
+    return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float64)
 
 
 def unwrap_angles(angles: np.ndarray) -> np.ndarray:

@@ -1,4 +1,5 @@
 import gc
+import shutil
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -10,7 +11,6 @@ import h5py
 import lancedb
 import numpy as np
 import pyarrow as pa
-import shutil
 import torch
 
 from config.config import get_cfg
@@ -577,7 +577,7 @@ class DatabaseBuilder:
         if H is None or int(np.sum(mask)) < min_matches:
             return None
 
-        return H.astype(np.float32)
+        return H.astype(np.float64)
 
     def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:
         """
@@ -721,7 +721,7 @@ class DatabaseBuilder:
                     self.lance_batch = []
             else:
                 self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
-            
+
             self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
             # local — slice assignment замість create_group + create_dataset

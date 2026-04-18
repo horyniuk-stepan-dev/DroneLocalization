@@ -146,8 +146,8 @@ class GeometryTransforms:
             logger.debug("PoseLib homography invalid, falling back to OpenCV")
 
         # OpenCV backend (USAC_MAGSAC)
-        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
-        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float64)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float64)
 
         H, mask = cv2.findHomography(
             src_pts_cv,
@@ -218,8 +218,8 @@ class GeometryTransforms:
     def apply_homography(points: np.ndarray, H: np.ndarray) -> np.ndarray:
         if H is None or len(points) == 0:
             return points
-        points_cv = points.reshape(-1, 1, 2).astype(np.float32)
-        transformed_pts_cv = cv2.perspectiveTransform(points_cv, H)
+        points_cv = points.reshape(-1, 1, 2).astype(np.float64)
+        transformed_pts_cv = cv2.perspectiveTransform(points_cv, H.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)
 
     @staticmethod
@@ -229,8 +229,8 @@ class GeometryTransforms:
             logger.debug(f"Cannot estimate affine: need ≥3 points, got {len(src_pts)}")
             return None, None
 
-        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
-        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float64)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float64)
 
         M, mask = cv2.estimateAffine2D(
             src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
@@ -254,8 +254,8 @@ class GeometryTransforms:
             logger.debug(f"Cannot estimate partial affine: need ≥2 points, got {len(src_pts)}")
             return None, None
 
-        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float32)
-        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float32)
+        src_pts_cv = src_pts.reshape(-1, 1, 2).astype(np.float64)
+        dst_pts_cv = dst_pts.reshape(-1, 1, 2).astype(np.float64)
 
         M, mask = cv2.estimateAffinePartial2D(
             src_pts_cv, dst_pts_cv, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold
@@ -276,6 +276,6 @@ class GeometryTransforms:
             return points
         if M.shape == (3, 3):
             M = M[:2, :]
-        points_cv = points.reshape(-1, 1, 2).astype(np.float32)
-        transformed_pts_cv = cv2.transform(points_cv, M)
+        points_cv = points.reshape(-1, 1, 2).astype(np.float64)
+        transformed_pts_cv = cv2.transform(points_cv, M.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)

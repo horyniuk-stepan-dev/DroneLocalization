@@ -78,7 +78,7 @@ class LanceDBRetrieval:
             return []
 
         q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
-        
+
         try:
             res = (
                 self.lance_table.search(q.astype(np.float32).flatten())

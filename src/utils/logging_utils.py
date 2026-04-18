@@ -54,16 +54,22 @@ def silent_output(force: bool = False):
     """
     Context manager to suppress output (stdout/stderr).
     By default, it uses a safe Python-level override.
-    If debug_mode is False (via APP_SETTINGS) or force is True, 
+    If debug_mode is False (via APP_SETTINGS) or force is True,
     it attempts a more aggressive FD-level redirection which catches C++ logs.
     """
-    from config.config import APP_SETTINGS
     import io
+
+    from config.config import APP_SETTINGS
 
     # Determine if we should be truly silent (FD-level) or just Python-silent
     # We use FD-level only if debug_mode is False to avoid the previous "permanent silence" issues
     # or if explicitly forced.
-    is_debug = getattr(getattr(APP_SETTINGS, "models", None), "performance", None).debug_mode if APP_SETTINGS else True
+    is_debug = True  # safe default: non-aggressive mode
+    if APP_SETTINGS:
+        _models = getattr(APP_SETTINGS, "models", None)
+        _perf = getattr(_models, "performance", None) if _models else None
+        if _perf is not None:
+            is_debug = getattr(_perf, "debug_mode", True)
     aggressive = not is_debug or force
 
     if not aggressive:

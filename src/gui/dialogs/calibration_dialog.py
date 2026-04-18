@@ -332,7 +332,7 @@ class CalibrationDialog(QDialog):
             self.points_gps = [tuple(p) for p in pts_gps]
             for i, (p2d, pgps) in enumerate(zip(self.points_2d, self.points_gps)):
                 self.points_list.addItem(
-                    f"  {i + 1}. ({p2d[0]}, {p2d[1]}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
+                    f"  {i + 1}. ({p2d[0]:.1f}, {p2d[1]:.1f}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
                 )
             self._redraw_points()
         else:
@@ -583,9 +583,9 @@ class CalibrationDialog(QDialog):
 
     # ── Points ───────────────────────────────────────────────────────────────
 
-    def on_video_clicked(self, x: int, y: int):
+    def on_video_clicked(self, x: float, y: float):
         self.current_2d_point = (x, y)
-        self.lbl_selected_px.setText(f"✔ Обрано піксель: ({x}, {y})")
+        self.lbl_selected_px.setText(f"✔ Обрано піксель: ({x:.1f}, {y:.1f})")
         self._redraw_points()
 
     def add_point_pair(self):
@@ -603,7 +603,7 @@ class CalibrationDialog(QDialog):
         self.points_gps.append((lat, lon))
         n = len(self.points_2d)
         self.points_list.addItem(
-            f"  {n}. ({self.current_2d_point[0]}, {self.current_2d_point[1]})"
+            f"  {n}. ({self.current_2d_point[0]:.1f}, {self.current_2d_point[1]:.1f})"
             f"  →  {lat:.5f}, {lon:.5f}"
         )
         self.current_2d_point = None

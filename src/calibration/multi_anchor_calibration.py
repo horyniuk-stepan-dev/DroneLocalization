@@ -67,7 +67,7 @@ class AnchorCalibration:
         self.quality_flag = self.qa_data.get("quality_flag", "normal")  # 'normal', 'warning', 'bad'
 
     def pixel_to_metric(self, x: float, y: float) -> tuple[float, float]:
-        pt = np.array([[x, y]], dtype=np.float32)
+        pt = np.array([[x, y]], dtype=np.float64)
         result = GeometryTransforms.apply_affine(pt, self.affine_matrix)[0]
         return float(result[0]), float(result[1])
 
@@ -109,7 +109,7 @@ class AnchorCalibration:
 
         return AnchorCalibration(
             frame_id=int(data["frame_id"]),
-            affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
+            affine_matrix=np.array(data["affine_matrix"], dtype=np.float64),
             qa_data=qa,
         )
 
@@ -211,7 +211,7 @@ class MultiAnchorCalibration:
         if self._interp is not None:
             M = self._get_interpolated_matrix(float(frame_id))
             if M is not None:
-                pt = np.array([[x, y]], dtype=np.float32)
+                pt = np.array([[x, y]], dtype=np.float64)
                 result = GeometryTransforms.apply_affine(pt, M)[0]
                 return float(result[0]), float(result[1])
 
@@ -283,7 +283,7 @@ class MultiAnchorCalibration:
             # Старий формат (один якір)
             anchor = AnchorCalibration(
                 frame_id=int(data.get("calib_frame_id", 0)),
-                affine_matrix=np.array(data["affine_matrix"], dtype=np.float32),
+                affine_matrix=np.array(data["affine_matrix"], dtype=np.float64),
             )
             self.anchors.append(anchor)
         elif "anchors" in data:

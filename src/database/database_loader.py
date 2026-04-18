@@ -228,6 +228,10 @@ class DatabaseLoader:
             else:
                 h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
                 w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
+        else:
+            # Frame group not found — use global metadata fallback
+            h = self.metadata.get("frame_height") or self.metadata.get("height") or 1080
+            w = self.metadata.get("frame_width") or self.metadata.get("width") or 1920
 
         res = (int(h), int(w))
         self._size_cache[frame_id] = res

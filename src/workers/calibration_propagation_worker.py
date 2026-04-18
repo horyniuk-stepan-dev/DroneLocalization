@@ -143,10 +143,22 @@ class CalibrationPropagationWorker(QThread):
             f"({temporal_count} temporal + {spatial_count} spatial)"
         )
 
-        # ── Phase 3: Fix anchors + BFS initialization ───────────────────────
-        self.progress.emit(60, "Фіксація GPS-якорів та ініціалізація графу...")
+        # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
+        self.progress.emit(60, "Фіксація GPS-якорів (Local Origin)...")
+
+        # Визначаємо локальну опорну точку для математичної стабільності (Local Center)
+        # Використовуємо метричну трансляцію першого якоря
+        ref_anchor = anchors[0]
+        origin_tx = float(ref_anchor.affine_matrix[0, 2])
+        origin_ty = float(ref_anchor.affine_matrix[1, 2])
+        logger.info(f"Local Origin established at: ({origin_tx:.2f}, {origin_ty:.2f})")
+
         for anchor in anchors:
-            optimizer.fix_node(anchor.frame_id, anchor.affine_matrix)
+            # Створюємо копію матриці з відносною трансляцією
+            local_affine = anchor.affine_matrix.copy().astype(np.float64)
+            local_affine[0, 2] -= origin_tx
+            local_affine[1, 2] -= origin_ty
+            optimizer.fix_node(anchor.frame_id, local_affine)
 
         if self.use_bfs:
             bfs_count = optimizer.initialize_from_bfs()
@@ -161,6 +173,11 @@ class CalibrationPropagationWorker(QThread):
             tolerance=self.tolerance,
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
+
+        # Відновлюємо абсолютні координати (додаємо Local Origin назад)
+        for fid in results:
+            results[fid][0, 2] += origin_tx
+            results[fid][1, 2] += origin_ty
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
         self.progress.emit(85, "Збереження результатів у HDF5...")
@@ -263,13 +280,13 @@ class CalibrationPropagationWorker(QThread):
         num_frames: int,
     ) -> int:
         """Знаходить просторові замикання через DINOv2 (LanceDB/FAISS) + LightGlue matching."""
-        
+
         has_lancedb = hasattr(self.database, "lance_table") and self.database.lance_table is not None
         lance_table = self.database.lance_table if has_lancedb else None
-        
+
         # Завантажуємо вектори для швидкого пошуку
         global_desc_dict = {}
-        
+
         if has_lancedb:
             logger.info("Extracting global descriptors from LanceDB for loop closures...")
             try:
@@ -321,7 +338,7 @@ class CalibrationPropagationWorker(QThread):
                 continue
 
             q = normed_dict[i]
-            
+
             candidates = []
             if has_lancedb:
                 try:
@@ -407,10 +424,10 @@ class CalibrationPropagationWorker(QThread):
         Формат 100% сумісний з існуючим DatabaseLoader.
         """
         num_frames = self.database.get_num_frames()
-        frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float32)
+        frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float64)
         frame_valid = np.zeros(num_frames, dtype=bool)
-        frame_rmse = np.zeros(num_frames, dtype=np.float32)
-        frame_disagreement = np.zeros(num_frames, dtype=np.float32)
+        frame_rmse = np.zeros(num_frames, dtype=np.float64)
+        frame_disagreement = np.zeros(num_frames, dtype=np.float64)
         frame_matches = np.zeros(num_frames, dtype=np.int32)
 
         # Записуємо результати оптимізації
@@ -418,7 +435,7 @@ class CalibrationPropagationWorker(QThread):
         # незв'язані кадри залишаться з frame_valid = False
         for frame_id, affine in results.items():
             if 0 <= frame_id < num_frames:
-                frame_affine[frame_id] = affine.astype(np.float32)
+                frame_affine[frame_id] = affine.astype(np.float64)
                 frame_valid[frame_id] = True
 
         filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)

@@ -10,7 +10,7 @@ logger = get_logger(__name__)
 class VideoWidget(QGraphicsView):
     """Displays video frames with optional overlay annotations (calibration points)."""
 
-    frame_clicked = pyqtSignal(int, int)  # pixel coords in image space
+    frame_clicked = pyqtSignal(float, float)  # pixel coords in image space (sub-pixel)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -42,7 +42,7 @@ class VideoWidget(QGraphicsView):
         pm = self._video_item.pixmap()
         return pm.devicePixelRatio() if pm and not pm.isNull() else 1.0
 
-    def draw_numbered_point(self, x: int, y: int, label: str, color: QColor):
+    def draw_numbered_point(self, x: float, y: float, label: str, color: QColor):
         """Draw a filled circle with a label at (x, y) in ACTUAL image pixel coordinates."""
         # Конвертуємо з фактичних пікселів у логічні координати сцени
         dpr = self._dpr()
@@ -106,15 +106,15 @@ class VideoWidget(QGraphicsView):
             # Множимо на pm_dpr (Device Pixel Ratio), оскільки Qt на High-DPI
             # повертає "логічні" координати (напр. 1280 замість 1920).
             # Нам потрібні ФІЗИЧНІ пікселі зображення для метчингу бази даних.
-            actual_x = int(item_pos.x() * scale_x * pm_dpr)
-            actual_y = int(item_pos.y() * scale_y * pm_dpr)
+            actual_x = (item_pos.x() * scale_x * pm_dpr) + 0.5
+            actual_y = (item_pos.y() * scale_y * pm_dpr) + 0.5
 
             logger.debug(
                 f"CLICK DIAG: "
                 f"event=({event.pos().x()},{event.pos().y()}) "
                 f"scene=({scene_pos.x():.0f},{scene_pos.y():.0f}) "
                 f"item=({item_pos.x():.0f},{item_pos.y():.0f}) "
-                f"actual=({actual_x},{actual_y}) "
+                f"actual=({actual_x:.1f},{actual_y:.1f}) "
                 f"pm_dpr={pm_dpr} screen_dpr={screen_dpr} "
                 f"pixmap={pm.width()}x{pm.height()} "
                 f"bRect={br.width():.0f}x{br.height():.0f} "

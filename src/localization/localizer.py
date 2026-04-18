@@ -280,7 +280,7 @@ class Localizer:
             "global_angle": best_global_angle,
         }
 
-        center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float32)
+        center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float64)
         pts_in_ref = GeometryTransforms.apply_homography(center_query, M_query_to_ref)
         if pts_in_ref is None or len(pts_in_ref) == 0:
             target_id = (
@@ -303,7 +303,7 @@ class Localizer:
         # Оскільки ми взяли одну центральну точку, просто беремо її координати
         mx = float(pts_metric[0, 0])
         my = float(pts_metric[0, 1])
-        metric_pt = np.array([mx, my], dtype=np.float32)
+        metric_pt = np.array([mx, my], dtype=np.float64)
 
         # 6. Перевіряємо чи нова точка — аномалія (стрибок координат)
         if self.outlier_detector.is_outlier(metric_pt, dt):
@@ -450,7 +450,7 @@ class Localizer:
         # Якщо точки змістилися на dx, dy в поточному кадрі відносно попереднього,
         # то центр поточного дрона фізично знаходився в точці (center - dx, center - dy) у КООРДИНАТАХ ПОПЕРЕДНЬОГО КАДРУ.
         center_query_shifted = np.array(
-            [[rot_width / 2.0 - dx_px, rot_height / 2.0 - dy_px]], dtype=np.float32
+            [[rot_width / 2.0 - dx_px, rot_height / 2.0 - dy_px]], dtype=np.float64
         )
 
         pts_in_ref = GeometryTransforms.apply_homography(
@@ -464,7 +464,7 @@ class Localizer:
             return {"success": False, "error": "OF affine failed"}
 
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
-        metric_pt = np.array([mx, my], dtype=np.float32)
+        metric_pt = np.array([mx, my], dtype=np.float64)
 
         # Оновлення Калмана
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
@@ -559,7 +559,7 @@ class Localizer:
 
         ref_h, ref_w = self.database.get_frame_size(frame_id)
         # Центр кадру в системі координат БД
-        center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float32)
+        center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float64)
         metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
 
         lat, lon = self.calibration.converter.metric_to_gps(metric_pt[0], metric_pt[1])

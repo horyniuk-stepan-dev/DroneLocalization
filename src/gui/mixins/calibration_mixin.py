@@ -73,11 +73,11 @@ class CalibrationMixin:
                 reference_gps = points_gps[0] if mode == "UTM" else None
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
 
-            pts_2d_np = np.array(points_2d, dtype=np.float32)
+            pts_2d_np = np.array(points_2d, dtype=np.float64)
             pts_metric = [
                 self.calibration.converter.gps_to_metric(lat, lon) for lat, lon in points_gps
             ]
-            pts_metric_np = np.array(pts_metric, dtype=np.float32)
+            pts_metric_np = np.array(pts_metric, dtype=np.float64)
 
             def calc_metrics(M, src, dst):
                 proj = GeometryTransforms.apply_affine(src, M)

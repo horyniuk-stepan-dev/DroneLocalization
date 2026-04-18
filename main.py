@@ -7,14 +7,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-os.environ["YOLO_VERBOSE"] = "False"             
-os.environ["OPENCV_LOG_LEVEL"] = "ERROR"           
-os.environ["TRT_LOGGER_SEVERITY"] = "3"           
+os.environ["YOLO_VERBOSE"] = "False"
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+os.environ["TRT_LOGGER_SEVERITY"] = "3"
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", category=UserWarning, message="xFormers is not available")
+
+import traceback
 
 import torch
 from PyQt6.QtCore import Qt, QThread
@@ -23,7 +25,7 @@ from PyQt6.QtWidgets import QApplication
 from config.config import APP_SETTINGS
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
-import traceback
+
 
 class StartupWorker(QThread):
     def __init__(self, model_manager):

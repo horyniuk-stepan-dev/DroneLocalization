@@ -2,8 +2,8 @@ import gc
 import os
 import threading
 import time
-from pathlib import Path
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 
@@ -323,23 +323,23 @@ class ModelManager:
                 # Визначаємо який конфіг використовувати
                 config_key = "models.lightglue" if features == "aliked" else "models.lightglue_superpoint"
                 config = get_cfg(self.config, config_key)
-                
+
                 backend = get_cfg(config, "backend", "git")
                 model_path = get_cfg(config, "model_path", None)
                 vram_req = get_cfg(config, "vram_required_mb", 800.0)
                 auto_convert = get_cfg(config, "auto_convert", True)
-                
+
                 logger.info(f"Loading LightGlue ({features}) using backend: {backend}...")
                 self._ensure_vram_available(vram_req)
-                
+
                 model = None
-                
+
                 # 1. Спроба завантажити як TensorRT або ONNX
                 if backend == "tensorrt" and model_path and os.path.exists(model_path):
                     try:
                         if model_path.endswith(".engine"):
                             logger.info(f"Loading LightGlue TensorRT: {model_path}")
-                            # Для справжнього TRT engine потрібен wrapper. 
+                            # Для справжнього TRT engine потрібен wrapper.
                             # Якщо він не передбачений, попереджаємо.
                             logger.warning("TensorRT engine loading requires specialized wrapper. Falling back.")
                         elif model_path.endswith(".onnx"):
@@ -354,7 +354,7 @@ class ModelManager:
                                 logger.warning("onnxruntime not installed. Falling back.")
                     except Exception as e:
                         logger.warning(f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git.")
-                
+
                 # 2. Спроба завантажити як TorchScript
                 if model is None and (backend == "torchscript" or backend == "tensorrt"):
                     if model_path and os.path.exists(model_path) and model_path.endswith(".pth"):
@@ -374,20 +374,20 @@ class ModelManager:
                     try:
                         if LightGlue is None:
                             raise ImportError("lightglue.LightGlue library not found")
-                        
+
                         logger.info(f"Loading LightGlue ({features}) from library (Git backend)...")
                         model = LightGlue(features=features).eval().to(self.device)
-                        
+
                         if auto_convert and model_path:
                             self._auto_export_lightglue(model, features, model_path, backend)
-                            
+
                     except Exception as e:
                         logger.error(f"Failed to load LightGlue from library: {e}")
                         raise
 
                 self.models[name] = model
                 logger.success(f"LightGlue ({features}) loaded successfully")
-                
+
             self._register_model_usage(name)
             return self.models[name]
 
@@ -396,7 +396,7 @@ class ModelManager:
         try:
             path = Path(model_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             if target_backend in ["torchscript", "tensorrt"] and not path.exists():
                 logger.info(f"Exporting LightGlue ({features}) to TorchScript: {model_path}")
                 model.eval()
@@ -413,11 +413,11 @@ class ModelManager:
                         "image_size": torch.tensor([[1024, 1024]], device=self.device)
                     }
                 }
-                
+
                 try:
                     # Використовуємо обгортку для стабільного трасування
                     wrapper = LightGlueExportWrapper(model)
-                    
+
                     # strict=False для підтримки динамічних форм у LightGlue
                     traced_model = torch.jit.trace(wrapper, (dummy_data,), strict=False)
                     traced_model.save(str(path))
@@ -433,7 +433,7 @@ class ModelManager:
         config = get_cfg(self.config, config_key)
         vram_req = get_cfg(config, "vram_required_mb", 800.0)
         vram_available = self.get_available_vram_mb()
-        
+
         if vram_req > vram_available:
             logger.warning(
                 f"VRAM insufficient for LightGlue ({features}). "
