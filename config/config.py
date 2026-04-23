@@ -56,7 +56,7 @@ class TrackingConfig(BaseModel):
     outlier_window: int = 10
     outlier_threshold_std: float = 150.0
     max_speed_mps: float = 1000.0
-    max_consecutive_outliers: int = 5
+    max_consecutive_outliers: int = 3
     process_fps: float = 1.0
 
 
@@ -198,7 +198,39 @@ class GraphOptimizationConfig(BaseModel):
     export_geojson: bool = True
 
 
+class ObjectTrackingConfig(BaseModel):
+    enabled: bool = True
+    track_activation_threshold: float = 0.25
+    lost_track_buffer: int = 30
+    minimum_matching_threshold: float = 0.8
+    tracked_classes: list[int] = [0, 1, 2, 3, 5, 7]  # COCO: person, bicycle, car, motorcycle, bus, truck
+    show_on_video: bool = True
+    show_on_map: bool = True
+    project_to_gps: bool = True
+
+
+class LiveStreamConfig(BaseModel):
+    enabled: bool = False
+    source_type: str = "file"  # "file" | "rtsp" | "usb"
+    rtsp_url: str = ""
+    usb_device: int = 0
+    reconnect_attempts: int = 5
+    reconnect_delay_sec: float = 2.0
+    buffer_size: int = 1
+
+class NetworkApiConfig(BaseModel):
+    enabled: bool = True
+    ws_enabled: bool = True
+    ws_host: str = "0.0.0.0"
+    ws_port: int = 8765
+    rest_enabled: bool = True
+    rest_host: str = "0.0.0.0"
+    rest_port: int = 8080
+
 class AppConfig(BaseModel):
+    live_stream: LiveStreamConfig = LiveStreamConfig()
+    network_api: NetworkApiConfig = NetworkApiConfig()
+    object_tracking: ObjectTrackingConfig = ObjectTrackingConfig()
     dinov2: Dinov2Config = Dinov2Config()
     database: DatabaseConfig = DatabaseConfig()
     localization: LocalizationConfig = LocalizationConfig()

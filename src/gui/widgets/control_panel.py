@@ -22,6 +22,7 @@ class ControlPanel(QWidget):
     load_database_clicked = pyqtSignal()
     rebuild_database_clicked = pyqtSignal()
     start_tracking_clicked = pyqtSignal()
+    start_live_tracking_clicked = pyqtSignal()
     stop_tracking_clicked = pyqtSignal()
     calibrate_clicked = pyqtSignal()
     load_calibration_clicked = pyqtSignal()
@@ -32,6 +33,7 @@ class ControlPanel(QWidget):
     verify_propagation_clicked = pyqtSignal()
     clear_map_clicked = pyqtSignal()
     stop_db_generation_clicked = pyqtSignal()
+    toggle_objects_clicked = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -106,23 +108,35 @@ class ControlPanel(QWidget):
         track_group = QGroupBox("Локалізація")
         track_layout = QVBoxLayout(track_group)
 
-        self.btn_start_tracking = QPushButton("▶  Почати відстеження")
+        self.btn_start_tracking = QPushButton("▶  Почати відстеження (Файл)")
         self.btn_start_tracking.setStyleSheet(
             "background:#2e7d32; color:white; font-weight:bold; padding:8px;"
+        )
+        self.btn_start_live = QPushButton("📡  Живий потік (RTSP/USB)")
+        self.btn_start_live.setStyleSheet(
+            "background:#0277bd; color:white; font-weight:bold; padding:8px;"
         )
         self.btn_stop_tracking = QPushButton("■  Зупинити відстеження")
         self.btn_stop_tracking.setStyleSheet(
             "background:#c62828; color:white; font-weight:bold; padding:8px;"
         )
         self.btn_localize_image = QPushButton("🔍  Локалізувати одне фото")
+        
+        self.btn_toggle_objects = QPushButton("👀 Показувати об'єкти")
+        self.btn_toggle_objects.setCheckable(True)
+        self.btn_toggle_objects.setChecked(True)
 
         self.btn_start_tracking.clicked.connect(self.start_tracking_clicked)
+        self.btn_start_live.clicked.connect(self.start_live_tracking_clicked)
         self.btn_stop_tracking.clicked.connect(self.stop_tracking_clicked)
         self.btn_localize_image.clicked.connect(self.localize_image_clicked)
+        self.btn_toggle_objects.toggled.connect(self.toggle_objects_clicked)
 
         track_layout.addWidget(self.btn_start_tracking)
+        track_layout.addWidget(self.btn_start_live)
         track_layout.addWidget(self.btn_stop_tracking)
         track_layout.addWidget(self.btn_localize_image)
+        track_layout.addWidget(self.btn_toggle_objects)
 
         # Export group
         export_group = QGroupBox("Результати")
@@ -188,6 +202,7 @@ class ControlPanel(QWidget):
         enabled=False → running state (Start disabled, Stop active)
         """
         self.btn_start_tracking.setEnabled(enabled)
+        self.btn_start_live.setEnabled(enabled)
         self.btn_stop_tracking.setEnabled(not enabled)
 
         # Disable DB/calibration ops during tracking to prevent GPU OOM

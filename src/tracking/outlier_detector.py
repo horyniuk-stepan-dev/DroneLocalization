@@ -22,10 +22,11 @@ class OutlierDetector:
             f"Parameters: window_size={window_size}, threshold_std={threshold_std}, max_speed_mps={max_speed_mps}"
         )
 
-    def add_position(self, position: tuple, dt: float = 1.0):
+    def add_position(self, position: tuple, dt: float = 1.0, reset_consecutive: bool = True):
         # Тепер зберігаємо і позицію, і dt (час, за який ця позиція була досягнута)
         self.window.append((np.array(position, dtype=np.float64), max(dt, 0.01)))
-        self._consecutive_outliers = 0
+        if reset_consecutive:
+            self._consecutive_outliers = 0
 
     def is_outlier(self, new_position: tuple, dt: float = 1.0) -> bool:
         if len(self.window) < 3:

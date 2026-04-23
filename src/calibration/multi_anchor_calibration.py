@@ -199,6 +199,14 @@ class MultiAnchorCalibration:
             logger.info(f"Removed anchor for frame {frame_id}")
         return success
 
+    def clear(self) -> None:
+        """Очищає всі якорі та скидає стан калібрування."""
+        self.anchors.clear()
+        self._interp = None
+        from src.geometry.coordinates import CoordinateConverter
+        self.converter = CoordinateConverter("WEB_MERCATOR")
+        logger.info("Cleared all anchors and reset calibration state.")
+
     def get_metric_position(self, frame_id: int, x: float, y: float) -> tuple[float, float] | None:
         if not self.is_calibrated:
             return None

@@ -234,6 +234,9 @@ class CalibrationMixin:
             if self.project_manager and self.project_manager.is_loaded:
                 self.calibration.save(self.project_manager.calibration_path)
 
+            if hasattr(self, "_update_project_info_panel"):
+                self._update_project_info_panel()
+
             # ── Діагностичний лог по точках ──────────────────────────────────────
             logger.info(f"--- Anchor {frame_id} Point-by-Point Analysis ---")
             for j in range(len(pts_2d_np)):
@@ -280,6 +283,9 @@ class CalibrationMixin:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
                     self.calibration.save(self.project_manager.calibration_path)
+
+                if hasattr(self, "_update_project_info_panel"):
+                    self._update_project_info_panel()
 
                 logger.info(f"Anchor {frame_id} removed from project")
                 self.status_bar.showMessage(
@@ -409,6 +415,9 @@ class CalibrationMixin:
         self.status_bar.showMessage(
             f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}м, Mat: {avg_matches:.0f}"
         )
+
+        if hasattr(self, "_update_project_info_panel"):
+            self._update_project_info_panel()
 
         if self.map_widget:
             self.on_verify_propagation()
@@ -600,6 +609,10 @@ class CalibrationMixin:
             propagated = self.database and self.database.is_propagated
             self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
             self.control_panel.update_status("Калібрування завантажено")
+
+            if hasattr(self, "_update_project_info_panel"):
+                self._update_project_info_panel()
+
             QMessageBox.information(
                 self,
                 "Успіх",

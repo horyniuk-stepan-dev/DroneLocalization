@@ -200,6 +200,17 @@ class DatabaseMixin:
             if self.database:
                 self.database.close()
 
+            # Очищення стану попереднього проєкту
+            if hasattr(self, "calibration") and self.calibration:
+                self.calibration.clear()
+            
+            if hasattr(self, "map_widget") and self.map_widget:
+                self.map_widget.clear_trajectory()
+                self.map_widget.clear_verification_markers()
+            
+            if hasattr(self, "_tracking_results"):
+                self._tracking_results = []
+
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 self.database = DatabaseLoader(db_path)
@@ -355,10 +366,16 @@ class DatabaseMixin:
                 if not path.endswith(".csv"):
                     path += ".csv"
                 ResultExporter.export_csv(self._tracking_results, path)
+                if hasattr(self, "_object_tracking_results") and self._object_tracking_results:
+                    obj_path = path.replace(".csv", "_objects.csv")
+                    ResultExporter.export_objects_csv(self._object_tracking_results, obj_path)
             elif path.endswith(".geojson") or "GeoJSON" in selected_filter:
                 if not path.endswith(".geojson"):
                     path += ".geojson"
                 ResultExporter.export_geojson(self._tracking_results, path)
+                if hasattr(self, "_object_tracking_results") and self._object_tracking_results:
+                    obj_path = path.replace(".geojson", "_objects.geojson")
+                    ResultExporter.export_objects_geojson(self._object_tracking_results, obj_path)
             elif path.endswith(".kml") or "KML" in selected_filter:
                 if not path.endswith(".kml"):
                     path += ".kml"

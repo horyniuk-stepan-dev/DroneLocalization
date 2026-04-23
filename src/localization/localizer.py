@@ -468,7 +468,7 @@ class Localizer:
 
         # Оновлення Калмана
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
-        self.outlier_detector.add_position(filtered_pt, dt=dt)
+        self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
 
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])

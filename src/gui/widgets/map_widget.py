@@ -34,6 +34,10 @@ class MapBridge(QObject):
     showVerificationMarkersSignal = pyqtSignal(str)
     clearVerificationMarkersSignal = pyqtSignal()
 
+    # Object tracking markers (JSON string of points)
+    updateObjectMarkersSignal = pyqtSignal(str)
+    toggleObjectMarkersSignal = pyqtSignal(bool)
+
     # JS -> Python: Map Click
     mapClickedSignal = pyqtSignal(float, float)
 
@@ -154,3 +158,14 @@ class MapWidget(QWebEngineView):
     @pyqtSlot()
     def clear_verification_markers(self):
         self.bridge.clearVerificationMarkersSignal.emit()
+
+    @pyqtSlot(list)
+    def update_object_markers(self, points: list):
+        """
+        Accepts points as list of dicts [{'lat': float, 'lon': float, 'label': str, 'class_name': str}]
+        """
+        self.bridge.updateObjectMarkersSignal.emit(json.dumps(points))
+
+    @pyqtSlot(bool)
+    def set_objects_visible(self, visible: bool):
+        self.bridge.toggleObjectMarkersSignal.emit(visible)

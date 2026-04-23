@@ -162,3 +162,44 @@ class ResultExporter:
             f.write("\n".join(lines))
 
         logger.success(f"Exported {len(results)} points to KML: {output_path}")
+
+    @staticmethod
+    def export_objects_csv(results: list[dict[str, Any]], output_path: str) -> None:
+        """Експорт об'єктів у CSV файл."""
+        if not results:
+            return
+        fieldnames = ["track_id", "class_name", "timestamp", "lat", "lon", "confidence"]
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in results:
+                writer.writerow(row)
+        logger.success(f"Exported {len(results)} objects to CSV: {output_path}")
+
+    @staticmethod
+    def export_objects_geojson(results: list[dict[str, Any]], output_path: str) -> None:
+        """Експорт об'єктів у GeoJSON."""
+        if not results:
+            return
+        features = []
+        for r in results:
+            if "lat" not in r or "lon" not in r:
+                continue
+            point = geojson.Feature(
+                geometry=geojson.Point((r["lon"], r["lat"])),
+                properties={
+                    "type": "object_point",
+                    "track_id": r.get("track_id"),
+                    "class_name": r.get("class_name"),
+                    "confidence": r.get("confidence"),
+                    "timestamp": r.get("timestamp"),
+                },
+            )
+            features.append(point)
+        
+        feature_collection = geojson.FeatureCollection(
+            features, properties={"exported_at": datetime.now().isoformat()}
+        )
+        with open(output_path, "w", encoding="utf-8") as f:
+            geojson.dump(feature_collection, f, indent=2, ensure_ascii=False)
+        logger.success(f"Exported {len(features)} objects to GeoJSON: {output_path}")

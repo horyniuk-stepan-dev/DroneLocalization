@@ -1,7 +1,7 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QDockWidget, QMainWindow, QStatusBar
 
-from config.config import APP_CONFIG
+from config.config import APP_CONFIG, APP_SETTINGS
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader
@@ -10,6 +10,7 @@ from src.gui.widgets.control_panel import ControlPanel
 from src.gui.widgets.map_widget import MapWidget
 from src.gui.widgets.video_widget import VideoWidget
 from src.models.model_manager import ModelManager
+from src.network.coordinates_broker import CoordinatesBroker
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -26,6 +27,8 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         self.project_manager = ProjectManager()
         self.database: DatabaseLoader | None = None
         self.calibration = MultiAnchorCalibration()
+        
+        self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
 
         # Workers
         self.db_worker = None
@@ -82,6 +85,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.load_database_clicked.connect(self.on_load_database)
         cp.rebuild_database_clicked.connect(self.on_rebuild_database)
         cp.start_tracking_clicked.connect(self.on_start_tracking)
+        cp.start_live_tracking_clicked.connect(self.on_start_live_tracking)
         cp.stop_tracking_clicked.connect(self.on_stop_tracking)
         cp.calibrate_clicked.connect(self.on_calibrate)
         cp.load_calibration_clicked.connect(self.on_load_calibration)
@@ -91,6 +95,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.verify_propagation_clicked.connect(self.on_verify_propagation)
         cp.clear_map_clicked.connect(self.map_widget.clear_trajectory)
         cp.export_results_clicked.connect(self.on_export_results)
+        cp.toggle_objects_clicked.connect(self.on_toggle_objects)
         self.map_widget.mapClicked.connect(self._on_map_clicked)
 
     def _on_map_clicked(self, lat: float, lon: float):

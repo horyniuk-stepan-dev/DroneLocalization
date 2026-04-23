@@ -25,6 +25,8 @@ class VideoWidget(QGraphicsView):
 
         self._video_item = QGraphicsPixmapItem()
         self._overlay_items: list = []
+        self._object_overlay_items: list = []
+        self._show_objects = True
         self._scene.addItem(self._video_item)
 
     # ── Display ──────────────────────────────────────────────────────────────
@@ -75,6 +77,63 @@ class VideoWidget(QGraphicsView):
             self._scene.removeItem(item)
             item.setParentItem(None)  # break Qt ownership before Python GC
         self._overlay_items.clear()
+
+    def draw_tracked_objects(self, objects: list):
+        """Малює bounding boxes з track_id та class_name на поточному кадрі."""
+        self.clear_object_overlays()
+        if not self._show_objects:
+            return
+        
+        COLOR_MAP = {
+            0: QColor(255, 100, 100),   # person
+            2: QColor(100, 200, 255),   # car
+            3: QColor(255, 200, 50),    # motorcycle
+            5: QColor(50, 255, 100),    # bus
+            7: QColor(255, 150, 50),    # truck
+        }
+        
+        dpr = self._dpr()
+        
+        for obj in objects:
+            color = COLOR_MAP.get(obj.class_id, QColor(200, 200, 200))
+            
+            lx1 = obj.bbox[0] / dpr
+            ly1 = obj.bbox[1] / dpr
+            lx2 = obj.bbox[2] / dpr
+            ly2 = obj.bbox[3] / dpr
+            
+            rect = self._scene.addRect(
+                lx1, ly1,
+                lx2 - lx1,
+                ly2 - ly1,
+                QPen(color, 2)
+            )
+            self._object_overlay_items.append(rect)
+            
+            label = f"#{obj.track_id} {obj.class_name} {obj.confidence:.0%}"
+            text = self._scene.addText(label)
+            text.setDefaultTextColor(QColor(255, 255, 255))
+            
+            font = text.font()
+            font.setBold(True)
+            img_width = self._video_item.boundingRect().width()
+            pixel_size = max(10, int(img_width) // 100)
+            font.setPixelSize(pixel_size)
+            text.setFont(font)
+            
+            text.setPos(lx1, ly1 - pixel_size - 4)
+            self._object_overlay_items.append(text)
+
+    def clear_object_overlays(self):
+        for item in self._object_overlay_items:
+            self._scene.removeItem(item)
+            item.setParentItem(None)
+        self._object_overlay_items.clear()
+
+    def set_objects_visible(self, visible: bool):
+        self._show_objects = visible
+        if not visible:
+            self.clear_object_overlays()
 
     # ── Events ───────────────────────────────────────────────────────────────
 

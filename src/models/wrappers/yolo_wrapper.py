@@ -45,8 +45,16 @@ class YOLOWrapper:
 
         # verbose=False вимикає зайве логування кожного кадру в консоль
         # half=True для FP16 інференсу
-        # conf=0.50 відкидає слабкі передбачення
-        results = self.model(images, verbose=False, half=self.use_half, conf=0.50)
+        # conf=0.25: збалансований поріг — достатньо для дрібних об'єктів з висоти,
+        # і водночас не генерує масу хибних детекцій, які псують static_mask
+        # classes: обмежуємо детекцію лише потрібними класами (люди, авто)
+        results = self.model(
+            images, 
+            verbose=False, 
+            half=self.use_half, 
+            conf=0.25, 
+            classes=list(self.dynamic_classes)
+        )
 
         MAX_SINGLE_MASK_RATIO = 0.40
         MAX_COMBINED_MASK_RATIO = 0.70

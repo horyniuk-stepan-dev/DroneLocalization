@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox, QInputDialog
 
 from config.config import get_cfg
 from src.localization.localizer import Localizer
@@ -95,9 +95,39 @@ class TrackingMixin:
         if not self._ensure_utm_initialized():
             return
 
+        self._start_tracking_worker(video_path)
+
+    @pyqtSlot()
+    def on_start_live_tracking(self):
+        if not self.database:
+            QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
+            return
+        if not self.calibration.is_calibrated and not (
+            self.database and self.database.is_propagated
+        ):
+            QMessageBox.warning(
+                self, "Увага", "Виконайте калібрування GPS або завантажте базу з пропагацією."
+            )
+            return
+
+        source, ok = QInputDialog.getText(
+            self, 
+            "Живий потік", 
+            "Введіть RTSP URL (rtsp://...) або індекс камери (0, 1, usb:0):", 
+            text="rtsp://"
+        )
+        if not ok or not source:
+            return
+
+        if not self._ensure_utm_initialized():
+            return
+
+        self._start_tracking_worker(source)
+
+    def _start_tracking_worker(self, video_source):
         localizer = self._build_localizer()
         self.tracking_worker = RealtimeTrackingWorker(
-            video_path,
+            video_source,
             localizer,
             model_manager=self.model_manager,
             config=self.config,
@@ -106,10 +136,18 @@ class TrackingMixin:
         self.tracking_worker.location_found.connect(self.on_location_found)
         self.tracking_worker.status_update.connect(self.control_panel.update_status)
         self.tracking_worker.fov_found.connect(self.map_widget.update_fov)
+        self.tracking_worker.objects_detected.connect(self.on_objects_detected)
+        self.tracking_worker.objects_gps_updated.connect(self.on_objects_gps_updated)
         self.tracking_worker.finished.connect(self._on_tracking_finished)
+        
+        if hasattr(self, "coordinates_broker") and self.coordinates_broker:
+            self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
+            self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
+            self.coordinates_broker.set_tracking_active(True)
 
         self.map_widget.clear_trajectory()
         self._tracking_results = []  # Ініціалізуємо список результатів
+        self._object_tracking_results = []  # Список для результатів трекінгу об'єктів
 
         self.control_panel.set_tracking_enabled(False)
         self.tracking_worker.start()
@@ -132,6 +170,8 @@ class TrackingMixin:
         logger.info("Tracking worker finished.")
         if self.model_manager:
             self.model_manager.unpin_all()
+        if hasattr(self, "coordinates_broker") and self.coordinates_broker:
+            self.coordinates_broker.set_tracking_active(False)
         self.control_panel.set_tracking_enabled(True)
         self.status_bar.showMessage("Відстеження зупинено")
         self.control_panel.update_status("Очікування")
@@ -266,3 +306,40 @@ class TrackingMixin:
         self.status_bar.showMessage(
             f"Локалізація: {lat:.6f}, {lon:.6f} | Впевненість: {confidence:.2f} | Точок: {inliers}"
         )
+
+    @pyqtSlot(object)
+    def on_objects_detected(self, objects: list):
+        if hasattr(self.video_widget, "draw_tracked_objects"):
+            self.video_widget.draw_tracked_objects(objects)
+
+    @pyqtSlot(object)
+    def on_objects_gps_updated(self, objects_gps: list):
+        points_to_show = []
+        for obj in objects_gps:
+            points_to_show.append({
+                'lat': obj.lat,
+                'lon': obj.lon,
+                'label': f"#{obj.track_id} {obj.class_name}",
+                'class_name': obj.class_name
+            })
+            
+            if not hasattr(self, "_object_tracking_results"):
+                self._object_tracking_results = []
+            self._object_tracking_results.append({
+                "track_id": obj.track_id,
+                "class_name": obj.class_name,
+                "lat": obj.lat,
+                "lon": obj.lon,
+                "confidence": obj.confidence,
+                "timestamp": str(np.datetime64("now"))
+            })
+            
+        if hasattr(self.map_widget, "update_object_markers"):
+            self.map_widget.update_object_markers(points_to_show)
+
+    @pyqtSlot(bool)
+    def on_toggle_objects(self, checked: bool):
+        if hasattr(self, "video_widget"):
+            self.video_widget.set_objects_visible(checked)
+        if hasattr(self, "map_widget"):
+            self.map_widget.set_objects_visible(checked)

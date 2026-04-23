@@ -120,6 +120,7 @@
         var fovPolygon       = L.polygon([], { color: '#00ff00', weight: 2, fillOpacity: 0.15 }).addTo(map);
         var panoramaOverlay  = null;
         var verificationMarkers = L.layerGroup().addTo(map);
+        var objectMarkersLayer = L.layerGroup().addTo(map);
 
         // ── Bridge functions ──────────────────────────────────────────────────
         function updateMarker(lat, lon) {
@@ -156,6 +157,9 @@
             }
             if (verificationMarkers) {
                 verificationMarkers.clearLayers();
+            }
+            if (objectMarkersLayer) {
+                objectMarkersLayer.clearLayers();
             }
         }
 
@@ -221,6 +225,46 @@
             verificationMarkers.clearLayers();
         }
 
+        function updateObjectMarkers(pointsJson) {
+            objectMarkersLayer.clearLayers();
+            var points = JSON.parse(pointsJson);
+            points.forEach(p => {
+                var colorMap = {
+                    'person': '#ff6464',
+                    'car': '#64c8ff',
+                    'motorcycle': '#ffc832',
+                    'bus': '#32ff64',
+                    'truck': '#ff9632'
+                };
+                var markerColor = colorMap[p.class_name] || '#aaaaaa';
+                var m = L.circleMarker([p.lat, p.lon], {
+                    radius: 6,
+                    color: '#ffffff',
+                    weight: 1,
+                    fillColor: markerColor,
+                    fillOpacity: 0.8
+                });
+                m.bindTooltip(p.label, {
+                    permanent: true,
+                    direction: 'top',
+                    className: 'marker-label'
+                });
+                objectMarkersLayer.addLayer(m);
+            });
+        }
+
+        function toggleObjectMarkers(show) {
+            if (show) {
+                if (!map.hasLayer(objectMarkersLayer)) {
+                    map.addLayer(objectMarkersLayer);
+                }
+            } else {
+                if (map.hasLayer(objectMarkersLayer)) {
+                    map.removeLayer(objectMarkersLayer);
+                }
+            }
+        }
+
         // ── QWebChannel init with retry ───────────────────────────────────────
         // DOMContentLoaded fires before Qt injects `qt.webChannelTransport`
         // → poll with retries instead of a one-shot check
@@ -235,6 +279,8 @@
                     bridge.setPanoramaSignal.connect(setPanoramaOverlay);
                     bridge.showVerificationMarkersSignal.connect(showVerificationMarkers);
                     bridge.clearVerificationMarkersSignal.connect(clearVerificationMarkers);
+                    bridge.updateObjectMarkersSignal.connect(updateObjectMarkers);
+                    bridge.toggleObjectMarkersSignal.connect(toggleObjectMarkers);
 
                     // ── JS -> Python: Notify on map click ─────────────────────
                     map.on('click', function(e) {
