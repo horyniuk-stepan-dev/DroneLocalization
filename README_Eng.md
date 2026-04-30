@@ -1,4 +1,4 @@
-﻿# Drone Topometric Localization System
+# Drone Topometric Localization System
 
 A professional system for topometric localization and visual navigation of drones in environments without a stable GPS signal. By leveraging modern Foundation Models and semantic analysis, the system provides high-precision coordinate determination that is robust to harsh changes in lighting, shadows, weather conditions, and seasons.
 

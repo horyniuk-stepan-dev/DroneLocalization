@@ -110,3 +110,5 @@ implementation_plan copy.md
 implementation_plan.md
 yolo11n-seg.onnx
 models/lightglue_aliked.pth
+.obsidian/*
+CodeGraph/*
