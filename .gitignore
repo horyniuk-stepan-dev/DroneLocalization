@@ -114,3 +114,5 @@ models/lightglue_aliked.pth
 CodeGraph/*
 walkthrough.md
 src/models/weights/*
+third_party/rdd/RDD/models/weights/*
+third_party/rdd/assets/*
