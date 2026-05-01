@@ -112,3 +112,4 @@ yolo11n-seg.onnx
 models/lightglue_aliked.pth
 .obsidian/*
 CodeGraph/*
+walkthrough.md

@@ -269,6 +269,10 @@ class DatabaseLoader:
                 "coords_2d": g["coords_2d"][:],
             }
 
+        # Додаємо image_size для коректної нормалізації у LightGlue
+        h, w = self.get_frame_size(frame_id)
+        res["image_size"] = np.array([h, w], dtype=np.int32)
+
         # LRU-витіснення
         if len(self._feature_cache) >= 200:
             self._feature_cache.popitem(last=False)

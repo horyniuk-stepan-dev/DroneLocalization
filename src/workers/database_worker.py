@@ -15,12 +15,14 @@ class DatabaseGenerationWorker(QThread):
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, video_path: str, output_path: str, model_manager, config=None):
+    def __init__(self, video_path: str, output_path: str, model_manager, config=None,
+                 project_manager=None):
         super().__init__()
         self.video_path = video_path
         self.output_path = output_path
         self.model_manager = model_manager
         self.config = config or {}
+        self.project_manager = project_manager
         self._is_running = True
 
         logger.info("DatabaseGenerationWorker initialized")
@@ -50,6 +52,7 @@ class DatabaseGenerationWorker(QThread):
                 video_path=self.video_path,
                 model_manager=self.model_manager,
                 progress_callback=update_progress,
+                project_manager=self.project_manager,
             )
 
             if self._is_running:

@@ -9,6 +9,7 @@ from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
+from src.utils.resolution_normalizer import ResolutionNormalizer
 from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
@@ -24,7 +25,8 @@ FAILURE_TYPES = {
 
 
 class Localizer:
-    def __init__(self, database, feature_extractor, matcher, calibration, config=None):
+    def __init__(self, database, feature_extractor, matcher, calibration, config=None,
+                 ref_frame_width: int = 0, ref_frame_height: int = 0):
         self.database = database
         self.feature_extractor = feature_extractor
         self.matcher = matcher
@@ -66,6 +68,10 @@ class Localizer:
         self._consecutive_failures = 0
         self._max_failures = get_cfg(self.config, "localization.max_consecutive_failures", 10)
 
+        # Нормалізація роздільної здатності вхідного кадру до еталонної роздільної здатності БД
+        self.normalizer = ResolutionNormalizer(ref_frame_width, ref_frame_height)
+        self._last_scale = 1.0
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
@@ -85,6 +91,12 @@ class Localizer:
                 "detail": f"Exceeded {self._max_failures} consecutive localization failures",
             }
 
+        height, width = query_frame.shape[:2]
+
+        # Нормалізація до еталонної роздільної здатності БД
+        query_frame, self._last_scale = self.normalizer.normalize(query_frame)
+        if static_mask is not None:
+            static_mask = self.normalizer.normalize_mask(static_mask)
         height, width = query_frame.shape[:2]
 
         angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]

@@ -202,6 +202,8 @@ class PanoramaMixin:
             matcher,
             self.calibration,
             {**self.config, "_model_manager": self.model_manager},
+            ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
+            ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
         )
 
         pts_pano, pts_metric = [], []

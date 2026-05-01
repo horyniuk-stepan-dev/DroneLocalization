@@ -26,9 +26,19 @@ class ProjectSettings:
     sensor_width_mm: float = 8.8
     image_width_px: int = 4000
 
+    # Еталонна роздільна здатність відео, з якого побудована БД.
+    # Заповнюється автоматично при побудові бази даних.
+    # 0 означає "не встановлено" (зворотна сумісність зі старими проєктами).
+    ref_frame_width: int = 0
+    ref_frame_height: int = 0
+
     @classmethod
     def from_dict(cls, data: dict):
-        return cls(**data)
+        # Фільтруємо тільки відомі поля для зворотної сумісності
+        import dataclasses
+        known_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered)
 
 
 class ProjectManager:

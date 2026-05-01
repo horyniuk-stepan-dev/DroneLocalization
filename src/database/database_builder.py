@@ -53,11 +53,13 @@ class DatabaseBuilder:
         model_manager,
         progress_callback=None,
         save_keypoint_video: bool = True,
+        project_manager=None,
     ):
         """
         Process video and build database.
         """
         self._temp_model_manager = model_manager
+        self._project_manager = project_manager
         logger.info(f"Starting database build from video: {video_path}")
 
         # Читаємо налаштування з конфігу (з дефолтом)
@@ -128,6 +130,13 @@ class DatabaseBuilder:
         logger.info(
             f"Processing with step={frame_step} -> {num_frames} frames to process ({effective_fps:.2f} effective FPS)"
         )
+
+        # Зберігаємо еталонну роздільну здатність у проєкт
+        if self._project_manager and hasattr(self._project_manager, 'settings') and self._project_manager.settings:
+            self._project_manager.settings.ref_frame_width = width
+            self._project_manager.settings.ref_frame_height = height
+            self._project_manager.save_project()
+            logger.info(f"Reference resolution saved to project: {width}x{height}")
 
         # Ініціалізуємо запис відео з keypoints
         kp_video_path = None

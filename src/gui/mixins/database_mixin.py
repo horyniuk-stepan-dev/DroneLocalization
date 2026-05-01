@@ -89,6 +89,7 @@ class DatabaseMixin:
             output_path=save_path,
             model_manager=self.model_manager,
             config=self.config,
+            project_manager=self.project_manager,
         )
         self.db_worker.progress.connect(self.on_db_progress)
         self.db_worker.completed.connect(self.on_db_completed)

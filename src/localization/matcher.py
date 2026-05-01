@@ -215,24 +215,38 @@ class FeatureMatcher:
 
             device = next(self.lightglue.parameters()).device
 
-            data = {
-                "image0": {
-                    "keypoints": torch.from_numpy(query_features["keypoints"])
-                    .float()[None]
-                    .to(device),
-                    "descriptors": torch.from_numpy(query_features["descriptors"])
-                    .float()[None]
-                    .to(device),
-                },
-                "image1": {
-                    "keypoints": torch.from_numpy(ref_features["keypoints"])
-                    .float()[None]
-                    .to(device),
-                    "descriptors": torch.from_numpy(ref_features["descriptors"])
-                    .float()[None]
-                    .to(device),
-                },
+            # image_size для коректної нормалізації координат [-1, 1] у LightGlue.
+            # Без цього крос-роздільні пари (4K query vs 1080p ref) дають ~0 matches.
+            image0_data = {
+                "keypoints": torch.from_numpy(query_features["keypoints"])
+                .float()[None]
+                .to(device),
+                "descriptors": torch.from_numpy(query_features["descriptors"])
+                .float()[None]
+                .to(device),
             }
+            image1_data = {
+                "keypoints": torch.from_numpy(ref_features["keypoints"])
+                .float()[None]
+                .to(device),
+                "descriptors": torch.from_numpy(ref_features["descriptors"])
+                .float()[None]
+                .to(device),
+            }
+
+            q_size = query_features.get("image_size")
+            r_size = ref_features.get("image_size")
+            if q_size is not None:
+                # image_size очікується як (W, H) у LightGlue
+                image0_data["image_size"] = torch.tensor(
+                    [[int(q_size[1]), int(q_size[0])]], device=device
+                )
+            if r_size is not None:
+                image1_data["image_size"] = torch.tensor(
+                    [[int(r_size[1]), int(r_size[0])]], device=device
+                )
+
+            data = {"image0": image0_data, "image1": image1_data}
 
             with torch.no_grad():
                 res = self.lightglue(data)

@@ -125,7 +125,12 @@ class FeatureExtractor:
                     f"The entire image may be covered by dynamic objects (vehicles, people)."
                 )
 
-        return {"keypoints": keypoints, "descriptors": descriptors, "coords_2d": keypoints.copy()}
+        return {
+            "keypoints": keypoints,
+            "descriptors": descriptors,
+            "coords_2d": keypoints.copy(),
+            "image_size": np.array([image.shape[0], image.shape[1]], dtype=np.int32),
+        }
 
     @torch.no_grad()
     def extract_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
@@ -245,8 +250,9 @@ class FeatureExtractor:
                     kp = np.empty((0, 2), dtype=np.float32)
                     desc = np.empty((0, 128), dtype=np.float32)
 
-            results.append(
-                {"keypoints": kp, "descriptors": desc, "coords_2d": kp.copy(), "global_desc": gd}
-            )
+            results.append({
+                "keypoints": kp, "descriptors": desc, "coords_2d": kp.copy(), "global_desc": gd,
+                "image_size": np.array([images[i].shape[0], images[i].shape[1]], dtype=np.int32),
+            })
 
         return results
