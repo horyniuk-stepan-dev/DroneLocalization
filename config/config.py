@@ -26,6 +26,7 @@ class DatabaseConfig(BaseModel):
     use_lancedb: bool = True
     lancedb_batch_size: int = 64
     lancedb_index_min_frames: int = 256
+    yolo_batch_size: int = 1
 
 
 class ConfidenceConfig(BaseModel):
@@ -123,6 +124,7 @@ class PerformanceConfig(BaseModel):
 
 class ModelsConfig(BaseModel):
     use_cuda: bool = True
+    local_extractor: str = "rdd"  # "aliked" | "rdd"
     yolo: YoloConfig = YoloConfig()
     xfeat: ModelSettings = ModelSettings(
         hub_repo="verlab/accelerated_features",
@@ -131,6 +133,11 @@ class ModelsConfig(BaseModel):
         vram_required_mb=300.0,
     )
     aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
+    rdd: ModelSettings = ModelSettings(
+        vram_required_mb=500.0,
+        model_path="src/models/weights/RDD-v2.pth",
+        max_keypoints=4096,
+    )
     superpoint: ModelSettings = ModelSettings(
         nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
     )
@@ -144,6 +151,12 @@ class ModelsConfig(BaseModel):
         vram_required_mb=800.0,
         backend="git",
         model_path="models/lightglue_superpoint.pth",
+        auto_convert=False,
+    )
+    lightglue_rdd: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        model_path="src/models/weights/RDD_lg-v2.pth",
         auto_convert=False,
     )
     dinov2: ModelSettings = ModelSettings(
@@ -227,7 +240,7 @@ class NetworkApiConfig(BaseModel):
     ws_port: int = 8765
     rest_enabled: bool = True
     rest_host: str = "0.0.0.0"
-    rest_port: int = 8080
+    rest_port: int = 8081
 
 class AppConfig(BaseModel):
     live_stream: LiveStreamConfig = LiveStreamConfig()

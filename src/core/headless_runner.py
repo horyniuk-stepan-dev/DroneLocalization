@@ -63,7 +63,7 @@ class HeadlessRunner:
                 raise ValueError("UTM projection is not initialized and calibration is missing.")
 
     def _build_localizer(self) -> Localizer:
-        xf = self.model_manager.load_aliked()
+        xf = self.model_manager.load_local_extractor()
         nv = self.model_manager.load_dinov2()
 
         cesp = None

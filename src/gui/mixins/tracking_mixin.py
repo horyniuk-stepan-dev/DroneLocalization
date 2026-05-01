@@ -18,7 +18,7 @@ class TrackingMixin:
     def _build_localizer(self) -> Localizer:
         """Shared factory — used by tracking and single-image localization."""
         # ОНОВЛЕНО: Завантажуємо ALIKED та DINOv2
-        xf = self.model_manager.load_aliked()
+        xf = self.model_manager.load_local_extractor()
         nv = self.model_manager.load_dinov2()
 
         # Опціональне завантаження CESP для покращення DINOv2 global descriptors

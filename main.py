@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 os.environ["YOLO_VERBOSE"] = "False"
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 os.environ["TRT_LOGGER_SEVERITY"] = "3"
-
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")

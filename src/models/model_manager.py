@@ -168,12 +168,21 @@ class ModelManager:
     def prewarm(self):
         """Centralized model prewarming, usually called at startup in parallel"""
         logger.info("Starting centralized model prewarm sequence...")
+        local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
         with silent_output():
             self.load_dinov2()
-            self.load_aliked()
-            self.load_lightglue_aliked()
+            self.load_local_extractor()
+            lg_features = "rdd" if local_extractor == "rdd" else "aliked"
+            self.load_lightglue(features=lg_features)
             self.load_yolo()
         logger.success("Centralized model prewarm complete")
+
+    def load_local_extractor(self):
+        """Завантажує поточний локальний екстрактор згідно конфігу (aliked або rdd)."""
+        local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
+        if local_extractor == "rdd":
+            return self.load_rdd()
+        return self.load_aliked()
 
     def load_yolo(self):
         name = "yolo"
@@ -315,13 +324,18 @@ class ModelManager:
     def load_lightglue(self, features: str = "superpoint"):
         """
         Уніфікований метод завантаження LightGlue з підтримкою різних бекендів.
-        features: "aliked" або "superpoint"
+        features: "aliked", "superpoint" або "rdd"
         """
         name = f"lightglue_{features}"
         with self._model_lock:
             if name not in self.models:
                 # Визначаємо який конфіг використовувати
-                config_key = "models.lightglue" if features == "aliked" else "models.lightglue_superpoint"
+                config_key_map = {
+                    "aliked": "models.lightglue",
+                    "superpoint": "models.lightglue_superpoint",
+                    "rdd": "models.lightglue_rdd",
+                }
+                config_key = config_key_map.get(features, "models.lightglue")
                 config = get_cfg(self.config, config_key)
 
                 backend = get_cfg(config, "backend", "git")
@@ -376,7 +390,16 @@ class ModelManager:
                             raise ImportError("lightglue.LightGlue library not found")
 
                         logger.info(f"Loading LightGlue ({features}) from library (Git backend)...")
-                        model = LightGlue(features=features).eval().to(self.device)
+                        
+                        # Для RDD використовуємо архітектуру SuperPoint (256-dim), оскільки 'rdd' не є нативним для бібліотеки
+                        lg_feature_type = "superpoint" if features == "rdd" else features
+                        model = LightGlue(features=lg_feature_type).eval().to(self.device)
+
+                        # Якщо вказано кастомні ваги (наприклад, для rdd), завантажуємо їх
+                        if model_path and os.path.exists(model_path):
+                            state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+                            model.load_state_dict(state_dict, strict=False)
+                            logger.info(f"Loaded custom LightGlue weights from {model_path}")
 
                         if auto_convert and model_path:
                             self._auto_export_lightglue(model, features, model_path, backend)
@@ -400,7 +423,7 @@ class ModelManager:
             if target_backend in ["torchscript", "tensorrt"] and not path.exists():
                 logger.info(f"Exporting LightGlue ({features}) to TorchScript: {model_path}")
                 model.eval()
-                dim = 128 if features == "aliked" else 256
+                dim = {"aliked": 128, "superpoint": 256, "rdd": 256}.get(features, 128)
                 dummy_data = {
                     "image0": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),
@@ -534,6 +557,43 @@ class ModelManager:
     def load_lightglue_aliked(self):
         """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
         return self.load_lightglue(features="aliked")
+
+    def load_rdd(self):
+        """Завантажує RDD extractor (deformable transformer, scale-invariant)"""
+        name = "rdd"
+        with self._model_lock:
+            if name not in self.models:
+                vram_req = get_cfg(self.config, "models.rdd.vram_required_mb", 500.0)
+                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/weights/rdd.pth")
+                max_keypoints = get_cfg(self.config, "models.rdd.max_keypoints", 4096)
+
+                logger.info(f"Loading RDD model (max_keypoints={max_keypoints})...")
+                self._ensure_vram_available(vram_req)
+                try:
+                    from src.models.wrappers.rdd_wrapper import RDDWrapper
+
+                    wrapper = RDDWrapper(
+                        weights_path=weights_path,
+                        device=self.device,
+                        max_keypoints=max_keypoints,
+                    )
+                    self.models[name] = wrapper
+                    logger.success(f"RDD loaded successfully on {self.device}")
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load RDD: {e} | "
+                        f"weights_path={weights_path}, device={self.device}, "
+                        f"available_vram={self.get_available_vram_mb():.0f} MB. "
+                        f"Install: git clone --recursive https://github.com/xtcpete/rdd third_party/rdd",
+                        exc_info=True,
+                    )
+                    raise
+            self._register_model_usage(name)
+            return self.models[name]
+
+    def load_lightglue_rdd(self):
+        """Завантажує LightGlue з вагами для RDD"""
+        return self.load_lightglue(features="rdd")
 
     def load_cesp(self):
         """Завантажує CESP модуль для покращення DINOv2 global descriptors"""

@@ -188,7 +188,7 @@ class DatabaseBuilder:
         if local_ext_type == "xfeat":
             local_model = model_manager.load_xfeat()
         else:
-            local_model = model_manager.load_aliked()
+            local_model = model_manager.load_local_extractor()
 
         nv_model = model_manager.load_dinov2()
 
@@ -327,7 +327,7 @@ class DatabaseBuilder:
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
             # YOLO micro-batching (П8)
-            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 2)
+            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 1)
             if yolo_batch_size > 1:
                 logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
             pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
@@ -410,36 +410,38 @@ class DatabaseBuilder:
 
                 return current_pose, prev_features, saved_count
 
-            while True:
-                idx, data = frame_queue.get()
+            with torch.no_grad():
+                while True:
+                    idx, data = frame_queue.get()
 
-                if idx != -1 and data is not None:
-                    frame, frame_rgb = data
-                    pending_frames.append((idx, frame, frame_rgb))
-                    if len(pending_frames) < yolo_batch_size:
-                        continue  # накопичуємо батч
+                    if idx != -1 and data is not None:
+                        frame, frame_rgb = data
+                        pending_frames.append((idx, frame, frame_rgb))
+                        if len(pending_frames) < yolo_batch_size:
+                            continue  # накопичуємо батч
 
-                # Якщо EOF або батч повний — обробляємо все накопичене
-                if not pending_frames:
-                    break
+                    # Якщо EOF або батч повний — обробляємо все накопичене
+                    if not pending_frames:
+                        break
 
-                processed = _flush_mask_batch(pending_frames)
-                pending_frames = []
+                    processed = _flush_mask_batch(pending_frames)
+                    pending_frames = []
 
-                for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
-                    current_pose, prev_features, saved_count = _process_single_frame(
-                        p_idx,
-                        p_frame,
-                        p_frame_rgb,
-                        p_static_mask,
-                        current_pose,
-                        prev_features,
-                        saved_count,
-                        frame_index_map,
-                    )
-
-                if idx == -1:
-                    break
+                    for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
+                        current_pose, prev_features, saved_count = _process_single_frame(
+                            p_idx,
+                            p_frame,
+                            p_frame_rgb,
+                            p_static_mask,
+                            current_pose,
+                            prev_features,
+                            saved_count,
+                            frame_index_map,
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    if idx == -1:
+                        break
 
         except Exception as e:
             logger.error(

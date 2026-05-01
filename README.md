@@ -48,6 +48,25 @@ pip install -e ".[dev]"
 pip install -e ".[tensorrt]"
 ```
 
+### 1.1 Встановлення RDD (Robust Deformable Detector)
+Оскільки система використовує RDD для стійкої до масштабу локалізації, необхідно завантажити його як сабмодуль та опціонально скомпілювати кастомні CUDA оператори:
+
+```powershell
+# Клонування RDD в third_party
+mkdir third_party
+git clone --recursive https://github.com/xtcpete/rdd third_party/rdd
+
+# Компіляція кастомних CUDA-операторів (рекомендовано для швидкості)
+cd third_party/rdd/RDD/models/ops
+pip install -e .
+cd ../../../../..
+```
+
+**Завантаження ваг (Weights):**
+Вам також необхідно вручну завантажити ваги для RDD:
+1. Завантажте файли `rdd.pth` та `lightglue_rdd.pth` [за цим посиланням](https://drive.google.com/drive/folders/1QgVaqm4iTUCqbWb7_Fi6mX09EHTId0oA).
+2. Помістіть завантажені файли у директорію проєкту `models/weights/`.
+
 > **Примітка:** PyTorch з підтримкою CUDA встановлюється окремо згідно з
 > [офіційною інструкцією](https://pytorch.org/get-started/locally/), оскільки
 > потрібна версія залежить від вашого GPU та драйвера.

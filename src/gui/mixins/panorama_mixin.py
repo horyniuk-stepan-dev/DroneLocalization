@@ -184,7 +184,7 @@ class PanoramaMixin:
             crops.append((img[y1 : y1 + crop_size, x1 : x1 + crop_size], x1, y1))
 
         device = self.model_manager.device
-        xf = self.model_manager.load_aliked()
+        xf = self.model_manager.load_local_extractor()
         nv = self.model_manager.load_dinov2()
 
         cesp = None

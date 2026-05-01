@@ -108,15 +108,17 @@ class FeatureMatcher:
         # 0.75 — стандартне значення Lowe's ratio test для нормалізованих L2-дескрипторів.
         self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.75)
 
-        # Завантажуємо LightGlue (ALIKED) через ModelManager
+        # Завантажуємо LightGlue (ALIKED/RDD) через ModelManager
         self.lightglue = None
         if self.model_manager:
+            local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
+            lg_features = "rdd" if local_extractor == "rdd" else "aliked"
             try:
-                self.lightglue = self.model_manager.load_lightglue_aliked()
-                logger.info("FeatureMatcher configured to use LightGlue (ALIKED)")
+                self.lightglue = self.model_manager.load_lightglue(features=lg_features)
+                logger.info(f"FeatureMatcher configured to use LightGlue ({lg_features})")
             except Exception as e:
                 logger.warning(
-                    f"Failed to load LightGlue ALIKED: {e}. "
+                    f"Failed to load LightGlue ({lg_features}): {e}. "
                     f"Cause: model files may be missing or VRAM insufficient. "
                     f"Falling back to Numpy L2 matching.",
                     exc_info=True,
@@ -135,13 +137,13 @@ class FeatureMatcher:
             query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
         )
 
-        # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED)
-        if self.lightglue is not None and desc_dim == 128:
+        # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED) або 256 (RDD/SuperPoint)
+        if self.lightglue is not None and desc_dim in (128, 256):
             return self._lightglue_match(query_features, ref_features)
 
-        if self.lightglue is not None and desc_dim != 128:
+        if self.lightglue is not None and desc_dim not in (128, 256):
             logger.debug(
-                f"LightGlue available but descriptor dim={desc_dim} != 128 (ALIKED). "
+                f"LightGlue available but descriptor dim={desc_dim} is unsupported. "
                 f"Using Numpy L2 matching instead."
             )
 

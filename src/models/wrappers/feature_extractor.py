@@ -1,4 +1,5 @@
 import contextlib
+import cv2
 
 import numpy as np
 import torch
@@ -13,10 +14,10 @@ logger = get_logger(__name__)
 
 
 class FeatureExtractor:
-    """Combined feature extraction (ALIKED + DINOv2 [+ CESP])"""
+    """Combined feature extraction (ALIKED/RDD + DINOv2 [+ CESP])"""
 
     def __init__(self, local_model, global_model, device="cuda", config=None, cesp_module=None):
-        self.local_model = local_model  # ALIKED
+        self.local_model = local_model  # ALIKED або RDD
         self.global_model = global_model  # DINOv2
         self.device = device
         self.config = config or {}
@@ -44,8 +45,9 @@ class FeatureExtractor:
             logger.info("FP16 mixed precision ENABLED for inference")
 
         cesp_status = "with CESP" if cesp_module is not None else "without CESP"
+        local_name = type(local_model).__name__
         logger.info(
-            f"FeatureExtractor initialized with ALIKED and DINOv2 ({cesp_status}) on {device}"
+            f"FeatureExtractor initialized with {local_name} and DINOv2 ({cesp_status}) on {device}"
         )
 
         if device == "cuda":
@@ -95,11 +97,11 @@ class FeatureExtractor:
         input_dict = {"image": rgb_tensor}
 
         # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
-        with Telemetry.profile("aliked"):
+        with Telemetry.profile("local_extractor"):
             with contextlib.nullcontext():
                 aliked_out = self.local_model(input_dict)
 
-        # LightGlue ALIKED wrapper повертає батч: (1, N, 2) та (1, N, 128)
+        # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
         keypoints = aliked_out["keypoints"][0].cpu().numpy()
         descriptors = aliked_out["descriptors"][0].cpu().numpy()
 
