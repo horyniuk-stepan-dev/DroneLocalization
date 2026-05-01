@@ -211,24 +211,22 @@ class RealtimeTrackingWorker(QThread):
                     
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
-                    # Кешуємо останні відстежені об'єкти для OF-кадрів
-                    last_tracked_objects = tracked_objects if tracked_objects else last_tracked_objects
-                    if tracked_objects:
-                        self.objects_detected.emit(tracked_objects)
+                    # ОНОВЛЕНО: Завжди оновлюємо кеш, навіть якщо порожній, щоб об'єкти могли зникати
+                    last_tracked_objects = tracked_objects
+                    self.objects_detected.emit(tracked_objects)
+                    if object_projector and getattr(self.localizer, "_last_state", None):
+                        H = self.localizer._last_state.get("H")
+                        affine = self.localizer._last_state.get("affine")
+                        angle = self.localizer._last_state.get("global_angle", 0)
                         
-                        if object_projector and getattr(self.localizer, "_last_state", None):
-                            H = self.localizer._last_state.get("H")
-                            affine = self.localizer._last_state.get("affine")
-                            angle = self.localizer._last_state.get("global_angle", 0)
-                            
-                            if H is not None and affine is not None:
-                                objects_gps = object_projector.project_objects(
-                                    tracked_objects, H, affine, angle, frame.shape[1], frame.shape[0]
-                                )
-                                if objects_gps:
-                                    obj_summary = ", ".join([f"{obj.class_name} #{obj.track_id}" for obj in objects_gps])
-                                    logger.info(f"Tracked {len(objects_gps)} objects (KF): {obj_summary}")
-                                    self.objects_gps_updated.emit(objects_gps)
+                        if H is not None and affine is not None:
+                            objects_gps = object_projector.project_objects(
+                                tracked_objects, H, affine, angle, frame.shape[1], frame.shape[0]
+                            )
+                            if objects_gps:
+                                obj_summary = ", ".join([f"{obj.class_name} #{obj.track_id}" for obj in objects_gps])
+                                logger.info(f"Tracked {len(objects_gps)} objects (KF): {obj_summary}")
+                            self.objects_gps_updated.emit(objects_gps)
             else:
                 # ====== OPTICAL FLOW TRACKING ======
                 if prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
@@ -266,7 +264,7 @@ class RealtimeTrackingWorker(QThread):
                         
                         # На OF-кадрах: повторно emit останні відомі об'єкти для візуальної
                         # безперервності (YOLO не запускається, тому нових детекцій немає)
-                        if object_tracker and last_tracked_objects:
+                        if object_tracker:
                             self.objects_detected.emit(last_tracked_objects)
                     else:
                         prev_pts_for_of = None  # Втрата точок — наступний кадр стане ключовим

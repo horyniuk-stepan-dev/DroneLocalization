@@ -2,9 +2,8 @@
 #
 # Єдиний конфіг для всього застосунку з валідацією через Pydantic.
 
-from typing import Any
-
-from pydantic import BaseModel
+import torch
+from pydantic import BaseModel, Field
 
 
 class Dinov2Config(BaseModel):
@@ -122,9 +121,21 @@ class PerformanceConfig(BaseModel):
     debug_mode: bool = True
 
 
+def get_default_local_extractor() -> str:
+    """Визначає дефолтний екстрактор на основі доступної VRAM."""
+    try:
+        if torch.cuda.is_available():
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if total_vram_gb < 7.5:  # 8GB cards usually show ~7.9GB
+                return "aliked"
+    except Exception:
+        pass
+    return "rdd"
+
+
 class ModelsConfig(BaseModel):
     use_cuda: bool = True
-    local_extractor: str = "rdd"  # "aliked" | "rdd"
+    local_extractor: str = Field(default_factory=get_default_local_extractor)  # "aliked" | "rdd"
     yolo: YoloConfig = YoloConfig()
     xfeat: ModelSettings = ModelSettings(
         hub_repo="verlab/accelerated_features",
