@@ -171,6 +171,8 @@ class HomographyConfig(BaseModel):
     ransac_threshold: float = 3.0
     max_iters: int = 2000
     confidence: float = 0.99
+    use_mad_ransac: bool = True  # Адаптивне уточнення порогу через MAD
+    mad_k_factor: float = 2.5   # Чутливість MAD (вищий → м'якший поріг)
 
 
 class GraphOptimizationConfig(BaseModel):

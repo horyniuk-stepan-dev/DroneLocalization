@@ -113,6 +113,39 @@ class GeometryTransforms:
             return False
 
     @staticmethod
+    def compute_mad_threshold(
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        H: np.ndarray,
+        k: float = 2.5,
+        min_threshold: float = 1.0,
+    ) -> float:
+        """MAD-RANSAC: адаптивний поріг на основі медіанного абсолютного відхилення помилок репроєкції.
+
+        Замість фіксованого порогу (3.0 px), обчислює поріг з розподілу помилок:
+            threshold = median(errors) + k * 1.4826 * MAD(errors)
+
+        Це робить RANSAC стійким до зміни GSD (висота польоту) та крос-роздільних пар.
+
+        Args:
+            src_pts: Точки джерела (N, 2)
+            dst_pts: Точки призначення (N, 2)
+            H: Попередньо обчислена гомографія (3x3)
+            k: Коефіцієнт чутливості (вищий → м'якший поріг)
+            min_threshold: Мінімальний поріг (px)
+
+        Returns:
+            Адаптивний поріг репроєкції (px)
+        """
+        pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
+        errors = np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
+        median_err = np.median(errors)
+        mad = np.median(np.abs(errors - median_err))
+        # 1.4826 — константа нормалізації MAD для нормального розподілу
+        threshold = median_err + k * 1.4826 * mad
+        return max(threshold, min_threshold)
+
+    @staticmethod
     def estimate_homography(
         src_pts: np.ndarray,
         dst_pts: np.ndarray,
@@ -121,6 +154,8 @@ class GeometryTransforms:
         confidence: float = 0.99,
         fallback_to_affine: bool = True,
         backend: str = "opencv",
+        use_mad_ransac: bool = False,
+        mad_k_factor: float = 2.5,
     ):
         """
         Estimate Homography with configurable backend.
@@ -175,6 +210,21 @@ class GeometryTransforms:
                 f"src_pts={len(src_pts)}, threshold={ransac_threshold}"
             )
             return None, None
+
+        # MAD-RANSAC: адаптивне уточнення inlier mask
+        if use_mad_ransac and H is not None:
+            mad_threshold = GeometryTransforms.compute_mad_threshold(
+                src_pts, dst_pts, H, k=mad_k_factor
+            )
+            # Перерахунок inlier mask з адаптивним порогом
+            pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
+            errors = np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
+            mask = (errors < mad_threshold).astype(np.uint8).reshape(-1, 1)
+            logger.debug(
+                f"MAD-RANSAC: initial_thresh={ransac_threshold:.1f} -> "
+                f"adaptive_thresh={mad_threshold:.2f} px, "
+                f"inliers={int(mask.sum())}/{len(mask)}"
+            )
 
         return H, mask
 

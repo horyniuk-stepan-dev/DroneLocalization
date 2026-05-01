@@ -38,6 +38,8 @@ class Localizer:
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
         self.enable_auto_rotation = get_cfg(self.config, "localization.auto_rotation", True)
         self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
+        self.use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
+        self.mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
 
         self.trajectory_filter = TrajectoryFilter(
             process_noise=get_cfg(self.config, "tracking.kalman_process_noise", 2.0),
@@ -179,6 +181,8 @@ class Localizer:
                         mkpts_q, mkpts_r,
                         ransac_threshold=self.ransac_thresh,
                         backend=self.homography_backend,
+                        use_mad_ransac=self.use_mad_ransac,
+                        mad_k_factor=self.mad_k_factor,
                     )
 
                 if H_eval is not None:

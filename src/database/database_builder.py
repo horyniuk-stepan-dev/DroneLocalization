@@ -566,6 +566,8 @@ class DatabaseBuilder:
         min_matches = get_cfg(self.config, "database.inter_frame_min_matches", 15)
         ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
         homography_backend = get_cfg(self.config, "homography.backend", "opencv")
+        use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
+        mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
 
         if self.matcher is None:
             # Спробуємо отримати model_manager з контексту, якщо він є
@@ -581,6 +583,8 @@ class DatabaseBuilder:
             mkpts_a, mkpts_b,
             ransac_threshold=ransac_thresh,
             backend=homography_backend,
+            use_mad_ransac=use_mad_ransac,
+            mad_k_factor=mad_k_factor,
         )
 
         if H is None or int(np.sum(mask)) < min_matches:
