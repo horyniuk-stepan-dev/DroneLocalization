@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -116,3 +116,5 @@ walkthrough.md
 src/models/weights/*
 third_party/rdd/RDD/models/weights/*
 third_party/rdd/assets/*
+models/*
+third_party/Depth-Anything-V2/assets/*

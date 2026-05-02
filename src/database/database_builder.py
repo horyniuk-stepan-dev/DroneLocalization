@@ -217,6 +217,19 @@ class DatabaseBuilder:
             )
             logger.info(f"Patchify ENABLED for DB build: {patchify.num_patches} patches per frame")
 
+        # Phase 2.1: Depth estimator integration
+        self._depth_estimator = None
+        depth_backend = get_cfg(self.config, "models.depth_estimator.backend", "depth_anything_v2")
+        if depth_backend != "none":
+            try:
+                from src.depth.depth_estimator import DepthEstimator
+                self._depth_estimator = DepthEstimator.build(
+                    backend=depth_backend, device=model_manager.device
+                )
+                logger.info(f"Depth estimator ({depth_backend}) initialized for DB build")
+            except Exception as e:
+                logger.warning(f"Failed to initialize depth estimator: {e}")
+
         # Fix 10: Dynamic descriptor dimension detection to avoid broadcast errors
         try:
             if torch.cuda.is_available():
@@ -370,6 +383,16 @@ class DatabaseBuilder:
                 # Patchify: витягуємо патч-дескриптори
                 if patchify is not None:
                     features["patch_descriptors"] = patchify.compute_patch_descriptors(p_frame_rgb)
+
+                # Phase 2.2: Depth estimation for scale recovery
+                features["depth_scale"] = np.float32(1.0)
+                if self._depth_estimator is not None:
+                    try:
+                        features["depth_scale"] = np.float32(
+                            self._depth_estimator.get_relative_scale(p_frame_rgb)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Depth estimation failed for frame {p_idx}: {e}")
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
@@ -737,6 +760,16 @@ class DatabaseBuilder:
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
 
+            # Phase 2.2: Dataset for depth scales
+            g3.create_dataset(
+                "depth_scales",
+                shape=(num_frames,),
+                maxshape=(None,),
+                dtype="float32",
+                compression=compression,
+                fillvalue=1.0,
+            )
+
             # --- Patchify: мультимасштабні патч-дескриптори ---
             if use_patchify and num_patches > 0:
                 pf = f.create_group("patch_descriptors")
@@ -790,3 +823,7 @@ class DatabaseBuilder:
             # Patchify descriptors
             if "patch_descriptors" in features and "patch_descriptors" in self.db_file:
                 self.db_file["patch_descriptors"]["descriptors"][frame_id] = features["patch_descriptors"]
+
+            # Save depth scale
+            if "depth_scale" in features:
+                self.db_file["metadata"]["depth_scales"][frame_id] = features["depth_scale"]
