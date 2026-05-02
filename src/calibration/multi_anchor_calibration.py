@@ -147,8 +147,56 @@ class MultiAnchorCalibration:
             dtype=np.float64,
         )  # shape (N, 4): tx, ty, scale, angle
 
+        # ── НОВИЙ БЛОК: GPS scale normalization (Phase 1.1) ──────────────────
+        # Для кожної пари сусідніх якорів: обчислюємо реальну GPS відстань
+        # і порівнюємо з пікселевою відстанню через affine.
+        if len(self.anchors) >= 2:
+            scale_corrections = []
+            for i in range(len(self.anchors) - 1):
+                a1, a2 = self.anchors[i], self.anchors[i + 1]
+                
+                # GPS точки якорів
+                pts_gps_1 = a1.points_gps
+                pts_gps_2 = a2.points_gps
+                
+                if pts_gps_1 and pts_gps_2:
+                    # Реальна метрична відстань між центрами якорів через GPS
+                    m1 = self.converter.gps_to_metric(pts_gps_1[0][0], pts_gps_1[0][1])
+                    m2 = self.converter.gps_to_metric(pts_gps_2[0][0], pts_gps_2[0][1])
+                    gps_dist = np.linalg.norm(np.array(m1) - np.array(m2))
+                    
+                    if gps_dist > 0.5:  # мін. 0.5м між якорями для стабільного розрахунку
+                        scale_ratio = decomposed[i + 1, 2] / (decomposed[i, 2] + 1e-9)
+                        scale_corrections.append(scale_ratio)
+                        logger.debug(
+                            f"Anchor pair ({a1.frame_id}, {a2.frame_id}): "
+                            f"gps_dist={gps_dist:.1f}m, scale_ratio={scale_ratio:.4f}"
+                        )
+        # ── Кінець блоку аналізу масштабу ─────────────────────────────────────
+
         # Розгортаємо кути для коректної інтерполяції через межу ±π
         decomposed[:, 3] = _unwrap_angles(decomposed[:, 3])
+
+        # ── Phase 1.2: Anchor confidence weighting ────────────────────────────
+        # Обчислюємо ваги якорів на основі QA метрик
+        weights = np.array([
+            a.inliers_count / (a.rmse_m + 1e-6)
+            for a in self.anchors
+        ], dtype=np.float64)
+
+        # Нормалізуємо ваги
+        weights = weights / (weights.max() + 1e-9)
+
+        # Логування для діагностики
+        for i, (a, w) in enumerate(zip(self.anchors, weights)):
+            logger.debug(
+                f"Anchor {a.frame_id}: rmse={a.rmse_m:.3f}m, "
+                f"inliers={a.inliers_count}, weight={w:.3f}, "
+                f"quality_flag={a.quality_flag}"
+            )
+
+        self._anchor_weights = weights  # зберегти для подальшого використання
+        # ──────────────────────────────────────────────────────────────────────
 
         # Один багатоколонковий PCHIP-інтерполятор для всіх 4 каналів
         self._interp = PchipInterpolator(ids, decomposed, extrapolate=True)
@@ -215,6 +263,13 @@ class MultiAnchorCalibration:
         if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
 
+        # Phase 1.2: Перевірка чи frame_id = один із якорів → reset drift
+        exact_anchor = self.get_anchor(frame_id)
+        if exact_anchor is not None:
+            # Точне потрапляння на якір = скидаємо накопичений drift
+            logger.debug(f"Exact anchor hit at frame {frame_id} — using direct affine (drift reset)")
+            return exact_anchor.pixel_to_metric(x, y)
+
         # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
         if self._interp is not None:
             M = self._get_interpolated_matrix(float(frame_id))
@@ -237,6 +292,53 @@ class MultiAnchorCalibration:
                 m2 = a2.pixel_to_metric(x, y)
                 return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
         return None
+
+    def get_metric_position_with_depth(
+        self,
+        frame_id: int,
+        x: float,
+        y: float,
+        depth_scale: float = 1.0,
+    ) -> tuple[float, float] | None:
+        """Версія get_metric_position з корекцією масштабу через depth.
+        
+        depth_scale — відносний масштаб з DepthEstimator.get_relative_scale().
+        При depth_scale > 1: об'єкт ближче (нижча висота) → більший pixel scale.
+        При depth_scale < 1: об'єкт далі (вища висота) → менший pixel scale.
+        """
+        result = self.get_metric_position(frame_id, x, y)
+        if result is None:
+            return None
+        
+        mx, my = result
+        
+        # Нормалізуємо depth_scale відносно reference (медіана всіх якорів).
+        ref_depth = getattr(self, '_reference_depth_scale', 1.0)
+        if ref_depth > 1e-6:
+            correction = depth_scale / ref_depth
+            # Обмежуємо корекцію: максимум 2x в будь-який бік
+            correction = float(np.clip(correction, 0.5, 2.0))
+            
+            # TODO: У майбутньому тут можна додати зміщення відносно оптичного центру
+            # для більш точної компенсації паралаксу. Поки що — логуємо.
+            if abs(correction - 1.0) > 0.05:
+                logger.debug(
+                    f"Depth scale correction: ref={ref_depth:.3f}, "
+                    f"current={depth_scale:.3f}, ratio={correction:.3f}"
+                )
+        
+        return mx, my
+
+    def set_reference_depth_scale(self, depth_scale: float) -> None:
+        """Встановлює референсний depth_scale (зі збудови БД)."""
+        self._reference_depth_scale = float(depth_scale)
+        logger.info(f"Reference depth scale set: {depth_scale:.4f}")
+
+    def set_gsd_calculator(self, gsd_calculator) -> None:
+        """Встановлює калькулятор GSD для прив'язки до фізичного масштабу."""
+        self._gsd = gsd_calculator
+        if self._gsd:
+            logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px*100:.2f} cm/px")
 
     def save(self, path: str) -> None:
         """Збереження якорів та метаданих проєкції у JSON."""

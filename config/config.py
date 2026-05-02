@@ -81,7 +81,7 @@ class GuiConfig(BaseModel):
 
 
 class YoloConfig(BaseModel):
-    model_path: str = "yolo11n-seg.pt"
+    model_path: str = "models/yolo11n-seg.pt"
     vram_required_mb: float = 200.0
     description: str = "YOLOv11n-seg (Nano) for dynamic object masking"
 
@@ -152,7 +152,7 @@ class ModelsConfig(BaseModel):
     aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
     rdd: ModelSettings = ModelSettings(
         vram_required_mb=500.0,
-        model_path="src/models/weights/RDD-v2.pth",
+        model_path="models/RDD-v2.pth",
         max_keypoints=4096,
     )
     superpoint: ModelSettings = ModelSettings(
@@ -173,7 +173,7 @@ class ModelsConfig(BaseModel):
     lightglue_rdd: ModelSettings = ModelSettings(
         vram_required_mb=800.0,
         backend="git",
-        model_path="src/models/weights/RDD_lg-v2.pth",
+        model_path="models/RDD_lg-v2.pth",
         auto_convert=False,
     )
     dinov2: ModelSettings = ModelSettings(

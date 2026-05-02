@@ -564,7 +564,7 @@ class ModelManager:
         with self._model_lock:
             if name not in self.models:
                 vram_req = get_cfg(self.config, "models.rdd.vram_required_mb", 500.0)
-                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/weights/rdd.pth")
+                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/rdd.pth")
                 max_keypoints = get_cfg(self.config, "models.rdd.max_keypoints", 4096)
 
                 logger.info(f"Loading RDD model (max_keypoints={max_keypoints})...")

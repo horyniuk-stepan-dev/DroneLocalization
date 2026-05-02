@@ -139,8 +139,24 @@ class Localizer:
             else:
                 logger.info(
                     "Patchify enabled in config but database has no patch_descriptors. "
-                    "Rebuild the database with use_patchify=True to enable patchify retrieval."
                 )
+        
+        # Phase 3.2: GSD integration
+        project_manager = self.config.get("_project_manager", None)
+        if project_manager and project_manager.settings:
+            try:
+                from src.geometry.gsd_calculator import GSDCalculator
+                s = project_manager.settings
+                gsd = GSDCalculator(
+                    altitude_m=getattr(s, "altitude_m", 100.0),
+                    focal_length_mm=getattr(s, "focal_length_mm", 13.2),
+                    sensor_width_mm=getattr(s, "sensor_width_mm", 8.8),
+                    image_width_px=getattr(s, "image_width_px", 4000),
+                )
+                gsd.log_summary()
+                self.calibration.set_gsd_calculator(gsd)
+            except Exception as e:
+                logger.warning(f"Failed to initialize GSD Calculator: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
 

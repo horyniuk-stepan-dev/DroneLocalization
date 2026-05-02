@@ -50,10 +50,10 @@ class RDDWrapper:
     детекції keypoints та побудови дескрипторів.
 
     Output format ідентичний ALIKED:
-        {\"keypoints\": (1, N, 2), \"descriptors\": (1, N, D)}
+        {"keypoints": (1, N, 2), "descriptors": (1, N, D)}
 
     Usage:
-        wrapper = RDDWrapper(weights_path=\"models/weights/rdd.pth\", device=\"cuda\")
+        wrapper = RDDWrapper(weights_path="models/rdd.pth", device="cuda")
         model = wrapper.model  # Pass to FeatureExtractor as local_model
     """
 
