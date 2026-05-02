@@ -220,8 +220,21 @@ class RealtimeTrackingWorker(QThread):
                         angle = self.localizer._last_state.get("global_angle", 0)
                         
                         if H is not None and affine is not None:
+                            # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
+                            scale = getattr(self.localizer, "_last_scale", 1.0)
+                            
+                            # Створюємо копії об'єктів з масштабованими координатами
+                            from copy import deepcopy
+                            scaled_tracked_objects = []
+                            for obj in tracked_objects:
+                                s_obj = deepcopy(obj)
+                                s_obj.center_px = (obj.center_px[0] * scale, obj.center_px[1] * scale)
+                                s_obj.bbox = [c * scale for c in obj.bbox]
+                                scaled_tracked_objects.append(s_obj)
+                            
                             objects_gps = object_projector.project_objects(
-                                tracked_objects, H, affine, angle, frame.shape[1], frame.shape[0]
+                                scaled_tracked_objects, H, affine, angle, 
+                                int(frame.shape[1] * scale), int(frame.shape[0] * scale)
                             )
                             if objects_gps:
                                 obj_summary = ", ".join([f"{obj.class_name} #{obj.track_id}" for obj in objects_gps])

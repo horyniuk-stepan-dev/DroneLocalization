@@ -2,6 +2,8 @@
 #
 # Єдиний конфіг для всього застосунку з валідацією через Pydantic.
 
+from typing import Any
+
 import torch
 from pydantic import BaseModel, Field
 
@@ -48,6 +50,10 @@ class LocalizationConfig(BaseModel):
     enable_lightglue_fallback: bool = True
     fallback_extractor: str = "aliked"
     confidence: ConfidenceConfig = ConfidenceConfig()
+    use_patchify: bool = True  # Мультимасштабний retrieval через патч-дескриптори DINOv2
+    patchify_grids: list[list[int]] = [[1, 1], [2, 2], [3, 3]]  # 1+4+9 = 14 патчів
+    patchify_batch_size: int = 1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
+    patchify_merge_weight: float = 0.4  # Вага патчів при злитті (w_standard = 1 - w_patch)
 
 
 class TrackingConfig(BaseModel):

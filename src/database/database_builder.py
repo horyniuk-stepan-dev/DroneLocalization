@@ -204,6 +204,19 @@ class DatabaseBuilder:
         )
         logger.success("All models loaded successfully")
 
+        # Patchify: мультимасштабні патч-дескриптори
+        use_patchify = get_cfg(self.config, "localization.use_patchify", False)
+        patchify = None
+        if use_patchify:
+            from src.localization.patchify import PatchifyRetrieval
+            patchify_grids = get_cfg(self.config, "localization.patchify_grids", [[1,1],[2,2],[3,3]])
+            patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
+            patchify = PatchifyRetrieval(
+                feature_extractor, descriptor_dim=self.descriptor_dim,
+                grids=patchify_grids, batch_size=patchify_batch,
+            )
+            logger.info(f"Patchify ENABLED for DB build: {patchify.num_patches} patches per frame")
+
         # Fix 10: Dynamic descriptor dimension detection to avoid broadcast errors
         try:
             if torch.cuda.is_available():
@@ -256,7 +269,8 @@ class DatabaseBuilder:
 
         # Create empty database structure
         logger.info("Creating HDF5 database structure...")
-        self.create_hdf5_structure(num_frames, width, height)
+        self.create_hdf5_structure(num_frames, width, height, use_patchify=use_patchify,
+                                  num_patches=patchify.num_patches if patchify else 0)
 
         current_pose = np.eye(3, dtype=np.float32)
         prev_features = None
@@ -352,6 +366,10 @@ class DatabaseBuilder:
                 """Обробляє один кадр після YOLO: feature extraction, pose, keyframe selection."""
                 features = feature_extractor.extract_features(p_frame_rgb, p_static_mask)
                 features["coords_2d"] = features["keypoints"]
+
+                # Patchify: витягуємо патч-дескриптори
+                if patchify is not None:
+                    features["patch_descriptors"] = patchify.compute_patch_descriptors(p_frame_rgb)
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
@@ -621,7 +639,8 @@ class DatabaseBuilder:
         angle_deg = abs(np.degrees(angle_rad))
         return angle_deg >= min_r
 
-    def create_hdf5_structure(self, num_frames: int, width: int, height: int):
+    def create_hdf5_structure(self, num_frames: int, width: int, height: int,
+                              use_patchify: bool = False, num_patches: int = 0):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
         chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
@@ -718,6 +737,21 @@ class DatabaseBuilder:
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
 
+            # --- Patchify: мультимасштабні патч-дескриптори ---
+            if use_patchify and num_patches > 0:
+                pf = f.create_group("patch_descriptors")
+                pf.create_dataset(
+                    "descriptors",
+                    shape=(num_frames, num_patches, self.descriptor_dim),
+                    maxshape=(None, num_patches, self.descriptor_dim),
+                    dtype="float32",
+                    compression=compression,
+                    chunks=(min(64, num_frames), num_patches, self.descriptor_dim),
+                )
+                g3.attrs["use_patchify"] = True
+                g3.attrs["patchify_num_patches"] = num_patches
+                logger.info(f"Patchify HDF5 group created: {num_patches} patches × {self.descriptor_dim}D")
+
             # Enable SWMR mode for parallel reading while writing
             f.swmr_mode = True
 
@@ -752,3 +786,7 @@ class DatabaseBuilder:
             lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
             lf["coords_2d"][frame_id, :n] = c2d[:n]
             lf["kp_counts"][frame_id] = n
+
+            # Patchify descriptors
+            if "patch_descriptors" in features and "patch_descriptors" in self.db_file:
+                self.db_file["patch_descriptors"]["descriptors"][frame_id] = features["patch_descriptors"]

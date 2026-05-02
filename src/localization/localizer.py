@@ -23,10 +23,36 @@ FAILURE_TYPES = {
     "Coordinate transformation": "transform_error",
 }
 
+# Матриці обертання вектора зсуву для кожного кута повороту кадру.
+# np.rot90(frame, k=K) повертає кадр проти годинникової стрілки на K*90°.
+# Якщо трекер обчислив зсув (dx, dy) в оригінальній системі координат,
+# цей словник перераховує його в систему координат повернутого кадру,
+# де побудована гомографія H.
+#
+# Виведення:
+#   k=1 (90° CCW):  x_rot = -y_orig, y_rot = x_orig  →  (dx,dy) → (-dy, dx)
+#   k=2 (180°):     x_rot = -x_orig, y_rot = -y_orig →  (dx,dy) → (-dx,-dy)
+#   k=3 (270° CCW): x_rot = y_orig,  y_rot = -x_orig →  (dx,dy) → (dy, -dx)
+_ROTATION_VEC: dict[int, tuple[int, int, int, int]] = {
+    # angle: (a, b, c, d) → new_dx = a*dx + b*dy, new_dy = c*dx + d*dy
+    0:   ( 1,  0,  0,  1),
+    90:  ( 0, -1,  1,  0),
+    180: (-1,  0,  0, -1),
+    270: ( 0,  1, -1,  0),
+}
+
 
 class Localizer:
-    def __init__(self, database, feature_extractor, matcher, calibration, config=None,
-                 ref_frame_width: int = 0, ref_frame_height: int = 0):
+    def __init__(
+        self,
+        database,
+        feature_extractor,
+        matcher,
+        calibration,
+        config=None,
+        ref_frame_width: int = 0,
+        ref_frame_height: int = 0,
+    ):
         self.database = database
         self.feature_extractor = feature_extractor
         self.matcher = matcher
@@ -59,7 +85,6 @@ class Localizer:
         else:
             self.retriever = FastRetrieval(self.database.global_descriptors)
 
-        # Fallback: SuperPoint+LightGlue для складних сцен
         self.model_manager = self.config.get("_model_manager", None)
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
         self.min_inliers_for_accept = get_cfg(self.config, "localization.min_inliers_accept", 10)
@@ -74,6 +99,51 @@ class Localizer:
         self.normalizer = ResolutionNormalizer(ref_frame_width, ref_frame_height)
         self._last_scale = 1.0
 
+        # ── Patchify: мультипатч-retrieval ────────────────────────────────────
+        # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
+        #   1. Увімкнено через конфіг
+        #   2. В базі є patch_descriptors (тобто БД будувалась з use_patchify=True)
+        # Якщо хоча б одна умова не виконана — patchify мовчки вимкнено (backward compat).
+        self.patchify_retrieval = None
+        use_patchify = get_cfg(self.config, "localization.use_patchify", False)
+        if use_patchify:
+            patch_desc = getattr(self.database, "patch_descriptors", None)
+            if patch_desc is not None and len(patch_desc) > 0:
+                try:
+                    from src.localization.patchify import PatchifyRetrieval
+                    patchify_grids = get_cfg(
+                        self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
+                    )
+                    patchify_batch = get_cfg(
+                        self.config, "localization.patchify_batch_size", 1
+                    )
+                    desc_dim = int(patch_desc.shape[-1])
+                    self.patchify_retrieval = PatchifyRetrieval(
+                        self.feature_extractor,
+                        descriptor_dim=desc_dim,
+                        grids=patchify_grids,
+                        batch_size=patchify_batch,
+                    )
+                    frame_ids = list(range(self.database.get_num_frames()))
+                    self.patchify_retrieval.build_index(patch_desc, frame_ids)
+                    logger.info(
+                        f"Patchify retrieval initialized: "
+                        f"{self.patchify_retrieval.num_patches} patches/frame, "
+                        f"dim={desc_dim}, grids={patchify_grids}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Patchify retrieval init failed — falling back to standard retrieval: {e}"
+                    )
+                    self.patchify_retrieval = None
+            else:
+                logger.info(
+                    "Patchify enabled in config but database has no patch_descriptors. "
+                    "Rebuild the database with use_patchify=True to enable patchify retrieval."
+                )
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
@@ -81,7 +151,8 @@ class Localizer:
         if self._consecutive_failures >= self._max_failures:
             self._consecutive_failures = 0
             self._log_failure(
-                FAILURE_TYPES["out_of_coverage"], details=f"Exceeded {self._max_failures} failures"
+                FAILURE_TYPES["out_of_coverage"],
+                details=f"Exceeded {self._max_failures} failures",
             )
             logger.warning(
                 f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
@@ -106,24 +177,24 @@ class Localizer:
         best_global_score = -1.0
         best_global_angle = 0
         best_global_candidates = []
-        best_query_features = None
 
         top_k = self.retrieval_top_k
 
-        # 1. Екстракція ознак для всіх дозволених кутів обертання та вибір найкращого ракурсу
+        # ── Крок 1: Вибір найкращого ракурсу за стандартним DINOv2 ──────────
+        # ТІЛЬКИ стандартний retrieval — patchify тут не запускається, бо:
+        #   - compute_patch_descriptors = 14 DINOv2 forward-пасів (для grids 1+4+9)
+        #   - 4 кути × 14 патчів = 56 зайвих форвард-пасів лише на вибір кута
+        #   - patchify-скор (avg cosine по 14 патчах) ≠ DINOv2 CLS-token cosine →
+        #     змішування робить порівняння між кутами некоректним
         for angle in angles_to_try:
             k = angle // 90
             rotated_frame = np.rot90(query_frame, k=k).copy()
-
-            # Витягуємо ТІЛЬКИ глобальний дескриптор DINOv2 для швидкого пошуку ракурсу
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
 
-            # Шукаємо кандидатів за допомогою DINOv2
             with Telemetry.profile("retrieval"):
                 candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
 
             if candidates:
-                # Оцінкою ракурсу вважаємо скор найкращого кандидата
                 top_score = candidates[0][1]
                 if top_score > best_global_score:
                     best_global_score = top_score
@@ -146,12 +217,43 @@ class Localizer:
             f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
         )
 
-        # 1.5. Локальна екстракція (XFeat) ТІЛЬКИ для НАЙКРАЩОГО ракурсу
+        # ── Крок 1.5: Готуємо повернутий кадр для найкращого ракурсу ────────
         k = best_global_angle // 90
         best_rotated_frame = np.rot90(query_frame, k=k).copy()
-        best_rotated_mask = np.rot90(static_mask, k=k).copy() if static_mask is not None else None
+        best_rotated_mask = (
+            np.rot90(static_mask, k=k).copy() if static_mask is not None else None
+        )
 
-        # Обчислюємо ключові точки лише один раз для обраного кута!
+        # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
+        # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
+        # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
+        # (наприклад, при зміні висоти польоту).
+        if self.patchify_retrieval is not None:
+            try:
+                with Telemetry.profile("patchify_retrieval"):
+                    patch_descs = self.patchify_retrieval.compute_patch_descriptors(
+                        best_rotated_frame
+                    )
+                    patch_candidates = self.patchify_retrieval.search(
+                        patch_descs, top_k=top_k
+                    )
+                if patch_candidates:
+                    # Об'єднуємо: max_results обмежує список, щоб не збільшувати час матчінгу
+                    merged = self._merge_candidates(
+                        best_global_candidates,
+                        patch_candidates,
+                        max_results=top_k * 2,
+                    )
+                    logger.debug(
+                        f"Patchify expanded candidates: "
+                        f"{len(best_global_candidates)} → {len(merged)} "
+                        f"(top patchify score: {patch_candidates[0][1]:.3f})"
+                    )
+                    best_global_candidates = merged
+            except Exception as e:
+                logger.warning(f"Patchify retrieval failed, using standard candidates: {e}")
+
+        # ── Крок 2: Локальна екстракція (ALIKED/RDD) для найкращого ракурсу ─
         best_query_features = self.feature_extractor.extract_local_features(
             best_rotated_frame, static_mask=best_rotated_mask
         )
@@ -166,7 +268,7 @@ class Localizer:
 
         early_stop = self.early_stop_inliers
 
-        # 2. Локальний пошук (XFeat) ТІЛЬКИ для найкращого знайденого ракурсу
+        # ── Крок 3: Локальний матчинг + RANSAC ──────────────────────────────
         for candidate_id, score in best_global_candidates:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = self.database.get_local_features(candidate_id)
@@ -175,10 +277,10 @@ class Localizer:
                 mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
 
             if len(mkpts_q) >= self.min_matches:
-                # Використовуємо Homography (8 DoF)
                 with Telemetry.profile("ransac_homography"):
                     H_eval, mask = GeometryTransforms.estimate_homography(
-                        mkpts_q, mkpts_r,
+                        mkpts_q,
+                        mkpts_r,
                         ransac_threshold=self.ransac_thresh,
                         backend=self.homography_backend,
                         use_mad_ransac=self.use_mad_ransac,
@@ -191,7 +293,6 @@ class Localizer:
                     pts_q_in = mkpts_q[inlier_mask]
                     pts_r_in = mkpts_r[inlier_mask]
 
-                    # Розрахунок RMSE для оцінки якості геометрії
                     pts_q_transformed = GeometryTransforms.apply_homography(pts_q_in, H_eval)
                     rmse = float(
                         np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
@@ -215,15 +316,11 @@ class Localizer:
                 )
                 break
 
-        # Оскільки LightGlue (ALIKED) тепер основний метод, окремий fallback не потрібен
-
         if (
             best_inliers < self.min_matches
             or best_mkpts_r_inliers is None
             or best_H_query_to_ref is None
         ):
-            # Спробуємо фоллбек перед тим як повертати помилку.
-            # Якщо ми не знайшли жодного відповідного кадру через Matching, беремо топ-1 з retrieval.
             target_id = (
                 best_candidate_id if (best_candidate_id != -1) else best_global_candidates[0][0]
             )
@@ -247,7 +344,7 @@ class Localizer:
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
             }
 
-        # 3. Отримуємо матрицю знайденого кадру з бази
+        # ── Крок 4: Отримуємо аффінну матрицю кандидата ─────────────────────
         affine_ref = self.database.get_frame_affine(best_candidate_id)
         if affine_ref is None:
             target_id = (
@@ -270,15 +367,12 @@ class Localizer:
                 ),
             }
 
-        # 4. Рахуємо розміри ПОВЕРНУТОГО зображення
-        if best_global_angle in [90, 270]:
+        # Розміри повернутого нормалізованого зображення
+        if best_global_angle in (90, 270):
             rot_height, rot_width = width, height
         else:
             rot_height, rot_width = height, width
 
-        # 4. Багатоточкова локалізація більше не потрібна. Беремо ідеальний центр кадру
-
-        # Використовуємо знайдену Homography
         M_query_to_ref = best_H_query_to_ref
         if M_query_to_ref is None:
             self._log_failure(
@@ -286,8 +380,7 @@ class Localizer:
             )
             return {"success": False, "error": "Failed to compute transform"}
 
-        # 5. Трансформуємо центральну точку: Query -> Reference (через Homography) -> Metric (через Affine)
-        # Збережемо стан для наступних викликів Optical Flow
+        # ── Крок 5: Зберігаємо стан для Optical Flow ────────────────────────
         self._last_state = {
             "H": M_query_to_ref,
             "affine": affine_ref,
@@ -296,6 +389,7 @@ class Localizer:
             "global_angle": best_global_angle,
         }
 
+        # ── Крок 6: Query center → Reference → Metric → GPS ─────────────────
         center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float64)
         pts_in_ref = GeometryTransforms.apply_homography(center_query, M_query_to_ref)
         if pts_in_ref is None or len(pts_in_ref) == 0:
@@ -305,7 +399,8 @@ class Localizer:
             fallback_res = self._localize_by_reference_frame(target_id, best_global_score)
             if fallback_res:
                 logger.info(
-                    f"Homography transform failure, using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})"
+                    f"Homography transform failure, using retrieval-only fallback for "
+                    f"frame {target_id} (score {best_global_score:.3f})"
                 )
                 return fallback_res
             self._log_failure(FAILURE_TYPES["Coordinate transformation"])
@@ -315,13 +410,11 @@ class Localizer:
             }
 
         pts_metric = GeometryTransforms.apply_affine(pts_in_ref, affine_ref)
-
-        # Оскільки ми взяли одну центральну точку, просто беремо її координати
         mx = float(pts_metric[0, 0])
         my = float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        # 6. Перевіряємо чи нова точка — аномалія (стрибок координат)
+        # ── Крок 7: Фільтрація аномалій ─────────────────────────────────────
         if self.outlier_detector.is_outlier(metric_pt, dt):
             logger.warning(
                 f"Outlier filtered | matched_frame={best_candidate_id}, "
@@ -331,34 +424,26 @@ class Localizer:
             self._log_failure(FAILURE_TYPES["Outlier detected"], inliers=best_inliers)
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
-        # Успішна локалізація — скидаємо лічильник невдач
         self._consecutive_failures = 0
 
-        # Оновлення Калмана (фільтрація шумів)
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
-
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
-
-        # Зсув для корекції FOV через фільтрацію
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
-        # 7. Розрахунок поля зору (FOV)
-        # Користувач очікує бачити повне покриття камери (від 0 до rot_width).
-        # Проектуємо повний кадр
+        # ── Крок 8: Розрахунок FOV ───────────────────────────────────────────
         corners = np.array(
-            [[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]], dtype=np.float32
+            [[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]],
+            dtype=np.float32,
         )
-
         ref_corners = GeometryTransforms.apply_homography(corners, M_query_to_ref)
 
-        # Захист від перспективного "вибуху" гомографії (якщо кластер ALIKED занадто локальний)
         is_exploded = False
         if ref_corners is not None:
             max_coord = np.max(np.abs(ref_corners))
-            if max_coord > 50000:  # якщо кут відлетів далі ніж на 50к пікселів
+            if max_coord > 50000:
                 is_exploded = True
 
         if is_exploded and best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
@@ -386,7 +471,6 @@ class Localizer:
             original_poly_px = corners
             logger.debug("FOV projected using full frame Homography matrix.")
 
-        # --- ДІАГНОСТИЧНІ ЛОГИ МАКСИМАЛЬНОГО РІВНЯ ---
         logger.info(f"--- FOV DIAGNOSTICS FOR FRAME {best_candidate_id} ---")
         w_px = np.linalg.norm(original_poly_px[0] - original_poly_px[1])
         h_px = np.linalg.norm(original_poly_px[1] - original_poly_px[2])
@@ -403,7 +487,6 @@ class Localizer:
         if ref_corners is not None:
             metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
             if metric_corners is not None:
-                # Діагностика розмірів FOV в метрах
                 fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
                 fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
                 logger.info(
@@ -427,12 +510,8 @@ class Localizer:
             best_candidate_id, best_inliers, best_total_matches, best_rmse
         )
 
-        # ДІАГНОСТИКА
-        logger.debug(
-            f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)"
-        )
+        logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
         logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
-
         logger.success(
             f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id} | "
             f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
@@ -449,12 +528,19 @@ class Localizer:
             "sample_spread_m": 0.0,
         }
 
+    # ─────────────────────────────────────────────────────────────────────────
+
     def localize_optical_flow(
         self, dx_px: float, dy_px: float, dt: float, rot_width: int, rot_height: int
     ) -> dict:
-        """
-        Локалізація базуючись на піксельному зсуві (dx, dy) від Optical Flow,
-        використовуючи матриці з останнього успішного кадру (Keyframe).
+        """Локалізація на основі піксельного зсуву від Optical Flow.
+
+        Параметри rot_width / rot_height — ОРИГІНАЛЬНІ розміри кадру (до нормалізації
+        і повороту), так як передаються з TrackingWorker через frame.shape.
+        Метод самостійно перераховує їх у простір гомографії H:
+          1. Масштабування на _last_scale (нормалізація роздільної здатності).
+          2. Swap width↔height при 90° / 270° обертанні.
+          3. Обертання вектора зсуву (dx, dy) у систему координат повернутого кадру.
         """
         if (
             not hasattr(self, "_last_state")
@@ -463,10 +549,36 @@ class Localizer:
         ):
             return {"success": False, "error": "No previous state to apply OF"}
 
-        # Якщо точки змістилися на dx, dy в поточному кадрі відносно попереднього,
-        # то центр поточного дрона фізично знаходився в точці (center - dx, center - dy) у КООРДИНАТАХ ПОПЕРЕДНЬОГО КАДРУ.
+        scale = self._last_scale
+        angle = self._last_state.get("global_angle", 0)
+
+        # ── 1. Вектор зсуву: оригінальний простір → нормалізований + повернутий ──
+        # Масштабуємо до нормалізованого простору
+        sdx = dx_px * scale
+        sdy = dy_px * scale
+
+        # Обертаємо вектор зсуву відповідно до повороту кадру.
+        # H побудована в просторі повернутого нормалізованого кадру, тому зсув
+        # теж має бути в тій самій системі координат.
+        a, b, c, d = _ROTATION_VEC.get(angle, (1, 0, 0, 1))
+        rot_sdx = a * sdx + b * sdy
+        rot_sdy = c * sdx + d * sdy
+
+        # ── 2. Розміри кадру: оригінальні → нормалізовані + повернуті ────────
+        if angle in (90, 270):
+            # 90° / 270°: рядки і стовпці міняються місцями
+            norm_rot_w = rot_height * scale
+            norm_rot_h = rot_width * scale
+        else:
+            norm_rot_w = rot_width * scale
+            norm_rot_h = rot_height * scale
+
+        # ── 3. Центр поточного кадру в системі координат попереднього ────────
+        # Якщо з моменту KF точки змістились на (dx, dy), то центр поточного
+        # дрона відповідає точці (center − displacement) у КС попереднього KF.
         center_query_shifted = np.array(
-            [[rot_width / 2.0 - dx_px, rot_height / 2.0 - dy_px]], dtype=np.float64
+            [[norm_rot_w / 2.0 - rot_sdx, norm_rot_h / 2.0 - rot_sdy]],
+            dtype=np.float64,
         )
 
         pts_in_ref = GeometryTransforms.apply_homography(
@@ -482,7 +594,6 @@ class Localizer:
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        # Оновлення Калмана
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
 
@@ -490,38 +601,71 @@ class Localizer:
             float(filtered_pt[0]), float(filtered_pt[1])
         )
 
-        # Для спрощення, OF не розраховує повний FOV-полігон, повертає None або оцінку
-        # Зберігаємо "уявний" inliers для сумісності з UI (беремо половину від останнього)
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
-
-        confidence = 0.8  # OF confidence is generally high since it's frame-to-frame
 
         return {
             "success": True,
             "lat": lat,
             "lon": lon,
-            "confidence": confidence,
+            "confidence": 0.8,
             "matched_frame": int(self._last_state.get("candidate_id", -1)),
             "inliers": of_inliers,
             "fov_polygon": None,
-            "is_of": True,  # Прапорець для логів
+            "is_of": True,
         }
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _merge_candidates(
+        self,
+        standard: list[tuple[int, float]],
+        patches: list[tuple[int, float]],
+        max_results: int | None = None,
+    ) -> list[tuple[int, float]]:
+        """Об'єднує результати стандартного та патч-retrieval через зважену суму.
+        
+        Ваги беруться з конфігу (localization.patchify_merge_weight).
+        Якщо кадр є в обох джерелах: score = w_std * s + w_patch * p.
+        Якщо тільки в одному: беремо скор як є (не штрафуємо за відсутність в іншому).
+        """
+        w_patch = get_cfg(self.config, "localization.patchify_merge_weight", 0.4)
+        w_standard = 1.0 - w_patch
+
+        standard_dict = dict(standard)
+        patch_dict = dict(patches)
+        all_fids = set(standard_dict.keys()) | set(patch_dict.keys())
+
+        merged = {}
+        for fid in all_fids:
+            s = standard_dict.get(fid, 0.0)
+            p = patch_dict.get(fid, 0.0)
+            
+            if fid in standard_dict and fid in patch_dict:
+                merged[fid] = w_standard * s + w_patch * p
+            elif fid in standard_dict:
+                merged[fid] = s
+            else:
+                merged[fid] = p
+
+        sorted_results = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+
+        if max_results is not None:
+            sorted_results = sorted_results[:max_results]
+
+        return sorted_results
 
     def _compute_confidence(
         self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
     ) -> float:
-        """Обчислює впевненість на основі QA бази даних (RMSE, Disagreement) та кількості інлаєрів."""
-        # Налаштування з конфігу
+        """Обчислює впевненість на основі QA бази даних та кількості інлаєрів."""
         max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
         rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
         diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
         w_inlier = get_cfg(self.config, "localization.confidence.inlier_weight", 0.7)
         w_stability = get_cfg(self.config, "localization.confidence.stability_weight", 0.3)
 
-        # 1. Показник інлаєрів (0-1)
         inlier_score = min(1.0, best_inliers / max_inliers)
 
-        # 2. Показник стабільності бази (на основі QA метрик)
         rmse = (
             self.database.frame_rmse[best_candidate_id]
             if self.database.frame_rmse is not None
@@ -534,26 +678,20 @@ class Localizer:
         )
 
         stability_score = 1.0 - (
-            min(rmse, rmse_norm) / rmse_norm * 0.5 + min(disagreement, diag_norm) / diag_norm * 0.5
+            min(rmse, rmse_norm) / rmse_norm * 0.5
+            + min(disagreement, diag_norm) / diag_norm * 0.5
         )
         stability_score = float(np.clip(stability_score, 0.0, 1.0))
 
-        # 3. Показник поточної відповідності (ПЕР-ФРЕЙМ)
-        # a) Inlier ratio
         ratio_score = float(best_inliers / (total_matches + 1e-6))
-        # b) RMSE score (1.0 if RMSE=0, 0.5 if RMSE=thresh)
         rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
-
         match_score = ratio_score * 0.5 + rmse_score_val * 0.5
 
-        # 4. Комбінована оцінка
-        # (QA бази * 0.3) + (Кількість інлаєрів * 0.4) + (Якість відповідності * 0.3)
         final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
-
         return float(np.clip(final_conf, 0.05, 1.0))
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
-        """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)"""
+        """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)."""
         if frame_id == -1:
             return None
 
@@ -574,7 +712,6 @@ class Localizer:
             return None
 
         ref_h, ref_w = self.database.get_frame_size(frame_id)
-        # Центр кадру в системі координат БД
         center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float64)
         metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
 
@@ -584,7 +721,7 @@ class Localizer:
             "success": True,
             "lat": lat,
             "lon": lon,
-            "confidence": 0.3,  # Низький confidence для retrieval-only
+            "confidence": 0.3,
             "inliers": 0,
             "matched_frame": frame_id,
             "fallback_mode": "retrieval_only",
@@ -601,7 +738,6 @@ class Localizer:
                 if write_header:
                     f.write("timestamp,error_type,inliers,details\n")
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                # Quote details to prevent CSV breakage
                 safe_details = details.replace('"', '""')
                 f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
         except Exception as e:

@@ -36,6 +36,9 @@ class DatabaseLoader:
         self._size_cache: dict[int, tuple[int, int]] = {}
         self._feature_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
 
+        # Patchify: мультимасштабні дескриптори (None якщо БД не має їх)
+        self.patch_descriptors: np.ndarray | None = None
+
         logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
 
@@ -96,6 +99,13 @@ class DatabaseLoader:
                 total_len = len(self.frame_poses)
                 self.frame_index_map = np.arange(total_len)
                 logger.debug("No frame_index_map found — using sequential indices")
+
+            # Завантажуємо патч-дескриптори якщо є (Patchify)
+            if "patch_descriptors" in self.db_file:
+                self.patch_descriptors = self.db_file["patch_descriptors"]["descriptors"][:]
+                logger.info(f"Loaded patch descriptors: shape={self.patch_descriptors.shape}")
+            else:
+                self.patch_descriptors = None
 
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()

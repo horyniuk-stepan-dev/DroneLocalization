@@ -1186,6 +1186,19 @@ class DatabaseBuilder:
         )
         logger.success("All models loaded successfully")
 
+        # Patchify: мультимасштабні патч-дескриптори
+        use_patchify = get_cfg(self.config, "localization.use_patchify", False)
+        patchify = None
+        if use_patchify:
+            from src.localization.patchify import PatchifyRetrieval
+            patchify_grids = get_cfg(self.config, "localization.patchify_grids", [[1,1],[2,2],[3,3]])
+            patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
+            patchify = PatchifyRetrieval(
+                feature_extractor, descriptor_dim=self.descriptor_dim,
+                grids=patchify_grids, batch_size=patchify_batch,
+            )
+            logger.info(f"Patchify ENABLED for DB build: {patchify.num_patches} patches per frame")
+
         # Fix 10: Dynamic descriptor dimension detection to avoid broadcast errors
         try:
             if torch.cuda.is_available():
@@ -1238,7 +1251,8 @@ class DatabaseBuilder:
 
         # Create empty database structure
         logger.info("Creating HDF5 database structure...")
-        self.create_hdf5_structure(num_frames, width, height)
+        self.create_hdf5_structure(num_frames, width, height, use_patchify=use_patchify,
+                                  num_patches=patchify.num_patches if patchify else 0)
 
         current_pose = np.eye(3, dtype=np.float32)
         prev_features = None
@@ -1309,7 +1323,7 @@ class DatabaseBuilder:
             logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
             # YOLO micro-batching (П8)
-            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 2)
+            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 1)
             if yolo_batch_size > 1:
                 logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
             pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
@@ -1334,6 +1348,10 @@ class DatabaseBuilder:
                 """Обробляє один кадр після YOLO: feature extraction, pose, keyframe selection."""
                 features = feature_extractor.extract_features(p_frame_rgb, p_static_mask)
                 features["coords_2d"] = features["keypoints"]
+
+                # Patchify: витягуємо патч-дескриптори
+                if patchify is not None:
+                    features["patch_descriptors"] = patchify.compute_patch_descriptors(p_frame_rgb)
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
@@ -1392,36 +1410,38 @@ class DatabaseBuilder:
 
                 return current_pose, prev_features, saved_count
 
-            while True:
-                idx, data = frame_queue.get()
+            with torch.no_grad():
+                while True:
+                    idx, data = frame_queue.get()
 
-                if idx != -1 and data is not None:
-                    frame, frame_rgb = data
-                    pending_frames.append((idx, frame, frame_rgb))
-                    if len(pending_frames) < yolo_batch_size:
-                        continue  # накопичуємо батч
+                    if idx != -1 and data is not None:
+                        frame, frame_rgb = data
+                        pending_frames.append((idx, frame, frame_rgb))
+                        if len(pending_frames) < yolo_batch_size:
+                            continue  # накопичуємо батч
 
-                # Якщо EOF або батч повний — обробляємо все накопичене
-                if not pending_frames:
-                    break
+                    # Якщо EOF або батч повний — обробляємо все накопичене
+                    if not pending_frames:
+                        break
 
-                processed = _flush_mask_batch(pending_frames)
-                pending_frames = []
+                    processed = _flush_mask_batch(pending_frames)
+                    pending_frames = []
 
-                for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
-                    current_pose, prev_features, saved_count = _process_single_frame(
-                        p_idx,
-                        p_frame,
-                        p_frame_rgb,
-                        p_static_mask,
-                        current_pose,
-                        prev_features,
-                        saved_count,
-                        frame_index_map,
-                    )
-
-                if idx == -1:
-                    break
+                    for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
+                        current_pose, prev_features, saved_count = _process_single_frame(
+                            p_idx,
+                            p_frame,
+                            p_frame_rgb,
+                            p_static_mask,
+                            current_pose,
+                            prev_features,
+                            saved_count,
+                            frame_index_map,
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    if idx == -1:
+                        break
 
         except Exception as e:
             logger.error(
@@ -1601,7 +1621,8 @@ class DatabaseBuilder:
         angle_deg = abs(np.degrees(angle_rad))
         return angle_deg >= min_r
 
-    def create_hdf5_structure(self, num_frames: int, width: int, height: int):
+    def create_hdf5_structure(self, num_frames: int, width: int, height: int,
+                              use_patchify: bool = False, num_patches: int = 0):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
         chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
@@ -1698,6 +1719,21 @@ class DatabaseBuilder:
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
 
+            # --- Patchify: мультимасштабні патч-дескриптори ---
+            if use_patchify and num_patches > 0:
+                pf = f.create_group("patch_descriptors")
+                pf.create_dataset(
+                    "descriptors",
+                    shape=(num_frames, num_patches, self.descriptor_dim),
+                    maxshape=(None, num_patches, self.descriptor_dim),
+                    dtype="float32",
+                    compression=compression,
+                    chunks=(min(64, num_frames), num_patches, self.descriptor_dim),
+                )
+                g3.attrs["use_patchify"] = True
+                g3.attrs["patchify_num_patches"] = num_patches
+                logger.info(f"Patchify HDF5 group created: {num_patches} patches × {self.descriptor_dim}D")
+
             # Enable SWMR mode for parallel reading while writing
             f.swmr_mode = True
 
@@ -1732,6 +1768,10 @@ class DatabaseBuilder:
             lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
             lf["coords_2d"][frame_id, :n] = c2d[:n]
             lf["kp_counts"][frame_id] = n
+
+            # Patchify descriptors
+            if "patch_descriptors" in features and "patch_descriptors" in self.db_file:
+                self.db_file["patch_descriptors"]["descriptors"][frame_id] = features["patch_descriptors"]
 
 
 # ================================================================================
@@ -1774,6 +1814,9 @@ class DatabaseLoader:
         # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
         self._feature_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
+
+        # Patchify: мультимасштабні дескриптори (None якщо БД не має їх)
+        self.patch_descriptors: np.ndarray | None = None
 
         logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
@@ -1835,6 +1878,13 @@ class DatabaseLoader:
                 total_len = len(self.frame_poses)
                 self.frame_index_map = np.arange(total_len)
                 logger.debug("No frame_index_map found — using sequential indices")
+
+            # Завантажуємо патч-дескриптори якщо є (Patchify)
+            if "patch_descriptors" in self.db_file:
+                self.patch_descriptors = self.db_file["patch_descriptors"]["descriptors"][:]
+                logger.info(f"Loaded patch descriptors: shape={self.patch_descriptors.shape}")
+            else:
+                self.patch_descriptors = None
 
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
@@ -6652,10 +6702,36 @@ FAILURE_TYPES = {
     "Coordinate transformation": "transform_error",
 }
 
+# Матриці обертання вектора зсуву для кожного кута повороту кадру.
+# np.rot90(frame, k=K) повертає кадр проти годинникової стрілки на K*90°.
+# Якщо трекер обчислив зсув (dx, dy) в оригінальній системі координат,
+# цей словник перераховує його в систему координат повернутого кадру,
+# де побудована гомографія H.
+#
+# Виведення:
+#   k=1 (90° CCW):  x_rot = -y_orig, y_rot = x_orig  →  (dx,dy) → (-dy, dx)
+#   k=2 (180°):     x_rot = -x_orig, y_rot = -y_orig →  (dx,dy) → (-dx,-dy)
+#   k=3 (270° CCW): x_rot = y_orig,  y_rot = -x_orig →  (dx,dy) → (dy, -dx)
+_ROTATION_VEC: dict[int, tuple[int, int, int, int]] = {
+    # angle: (a, b, c, d) → new_dx = a*dx + b*dy, new_dy = c*dx + d*dy
+    0:   ( 1,  0,  0,  1),
+    90:  ( 0, -1,  1,  0),
+    180: (-1,  0,  0, -1),
+    270: ( 0,  1, -1,  0),
+}
+
 
 class Localizer:
-    def __init__(self, database, feature_extractor, matcher, calibration, config=None,
-                 ref_frame_width: int = 0, ref_frame_height: int = 0):
+    def __init__(
+        self,
+        database,
+        feature_extractor,
+        matcher,
+        calibration,
+        config=None,
+        ref_frame_width: int = 0,
+        ref_frame_height: int = 0,
+    ):
         self.database = database
         self.feature_extractor = feature_extractor
         self.matcher = matcher
@@ -6688,7 +6764,6 @@ class Localizer:
         else:
             self.retriever = FastRetrieval(self.database.global_descriptors)
 
-        # Fallback: SuperPoint+LightGlue для складних сцен
         self.model_manager = self.config.get("_model_manager", None)
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
         self.min_inliers_for_accept = get_cfg(self.config, "localization.min_inliers_accept", 10)
@@ -6703,6 +6778,51 @@ class Localizer:
         self.normalizer = ResolutionNormalizer(ref_frame_width, ref_frame_height)
         self._last_scale = 1.0
 
+        # ── Patchify: мультипатч-retrieval ────────────────────────────────────
+        # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
+        #   1. Увімкнено через конфіг
+        #   2. В базі є patch_descriptors (тобто БД будувалась з use_patchify=True)
+        # Якщо хоча б одна умова не виконана — patchify мовчки вимкнено (backward compat).
+        self.patchify_retrieval = None
+        use_patchify = get_cfg(self.config, "localization.use_patchify", False)
+        if use_patchify:
+            patch_desc = getattr(self.database, "patch_descriptors", None)
+            if patch_desc is not None and len(patch_desc) > 0:
+                try:
+                    from src.localization.patchify import PatchifyRetrieval
+                    patchify_grids = get_cfg(
+                        self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
+                    )
+                    patchify_batch = get_cfg(
+                        self.config, "localization.patchify_batch_size", 1
+                    )
+                    desc_dim = int(patch_desc.shape[-1])
+                    self.patchify_retrieval = PatchifyRetrieval(
+                        self.feature_extractor,
+                        descriptor_dim=desc_dim,
+                        grids=patchify_grids,
+                        batch_size=patchify_batch,
+                    )
+                    frame_ids = list(range(self.database.get_num_frames()))
+                    self.patchify_retrieval.build_index(patch_desc, frame_ids)
+                    logger.info(
+                        f"Patchify retrieval initialized: "
+                        f"{self.patchify_retrieval.num_patches} patches/frame, "
+                        f"dim={desc_dim}, grids={patchify_grids}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Patchify retrieval init failed — falling back to standard retrieval: {e}"
+                    )
+                    self.patchify_retrieval = None
+            else:
+                logger.info(
+                    "Patchify enabled in config but database has no patch_descriptors. "
+                    "Rebuild the database with use_patchify=True to enable patchify retrieval."
+                )
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
@@ -6710,7 +6830,8 @@ class Localizer:
         if self._consecutive_failures >= self._max_failures:
             self._consecutive_failures = 0
             self._log_failure(
-                FAILURE_TYPES["out_of_coverage"], details=f"Exceeded {self._max_failures} failures"
+                FAILURE_TYPES["out_of_coverage"],
+                details=f"Exceeded {self._max_failures} failures",
             )
             logger.warning(
                 f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
@@ -6735,24 +6856,24 @@ class Localizer:
         best_global_score = -1.0
         best_global_angle = 0
         best_global_candidates = []
-        best_query_features = None
 
         top_k = self.retrieval_top_k
 
-        # 1. Екстракція ознак для всіх дозволених кутів обертання та вибір найкращого ракурсу
+        # ── Крок 1: Вибір найкращого ракурсу за стандартним DINOv2 ──────────
+        # ТІЛЬКИ стандартний retrieval — patchify тут не запускається, бо:
+        #   - compute_patch_descriptors = 14 DINOv2 forward-пасів (для grids 1+4+9)
+        #   - 4 кути × 14 патчів = 56 зайвих форвард-пасів лише на вибір кута
+        #   - patchify-скор (avg cosine по 14 патчах) ≠ DINOv2 CLS-token cosine →
+        #     змішування робить порівняння між кутами некоректним
         for angle in angles_to_try:
             k = angle // 90
             rotated_frame = np.rot90(query_frame, k=k).copy()
-
-            # Витягуємо ТІЛЬКИ глобальний дескриптор DINOv2 для швидкого пошуку ракурсу
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
 
-            # Шукаємо кандидатів за допомогою DINOv2
             with Telemetry.profile("retrieval"):
                 candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
 
             if candidates:
-                # Оцінкою ракурсу вважаємо скор найкращого кандидата
                 top_score = candidates[0][1]
                 if top_score > best_global_score:
                     best_global_score = top_score
@@ -6775,12 +6896,43 @@ class Localizer:
             f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
         )
 
-        # 1.5. Локальна екстракція (XFeat) ТІЛЬКИ для НАЙКРАЩОГО ракурсу
+        # ── Крок 1.5: Готуємо повернутий кадр для найкращого ракурсу ────────
         k = best_global_angle // 90
         best_rotated_frame = np.rot90(query_frame, k=k).copy()
-        best_rotated_mask = np.rot90(static_mask, k=k).copy() if static_mask is not None else None
+        best_rotated_mask = (
+            np.rot90(static_mask, k=k).copy() if static_mask is not None else None
+        )
 
-        # Обчислюємо ключові точки лише один раз для обраного кута!
+        # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
+        # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
+        # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
+        # (наприклад, при зміні висоти польоту).
+        if self.patchify_retrieval is not None:
+            try:
+                with Telemetry.profile("patchify_retrieval"):
+                    patch_descs = self.patchify_retrieval.compute_patch_descriptors(
+                        best_rotated_frame
+                    )
+                    patch_candidates = self.patchify_retrieval.search(
+                        patch_descs, top_k=top_k
+                    )
+                if patch_candidates:
+                    # Об'єднуємо: max_results обмежує список, щоб не збільшувати час матчінгу
+                    merged = self._merge_candidates(
+                        best_global_candidates,
+                        patch_candidates,
+                        max_results=top_k * 2,
+                    )
+                    logger.debug(
+                        f"Patchify expanded candidates: "
+                        f"{len(best_global_candidates)} → {len(merged)} "
+                        f"(top patchify score: {patch_candidates[0][1]:.3f})"
+                    )
+                    best_global_candidates = merged
+            except Exception as e:
+                logger.warning(f"Patchify retrieval failed, using standard candidates: {e}")
+
+        # ── Крок 2: Локальна екстракція (ALIKED/RDD) для найкращого ракурсу ─
         best_query_features = self.feature_extractor.extract_local_features(
             best_rotated_frame, static_mask=best_rotated_mask
         )
@@ -6795,7 +6947,7 @@ class Localizer:
 
         early_stop = self.early_stop_inliers
 
-        # 2. Локальний пошук (XFeat) ТІЛЬКИ для найкращого знайденого ракурсу
+        # ── Крок 3: Локальний матчинг + RANSAC ──────────────────────────────
         for candidate_id, score in best_global_candidates:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = self.database.get_local_features(candidate_id)
@@ -6804,10 +6956,10 @@ class Localizer:
                 mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
 
             if len(mkpts_q) >= self.min_matches:
-                # Використовуємо Homography (8 DoF)
                 with Telemetry.profile("ransac_homography"):
                     H_eval, mask = GeometryTransforms.estimate_homography(
-                        mkpts_q, mkpts_r,
+                        mkpts_q,
+                        mkpts_r,
                         ransac_threshold=self.ransac_thresh,
                         backend=self.homography_backend,
                         use_mad_ransac=self.use_mad_ransac,
@@ -6820,7 +6972,6 @@ class Localizer:
                     pts_q_in = mkpts_q[inlier_mask]
                     pts_r_in = mkpts_r[inlier_mask]
 
-                    # Розрахунок RMSE для оцінки якості геометрії
                     pts_q_transformed = GeometryTransforms.apply_homography(pts_q_in, H_eval)
                     rmse = float(
                         np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
@@ -6844,15 +6995,11 @@ class Localizer:
                 )
                 break
 
-        # Оскільки LightGlue (ALIKED) тепер основний метод, окремий fallback не потрібен
-
         if (
             best_inliers < self.min_matches
             or best_mkpts_r_inliers is None
             or best_H_query_to_ref is None
         ):
-            # Спробуємо фоллбек перед тим як повертати помилку.
-            # Якщо ми не знайшли жодного відповідного кадру через Matching, беремо топ-1 з retrieval.
             target_id = (
                 best_candidate_id if (best_candidate_id != -1) else best_global_candidates[0][0]
             )
@@ -6876,7 +7023,7 @@ class Localizer:
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
             }
 
-        # 3. Отримуємо матрицю знайденого кадру з бази
+        # ── Крок 4: Отримуємо аффінну матрицю кандидата ─────────────────────
         affine_ref = self.database.get_frame_affine(best_candidate_id)
         if affine_ref is None:
             target_id = (
@@ -6899,15 +7046,12 @@ class Localizer:
                 ),
             }
 
-        # 4. Рахуємо розміри ПОВЕРНУТОГО зображення
-        if best_global_angle in [90, 270]:
+        # Розміри повернутого нормалізованого зображення
+        if best_global_angle in (90, 270):
             rot_height, rot_width = width, height
         else:
             rot_height, rot_width = height, width
 
-        # 4. Багатоточкова локалізація більше не потрібна. Беремо ідеальний центр кадру
-
-        # Використовуємо знайдену Homography
         M_query_to_ref = best_H_query_to_ref
         if M_query_to_ref is None:
             self._log_failure(
@@ -6915,8 +7059,7 @@ class Localizer:
             )
             return {"success": False, "error": "Failed to compute transform"}
 
-        # 5. Трансформуємо центральну точку: Query -> Reference (через Homography) -> Metric (через Affine)
-        # Збережемо стан для наступних викликів Optical Flow
+        # ── Крок 5: Зберігаємо стан для Optical Flow ────────────────────────
         self._last_state = {
             "H": M_query_to_ref,
             "affine": affine_ref,
@@ -6925,6 +7068,7 @@ class Localizer:
             "global_angle": best_global_angle,
         }
 
+        # ── Крок 6: Query center → Reference → Metric → GPS ─────────────────
         center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float64)
         pts_in_ref = GeometryTransforms.apply_homography(center_query, M_query_to_ref)
         if pts_in_ref is None or len(pts_in_ref) == 0:
@@ -6934,7 +7078,8 @@ class Localizer:
             fallback_res = self._localize_by_reference_frame(target_id, best_global_score)
             if fallback_res:
                 logger.info(
-                    f"Homography transform failure, using retrieval-only fallback for frame {target_id} (score {best_global_score:.3f})"
+                    f"Homography transform failure, using retrieval-only fallback for "
+                    f"frame {target_id} (score {best_global_score:.3f})"
                 )
                 return fallback_res
             self._log_failure(FAILURE_TYPES["Coordinate transformation"])
@@ -6944,13 +7089,11 @@ class Localizer:
             }
 
         pts_metric = GeometryTransforms.apply_affine(pts_in_ref, affine_ref)
-
-        # Оскільки ми взяли одну центральну точку, просто беремо її координати
         mx = float(pts_metric[0, 0])
         my = float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        # 6. Перевіряємо чи нова точка — аномалія (стрибок координат)
+        # ── Крок 7: Фільтрація аномалій ─────────────────────────────────────
         if self.outlier_detector.is_outlier(metric_pt, dt):
             logger.warning(
                 f"Outlier filtered | matched_frame={best_candidate_id}, "
@@ -6960,34 +7103,26 @@ class Localizer:
             self._log_failure(FAILURE_TYPES["Outlier detected"], inliers=best_inliers)
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
-        # Успішна локалізація — скидаємо лічильник невдач
         self._consecutive_failures = 0
 
-        # Оновлення Калмана (фільтрація шумів)
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
-
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
-
-        # Зсув для корекції FOV через фільтрацію
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
-        # 7. Розрахунок поля зору (FOV)
-        # Користувач очікує бачити повне покриття камери (від 0 до rot_width).
-        # Проектуємо повний кадр
+        # ── Крок 8: Розрахунок FOV ───────────────────────────────────────────
         corners = np.array(
-            [[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]], dtype=np.float32
+            [[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]],
+            dtype=np.float32,
         )
-
         ref_corners = GeometryTransforms.apply_homography(corners, M_query_to_ref)
 
-        # Захист від перспективного "вибуху" гомографії (якщо кластер ALIKED занадто локальний)
         is_exploded = False
         if ref_corners is not None:
             max_coord = np.max(np.abs(ref_corners))
-            if max_coord > 50000:  # якщо кут відлетів далі ніж на 50к пікселів
+            if max_coord > 50000:
                 is_exploded = True
 
         if is_exploded and best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
@@ -7015,7 +7150,6 @@ class Localizer:
             original_poly_px = corners
             logger.debug("FOV projected using full frame Homography matrix.")
 
-        # --- ДІАГНОСТИЧНІ ЛОГИ МАКСИМАЛЬНОГО РІВНЯ ---
         logger.info(f"--- FOV DIAGNOSTICS FOR FRAME {best_candidate_id} ---")
         w_px = np.linalg.norm(original_poly_px[0] - original_poly_px[1])
         h_px = np.linalg.norm(original_poly_px[1] - original_poly_px[2])
@@ -7032,7 +7166,6 @@ class Localizer:
         if ref_corners is not None:
             metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
             if metric_corners is not None:
-                # Діагностика розмірів FOV в метрах
                 fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
                 fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
                 logger.info(
@@ -7056,12 +7189,8 @@ class Localizer:
             best_candidate_id, best_inliers, best_total_matches, best_rmse
         )
 
-        # ДІАГНОСТИКА
-        logger.debug(
-            f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)"
-        )
+        logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
         logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
-
         logger.success(
             f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id} | "
             f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
@@ -7078,12 +7207,19 @@ class Localizer:
             "sample_spread_m": 0.0,
         }
 
+    # ─────────────────────────────────────────────────────────────────────────
+
     def localize_optical_flow(
         self, dx_px: float, dy_px: float, dt: float, rot_width: int, rot_height: int
     ) -> dict:
-        """
-        Локалізація базуючись на піксельному зсуві (dx, dy) від Optical Flow,
-        використовуючи матриці з останнього успішного кадру (Keyframe).
+        """Локалізація на основі піксельного зсуву від Optical Flow.
+
+        Параметри rot_width / rot_height — ОРИГІНАЛЬНІ розміри кадру (до нормалізації
+        і повороту), так як передаються з TrackingWorker через frame.shape.
+        Метод самостійно перераховує їх у простір гомографії H:
+          1. Масштабування на _last_scale (нормалізація роздільної здатності).
+          2. Swap width↔height при 90° / 270° обертанні.
+          3. Обертання вектора зсуву (dx, dy) у систему координат повернутого кадру.
         """
         if (
             not hasattr(self, "_last_state")
@@ -7092,10 +7228,36 @@ class Localizer:
         ):
             return {"success": False, "error": "No previous state to apply OF"}
 
-        # Якщо точки змістилися на dx, dy в поточному кадрі відносно попереднього,
-        # то центр поточного дрона фізично знаходився в точці (center - dx, center - dy) у КООРДИНАТАХ ПОПЕРЕДНЬОГО КАДРУ.
+        scale = self._last_scale
+        angle = self._last_state.get("global_angle", 0)
+
+        # ── 1. Вектор зсуву: оригінальний простір → нормалізований + повернутий ──
+        # Масштабуємо до нормалізованого простору
+        sdx = dx_px * scale
+        sdy = dy_px * scale
+
+        # Обертаємо вектор зсуву відповідно до повороту кадру.
+        # H побудована в просторі повернутого нормалізованого кадру, тому зсув
+        # теж має бути в тій самій системі координат.
+        a, b, c, d = _ROTATION_VEC.get(angle, (1, 0, 0, 1))
+        rot_sdx = a * sdx + b * sdy
+        rot_sdy = c * sdx + d * sdy
+
+        # ── 2. Розміри кадру: оригінальні → нормалізовані + повернуті ────────
+        if angle in (90, 270):
+            # 90° / 270°: рядки і стовпці міняються місцями
+            norm_rot_w = rot_height * scale
+            norm_rot_h = rot_width * scale
+        else:
+            norm_rot_w = rot_width * scale
+            norm_rot_h = rot_height * scale
+
+        # ── 3. Центр поточного кадру в системі координат попереднього ────────
+        # Якщо з моменту KF точки змістились на (dx, dy), то центр поточного
+        # дрона відповідає точці (center − displacement) у КС попереднього KF.
         center_query_shifted = np.array(
-            [[rot_width / 2.0 - dx_px, rot_height / 2.0 - dy_px]], dtype=np.float64
+            [[norm_rot_w / 2.0 - rot_sdx, norm_rot_h / 2.0 - rot_sdy]],
+            dtype=np.float64,
         )
 
         pts_in_ref = GeometryTransforms.apply_homography(
@@ -7111,7 +7273,6 @@ class Localizer:
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        # Оновлення Калмана
         filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
 
@@ -7119,38 +7280,59 @@ class Localizer:
             float(filtered_pt[0]), float(filtered_pt[1])
         )
 
-        # Для спрощення, OF не розраховує повний FOV-полігон, повертає None або оцінку
-        # Зберігаємо "уявний" inliers для сумісності з UI (беремо половину від останнього)
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
-
-        confidence = 0.8  # OF confidence is generally high since it's frame-to-frame
 
         return {
             "success": True,
             "lat": lat,
             "lon": lon,
-            "confidence": confidence,
+            "confidence": 0.8,
             "matched_frame": int(self._last_state.get("candidate_id", -1)),
             "inliers": of_inliers,
             "fov_polygon": None,
-            "is_of": True,  # Прапорець для логів
+            "is_of": True,
         }
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _merge_candidates(
+        self,
+        standard: list[tuple[int, float]],
+        patches: list[tuple[int, float]],
+        max_results: int | None = None,
+    ) -> list[tuple[int, float]]:
+        """Об'єднує результати стандартного та патч-retrieval.
+
+        Для кожного frame_id зберігається МАКСИМАЛЬНИЙ скор з двох джерел.
+        max_results обмежує підсумковий список (None = без ліміту).
+
+        Примітка про шкали: стандартний DINOv2 і patchify обидва повертають
+        усереднений cosine similarity ∈ [-1, 1] — шкали порівнянні.
+        """
+        merged: dict[int, float] = {fid: score for fid, score in standard}
+        for fid, score in patches:
+            if fid not in merged or score > merged[fid]:
+                merged[fid] = score
+
+        sorted_results = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+
+        if max_results is not None:
+            sorted_results = sorted_results[:max_results]
+
+        return sorted_results
 
     def _compute_confidence(
         self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
     ) -> float:
-        """Обчислює впевненість на основі QA бази даних (RMSE, Disagreement) та кількості інлаєрів."""
-        # Налаштування з конфігу
+        """Обчислює впевненість на основі QA бази даних та кількості інлаєрів."""
         max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
         rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
         diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
         w_inlier = get_cfg(self.config, "localization.confidence.inlier_weight", 0.7)
         w_stability = get_cfg(self.config, "localization.confidence.stability_weight", 0.3)
 
-        # 1. Показник інлаєрів (0-1)
         inlier_score = min(1.0, best_inliers / max_inliers)
 
-        # 2. Показник стабільності бази (на основі QA метрик)
         rmse = (
             self.database.frame_rmse[best_candidate_id]
             if self.database.frame_rmse is not None
@@ -7163,26 +7345,20 @@ class Localizer:
         )
 
         stability_score = 1.0 - (
-            min(rmse, rmse_norm) / rmse_norm * 0.5 + min(disagreement, diag_norm) / diag_norm * 0.5
+            min(rmse, rmse_norm) / rmse_norm * 0.5
+            + min(disagreement, diag_norm) / diag_norm * 0.5
         )
         stability_score = float(np.clip(stability_score, 0.0, 1.0))
 
-        # 3. Показник поточної відповідності (ПЕР-ФРЕЙМ)
-        # a) Inlier ratio
         ratio_score = float(best_inliers / (total_matches + 1e-6))
-        # b) RMSE score (1.0 if RMSE=0, 0.5 if RMSE=thresh)
         rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
-
         match_score = ratio_score * 0.5 + rmse_score_val * 0.5
 
-        # 4. Комбінована оцінка
-        # (QA бази * 0.3) + (Кількість інлаєрів * 0.4) + (Якість відповідності * 0.3)
         final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
-
         return float(np.clip(final_conf, 0.05, 1.0))
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
-        """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)"""
+        """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)."""
         if frame_id == -1:
             return None
 
@@ -7203,7 +7379,6 @@ class Localizer:
             return None
 
         ref_h, ref_w = self.database.get_frame_size(frame_id)
-        # Центр кадру в системі координат БД
         center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float64)
         metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
 
@@ -7213,7 +7388,7 @@ class Localizer:
             "success": True,
             "lat": lat,
             "lon": lon,
-            "confidence": 0.3,  # Низький confidence для retrieval-only
+            "confidence": 0.3,
             "inliers": 0,
             "matched_frame": frame_id,
             "fallback_mode": "retrieval_only",
@@ -7230,12 +7405,10 @@ class Localizer:
                 if write_header:
                     f.write("timestamp,error_type,inliers,details\n")
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                # Quote details to prevent CSV breakage
                 safe_details = details.replace('"', '""')
                 f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
         except Exception as e:
             logger.error(f"Failed to log to localization_failures.csv: {e}")
-
 
 # ================================================================================
 # File: localization\matcher.py
@@ -7519,6 +7692,213 @@ class FeatureMatcher:
                 exc_info=True,
             )
             return np.empty((0, 2)), np.empty((0, 2))
+
+
+# ================================================================================
+# File: localization\patchify.py
+# ================================================================================
+import numpy as np
+import torch
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class PatchifyRetrieval:
+    """Мультимасштабний retrieval через патч-дескриптори DINOv2.
+
+    Розбиває зображення на патчі за сітками (1×1, 2×2, 3×3) = 14 патчів,
+    для кожного витягує DINOv2 CLS-token, і шукає найбільш схожі кадри
+    за агрегованими патч-скорами.
+    """
+
+    DEFAULT_GRIDS = [(1, 1), (2, 2), (3, 3)]  # 1 + 4 + 9 = 14 патчів
+
+    def __init__(self, feature_extractor, descriptor_dim: int = 1024,
+                 grids: list[list[int]] | None = None, batch_size: int = 1):
+        self.feature_extractor = feature_extractor
+        self.descriptor_dim = descriptor_dim
+        self.batch_size = max(1, batch_size)
+        self.grids = [tuple(g) for g in grids] if grids else self.DEFAULT_GRIDS
+        self.num_patches = sum(r * c for r, c in self.grids)
+
+        # FAISS index (заповнюється через build_index)
+        self.patch_index = None
+        # Маппінг: linear_patch_idx → frame_id
+        self.patch_frame_ids: np.ndarray | None = None
+
+        logger.info(
+            f"PatchifyRetrieval initialized: grids={self.grids}, "
+            f"num_patches={self.num_patches}, batch_size={self.batch_size}, dim={descriptor_dim}"
+        )
+
+    # ── Patch extraction ─────────────────────────────────────────────────
+
+    @staticmethod
+    def extract_patches(image: np.ndarray, grids: list[tuple[int, int]]) -> list[np.ndarray]:
+        """Розрізає зображення на патчі за сітками.
+
+        Args:
+            image: (H, W, 3) RGB зображення
+            grids: Список (rows, cols) сіток
+
+        Returns:
+            Список кропів у порядку: grid(1,1) → grid(2,2) → grid(3,3)
+        """
+        h, w = image.shape[:2]
+        patches = []
+
+        for rows, cols in grids:
+            ph = h // rows
+            pw = w // cols
+            for r in range(rows):
+                for c in range(cols):
+                    y1 = r * ph
+                    x1 = c * pw
+                    # Останній патч забирає залишок (щоб не втрачати пікселі)
+                    y2 = h if r == rows - 1 else (r + 1) * ph
+                    x2 = w if c == cols - 1 else (c + 1) * pw
+                    patches.append(image[y1:y2, x1:x2].copy())
+
+        return patches
+
+    # ── Descriptor computation ───────────────────────────────────────────
+
+    @torch.no_grad()
+    def compute_patch_descriptors(self, image: np.ndarray) -> np.ndarray:
+        """Витягує DINOv2 дескриптор для кожного патча зображення.
+
+        Args:
+            image: (H, W, 3) RGB зображення
+
+        Returns:
+            (num_patches, descriptor_dim) float32 масив дескрипторів
+        """
+        patches = self.extract_patches(image, self.grids)
+        descriptors = np.empty((len(patches), self.descriptor_dim), dtype=np.float32)
+
+        if self.batch_size <= 1:
+            # Послідовний інференс — мінімальне споживання VRAM
+            for i, patch in enumerate(patches):
+                descriptors[i] = self.feature_extractor.extract_global_descriptor(patch)
+        else:
+            # Батчований інференс — швидше, але більше VRAM
+            for start in range(0, len(patches), self.batch_size):
+                batch = patches[start:start + self.batch_size]
+                batch_descs = self._extract_batch_descriptors(batch)
+                descriptors[start:start + len(batch)] = batch_descs
+
+        return descriptors
+
+    @torch.no_grad()
+    def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
+        """Батчований DINOv2 інференс для групи патчів."""
+        import torchvision.transforms as T
+
+        fe = self.feature_extractor
+        device = fe.device
+
+        dino_size = fe.dino_size
+        transform = T.Compose([
+            T.Resize((dino_size, dino_size), antialias=True),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        tensors = []
+        for patch in patches:
+            t = torch.from_numpy(patch).float().div_(255.0).permute(2, 0, 1)
+            tensors.append(t)
+
+        batch_tensor = torch.stack(tensors).to(device, non_blocking=True)
+        batch_input = transform(batch_tensor)
+
+        amp_dtype = fe.amp_dtype
+        use_half = fe.use_half
+
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_half):
+            out = fe.global_model(batch_input).float()
+
+        return out.cpu().numpy()
+
+    # ── Index management ─────────────────────────────────────────────────
+
+    def build_index(self, patch_descriptors_all: np.ndarray, frame_ids: list[int]):
+        """Будує FAISS індекс з усіх патч-дескрипторів.
+
+        Args:
+            patch_descriptors_all: (N_frames, num_patches, D) — всі патч-дескриптори
+            frame_ids: Список frame_id для кожного кадру
+        """
+        import faiss
+
+        n_frames, n_patches, dim = patch_descriptors_all.shape
+        assert n_patches == self.num_patches, (
+            f"Expected {self.num_patches} patches per frame, got {n_patches}"
+        )
+
+        # Розгортаємо (N_frames × num_patches, D)
+        flat = patch_descriptors_all.reshape(-1, dim).astype(np.float32)
+
+        # Нормалізація для cosine similarity
+        norms = np.linalg.norm(flat, axis=1, keepdims=True)
+        flat = flat / (norms + 1e-8)
+
+        # Маппінг: кожен рядок flat → frame_id
+        self.patch_frame_ids = np.repeat(np.array(frame_ids, dtype=np.int32), n_patches)
+
+        # FAISS Inner Product index
+        base_index = faiss.IndexFlatIP(dim)
+        self.patch_index = base_index
+        self.patch_index.add(flat)
+
+        logger.info(
+            f"Patchify FAISS index built: {self.patch_index.ntotal} vectors "
+            f"({n_frames} frames × {n_patches} patches)"
+        )
+
+    def search(self, query_descriptors: np.ndarray, top_k: int = 10) -> list[tuple[int, float]]:
+        """Пошук top-K кадрів за агрегованими патч-скорами.
+
+        Args:
+            query_descriptors: (num_patches, D) — патч-дескриптори query
+            top_k: Кількість кандидатів
+
+        Returns:
+            Список (frame_id, aggregated_score) відсортований за зменшенням скору
+        """
+        if self.patch_index is None or self.patch_frame_ids is None:
+            logger.warning("Patchify index not built, returning empty results")
+            return []
+
+        # Нормалізація query
+        q = query_descriptors.astype(np.float32)
+        norms = np.linalg.norm(q, axis=1, keepdims=True)
+        q = q / (norms + 1e-8)
+
+        # Для кожного з num_patches query-патчів знаходимо top-K ref-патчів
+        search_k = top_k * 3  # шукаємо більше для кращої агрегації
+        scores, indices = self.patch_index.search(q, search_k)
+
+        # Агрегація: сумуємо cosine-скори для кожного frame_id
+        frame_scores: dict[int, float] = {}
+        for patch_idx in range(len(q)):
+            for j in range(search_k):
+                ref_idx = indices[patch_idx, j]
+                if ref_idx < 0:
+                    continue
+                fid = int(self.patch_frame_ids[ref_idx])
+                score = float(scores[patch_idx, j])
+                frame_scores[fid] = frame_scores.get(fid, 0.0) + score
+
+        # Нормалізуємо по кількості патчів для порівнянності зі стандартним retrieval
+        num_patches = len(q)
+        for fid in frame_scores:
+            frame_scores[fid] /= num_patches
+
+        # Сортуємо та повертаємо top-K
+        sorted_frames = sorted(frame_scores.items(), key=lambda x: x[1], reverse=True)
+        return sorted_frames[:top_k]
 
 
 # ================================================================================
@@ -8321,6 +8701,7 @@ class CESP(nn.Module):
 # File: models\wrappers\feature_extractor.py
 # ================================================================================
 import contextlib
+import cv2
 
 import numpy as np
 import torch
@@ -8418,11 +8799,11 @@ class FeatureExtractor:
         input_dict = {"image": rgb_tensor}
 
         # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
-        with Telemetry.profile("aliked"):
+        with Telemetry.profile("local_extractor"):
             with contextlib.nullcontext():
                 aliked_out = self.local_model(input_dict)
 
-        # LightGlue ALIKED wrapper повертає батч: (1, N, 2) та (1, N, 128)
+        # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
         keypoints = aliked_out["keypoints"][0].cpu().numpy()
         descriptors = aliked_out["descriptors"][0].cpu().numpy()
 
@@ -11445,24 +11826,35 @@ class RealtimeTrackingWorker(QThread):
                     
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
-                    # Кешуємо останні відстежені об'єкти для OF-кадрів
-                    last_tracked_objects = tracked_objects if tracked_objects else last_tracked_objects
-                    if tracked_objects:
-                        self.objects_detected.emit(tracked_objects)
+                    # ОНОВЛЕНО: Завжди оновлюємо кеш, навіть якщо порожній, щоб об'єкти могли зникати
+                    last_tracked_objects = tracked_objects
+                    self.objects_detected.emit(tracked_objects)
+                    if object_projector and getattr(self.localizer, "_last_state", None):
+                        H = self.localizer._last_state.get("H")
+                        affine = self.localizer._last_state.get("affine")
+                        angle = self.localizer._last_state.get("global_angle", 0)
                         
-                        if object_projector and getattr(self.localizer, "_last_state", None):
-                            H = self.localizer._last_state.get("H")
-                            affine = self.localizer._last_state.get("affine")
-                            angle = self.localizer._last_state.get("global_angle", 0)
+                        if H is not None and affine is not None:
+                            # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
+                            scale = getattr(self.localizer, "_last_scale", 1.0)
                             
-                            if H is not None and affine is not None:
-                                objects_gps = object_projector.project_objects(
-                                    tracked_objects, H, affine, angle, frame.shape[1], frame.shape[0]
-                                )
-                                if objects_gps:
-                                    obj_summary = ", ".join([f"{obj.class_name} #{obj.track_id}" for obj in objects_gps])
-                                    logger.info(f"Tracked {len(objects_gps)} objects (KF): {obj_summary}")
-                                    self.objects_gps_updated.emit(objects_gps)
+                            # Створюємо копії об'єктів з масштабованими координатами
+                            from copy import deepcopy
+                            scaled_tracked_objects = []
+                            for obj in tracked_objects:
+                                s_obj = deepcopy(obj)
+                                s_obj.center_px = (obj.center_px[0] * scale, obj.center_px[1] * scale)
+                                s_obj.bbox = [c * scale for c in obj.bbox]
+                                scaled_tracked_objects.append(s_obj)
+                            
+                            objects_gps = object_projector.project_objects(
+                                scaled_tracked_objects, H, affine, angle, 
+                                int(frame.shape[1] * scale), int(frame.shape[0] * scale)
+                            )
+                            if objects_gps:
+                                obj_summary = ", ".join([f"{obj.class_name} #{obj.track_id}" for obj in objects_gps])
+                                logger.info(f"Tracked {len(objects_gps)} objects (KF): {obj_summary}")
+                            self.objects_gps_updated.emit(objects_gps)
             else:
                 # ====== OPTICAL FLOW TRACKING ======
                 if prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
@@ -11500,7 +11892,7 @@ class RealtimeTrackingWorker(QThread):
                         
                         # На OF-кадрах: повторно emit останні відомі об'єкти для візуальної
                         # безперервності (YOLO не запускається, тому нових детекцій немає)
-                        if object_tracker and last_tracked_objects:
+                        if object_tracker:
                             self.objects_detected.emit(last_tracked_objects)
                     else:
                         prev_pts_for_of = None  # Втрата точок — наступний кадр стане ключовим
