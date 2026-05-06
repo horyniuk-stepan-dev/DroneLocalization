@@ -19,7 +19,7 @@
 - **GPU**: NVIDIA з підтримкою CUDA (мінімум **4GB VRAM**, наприклад, GTX 1650 або краще)
 - **CPU**: 6+ ядер
 - **RAM**: 16 GB (рекомендовано 32 GB для великих баз даних)
-- **Накопичувач**: SSD (рекомендовано, бази даних HDF5 займають мінімум місця завдяки розмірності дескрипторів 1024)
+- **Накопичувач**: SSD (рекомендовано)
 
 ### Програмні вимоги
 - Python 3.10–3.11
@@ -31,7 +31,7 @@
 
 ```powershell
 # Клонування репозиторію
-git clone <repository-url>
+git clone https://github.com/horyniuk-stepan-dev/DroneLocalization.git
 cd DroneLocalization
 
 # Створення віртуального середовища
@@ -49,23 +49,16 @@ pip install -e ".[tensorrt]"
 ```
 
 ### 1.1 Встановлення RDD (Robust Deformable Detector)
-Оскільки система використовує RDD для стійкої до масштабу локалізації, необхідно завантажити його як сабмодуль та опціонально скомпілювати кастомні CUDA оператори:
+Оскільки система використовує RDD для стійкої до масштабу локалізації (сирцевий код вже включено до репозиторію), рекомендується скомпілювати кастомні CUDA оператори для швидкодії:
 
 ```powershell
-# Клонування RDD в third_party
-mkdir third_party
-git clone --recursive https://github.com/xtcpete/rdd third_party/rdd
+# Встановлення залежностей RDD
+pip install -r third_party/rdd/requirements.txt
 
 # Компіляція кастомних CUDA-операторів (рекомендовано для швидкості)
 cd third_party/rdd/RDD/models/ops
-pip install -e .
-cd ../../../../..
+pip install -e . --no-build-isolation
 ```
-
-**Завантаження ваг (Weights):**
-Вам також необхідно вручну завантажити ваги для RDD:
-1. Завантажте файли `rdd.pth` та `lightglue_rdd.pth` [за цим посиланням](https://drive.google.com/drive/folders/1QgVaqm4iTUCqbWb7_Fi6mX09EHTId0oA).
-2. Помістіть завантажені файли у директорію проєкту `models/weights/`.
 
 > **Примітка:** PyTorch з підтримкою CUDA встановлюється окремо згідно з
 > [офіційною інструкцією](https://pytorch.org/get-started/locally/), оскільки
@@ -79,8 +72,15 @@ cd ../../../../..
 git clone https://github.com/DepthAnything/Depth-Anything-V2 third_party/Depth-Anything-V2
 ```
 
+### Встановлення залежностей Depth-Anything-V2
+```powershell
+pip install -r third_party/Depth-Anything-V2/requirements.txt
+```
+
 **Завантаження ваг (Weights):**
-Модель потребує попередньо навчених ваг (наприклад, `depth_anything_v2_vits.pth` або `depth_anything_v2_vitl.pth`). Завантажте їх з [офіційного репозиторію Depth-Anything-V2](https://github.com/DepthAnything/Depth-Anything-V2) та розмістіть у папку `third_party/Depth-Anything-V2/checkpoints/` або у директорію ваг вашого проєкту (згідно з конфігурацією).
+Вам також необхідно вручну завантажити ваги для RDD та Depth-Anything-V2:
+1. Завантажте файли `models.zip` [за цим посиланням](https://drive.google.com/drive/folders/1qyO9AtUNkmkHXswvCbNkYcoTv8ChBbyP?usp=sharing).
+2. Помістіть завантажені файли у директорію проєкту `models/weights/`.
 
 ### 2. Запуск програми
 
