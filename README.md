@@ -71,6 +71,17 @@ cd ../../../../..
 > [офіційною інструкцією](https://pytorch.org/get-started/locally/), оскільки
 > потрібна версія залежить від вашого GPU та драйвера.
 
+### 1.2 Встановлення Depth-Anything-V2
+Для оцінки глибини кадру використовується модуль Depth-Anything-V2, який потрібно завантажити у папку `third_party`:
+
+```powershell
+# Клонування Depth-Anything-V2 в third_party
+git clone https://github.com/DepthAnything/Depth-Anything-V2 third_party/Depth-Anything-V2
+```
+
+**Завантаження ваг (Weights):**
+Модель потребує попередньо навчених ваг (наприклад, `depth_anything_v2_vits.pth` або `depth_anything_v2_vitl.pth`). Завантажте їх з [офіційного репозиторію Depth-Anything-V2](https://github.com/DepthAnything/Depth-Anything-V2) та розмістіть у папку `third_party/Depth-Anything-V2/checkpoints/` або у директорію ваг вашого проєкту (згідно з конфігурацією).
+
 ### 2. Запуск програми
 
 ```powershell
