@@ -18,7 +18,7 @@ try:
     import tensorrt as trt
 
     _TRT_AVAILABLE = True
-except ImportError:
+except Exception:
     _TRT_AVAILABLE = False
 
 

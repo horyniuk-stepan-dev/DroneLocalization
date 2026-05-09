@@ -14,7 +14,7 @@ authors = [
 ]
 
 dependencies = [
-    "numpy>=2.0.0",
+    "numpy<2.0.0",
     "opencv-contrib-python>=4.9.0",
     "h5py>=3.10.0",
     "PyQt6>=6.6.0",

@@ -161,8 +161,56 @@ class MultiAnchorCalibration:
             dtype=np.float64,
         )  # shape (N, 4): tx, ty, scale, angle
 
+        # ── НОВИЙ БЛОК: GPS scale normalization (Phase 1.1) ──────────────────
+        # Для кожної пари сусідніх якорів: обчислюємо реальну GPS відстань
+        # і порівнюємо з пікселевою відстанню через affine.
+        if len(self.anchors) >= 2:
+            scale_corrections = []
+            for i in range(len(self.anchors) - 1):
+                a1, a2 = self.anchors[i], self.anchors[i + 1]
+                
+                # GPS точки якорів
+                pts_gps_1 = a1.points_gps
+                pts_gps_2 = a2.points_gps
+                
+                if pts_gps_1 and pts_gps_2:
+                    # Реальна метрична відстань між центрами якорів через GPS
+                    m1 = self.converter.gps_to_metric(pts_gps_1[0][0], pts_gps_1[0][1])
+                    m2 = self.converter.gps_to_metric(pts_gps_2[0][0], pts_gps_2[0][1])
+                    gps_dist = np.linalg.norm(np.array(m1) - np.array(m2))
+                    
+                    if gps_dist > 0.5:  # мін. 0.5м між якорями для стабільного розрахунку
+                        scale_ratio = decomposed[i + 1, 2] / (decomposed[i, 2] + 1e-9)
+                        scale_corrections.append(scale_ratio)
+                        logger.debug(
+                            f"Anchor pair ({a1.frame_id}, {a2.frame_id}): "
+                            f"gps_dist={gps_dist:.1f}m, scale_ratio={scale_ratio:.4f}"
+                        )
+        # ── Кінець блоку аналізу масштабу ─────────────────────────────────────
+
         # Розгортаємо кути для коректної інтерполяції через межу ±π
         decomposed[:, 3] = _unwrap_angles(decomposed[:, 3])
+
+        # ── Phase 1.2: Anchor confidence weighting ────────────────────────────
+        # Обчислюємо ваги якорів на основі QA метрик
+        weights = np.array([
+            a.inliers_count / (a.rmse_m + 1e-6)
+            for a in self.anchors
+        ], dtype=np.float64)
+
+        # Нормалізуємо ваги
+        weights = weights / (weights.max() + 1e-9)
+
+        # Логування для діагностики
+        for i, (a, w) in enumerate(zip(self.anchors, weights)):
+            logger.debug(
+                f"Anchor {a.frame_id}: rmse={a.rmse_m:.3f}m, "
+                f"inliers={a.inliers_count}, weight={w:.3f}, "
+                f"quality_flag={a.quality_flag}"
+            )
+
+        self._anchor_weights = weights  # зберегти для подальшого використання
+        # ──────────────────────────────────────────────────────────────────────
 
         # Один багатоколонковий PCHIP-інтерполятор для всіх 4 каналів
         self._interp = PchipInterpolator(ids, decomposed, extrapolate=True)
@@ -229,6 +277,13 @@ class MultiAnchorCalibration:
         if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
 
+        # Phase 1.2: Перевірка чи frame_id = один із якорів → reset drift
+        exact_anchor = self.get_anchor(frame_id)
+        if exact_anchor is not None:
+            # Точне потрапляння на якір = скидаємо накопичений drift
+            logger.debug(f"Exact anchor hit at frame {frame_id} — using direct affine (drift reset)")
+            return exact_anchor.pixel_to_metric(x, y)
+
         # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
         if self._interp is not None:
             M = self._get_interpolated_matrix(float(frame_id))
@@ -251,6 +306,53 @@ class MultiAnchorCalibration:
                 m2 = a2.pixel_to_metric(x, y)
                 return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
         return None
+
+    def get_metric_position_with_depth(
+        self,
+        frame_id: int,
+        x: float,
+        y: float,
+        depth_scale: float = 1.0,
+    ) -> tuple[float, float] | None:
+        """Версія get_metric_position з корекцією масштабу через depth.
+        
+        depth_scale — відносний масштаб з DepthEstimator.get_relative_scale().
+        При depth_scale > 1: об'єкт ближче (нижча висота) → більший pixel scale.
+        При depth_scale < 1: об'єкт далі (вища висота) → менший pixel scale.
+        """
+        result = self.get_metric_position(frame_id, x, y)
+        if result is None:
+            return None
+        
+        mx, my = result
+        
+        # Нормалізуємо depth_scale відносно reference (медіана всіх якорів).
+        ref_depth = getattr(self, '_reference_depth_scale', 1.0)
+        if ref_depth > 1e-6:
+            correction = depth_scale / ref_depth
+            # Обмежуємо корекцію: максимум 2x в будь-який бік
+            correction = float(np.clip(correction, 0.5, 2.0))
+            
+            # TODO: У майбутньому тут можна додати зміщення відносно оптичного центру
+            # для більш точної компенсації паралаксу. Поки що — логуємо.
+            if abs(correction - 1.0) > 0.05:
+                logger.debug(
+                    f"Depth scale correction: ref={ref_depth:.3f}, "
+                    f"current={depth_scale:.3f}, ratio={correction:.3f}"
+                )
+        
+        return mx, my
+
+    def set_reference_depth_scale(self, depth_scale: float) -> None:
+        """Встановлює референсний depth_scale (зі збудови БД)."""
+        self._reference_depth_scale = float(depth_scale)
+        logger.info(f"Reference depth scale set: {depth_scale:.4f}")
+
+    def set_gsd_calculator(self, gsd_calculator) -> None:
+        """Встановлює калькулятор GSD для прив'язки до фізичного масштабу."""
+        self._gsd = gsd_calculator
+        if self._gsd:
+            logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px*100:.2f} cm/px")
 
     def save(self, path: str) -> None:
         """Збереження якорів та метаданих проєкції у JSON."""
@@ -316,6 +418,110 @@ class MultiAnchorCalibration:
         self.anchors.sort(key=lambda a: a.frame_id)
         self._rebuild_interpolators()
         logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")
+
+
+# ================================================================================
+# File: calibration\multi_calibration_manager.py
+# ================================================================================
+"""
+multi_calibration_manager.py — Менеджер множинних калібрацій.
+
+Зберігає dict[source_id → MultiAnchorCalibration].
+Логіка самої калібрації не змінюється — лише оркестрація.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.utils.logging_utils import get_logger
+
+if TYPE_CHECKING:
+    from src.core.project_video_source import ProjectVideoSource
+
+logger = get_logger(__name__)
+
+
+class MultiCalibrationManager:
+    """Менеджер множинних калібрацій: dict[source_id → MultiAnchorCalibration]."""
+
+    def __init__(self) -> None:
+        self._calibrations: dict[str, MultiAnchorCalibration] = {}
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def get(self, source_id: str) -> MultiAnchorCalibration:
+        """Повертає калібрацію для source_id. Створює порожню якщо не існує."""
+        if source_id not in self._calibrations:
+            self._calibrations[source_id] = MultiAnchorCalibration()
+            logger.debug(f"Created empty calibration for source '{source_id}'")
+        return self._calibrations[source_id]
+
+    def load_all(
+        self,
+        sources: list[ProjectVideoSource],
+        project_dir: Path,
+    ) -> None:
+        """Завантажує калібрації для всіх enabled джерел."""
+        self._calibrations.clear()
+        for src in sources:
+            if not src.enabled:
+                continue
+            calib_path = project_dir / src.calibration_file
+            cal = MultiAnchorCalibration()
+            if calib_path.exists():
+                try:
+                    cal.load(str(calib_path))
+                    logger.info(
+                        f"Calibration loaded for '{src.source_id}': "
+                        f"{len(cal.anchors)} anchors from {calib_path}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load calibration for '{src.source_id}' "
+                        f"from {calib_path}: {e}. Using empty calibration."
+                    )
+            else:
+                logger.debug(f"No calibration file for '{src.source_id}' at {calib_path}")
+            self._calibrations[src.source_id] = cal
+
+    def save_all(
+        self,
+        sources: list[ProjectVideoSource],
+        project_dir: Path,
+    ) -> None:
+        """Зберігає всі модифіковані калібрації. Створює підпапки якщо потрібно."""
+        for src in sources:
+            if src.source_id not in self._calibrations:
+                continue
+            cal = self._calibrations[src.source_id]
+            if not cal.is_calibrated:
+                continue
+            calib_path = project_dir / src.calibration_file
+            calib_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                cal.save(str(calib_path))
+            except Exception as e:
+                logger.error(f"Failed to save calibration for '{src.source_id}': {e}")
+
+    # ── Властивості ──────────────────────────────────────────────────────────
+
+    @property
+    def is_any_calibrated(self) -> bool:
+        """True якщо хоча б одне джерело має повну калібрацію."""
+        return any(cal.is_calibrated for cal in self._calibrations.values())
+
+    @property
+    def source_ids(self) -> list[str]:
+        """Список source_id з завантаженими калібраціями."""
+        return list(self._calibrations.keys())
+
+    def __contains__(self, source_id: str) -> bool:
+        return source_id in self._calibrations
+
+    def __len__(self) -> int:
+        return len(self._calibrations)
 
 
 # ================================================================================
@@ -545,8 +751,10 @@ from pathlib import Path
 from PyQt6.QtCore import QCoreApplication
 
 from config.config import APP_CONFIG, APP_SETTINGS
+from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader
+from src.database.multi_database_manager import MultiDatabaseManager
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
@@ -573,6 +781,10 @@ class HeadlessRunner:
         self.calibration = MultiAnchorCalibration()
         self.database = None
         self.tracking_worker = None
+
+        # Мультиджерельна підтримка
+        self.db_manager = None
+        self.calib_manager = None
         
         # Вмикаємо network api примусово для headless
         APP_SETTINGS.network_api.enabled = True
@@ -581,18 +793,56 @@ class HeadlessRunner:
     def _setup_project(self):
         """Завантажує БД та калібрування з проекту."""
         logger.info(f"Loading project from {self.project_dir}")
-        db_path = self.project_dir / "database.h5"
-        calib_path = self.project_dir / "calibration.json"
-        
-        if not db_path.exists():
-            raise FileNotFoundError(f"Database not found at {db_path}")
+
+        # Завантажуємо проект через ProjectManager для підтримки multi-source
+        pm = ProjectManager()
+        if pm.load_project(str(self.project_dir)):
+            sources = pm.settings.get_enabled_sources()
+            is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
+
+            if is_multi and len(sources) > 0:
+                # Мультиджерельний режим
+                self.db_manager = MultiDatabaseManager(
+                    sources, self.project_dir, config=APP_CONFIG.model_dump()
+                )
+                self.calib_manager = MultiCalibrationManager()
+                self.calib_manager.load_all(sources, self.project_dir)
+
+                first_id = self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                if first_id:
+                    self.database = self.db_manager.get_database(first_id)
+                    self.calibration = self.calib_manager.get(first_id)
+                else:
+                    raise RuntimeError("Multi-source project: no database loaded")
+
+                logger.info(
+                    f"Multi-source project: {self.db_manager.num_databases} databases, "
+                    f"sources={self.db_manager.all_source_ids}"
+                )
+            else:
+                # Single-source mode
+                db_path = self.project_dir / "database.h5"
+                if not db_path.exists():
+                    raise FileNotFoundError(f"Database not found at {db_path}")
+                self.database = DatabaseLoader(str(db_path))
+
+                calib_path = self.project_dir / "calibration.json"
+                if calib_path.exists():
+                    self.calibration.load(str(calib_path))
+        else:
+            # Fallback: прямий шлях (legacy)
+            db_path = self.project_dir / "database.h5"
+            calib_path = self.project_dir / "calibration.json"
             
-        self.database = DatabaseLoader(str(db_path))
+            if not db_path.exists():
+                raise FileNotFoundError(f"Database not found at {db_path}")
+                
+            self.database = DatabaseLoader(str(db_path))
+            if calib_path.exists():
+                self.calibration.load(str(calib_path))
+
         if not self.database.is_propagated:
             logger.warning("Database is not propagated! Precision will be degraded.")
-            
-        if calib_path.exists():
-            self.calibration.load(str(calib_path))
             
         if not self.calibration.converter.is_initialized:
             ref_gps = self.calibration.converter.reference_gps
@@ -623,6 +873,8 @@ class HeadlessRunner:
             self.database, fe, matcher, self.calibration, config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
             ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
+            db_manager=self.db_manager,
+            calib_manager=self.calib_manager,
         )
 
     def run(self):
@@ -678,10 +930,12 @@ class HeadlessRunner:
 # File: core\project.py
 # ================================================================================
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+from src.core.project_video_source import ProjectVideoSource
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -695,9 +949,12 @@ class ProjectSettings:
     created_at: str
     video_path: str
 
-    # Internal relative paths
+    # Internal relative paths (legacy — для зворотної сумісності)
     database_filename: str = "database.h5"
     calibration_filename: str = "calibration.json"
+
+    # Мультиджерельна конфігурація (список dict для JSON-серіалізації)
+    video_sources: list[dict[str, Any]] = field(default_factory=list)
 
     # Optional mission parameters inherited from NewMissionDialog
     altitude_m: float = 100.0
@@ -717,7 +974,68 @@ class ProjectSettings:
         import dataclasses
         known_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known_fields}
-        return cls(**filtered)
+        instance = cls(**filtered)
+
+        # Авто-міграція: якщо немає video_sources — створюємо з legacy полів
+        if not instance.video_sources and instance.video_path:
+            instance.video_sources = [
+                ProjectVideoSource(
+                    source_id="main",
+                    area_id="area_main",
+                    video_path=instance.video_path,
+                    database_file=instance.database_filename,
+                    calibration_file=instance.calibration_filename,
+                    description="Auto-migrated from legacy project",
+                    enabled=True,
+                    priority=0,
+                ).to_dict()
+            ]
+            logger.info(
+                "Auto-migrated legacy project to video_sources format "
+                "(source_id='main', area_id='area_main')"
+            )
+        return instance
+
+    def source_configs(self) -> list[ProjectVideoSource]:
+        """Повертає список ProjectVideoSource з серіалізованих dicts."""
+        return [ProjectVideoSource.from_dict(d) for d in self.video_sources]
+
+    def get_enabled_sources(self) -> list[ProjectVideoSource]:
+        """Повертає тільки enabled джерела."""
+        return [s for s in self.source_configs() if s.enabled]
+
+    def add_source(self, source: ProjectVideoSource) -> None:
+        """Додає нове джерело. Перевіряє унікальність source_id."""
+        existing_ids = {s["source_id"] for s in self.video_sources}
+        if source.source_id in existing_ids:
+            raise ValueError(f"Source ID '{source.source_id}' already exists in project")
+        self.video_sources.append(source.to_dict())
+        logger.info(f"Added video source: {source.source_id} (area: {source.area_id})")
+
+    def remove_source(self, source_id: str) -> bool:
+        """Видаляє джерело за source_id. Повертає True якщо знайдено."""
+        before = len(self.video_sources)
+        self.video_sources = [s for s in self.video_sources if s.get("source_id") != source_id]
+        removed = len(self.video_sources) < before
+        if removed:
+            logger.info(f"Removed video source: {source_id}")
+        return removed
+
+    def get_source(self, source_id: str) -> ProjectVideoSource | None:
+        """Повертає конфіг за source_id або None."""
+        for d in self.video_sources:
+            if d.get("source_id") == source_id:
+                return ProjectVideoSource.from_dict(d)
+        return None
+
+    def update_source(self, source: ProjectVideoSource) -> None:
+        """Оновлює існуюче джерело (шукає за source_id)."""
+        for i, d in enumerate(self.video_sources):
+            if d.get("source_id") == source.source_id:
+                self.video_sources[i] = source.to_dict()
+                logger.info(f"Updated video source: {source.source_id}")
+                return
+        raise ValueError(f"Source ID '{source.source_id}' not found in project")
 
 
 class ProjectManager:
@@ -921,6 +1239,7 @@ class ProjectRegistry:
         """Додати або оновити проєкт у реєстрі."""
         idx = self._find_index(project_dir)
         now = datetime.now().isoformat()
+        p = Path(project_dir)
 
         entry = {
             "name": name,
@@ -928,8 +1247,8 @@ class ProjectRegistry:
             "video_path": video_path,
             "created_at": now,
             "last_opened": now,
-            "has_database": (Path(project_dir) / "database.h5").exists(),
-            "has_calibration": (Path(project_dir) / "calibration.json").exists(),
+            "has_database": self._check_has_database(p),
+            "has_calibration": self._check_has_calibration(p),
         }
 
         if idx >= 0:
@@ -962,9 +1281,33 @@ class ProjectRegistry:
         idx = self._find_index(project_dir)
         if idx >= 0:
             p = Path(project_dir)
-            self._projects[idx]["has_database"] = (p / "database.h5").exists()
-            self._projects[idx]["has_calibration"] = (p / "calibration.json").exists()
+            self._projects[idx]["has_database"] = self._check_has_database(p)
+            self._projects[idx]["has_calibration"] = self._check_has_calibration(p)
             self._save()
+
+    @staticmethod
+    def _check_has_database(project_dir: Path) -> bool:
+        """Перевіряє наявність БД: у корені (legacy) або в sources/{id}/."""
+        if (project_dir / "database.h5").exists():
+            return True
+        sources_dir = project_dir / "sources"
+        if sources_dir.is_dir():
+            for sub in sources_dir.iterdir():
+                if sub.is_dir() and (sub / "database.h5").exists():
+                    return True
+        return False
+
+    @staticmethod
+    def _check_has_calibration(project_dir: Path) -> bool:
+        """Перевіряє наявність калібрації: у корені (legacy) або в sources/{id}/."""
+        if (project_dir / "calibration.json").exists():
+            return True
+        sources_dir = project_dir / "sources"
+        if sources_dir.is_dir():
+            for sub in sources_dir.iterdir():
+                if sub.is_dir() and (sub / "calibration.json").exists():
+                    return True
+        return False
 
     def get_recent(self, limit: int = 10) -> list[dict]:
         """Повернути останні відкриті проєкти (відсортовані за датою)."""
@@ -975,6 +1318,51 @@ class ProjectRegistry:
     def get_all(self) -> list[dict]:
         """Повернути всі зареєстровані проєкти."""
         return list(self._projects)
+
+
+# ================================================================================
+# File: core\project_video_source.py
+# ================================================================================
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
+from typing import Any
+
+@dataclass
+class ProjectVideoSource:
+    source_id: str
+    area_id: str
+    video_path: str
+    database_file: str
+    calibration_file: str
+    description: str = ""
+    enabled: bool = True
+    priority: int = 0
+    geo_bounds: tuple[float, float, float, float] | None = None
+    camera_params: dict[str, Any] | None = None  
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        if d["geo_bounds"] is not None:
+            d["geo_bounds"] = list(d["geo_bounds"])
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProjectVideoSource":
+        d = dict(data)
+        gb = d.get("geo_bounds")
+        if gb is not None:
+            d["geo_bounds"] = tuple(gb)
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(cls)}
+        d = {k: v for k, v in d.items() if k in known}
+        return cls(**d)
+
+
+    def contains_point(self, lat: float, lon: float) -> bool:
+        if self.geo_bounds is None:
+            return True
+        lat_min, lon_min, lat_max, lon_max = self.geo_bounds
+        return lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
 
 
 # ================================================================================
@@ -1199,6 +1587,19 @@ class DatabaseBuilder:
             )
             logger.info(f"Patchify ENABLED for DB build: {patchify.num_patches} patches per frame")
 
+        # Phase 2.1: Depth estimator integration
+        self._depth_estimator = None
+        depth_backend = get_cfg(self.config, "models.depth_estimator.backend", "depth_anything_v2")
+        if depth_backend != "none":
+            try:
+                from src.depth.depth_estimator import DepthEstimator
+                self._depth_estimator = DepthEstimator.build(
+                    backend=depth_backend, device=model_manager.device
+                )
+                logger.info(f"Depth estimator ({depth_backend}) initialized for DB build")
+            except Exception as e:
+                logger.warning(f"Failed to initialize depth estimator: {e}")
+
         # Fix 10: Dynamic descriptor dimension detection to avoid broadcast errors
         try:
             if torch.cuda.is_available():
@@ -1352,6 +1753,16 @@ class DatabaseBuilder:
                 # Patchify: витягуємо патч-дескриптори
                 if patchify is not None:
                     features["patch_descriptors"] = patchify.compute_patch_descriptors(p_frame_rgb)
+
+                # Phase 2.2: Depth estimation for scale recovery
+                features["depth_scale"] = np.float32(1.0)
+                if self._depth_estimator is not None:
+                    try:
+                        features["depth_scale"] = np.float32(
+                            self._depth_estimator.get_relative_scale(p_frame_rgb)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Depth estimation failed for frame {p_idx}: {e}")
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
@@ -1719,6 +2130,16 @@ class DatabaseBuilder:
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
 
+            # Phase 2.2: Dataset for depth scales
+            g3.create_dataset(
+                "depth_scales",
+                shape=(num_frames,),
+                maxshape=(None,),
+                dtype="float32",
+                compression=compression,
+                fillvalue=1.0,
+            )
+
             # --- Patchify: мультимасштабні патч-дескриптори ---
             if use_patchify and num_patches > 0:
                 pf = f.create_group("patch_descriptors")
@@ -1773,6 +2194,10 @@ class DatabaseBuilder:
             if "patch_descriptors" in features and "patch_descriptors" in self.db_file:
                 self.db_file["patch_descriptors"]["descriptors"][frame_id] = features["patch_descriptors"]
 
+            # Save depth scale
+            if "depth_scale" in features:
+                self.db_file["metadata"]["depth_scales"][frame_id] = features["depth_scale"]
+
 
 # ================================================================================
 # File: database\database_loader.py
@@ -1810,6 +2235,10 @@ class DatabaseLoader:
         self.frame_rmse: np.ndarray | None = None  # (N,)      — RMSE кожного кадру
         self.frame_disagreement: np.ndarray | None = None  # (N,)   — Розбіжність між гілками
         self.frame_matches: np.ndarray | None = None  # (N,)      — Кількість точок (inliers)
+
+        # GPS-координати кадрів та просторовий індекс (мультиджерельна геолокалізація)
+        self.frame_gps: np.ndarray | None = None  # (N, 2) — [lat, lon] per frame
+        self.spatial_index = None  # SpatialIndex | None
 
         # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
@@ -1885,6 +2314,24 @@ class DatabaseLoader:
                 logger.info(f"Loaded patch descriptors: shape={self.patch_descriptors.shape}")
             else:
                 self.patch_descriptors = None
+
+            # Завантажуємо frame_gps якщо є (мультиджерельна геолокалізація)
+            if "frame_gps" in self.db_file:
+                self.frame_gps = self.db_file["frame_gps"][:]
+                # Перевіряємо чи є non-NaN значення
+                valid_count = int(np.sum(~np.isnan(self.frame_gps[:, 0])))
+                if valid_count > 0:
+                    from src.database.spatial_index import SpatialIndex
+                    self.spatial_index = SpatialIndex(self.frame_gps)
+                    logger.info(
+                        f"Loaded frame_gps: {valid_count}/{len(self.frame_gps)} "
+                        f"frames with GPS. SpatialIndex built."
+                    )
+                else:
+                    logger.info("frame_gps dataset exists but has no valid GPS values.")
+                    self.frame_gps = None
+            else:
+                self.frame_gps = None
 
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
@@ -2085,9 +2532,609 @@ class DatabaseLoader:
 
 
 # ================================================================================
+# File: database\multi_database_manager.py
+# ================================================================================
+"""
+multi_database_manager.py — Менеджер множинних баз даних.
+
+Координує завантаження DatabaseLoader для кожного джерела,
+просторову фільтрацію активних джерел та вибір найкращого збігу.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+from src.database.database_loader import DatabaseLoader
+from src.localization.geo_aware_retriever import GeoAwareRetriever
+from src.localization.matcher import FastRetrieval, LanceDBRetrieval
+from src.utils.logging_utils import get_logger
+
+if TYPE_CHECKING:
+    from src.core.project_video_source import ProjectVideoSource
+
+logger = get_logger(__name__)
+
+
+class MultiDatabaseManager:
+    """
+    Центральний координаційний клас.
+    Замінює прямий доступ до одного DatabaseLoader.
+    
+    Відповідає за:
+    - Завантаження баз для enabled джерел
+    - Створення retrievers (FAISS або LanceDB)
+    - Просторову фільтрацію активних джерел
+    - Вибір найкращого збігу через get_best_match
+    """
+
+    def __init__(
+        self,
+        sources: list[ProjectVideoSource],
+        project_dir: Path,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        self._sources: dict[str, ProjectVideoSource] = {}
+        self._databases: dict[str, DatabaseLoader] = {}
+        self._retrievers: dict[str, FastRetrieval | LanceDBRetrieval | GeoAwareRetriever] = {}
+        self._active_source_ids: set[str] = set()
+        self._project_dir = project_dir
+        self._config = config or {}
+
+        self._load_sources(sources)
+
+    # ── Ініціалізація ────────────────────────────────────────────────────────
+
+    def _load_sources(self, sources: list[ProjectVideoSource]) -> None:
+        """Завантажує DatabaseLoader та створює retriever для кожного enabled джерела."""
+        for src in sources:
+            if not src.enabled:
+                logger.debug(f"Skipping disabled source '{src.source_id}'")
+                continue
+
+            db_path = self._project_dir / src.database_file
+            if not db_path.exists():
+                logger.warning(
+                    f"Database not found for source '{src.source_id}': {db_path}. "
+                    f"Skipping this source."
+                )
+                continue
+
+            try:
+                loader = DatabaseLoader(str(db_path))
+                self._databases[src.source_id] = loader
+                self._sources[src.source_id] = src
+
+                # Створюємо retriever (пріоритет LanceDB → GeoAware → FAISS)
+                if loader.lance_table is not None:
+                    retriever = LanceDBRetrieval(loader.lance_table)
+                    logger.info(
+                        f"Source '{src.source_id}': LanceDB retriever "
+                        f"({loader.lance_table.count_rows()} vectors)"
+                    )
+                elif loader.global_descriptors is not None:
+                    if loader.spatial_index is not None and loader.spatial_index.is_available:
+                        # GeoAwareRetriever: геофільтрація через SpatialIndex
+                        retriever = GeoAwareRetriever(
+                            loader.global_descriptors,
+                            spatial_index=loader.spatial_index,
+                        )
+                        logger.info(
+                            f"Source '{src.source_id}': GeoAwareRetriever "
+                            f"({len(loader.global_descriptors)} vectors, "
+                            f"{loader.spatial_index.num_indexed} geo-indexed)"
+                        )
+                    else:
+                        retriever = FastRetrieval(loader.global_descriptors)
+                        logger.info(
+                            f"Source '{src.source_id}': FAISS retriever "
+                            f"({len(loader.global_descriptors)} vectors)"
+                        )
+                else:
+                    logger.error(
+                        f"Source '{src.source_id}': no descriptors available. "
+                        f"Database may be corrupted."
+                    )
+                    continue
+
+                self._retrievers[src.source_id] = retriever
+                self._active_source_ids.add(src.source_id)
+
+            except Exception as e:
+                logger.error(
+                    f"Failed to load database for source '{src.source_id}': {e}",
+                    exc_info=True,
+                )
+
+        logger.info(
+            f"MultiDatabaseManager initialized: {len(self._databases)} databases loaded, "
+            f"{len(self._active_source_ids)} active"
+        )
+
+    # ── Retrieval ────────────────────────────────────────────────────────────
+
+    def get_best_match(
+        self,
+        global_desc: np.ndarray,
+        top_k: int = 8,
+    ) -> tuple[str | None, list[tuple[int, float]]]:
+        """
+        Виконує vectorний пошук у кожній активній базі.
+        
+        Returns:
+            (source_id, candidates): source_id з найвищим top-1 score,
+            candidates — список (frame_id, score). None якщо нічого не знайдено.
+        """
+        if not self._active_source_ids:
+            logger.warning("No active sources for retrieval")
+            return None, []
+
+        best_source_id: str | None = None
+        best_candidates: list[tuple[int, float]] = []
+        best_top_score: float = -1.0
+
+        # Сортуємо за priority (0 = найвищий) для детерміністичного tiebreak
+        sorted_ids = sorted(
+            self._active_source_ids,
+            key=lambda sid: self._sources[sid].priority,
+        )
+
+        for source_id in sorted_ids:
+            retriever = self._retrievers.get(source_id)
+            if retriever is None:
+                continue
+
+            try:
+                candidates = retriever.find_similar_frames(global_desc, top_k)
+                if not candidates:
+                    continue
+
+                top_score = candidates[0][1]  # (frame_id, score)
+                if top_score > best_top_score:
+                    best_top_score = top_score
+                    best_source_id = source_id
+                    best_candidates = candidates
+
+            except Exception as e:
+                logger.error(
+                    f"Retrieval failed for source '{source_id}': {e}",
+                    exc_info=True,
+                )
+
+        if best_source_id is not None:
+            logger.debug(
+                f"Best match: source='{best_source_id}', "
+                f"top_score={best_top_score:.4f}, "
+                f"candidates={len(best_candidates)}"
+            )
+
+        return best_source_id, best_candidates
+
+    # ── Доступ до об'єктів ───────────────────────────────────────────────────
+
+    def get_database(self, source_id: str) -> DatabaseLoader | None:
+        """Повертає DatabaseLoader для вказаного source_id."""
+        return self._databases.get(source_id)
+
+    def get_source_config(self, source_id: str) -> ProjectVideoSource | None:
+        """Повертає ProjectVideoSource для вказаного source_id."""
+        return self._sources.get(source_id)
+
+    # ── Просторова фільтрація ────────────────────────────────────────────────
+
+    def set_active_area(self, area_id: str) -> None:
+        """Активує всі джерела вказаної зони."""
+        new_active = {
+            sid
+            for sid, src in self._sources.items()
+            if src.area_id == area_id and sid in self._databases
+        }
+        if new_active != self._active_source_ids:
+            self._active_source_ids = new_active
+            logger.info(
+                f"Active area set to '{area_id}': "
+                f"{sorted(self._active_source_ids)}"
+            )
+
+    def set_active_by_gps(
+        self,
+        lat: float,
+        lon: float,
+        radius_m: float = 2500.0,
+    ) -> bool:
+        """
+        Активує джерела, geo_bounds яких містять точку (lat, lon).
+        Джерела без geo_bounds завжди залишаються активними.
+        
+        Returns:
+            True якщо набір активних джерел змінився.
+        """
+        new_active: set[str] = set()
+        for sid, src in self._sources.items():
+            if sid not in self._databases:
+                continue
+            if src.contains_point(lat, lon):
+                new_active.add(sid)
+
+        changed = new_active != self._active_source_ids
+        if changed:
+            old = sorted(self._active_source_ids)
+            self._active_source_ids = new_active
+            logger.info(
+                f"Active sources changed by GPS ({lat:.5f}, {lon:.5f}): "
+                f"{old} → {sorted(self._active_source_ids)}"
+            )
+        return changed
+
+    def update_retriever_positions(self, lat: float, lon: float) -> None:
+        """Оновлює позицію у всіх GeoAwareRetriever-ах для перебудови FAISS-підмножини."""
+        for sid in self._active_source_ids:
+            retriever = self._retrievers.get(sid)
+            if isinstance(retriever, GeoAwareRetriever) and retriever.is_geo_aware:
+                retriever.update_position(lat, lon)
+
+    def set_all_active(self) -> None:
+        """Активує всі завантажені джерела."""
+        self._active_source_ids = set(self._databases.keys())
+
+    # ── Утиліти ──────────────────────────────────────────────────────────────
+
+    @property
+    def active_source_ids(self) -> set[str]:
+        return set(self._active_source_ids)
+
+    @property
+    def all_source_ids(self) -> list[str]:
+        return list(self._databases.keys())
+
+    @property
+    def num_databases(self) -> int:
+        return len(self._databases)
+
+    def close_all(self) -> None:
+        """Закриває всі DatabaseLoader."""
+        for sid, db in self._databases.items():
+            try:
+                db.close()
+            except Exception as e:
+                logger.warning(f"Error closing database '{sid}': {e}")
+        self._databases.clear()
+        self._retrievers.clear()
+        self._active_source_ids.clear()
+        logger.info("All databases closed")
+
+    def __contains__(self, source_id: str) -> bool:
+        return source_id in self._databases
+
+    def __len__(self) -> int:
+        return len(self._databases)
+
+
+# ================================================================================
+# File: database\spatial_index.py
+# ================================================================================
+"""
+spatial_index.py — Просторовий тайловий індекс для геофільтрації кадрів.
+
+Будується поверх даних frame_gps з HDF5. Не вимагає зовнішніх
+геосторонніх бібліотек (H3, S2 тощо).
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class SpatialIndex:
+    """
+    Тайловий просторовий індекс для швидкої геофільтрації кадрів.
+    
+    Територія розбивається на рівні прямокутні тайли за формулою:
+        tile_key = (int(lat / tile_deg), int(lon / tile_deg))
+    де tile_deg ≈ 0.005° ≈ 500 метрів.
+    
+    Для кожного тайлу зберігається список frame_id кадрів,
+    GPS-координати яких потрапляють у цей тайл.
+    """
+
+    TILE_DEG: float = 0.005  # ≈ 500m
+
+    def __init__(self, frame_gps: np.ndarray, tile_deg: float | None = None) -> None:
+        """
+        Args:
+            frame_gps: Масив (N, 2) з [lat, lon] для кожного кадру.
+                       NaN значення ігноруються.
+            tile_deg:  Розмір тайлу у градусах. За замовчуванням 0.005° ≈ 500m.
+        """
+        if tile_deg is not None:
+            self.tile_deg = tile_deg
+        else:
+            self.tile_deg = self.TILE_DEG
+
+        self._tiles: dict[tuple[int, int], list[int]] = defaultdict(list)
+        self._frame_gps = frame_gps
+        self._num_indexed = 0
+
+        self._build(frame_gps)
+
+    def _build(self, frame_gps: np.ndarray) -> None:
+        """Будує індекс з масиву GPS-координат."""
+        for frame_id in range(len(frame_gps)):
+            lat, lon = frame_gps[frame_id]
+            if np.isnan(lat) or np.isnan(lon):
+                continue
+            tile_key = self._to_tile(lat, lon)
+            self._tiles[tile_key].append(frame_id)
+            self._num_indexed += 1
+
+        logger.info(
+            f"SpatialIndex built: {self._num_indexed} frames in "
+            f"{len(self._tiles)} tiles (tile_deg={self.tile_deg}°)"
+        )
+
+    def _to_tile(self, lat: float, lon: float) -> tuple[int, int]:
+        """Конвертує GPS у ключ тайлу."""
+        return int(lat / self.tile_deg), int(lon / self.tile_deg)
+
+    def get_frame_ids_near(
+        self,
+        lat: float,
+        lon: float,
+        radius_tiles: int = 2,
+    ) -> list[int]:
+        """
+        Повертає об'єднаний список frame_id з квадрата тайлів навколо точки.
+        
+        При radius_tiles=2 та tile_deg=0.005° це дає покриття
+        ≈ 2.5 км у кожному напрямку.
+        
+        Args:
+            lat:           Широта центру пошуку.
+            lon:           Довгота центру пошуку.
+            radius_tiles:  Радіус пошуку у тайлах.
+            
+        Returns:
+            Список frame_id кадрів у радіусі.
+        """
+        center_t_lat, center_t_lon = self._to_tile(lat, lon)
+        result: list[int] = []
+
+        for dt_lat in range(-radius_tiles, radius_tiles + 1):
+            for dt_lon in range(-radius_tiles, radius_tiles + 1):
+                key = (center_t_lat + dt_lat, center_t_lon + dt_lon)
+                if key in self._tiles:
+                    result.extend(self._tiles[key])
+
+        return result
+
+    def get_frame_gps(self, frame_id: int) -> tuple[float, float] | None:
+        """Повертає (lat, lon) для frame_id або None."""
+        if frame_id < 0 or frame_id >= len(self._frame_gps):
+            return None
+        lat, lon = self._frame_gps[frame_id]
+        if np.isnan(lat) or np.isnan(lon):
+            return None
+        return float(lat), float(lon)
+
+    @property
+    def num_indexed(self) -> int:
+        """Кількість проіндексованих кадрів."""
+        return self._num_indexed
+
+    @property
+    def num_tiles(self) -> int:
+        """Кількість тайлів."""
+        return len(self._tiles)
+
+    @property
+    def is_available(self) -> bool:
+        """True якщо індекс містить хоча б один кадр."""
+        return self._num_indexed > 0
+
+
+# ================================================================================
 # File: database\__init__.py
 # ================================================================================
 """Database module"""
+
+
+# ================================================================================
+# File: depth\depth_estimator.py
+# ================================================================================
+"""Lightweight depth estimation wrapper для scale recovery.
+
+Підтримує:
+  - Depth Anything V2 (рекомендовано — краща точність)
+  - MiDaS v3 (fallback — менші вимоги до VRAM)
+  - Dummy estimator (для тестів без GPU)
+
+Використання в pipeline:
+  depth_est = DepthEstimator.build("depth_anything_v2", device="cuda")
+  scale = depth_est.get_relative_scale(frame_rgb)  # float
+"""
+
+import numpy as np
+import torch
+import cv2
+import contextlib
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class DepthEstimator:
+    """Абстрактний depth estimator. Використовуй DepthEstimator.build()."""
+
+    def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
+        """Повертає depth map (H, W) float32, відносні значення."""
+        raise NotImplementedError
+
+    def get_relative_scale(self, image_rgb: np.ndarray) -> float:
+        """Повертає скалярний відносний масштаб (1/median_depth).
+        
+        Менше значення = об'єкт далі (більша висота) = менший GSD.
+        Більше значення = об'єкт ближче (менша висота) = більший GSD.
+        """
+        depth = self.estimate(image_rgb)
+        # Беремо центральний регіон (ігноруємо краї де artifacts)
+        h, w = depth.shape
+        cx1, cx2 = w // 4, 3 * w // 4
+        cy1, cy2 = h // 4, 3 * h // 4
+        center_depth = depth[cy1:cy2, cx1:cx2]
+        
+        # Маска валідних значень (не нулі)
+        valid_mask = center_depth > 0
+        if not np.any(valid_mask):
+            return 1.0
+            
+        median_d = float(np.median(center_depth[valid_mask]))
+        if median_d < 1e-6:
+            return 1.0
+            
+        return 1.0 / median_d  # відносний scale: далі = менше
+
+    @staticmethod
+    def build(backend: str = "depth_anything_v2", device: str = "cuda") -> "DepthEstimator":
+        if backend == "depth_anything_v2":
+            return _DepthAnythingV2Estimator(device)
+        elif backend == "midas":
+            return _MiDaSEstimator(device)
+        elif backend == "dummy":
+            return _DummyDepthEstimator()
+        else:
+            raise ValueError(f"Unknown depth backend: {backend}")
+
+
+class _DepthAnythingV2Estimator(DepthEstimator):
+    """Depth Anything V2 Small/Base/Large wrapper."""
+
+    def __init__(self, device: str = "cuda"):
+        self.device = device
+        self._model = None
+
+    def _lazy_load(self):
+        if self._model is not None:
+            return
+        try:
+            try:
+                from depth_anything_v2.dpt import DepthAnythingV2
+            except ImportError:
+                # Шукаємо у third_party/Depth-Anything-V2
+                import sys
+                import os
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                local_path = os.path.join(project_root, "third_party", "Depth-Anything-V2")
+                if os.path.exists(local_path):
+                    sys.path.append(local_path)
+                    from depth_anything_v2.dpt import DepthAnythingV2
+                else:
+                    raise ImportError(f"Depth-Anything-V2 not found in {local_path}")
+
+            model_configs = {
+                'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+                'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+                'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+                'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+            }
+            
+            # Визначаємо тип енкодера (за замовчуванням vits для швидкості)
+            encoder = 'vits'
+            self._model = DepthAnythingV2(**model_configs[encoder])
+            
+            import os
+            # Шукаємо ваги за різними можливими іменами
+            weight_names = [
+                f"depth_anything_v2_{encoder}.pth",
+                "depth_anything_v2_vits.pth"
+            ]
+            
+            weight_paths = []
+            for name in weight_names:
+                weight_paths.extend([
+                    os.path.join("models", name),
+                    os.path.expanduser(f"~/.cache/depth_anything_v2/{name}")
+                ])
+            
+            for wp in weight_paths:
+                if os.path.exists(wp):
+                    self._model.load_state_dict(
+                        torch.load(wp, map_location='cpu', weights_only=True)
+                    )
+                    logger.info(f"Depth Anything V2 weights loaded from {wp}")
+                    break
+            else:
+                logger.warning(
+                    f"Depth Anything V2 weights not found. Searched in: {weight_paths}"
+                )
+            
+            self._model = self._model.to(self.device).eval()
+            logger.info(f"Depth Anything V2 ({encoder}) initialized on {self.device}")
+        except ImportError:
+            logger.error("depth_anything_v2 not installed. Fallback to MiDaS is recommended.")
+            raise
+
+    @torch.no_grad()
+    def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
+        try:
+            self._lazy_load()
+            # Depth Anything очікує BGR для infer_image
+            bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+            depth = self._model.infer_image(bgr)
+            return depth.astype(np.float32)
+        except Exception as e:
+            logger.error(f"Depth Anything V2 inference failed: {e}")
+            return np.ones(image_rgb.shape[:2], dtype=np.float32)
+
+
+class _MiDaSEstimator(DepthEstimator):
+    """MiDaS v3 через torch.hub."""
+
+    def __init__(self, device: str = "cuda"):
+        self.device = device
+        self._model = None
+        self._transform = None
+
+    def _lazy_load(self):
+        if self._model is not None:
+            return
+        logger.info("Loading MiDaS DPT_BEiT_L_512 from torch.hub...")
+        self._model = torch.hub.load("intel-isl/MiDaS", "DPT_BEiT_L_512")
+        self._model.to(self.device).eval()
+        transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+        self._transform = transforms.beit512_transform
+        logger.info("MiDaS loaded successfully")
+
+    @torch.no_grad()
+    def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
+        try:
+            self._lazy_load()
+            # MiDaS очікує BGR
+            bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+            input_batch = self._transform(bgr).to(self.device)
+            prediction = self._model(input_batch)
+            prediction = torch.nn.functional.interpolate(
+                prediction.unsqueeze(1),
+                size=image_rgb.shape[:2],
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze()
+            return prediction.cpu().numpy().astype(np.float32)
+        except Exception as e:
+            logger.error(f"MiDaS inference failed: {e}")
+            return np.ones(image_rgb.shape[:2], dtype=np.float32)
+
+
+class _DummyDepthEstimator(DepthEstimator):
+    """Заглушка для систем без GPU."""
+    def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
+        return np.ones(image_rgb.shape[:2], dtype=np.float32)
 
 
 # ================================================================================
@@ -2293,6 +3340,71 @@ class CoordinateConverter:
 
 # Глобальний екземпляр для зворотної сумісності (тимчасово)
 DEFAULT_CONVERTER = CoordinateConverter("WEB_MERCATOR")
+
+
+# ================================================================================
+# File: geometry\gsd_calculator.py
+# ================================================================================
+"""Ground Sample Distance calculator.
+
+GSD = (altitude * sensor_width) / (focal_length * image_width_px)
+Дає метрів на піксель — прямий фізичний масштаб.
+
+Використання:
+    gsd = GSDCalculator(altitude_m=100, focal_mm=13.2,
+                        sensor_w_mm=8.8, image_w_px=4000)
+    meters_per_pixel = gsd.gsd_m_per_px  # напр. 0.022 м/px
+"""
+
+from dataclasses import dataclass
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class GSDCalculator:
+    altitude_m: float        # висота польоту [м] (еталонна)
+    focal_length_mm: float   # фокусна відстань [мм]
+    sensor_width_mm: float   # ширина сенсора [мм]
+    image_width_px: int      # ширина зображення [пікселі]
+
+    @property
+    def gsd_m_per_px(self) -> float:
+        """Метрів на піксель для поточних параметрів польоту."""
+        if self.focal_length_mm <= 0 or self.image_width_px <= 0:
+            return 0.0
+        gsd = (self.altitude_m * self.sensor_width_mm) / \
+              (self.focal_length_mm * self.image_width_px)
+        return gsd
+
+    @property
+    def px_per_meter(self) -> float:
+        """Пікселів на метр — обернений GSD."""
+        gsd = self.gsd_m_per_px
+        return 1.0 / gsd if gsd > 1e-9 else 0.0
+
+    def scale_from_altitude(self, actual_altitude_m: float) -> float:
+        """Scale factor відносно reference altitude.
+        
+        Якщо дрон летить нижче reference → scale > 1 (більше пікселів на метр).
+        Якщо дрон летить вище reference → scale < 1 (менше пікселів на метр).
+        """
+        if actual_altitude_m <= 0:
+            return 1.0
+        return self.altitude_m / actual_altitude_m
+
+    def log_summary(self):
+        gsd = self.gsd_m_per_px
+        logger.info(
+            f"GSD Configuration: altitude={self.altitude_m}m, "
+            f"focal={self.focal_length_mm}mm, "
+            f"sensor={self.sensor_width_mm}mm, "
+            f"img_w={self.image_width_px}px"
+        )
+        logger.info(
+            f"Resulting GSD: {gsd*100:.2f} cm/px ({self.px_per_meter:.1f} px/m)"
+        )
 
 
 # ================================================================================
@@ -3236,6 +4348,8 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.clear_map_clicked.connect(self.map_widget.clear_trajectory)
         cp.export_results_clicked.connect(self.on_export_results)
         cp.toggle_objects_clicked.connect(self.on_toggle_objects)
+        cp.add_source_clicked.connect(self.on_add_video_source)
+        cp.source_action.connect(self.on_source_action)
         self.map_widget.mapClicked.connect(self._on_map_clicked)
 
     def _on_map_clicked(self, lat: float, lon: float):
@@ -3249,6 +4363,263 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
 # File: gui\__init__.py
 # ================================================================================
 """GUI module - PyQt6 interface"""
+
+
+# ================================================================================
+# File: gui\dialogs\add_video_source_dialog.py
+# ================================================================================
+"""
+add_video_source_dialog.py — Діалог додавання нового відеоджерела до проєкту.
+
+Дозволяє вибрати відео, вказати source_id, area_id, режим (шар/зона),
+та опціонально geo_bounds.
+"""
+from PyQt6.QtCore import pyqtSlot
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+)
+
+from src.core.project_video_source import ProjectVideoSource
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class AddVideoSourceDialog(QDialog):
+    """Діалог для додавання нового відеоджерела до мультиджерельного проєкту."""
+
+    def __init__(self, existing_area_ids: list[str] | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Додати відеоджерело")
+        self.setMinimumWidth(500)
+        self._existing_areas = existing_area_ids or []
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ── Основні параметри ────────────────────────────────────────────────
+        basic_group = QGroupBox("Основні параметри")
+        form = QFormLayout(basic_group)
+
+        self.source_id_edit = QLineEdit()
+        self.source_id_edit.setPlaceholderText("Унікальний ідентифікатор (напр. winter_2025)")
+        form.addRow("Source ID:", self.source_id_edit)
+
+        self.description_edit = QLineEdit()
+        self.description_edit.setPlaceholderText("Опис (зима 2025, ранковий політ, тощо)")
+        form.addRow("Опис:", self.description_edit)
+
+        # Відео
+        video_row = QHBoxLayout()
+        self.video_path_edit = QLineEdit()
+        self.video_path_edit.setReadOnly(True)
+        self.video_path_edit.setPlaceholderText("Шлях до відео не вибрано")
+        btn_browse = QPushButton("Огляд...")
+        btn_browse.clicked.connect(self._browse_video)
+        video_row.addWidget(self.video_path_edit)
+        video_row.addWidget(btn_browse)
+        form.addRow("Відеофайл:", video_row)
+
+        # Режим
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("📊 Новий шар (overlay поверх існуючої зони)", "layer")
+        self.mode_combo.addItem("🗺 Нова географічна зона", "zone")
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addRow("Режим:", self.mode_combo)
+
+        # Area ID
+        self.area_combo = QComboBox()
+        self.area_combo.setEditable(True)
+        if self._existing_areas:
+            for area in self._existing_areas:
+                self.area_combo.addItem(area)
+        self.area_combo.setCurrentText("")
+        self.area_combo.lineEdit().setPlaceholderText("Виберіть або введіть area_id")
+        form.addRow("Area ID:", self.area_combo)
+
+        # Пріоритет
+        self.priority_spin = QSpinBox()
+        self.priority_spin.setRange(0, 100)
+        self.priority_spin.setValue(0)
+        self.priority_spin.setToolTip("0 = найвищий пріоритет. При рівних cosine — вибирається джерело з нижчим priority.")
+        form.addRow("Пріоритет:", self.priority_spin)
+
+        layout.addWidget(basic_group)
+
+        # ── Параметри камери ───────────────────────────────────────────────────
+        camera_group = QGroupBox("Параметри камери")
+        cam_form = QFormLayout(camera_group)
+
+        self.altitude_spinbox = QDoubleSpinBox()
+        self.altitude_spinbox.setRange(10.0, 5000.0)
+        self.altitude_spinbox.setValue(100.0)
+        self.altitude_spinbox.setSuffix(" м")
+        cam_form.addRow("Висота польоту:", self.altitude_spinbox)
+
+        self.focal_length_spinbox = QDoubleSpinBox()
+        self.focal_length_spinbox.setRange(1.0, 100.0)
+        self.focal_length_spinbox.setValue(13.2)
+        self.focal_length_spinbox.setSuffix(" мм")
+        cam_form.addRow("Фокусна відстань:", self.focal_length_spinbox)
+
+        self.sensor_width_spinbox = QDoubleSpinBox()
+        self.sensor_width_spinbox.setRange(1.0, 50.0)
+        self.sensor_width_spinbox.setValue(8.8)
+        self.sensor_width_spinbox.setSuffix(" мм")
+        cam_form.addRow("Ширина сенсора:", self.sensor_width_spinbox)
+
+        self.image_width_spinbox = QSpinBox()
+        self.image_width_spinbox.setRange(640, 8000)
+        self.image_width_spinbox.setValue(4000)
+        self.image_width_spinbox.setSuffix(" px")
+        cam_form.addRow("Ширина зображення:", self.image_width_spinbox)
+
+        layout.addWidget(camera_group)
+
+        # ── Geo Bounds (опційно) ─────────────────────────────────────────────
+        self.geo_group = QGroupBox("Географічні межі (опційно)")
+        self.geo_group.setCheckable(True)
+        self.geo_group.setChecked(False)
+        geo_layout = QFormLayout(self.geo_group)
+
+        self.lat_min_spin = QDoubleSpinBox()
+        self.lat_min_spin.setRange(-90.0, 90.0)
+        self.lat_min_spin.setDecimals(6)
+        self.lat_min_spin.setSuffix("°")
+        geo_layout.addRow("Lat min:", self.lat_min_spin)
+
+        self.lon_min_spin = QDoubleSpinBox()
+        self.lon_min_spin.setRange(-180.0, 180.0)
+        self.lon_min_spin.setDecimals(6)
+        self.lon_min_spin.setSuffix("°")
+        geo_layout.addRow("Lon min:", self.lon_min_spin)
+
+        self.lat_max_spin = QDoubleSpinBox()
+        self.lat_max_spin.setRange(-90.0, 90.0)
+        self.lat_max_spin.setDecimals(6)
+        self.lat_max_spin.setValue(90.0)
+        self.lat_max_spin.setSuffix("°")
+        geo_layout.addRow("Lat max:", self.lat_max_spin)
+
+        self.lon_max_spin = QDoubleSpinBox()
+        self.lon_max_spin.setRange(-180.0, 180.0)
+        self.lon_max_spin.setDecimals(6)
+        self.lon_max_spin.setValue(180.0)
+        self.lon_max_spin.setSuffix("°")
+        geo_layout.addRow("Lon max:", self.lon_max_spin)
+
+        layout.addWidget(self.geo_group)
+
+        # ── Buttons ──────────────────────────────────────────────────────────
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self._on_accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    # ── Slots ────────────────────────────────────────────────────────────────
+
+    @pyqtSlot()
+    def _browse_video(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Виберіть відеофайл",
+            "",
+            "Video Files (*.mp4 *.avi *.mkv);;All Files (*)",
+        )
+        if path:
+            self.video_path_edit.setText(path)
+
+    @pyqtSlot(int)
+    def _on_mode_changed(self, idx):
+        mode = self.mode_combo.currentData()
+        if mode == "layer" and self._existing_areas:
+            # Для шару — пропонуємо вибрати існуючу area
+            self.area_combo.setCurrentText(self._existing_areas[0])
+        else:
+            # Для зони — пропонуємо нову area
+            self.area_combo.setCurrentText("")
+
+    @pyqtSlot()
+    def _on_accept(self):
+        source_id = self.source_id_edit.text().strip()
+        if not source_id:
+            QMessageBox.warning(self, "Помилка", "Введіть Source ID!")
+            self.source_id_edit.setFocus()
+            return
+        if not source_id.replace("_", "").replace("-", "").isalnum():
+            QMessageBox.warning(
+                self, "Помилка",
+                "Source ID може містити тільки латинські літери, цифри, _ та -"
+            )
+            return
+        if not self.video_path_edit.text():
+            QMessageBox.warning(self, "Помилка", "Виберіть відеофайл!")
+            return
+
+        area_id = self.area_combo.currentText().strip()
+        if not area_id:
+            QMessageBox.warning(self, "Помилка", "Введіть або виберіть Area ID!")
+            self.area_combo.setFocus()
+            return
+
+        if self.geo_group.isChecked():
+            if self.lat_min_spin.value() >= self.lat_max_spin.value():
+                QMessageBox.warning(self, "Помилка", "Lat min має бути менше Lat max!")
+                return
+            if self.lon_min_spin.value() >= self.lon_max_spin.value():
+                QMessageBox.warning(self, "Помилка", "Lon min має бути менше Lon max!")
+                return
+
+        self.accept()
+
+    # ── Data ─────────────────────────────────────────────────────────────────
+
+    def get_source_config(self) -> ProjectVideoSource:
+        """Повертає заповнений ProjectVideoSource."""
+        source_id = self.source_id_edit.text().strip()
+
+        geo_bounds = None
+        if self.geo_group.isChecked():
+            geo_bounds = (
+                self.lat_min_spin.value(),
+                self.lon_min_spin.value(),
+                self.lat_max_spin.value(),
+                self.lon_max_spin.value(),
+            )
+
+        return ProjectVideoSource(
+            source_id=source_id,
+            area_id=self.area_combo.currentText().strip(),
+            video_path=self.video_path_edit.text(),
+            database_file=f"sources/{source_id}/database.h5",
+            calibration_file=f"sources/{source_id}/calibration.json",
+            description=self.description_edit.text().strip(),
+            enabled=True,
+            priority=self.priority_spin.value(),
+            geo_bounds=geo_bounds,
+            camera_params={
+                "altitude_m": self.altitude_spinbox.value(),
+                "focal_length_mm": self.focal_length_spinbox.value(),
+                "sensor_width_mm": self.sensor_width_spinbox.value(),
+                "image_width_px": self.image_width_spinbox.value(),
+            },
+        )
 
 
 # ================================================================================
@@ -5001,9 +6372,11 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.export_results import ResultExporter
 from src.core.project_registry import ProjectRegistry
 from src.database.database_loader import DatabaseLoader
+from src.database.multi_database_manager import MultiDatabaseManager
 from src.geometry.coordinates import CoordinateConverter
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
@@ -5197,6 +6570,9 @@ class DatabaseMixin:
 
             if self.database:
                 self.database.close()
+            # Закриваємо попередні мульти-менеджери
+            if hasattr(self, "db_manager") and self.db_manager:
+                self.db_manager.close_all()
 
             # Очищення стану попереднього проєкту
             if hasattr(self, "calibration") and self.calibration:
@@ -5211,7 +6587,38 @@ class DatabaseMixin:
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
-                self.database = DatabaseLoader(db_path)
+                # Перевіряємо чи проєкт мультиджерельний
+                sources = self.project_manager.settings.get_enabled_sources()
+                is_multi = len(sources) > 1 or any(
+                    s.source_id != "main" for s in sources
+                )
+
+                if is_multi and len(sources) > 0:
+                    # Мультиджерельний режим
+                    project_dir = self.project_manager.project_dir
+                    self.db_manager = MultiDatabaseManager(
+                        sources, project_dir, config=self.config
+                    )
+                    self.calib_manager = MultiCalibrationManager()
+                    self.calib_manager.load_all(sources, project_dir)
+
+                    # self.database — перше джерело для сумісності з UI
+                    first_id = self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                    if first_id:
+                        self.database = self.db_manager.get_database(first_id)
+                        self.calibration = self.calib_manager.get(first_id)
+                    else:
+                        raise RuntimeError("Мультиджерельний проєкт: жодна база не завантажена")
+
+                    logger.info(
+                        f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
+                        f"sources={self.db_manager.all_source_ids}"
+                    )
+                else:
+                    # Single-source режим (зворотна сумісність)
+                    self.db_manager = None
+                    self.calib_manager = None
+                    self.database = DatabaseLoader(db_path)
             finally:
                 QApplication.restoreOverrideCursor()
             self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
@@ -5226,10 +6633,11 @@ class DatabaseMixin:
                 else "",
             )
 
-            # Завантажити калібрацію якщо є
-            calib_path = self.project_manager.calibration_path
-            if calib_path and Path(calib_path).exists():
-                self.calibration.load(calib_path)
+            # Завантажити калібрацію якщо є (single-mode)
+            if self.calib_manager is None:
+                calib_path = self.project_manager.calibration_path
+                if calib_path and Path(calib_path).exists():
+                    self.calibration.load(calib_path)
 
             # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
             if self.database and self.database.converter is not None:
@@ -5421,6 +6829,119 @@ class DatabaseMixin:
             num_propagated=num_propagated,
             db_size_mb=db_size_mb,
         )
+
+        # Оновлюємо панель відеоджерел
+        self._refresh_sources_panel()
+
+    def _refresh_sources_panel(self):
+        """Оновлює таблицю відеоджерел у ControlPanel."""
+        if not self.project_manager.is_loaded or not self.project_manager.settings:
+            return
+        sources_raw = self.project_manager.settings.video_sources or []
+        project_dir = str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
+        self.control_panel.update_sources_list(sources_raw, project_dir=project_dir)
+
+    # ── Мультиджерельні слоти ─────────────────────────────────────────────────
+
+    @pyqtSlot()
+    def on_add_video_source(self):
+        """Слот для кнопки 'Додати джерело'."""
+        if not self.project_manager.is_loaded:
+            QMessageBox.warning(self, "Помилка", "Спочатку відкрийте або створіть проєкт!")
+            return
+
+        from src.gui.dialogs.add_video_source_dialog import AddVideoSourceDialog
+
+        # Збираємо існуючі area_id
+        existing_areas = set()
+        for src in (self.project_manager.settings.video_sources or []):
+            area = src.get("area_id", "")
+            if area:
+                existing_areas.add(area)
+
+        dialog = AddVideoSourceDialog(
+            existing_area_ids=sorted(existing_areas), parent=self
+        )
+        if not dialog.exec():
+            return
+
+        new_source = dialog.get_source_config()
+
+        # Перевірка на дублікат
+        if self.project_manager.settings.get_source(new_source.source_id) is not None:
+            QMessageBox.warning(
+                self, "Помилка",
+                f"Джерело з ID '{new_source.source_id}' вже існує в проєкті!"
+            )
+            return
+
+        # Додаємо до проєкту
+        self.project_manager.settings.add_source(new_source)
+        self.project_manager.save_project()
+
+        # Створюємо директорію для джерела
+        source_dir = self.project_manager.project_dir / "sources" / new_source.source_id
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            f"Video source added: {new_source.source_id} "
+            f"(area={new_source.area_id}, video={Path(new_source.video_path).name})"
+        )
+
+        self._refresh_sources_panel()
+        self.status_bar.showMessage(
+            f"Додано відеоджерело '{new_source.source_id}'. "
+            f"Побудуйте БД через контекстне меню таблиці."
+        )
+
+    @pyqtSlot(str, str)
+    def on_source_action(self, source_id: str, action: str):
+        """Обробка дій з контекстного меню таблиці джерел."""
+        if not self.project_manager.is_loaded:
+            return
+
+        settings = self.project_manager.settings
+        source = settings.get_source(source_id)
+        if source is None:
+            QMessageBox.warning(self, "Помилка", f"Джерело '{source_id}' не знайдено!")
+            return
+
+        if action == "build_db":
+            # Генерація БД для конкретного джерела
+            video_path = source.video_path
+            db_path = str(self.project_manager.project_dir / source.database_file)
+            db_dir = Path(db_path).parent
+            db_dir.mkdir(parents=True, exist_ok=True)
+            self._start_database_generation(video_path, db_path)
+
+        elif action == "calibrate":
+            # Поки що — відкриваємо стандартний калібрувальний діалог
+            self.status_bar.showMessage(
+                f"Для калібрування '{source_id}' використовуйте стандартний калібрувальний інструмент."
+            )
+
+        elif action == "toggle":
+            source.enabled = not source.enabled
+            settings.update_source(source)
+            self.project_manager.save_project()
+            self._refresh_sources_panel()
+            state = "увімкнено" if source.enabled else "вимкнено"
+            self.status_bar.showMessage(f"Джерело '{source_id}' {state}")
+
+        elif action == "remove":
+            reply = QMessageBox.question(
+                self,
+                "Видалення джерела",
+                f"Видалити відеоджерело '{source_id}'?\n\n"
+                f"Файли бази та калібрації НЕ будуть видалені з диску.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                settings.remove_source(source_id)
+                self.project_manager.save_project()
+                self._refresh_sources_panel()
+                self.status_bar.showMessage(f"Джерело '{source_id}' видалено з проєкту")
+
 
 
 # ================================================================================
@@ -5716,10 +7237,17 @@ class TrackingMixin:
 
         # Передаємо model_manager у конфіг для SuperPoint+LightGlue fallback
         localizer_config = {**self.config, "_model_manager": self.model_manager}
+
+        # Мультиджерельна підтримка: передаємо менеджери якщо вони є
+        db_manager = getattr(self, "db_manager", None)
+        calib_manager = getattr(self, "calib_manager", None)
+
         return Localizer(
             self.database, fe, matcher, self.calibration, config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
             ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
+            db_manager=db_manager,
+            calib_manager=calib_manager,
         )
 
     def _ensure_utm_initialized(self) -> bool:
@@ -6043,12 +7571,19 @@ __all__ = ["CalibrationMixin", "DatabaseMixin", "TrackingMixin", "PanoramaMixin"
 # ================================================================================
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QMenu,
     QProgressBar,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -6077,6 +7612,8 @@ class ControlPanel(QWidget):
     clear_map_clicked = pyqtSignal()
     stop_db_generation_clicked = pyqtSignal()
     toggle_objects_clicked = pyqtSignal(bool)
+    add_source_clicked = pyqtSignal()
+    source_action = pyqtSignal(str, str)  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6213,11 +7750,57 @@ class ControlPanel(QWidget):
         status_layout.addWidget(self.lbl_status)
         status_layout.addWidget(self.progress_bar)
 
+        # Video Sources group (мультиджерельна підтримка)
+        self.sources_group = QGroupBox("Відеоджерела")
+        sources_layout = QVBoxLayout(self.sources_group)
+
+        self.sources_table = QTableWidget()
+        self.sources_table.setColumnCount(3)
+        self.sources_table.setHorizontalHeaderLabels(["Source ID", "Area", "Статус"])
+        self.sources_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.sources_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.sources_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.sources_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.sources_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.sources_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.sources_table.setMaximumHeight(120)
+        self.sources_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.sources_table.customContextMenuRequested.connect(
+            self._on_sources_context_menu
+        )
+        self.sources_table.setVisible(False)  # Прихований до відкриття мульти-проєкту
+        sources_layout.addWidget(self.sources_table)
+
+        btn_row = QHBoxLayout()
+        self.btn_add_source = QPushButton("➕ Додати джерело")
+        self.btn_add_source.setToolTip("Додати нове відеоджерело до проєкту")
+        self.btn_add_source.clicked.connect(self.add_source_clicked)
+        self.btn_add_source.setVisible(False)
+        btn_row.addWidget(self.btn_add_source)
+        sources_layout.addLayout(btn_row)
+
+        self.sources_group.setVisible(False)  # Показується тільки для мульти-проєктів
+
         for group in [
             db_group,
             calib_group,
             track_group,
             export_group,
+            self.sources_group,
             self.info_group,
             status_group,
         ]:
@@ -6295,6 +7878,101 @@ class ControlPanel(QWidget):
         self.lbl_project_info.setText("<br>".join(lines))
         self.lbl_project_info.setStyleSheet("font-size: 11px; color: #000;")
         self.btn_rebuild_db.setEnabled(True)
+
+    # ── Video Sources Panel ──────────────────────────────────────────────────
+
+    def update_sources_list(
+        self,
+        sources: list[dict],
+        project_dir: str = "",
+    ):
+        """Оновлює таблицю відеоджерел.
+
+        Args:
+            sources: Список dict з полями source_id, area_id, enabled,
+                     database_file, calibration_file.
+            project_dir: Шлях до кореня проєкту для перевірки файлів.
+        """
+        is_multi = len(sources) > 1 or any(
+            s.get("source_id") != "main" for s in sources
+        )
+        # Група завжди видима при відкритому проєкті, таблиця — тільки для multi
+        self.sources_group.setVisible(True)
+        self.sources_table.setVisible(is_multi)
+        self.btn_add_source.setVisible(True)
+
+        if not is_multi:
+            return
+
+        self.sources_table.setRowCount(len(sources))
+        for row, src in enumerate(sources):
+            sid = src.get("source_id", "?")
+            area = src.get("area_id", "?")
+            enabled = src.get("enabled", True)
+
+            # Визначаємо статус
+            status = "⏳ Очікує"
+            status_color = QColor("#888")
+            if project_dir:
+                db_exists = (Path(project_dir) / src.get("database_file", "")).exists()
+                cal_exists = (Path(project_dir) / src.get("calibration_file", "")).exists()
+                if db_exists and cal_exists:
+                    status = "✅ Готово"
+                    status_color = QColor("#2e7d32")
+                elif db_exists:
+                    status = "⚠ Без калібр."
+                    status_color = QColor("#e65100")
+                else:
+                    status = "❌ Без БД"
+                    status_color = QColor("#c62828")
+
+            if not enabled:
+                status = "🔇 Вимкнено"
+                status_color = QColor("#999")
+
+            item_sid = QTableWidgetItem(sid)
+            item_area = QTableWidgetItem(area)
+            item_status = QTableWidgetItem(status)
+            item_status.setForeground(status_color)
+
+            # Зберігаємо source_id як data для context menu
+            item_sid.setData(Qt.ItemDataRole.UserRole, sid)
+
+            self.sources_table.setItem(row, 0, item_sid)
+            self.sources_table.setItem(row, 1, item_area)
+            self.sources_table.setItem(row, 2, item_status)
+
+    @pyqtSlot("QPoint")
+    def _on_sources_context_menu(self, pos):
+        """Контекстне меню для таблиці джерел."""
+        row = self.sources_table.rowAt(pos.y())
+        if row < 0:
+            return
+
+        item = self.sources_table.item(row, 0)
+        if item is None:
+            return
+        source_id = item.data(Qt.ItemDataRole.UserRole)
+        if not source_id:
+            return
+
+        menu = QMenu(self)
+        act_build = menu.addAction("🔨 Побудувати базу даних")
+        act_calib = menu.addAction("📐 Калібрувати")
+        menu.addSeparator()
+        act_toggle = menu.addAction("🔇 Увімкнути/Вимкнути")
+        menu.addSeparator()
+        act_remove = menu.addAction("🗑 Видалити")
+
+        action = menu.exec(self.sources_table.viewport().mapToGlobal(pos))
+        if action == act_build:
+            self.source_action.emit(source_id, "build_db")
+        elif action == act_calib:
+            self.source_action.emit(source_id, "calibrate")
+        elif action == act_toggle:
+            self.source_action.emit(source_id, "toggle")
+        elif action == act_remove:
+            self.source_action.emit(source_id, "remove")
 
 
 # ================================================================================
@@ -6675,6 +8353,197 @@ class VideoWidget(QGraphicsView):
 
 
 # ================================================================================
+# File: localization\geo_aware_retriever.py
+# ================================================================================
+"""
+geo_aware_retriever.py — Геозалежний ретривер з фоновою перебудовою FAISS.
+
+Замінює FastRetrieval для джерел із frame_gps. При наявності
+просторового контексту будує FAISS IndexFlatIP тільки з підмножини
+кадрів в активному радіусі.
+"""
+from __future__ import annotations
+
+import threading
+from typing import TYPE_CHECKING
+
+import faiss
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+if TYPE_CHECKING:
+    from src.database.spatial_index import SpatialIndex
+
+logger = get_logger(__name__)
+
+
+class GeoAwareRetriever:
+    """
+    Геозалежний FAISS-ретривер з фоновою перебудовою індексу.
+    
+    При виклику update_position():
+    - Визначає новий набір frame_id через SpatialIndex
+    - Якщо набір змінився — перебудовує FAISS у daemon-потоці
+    - Під час перебудови поточний індекс залишається активним
+    
+    Для джерел без frame_gps деградує до GlobalRetriever (повний масив).
+    """
+
+    def __init__(
+        self,
+        global_descriptors: np.ndarray,
+        spatial_index: SpatialIndex | None = None,
+    ) -> None:
+        """
+        Args:
+            global_descriptors: Повний масив дескрипторів (N, D).
+            spatial_index:      SpatialIndex або None для fallback.
+        """
+        self._full_descriptors = global_descriptors
+        self._spatial_index = spatial_index
+        self._dim = global_descriptors.shape[1]
+
+        # Активний стан
+        self._active_frame_ids: list[int] = list(range(len(global_descriptors)))
+        self._lock = threading.Lock()
+
+        # Починаємо з повного індексу
+        self._index = self._build_faiss_index(
+            global_descriptors, self._active_frame_ids
+        )
+
+        if spatial_index is not None and spatial_index.is_available:
+            logger.info(
+                f"GeoAwareRetriever initialized with SpatialIndex "
+                f"({spatial_index.num_indexed} frames, {spatial_index.num_tiles} tiles). "
+                f"Full index active until first position update."
+            )
+        else:
+            logger.info(
+                f"GeoAwareRetriever: no SpatialIndex available. "
+                f"Operating in global mode ({len(global_descriptors)} vectors)."
+            )
+
+    def _build_faiss_index(
+        self,
+        descriptors: np.ndarray,
+        frame_ids: list[int],
+    ) -> faiss.IndexIDMap:
+        """Будує FAISS IndexFlatIP з нормалізованих дескрипторів."""
+        base_index = faiss.IndexFlatIP(self._dim)
+        index = faiss.IndexIDMap(base_index)
+
+        if len(frame_ids) == 0:
+            return index
+
+        normed = descriptors / (
+            np.linalg.norm(descriptors, axis=1, keepdims=True) + 1e-8
+        )
+        ids = np.array(frame_ids, dtype=np.int64)
+        index.add_with_ids(normed.astype(np.float32), ids)
+        return index
+
+    # ── Оновлення позиції ────────────────────────────────────────────────────
+
+    def update_position(self, lat: float, lon: float, radius_tiles: int = 2) -> bool:
+        """
+        Оновлює активну підмножину кадрів за GPS-позицією.
+        
+        Якщо набір frame_id змінився — запускає перебудову FAISS у фоновому потоці.
+        Під час перебудови поточний індекс залишається активним.
+        
+        Returns:
+            True якщо набір змінився (перебудова ініційована).
+        """
+        if self._spatial_index is None or not self._spatial_index.is_available:
+            return False
+
+        new_frame_ids = sorted(
+            self._spatial_index.get_frame_ids_near(lat, lon, radius_tiles)
+        )
+
+        if new_frame_ids == self._active_frame_ids:
+            return False
+
+        logger.info(
+            f"GeoAwareRetriever: position update ({lat:.5f}, {lon:.5f}). "
+            f"Active frames: {len(self._active_frame_ids)} → {len(new_frame_ids)}"
+        )
+
+        # Перебудова у фоновому потоці
+        thread = threading.Thread(
+            target=self._rebuild_in_background,
+            args=(new_frame_ids,),
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _rebuild_in_background(self, new_frame_ids: list[int]) -> None:
+        """Перебудовує FAISS-індекс у daemon-потоці."""
+        try:
+            # Збираємо дескриптори для підмножини
+            descriptors = self._full_descriptors[new_frame_ids]
+            new_index = self._build_faiss_index(descriptors, new_frame_ids)
+
+            # Атомарна заміна
+            with self._lock:
+                self._index = new_index
+                self._active_frame_ids = new_frame_ids
+
+            logger.info(
+                f"GeoAwareRetriever: index rebuilt with {len(new_frame_ids)} frames"
+            )
+        except Exception as e:
+            logger.error(
+                f"GeoAwareRetriever: background rebuild failed: {e}",
+                exc_info=True,
+            )
+
+    # ── Пошук ────────────────────────────────────────────────────────────────
+
+    def find_similar_frames(
+        self,
+        query_desc: np.ndarray,
+        top_k: int = 5,
+    ) -> list[tuple[int, float]]:
+        """
+        Пошук схожих кадрів у активному індексі.
+        
+        Returns:
+            Список (frame_id, cosine_score). frame_id — реальний ID у вихідній базі.
+        """
+        q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
+        q = q.astype(np.float32)
+        if q.ndim == 1:
+            q = q[None]
+
+        with self._lock:
+            if self._index.ntotal == 0:
+                return []
+            scores, ids = self._index.search(q, min(top_k, self._index.ntotal))
+
+        results = [
+            (int(idx), float(score))
+            for idx, score in zip(ids[0], scores[0])
+            if idx != -1
+        ]
+        return results
+
+    # ── Утиліти ──────────────────────────────────────────────────────────────
+
+    @property
+    def num_active_frames(self) -> int:
+        with self._lock:
+            return len(self._active_frame_ids)
+
+    @property
+    def is_geo_aware(self) -> bool:
+        return self._spatial_index is not None and self._spatial_index.is_available
+
+
+# ================================================================================
 # File: localization\localizer.py
 # ================================================================================
 import os
@@ -6731,12 +8600,19 @@ class Localizer:
         config=None,
         ref_frame_width: int = 0,
         ref_frame_height: int = 0,
+        db_manager=None,
+        calib_manager=None,
     ):
         self.database = database
         self.feature_extractor = feature_extractor
         self.matcher = matcher
         self.calibration = calibration
         self.config = config or {}
+
+        # Мультиджерельна підтримка (Phase 3 ТЗ)
+        self.db_manager = db_manager        # MultiDatabaseManager | None
+        self.calib_manager = calib_manager  # MultiCalibrationManager | None
+        self._active_source_id: str | None = None
 
         # Дефолти синхронізовані з APP_CONFIG через get_cfg()
         self.min_matches = get_cfg(self.config, "localization.min_matches", 12)
@@ -6758,11 +8634,14 @@ class Localizer:
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
-        # Choose correct vector retrieval backend based on database config
-        if hasattr(self.database, "lance_table") and self.database.lance_table is not None:
-            self.retriever = LanceDBRetrieval(self.database.lance_table)
-        else:
-            self.retriever = FastRetrieval(self.database.global_descriptors)
+        # Retriever: при мульти-режимі він у db_manager, тут — для single-mode
+        self.retriever = None
+        if self.db_manager is None:
+            # Single-database mode (зворотна сумісність)
+            if hasattr(self.database, "lance_table") and self.database.lance_table is not None:
+                self.retriever = LanceDBRetrieval(self.database.lance_table)
+            else:
+                self.retriever = FastRetrieval(self.database.global_descriptors)
 
         self.model_manager = self.config.get("_model_manager", None)
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
@@ -6818,8 +8697,24 @@ class Localizer:
             else:
                 logger.info(
                     "Patchify enabled in config but database has no patch_descriptors. "
-                    "Rebuild the database with use_patchify=True to enable patchify retrieval."
                 )
+        
+        # Phase 3.2: GSD integration
+        project_manager = self.config.get("_project_manager", None)
+        if project_manager and project_manager.settings:
+            try:
+                from src.geometry.gsd_calculator import GSDCalculator
+                s = project_manager.settings
+                gsd = GSDCalculator(
+                    altitude_m=getattr(s, "altitude_m", 100.0),
+                    focal_length_mm=getattr(s, "focal_length_mm", 13.2),
+                    sensor_width_mm=getattr(s, "sensor_width_mm", 8.8),
+                    image_width_px=getattr(s, "image_width_px", 4000),
+                )
+                gsd.log_summary()
+                self.calibration.set_gsd_calculator(gsd)
+            except Exception as e:
+                logger.warning(f"Failed to initialize GSD Calculator: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -6865,13 +8760,25 @@ class Localizer:
         #   - 4 кути × 14 патчів = 56 зайвих форвард-пасів лише на вибір кута
         #   - patchify-скор (avg cosine по 14 патчах) ≠ DINOv2 CLS-token cosine →
         #     змішування робить порівняння між кутами некоректним
+        best_source_id_per_angle: str | None = None  # для мульти-режиму
+
         for angle in angles_to_try:
             k = angle // 90
             rotated_frame = np.rot90(query_frame, k=k).copy()
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
 
             with Telemetry.profile("retrieval"):
-                candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
+                if self.db_manager is not None:
+                    # Мульти-режим: пошук у всіх активних базах
+                    src_id, candidates = self.db_manager.get_best_match(
+                        global_desc, top_k=top_k
+                    )
+                else:
+                    # Single-mode (зворотна сумісність)
+                    candidates = self.retriever.find_similar_frames(
+                        global_desc, top_k=top_k
+                    )
+                    src_id = None
 
             if candidates:
                 top_score = candidates[0][1]
@@ -6879,6 +8786,7 @@ class Localizer:
                     best_global_score = top_score
                     best_global_angle = angle
                     best_global_candidates = candidates
+                    best_source_id_per_angle = src_id
 
         if not best_global_candidates:
             self._consecutive_failures += 1
@@ -6895,6 +8803,14 @@ class Localizer:
         logger.info(
             f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
         )
+
+        # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
+        if self.db_manager is not None and best_source_id_per_angle is not None:
+            self._active_source_id = best_source_id_per_angle
+            self.database = self.db_manager.get_database(best_source_id_per_angle)
+            if self.calib_manager is not None:
+                self.calibration = self.calib_manager.get(best_source_id_per_angle)
+            logger.debug(f"Active source switched to '{best_source_id_per_angle}'")
 
         # ── Крок 1.5: Готуємо повернутий кадр для найкращого ракурсу ────────
         k = best_global_angle // 90
@@ -7066,6 +8982,7 @@ class Localizer:
             "candidate_id": best_candidate_id,
             "inliers": best_inliers,
             "global_angle": best_global_angle,
+            "source_id": self._active_source_id,
         }
 
         # ── Крок 6: Query center → Reference → Metric → GPS ─────────────────
@@ -7205,6 +9122,7 @@ class Localizer:
             "inliers": int(best_inliers),
             "fov_polygon": gps_corners,
             "sample_spread_m": 0.0,
+            "source_id": self._active_source_id,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -7227,6 +9145,13 @@ class Localizer:
             or self._last_state["affine"] is None
         ):
             return {"success": False, "error": "No previous state to apply OF"}
+
+        # Відновлюємо database/calibration для збереженого source_id (мульти-режим)
+        last_source_id = self._last_state.get("source_id")
+        if last_source_id is not None and self.db_manager is not None:
+            self.database = self.db_manager.get_database(last_source_id)
+            if self.calib_manager is not None:
+                self.calibration = self.calib_manager.get(last_source_id)
 
         scale = self._last_scale
         angle = self._last_state.get("global_angle", 0)
@@ -7301,18 +9226,30 @@ class Localizer:
         patches: list[tuple[int, float]],
         max_results: int | None = None,
     ) -> list[tuple[int, float]]:
-        """Об'єднує результати стандартного та патч-retrieval.
-
-        Для кожного frame_id зберігається МАКСИМАЛЬНИЙ скор з двох джерел.
-        max_results обмежує підсумковий список (None = без ліміту).
-
-        Примітка про шкали: стандартний DINOv2 і patchify обидва повертають
-        усереднений cosine similarity ∈ [-1, 1] — шкали порівнянні.
+        """Об'єднує результати стандартного та патч-retrieval через зважену суму.
+        
+        Ваги беруться з конфігу (localization.patchify_merge_weight).
+        Якщо кадр є в обох джерелах: score = w_std * s + w_patch * p.
+        Якщо тільки в одному: беремо скор як є (не штрафуємо за відсутність в іншому).
         """
-        merged: dict[int, float] = {fid: score for fid, score in standard}
-        for fid, score in patches:
-            if fid not in merged or score > merged[fid]:
-                merged[fid] = score
+        w_patch = get_cfg(self.config, "localization.patchify_merge_weight", 0.4)
+        w_standard = 1.0 - w_patch
+
+        standard_dict = dict(standard)
+        patch_dict = dict(patches)
+        all_fids = set(standard_dict.keys()) | set(patch_dict.keys())
+
+        merged = {}
+        for fid in all_fids:
+            s = standard_dict.get(fid, 0.0)
+            p = patch_dict.get(fid, 0.0)
+            
+            if fid in standard_dict and fid in patch_dict:
+                merged[fid] = w_standard * s + w_patch * p
+            elif fid in standard_dict:
+                merged[fid] = s
+            else:
+                merged[fid] = p
 
         sorted_results = sorted(merged.items(), key=lambda x: x[1], reverse=True)
 
@@ -7746,12 +9683,20 @@ class PatchifyRetrieval:
         Returns:
             Список кропів у порядку: grid(1,1) → grid(2,2) → grid(3,3)
         """
+        MIN_PATCH_PX = 32  # мінімальний розмір патча в пікселях
+
         h, w = image.shape[:2]
         patches = []
 
         for rows, cols in grids:
-            ph = h // rows
-            pw = w // cols
+            ph, pw = h // rows, w // cols
+            if ph < MIN_PATCH_PX or pw < MIN_PATCH_PX:
+                raise ValueError(
+                    f"Patch too small for grid {rows}×{cols}: "
+                    f"{ph}×{pw}px (min={MIN_PATCH_PX}px). "
+                    f"Image size: {w}×{h}."
+                )
+            
             for r in range(rows):
                 for c in range(cols):
                     y1 = r * ph
@@ -7815,8 +9760,12 @@ class PatchifyRetrieval:
 
         amp_dtype = fe.amp_dtype
         use_half = fe.use_half
+        
+        # Визначаємо тип пристрою динамічно для коректного autocast (Fix Bug 2)
+        device_type = "cuda" if "cuda" in str(device) else "cpu"
+        enabled = use_half and device_type == "cuda"
 
-        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_half):
+        with torch.amp.autocast(device_type, dtype=amp_dtype, enabled=enabled):
             out = fe.global_model(batch_input).float()
 
         return out.cpu().numpy()
@@ -7878,10 +9827,19 @@ class PatchifyRetrieval:
 
         # Для кожного з num_patches query-патчів знаходимо top-K ref-патчів
         search_k = top_k * 3  # шукаємо більше для кращої агрегації
+        
+        # Захист: search_k не може бути більше за розмір індексу (Fix Bug 4)
+        max_k = self.patch_index.ntotal
+        if search_k > max_k:
+            logger.debug(f"search_k={search_k} > index size={max_k}, clamping")
+            search_k = max_k
+
         scores, indices = self.patch_index.search(q, search_k)
 
-        # Агрегація: сумуємо cosine-скори для кожного frame_id
+        # Агрегація: сумуємо cosine-скори та рахуємо хіти для кожного frame_id (Fix Bug 1)
         frame_scores: dict[int, float] = {}
+        frame_hits: dict[int, int] = {}
+
         for patch_idx in range(len(q)):
             for j in range(search_k):
                 ref_idx = indices[patch_idx, j]
@@ -7889,15 +9847,21 @@ class PatchifyRetrieval:
                     continue
                 fid = int(self.patch_frame_ids[ref_idx])
                 score = float(scores[patch_idx, j])
+                
                 frame_scores[fid] = frame_scores.get(fid, 0.0) + score
+                frame_hits[fid] = frame_hits.get(fid, 0) + 1
 
-        # Нормалізуємо по кількості патчів для порівнянності зі стандартним retrieval
+        # Розрахунок підсумкового скору: coverage * avg_score
         num_patches = len(q)
+        final_scores: dict[int, float] = {}
         for fid in frame_scores:
-            frame_scores[fid] /= num_patches
+            hits = frame_hits[fid]
+            avg_score = frame_scores[fid] / hits  # якість патчів що знайшли
+            coverage = hits / num_patches          # частка патчів що знайшли
+            final_scores[fid] = coverage * avg_score
 
         # Сортуємо та повертаємо top-K
-        sorted_frames = sorted(frame_scores.items(), key=lambda x: x[1], reverse=True)
+        sorted_frames = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_frames[:top_k]
 
 
@@ -7933,11 +9897,13 @@ try:
 except ImportError:
     ALIKED = LightGlue = SuperPoint = None
 
+
 class LightGlueExportWrapper(torch.nn.Module):
     """
     Велика частина логіки LightGlue повертає словники зі змішаними типами (Tensors, int),
     що ламає torch.jit.trace. Ця обгортка повертає лише основні тензори матчів.
     """
+
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -7947,6 +9913,7 @@ class LightGlueExportWrapper(torch.nn.Module):
         # Повертаємо matches0 та matches1 (тензори індексів)
         # Це найбільш стабільний формат для експорту
         return res["matches0"], res["matches1"], res["matching_scores0"]
+
 
 try:
     from src.models.wrappers.trt_dinov2_wrapper import (
@@ -8113,7 +10080,7 @@ class ModelManager:
                     engine_path = str(model_path).replace(".pt", ".engine")
                     import os
 
-                    if use_trt and self.device == "cuda":
+                    if use_trt and self.device == "cuda" and is_trt_available():
                         if os.path.exists(engine_path):
                             logger.info(f"Found YOLO TRT engine: {engine_path}. Loading...")
                             with silent_output():
@@ -8124,24 +10091,32 @@ class ModelManager:
                             )
                             model = YOLO(model_path, verbose=False)
                             model.to(self.device)
-                            logger.info(
-                                "Exporting YOLO to TensorRT format (this may take a while)..."
-                            )
-                            try:
-                                # ultralytics automatically places the exported file next to the original
-                                exported_path = model.export(
-                                    format="engine", half=True, dynamic=True, batch=2,
-                                    verbose=False,
-                                )
-                                logger.success(f"YOLO TRT export complete: {exported_path}")
-                                if os.path.exists(exported_path):
-                                    with silent_output():
-                                        model = YOLO(exported_path, verbose=False)
-                                    logger.info("YOLO TensorRT engine loaded successfully.")
-                            except Exception as ex:
+                            if not is_trt_available():
                                 logger.warning(
-                                    f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
+                                    "TensorRT library not found. Skipping YOLO TRT export."
                                 )
+                            else:
+                                logger.info(
+                                    "Exporting YOLO to TensorRT format (this may take a while)..."
+                                )
+                                try:
+                                    # ultralytics automatically places the exported file next to the original
+                                    exported_path = model.export(
+                                        format="engine",
+                                        half=True,
+                                        dynamic=True,
+                                        batch=2,
+                                        verbose=False,
+                                    )
+                                    logger.success(f"YOLO TRT export complete: {exported_path}")
+                                    if os.path.exists(exported_path):
+                                        with silent_output():
+                                            model = YOLO(exported_path, verbose=False)
+                                        logger.info("YOLO TensorRT engine loaded successfully.")
+                                except Exception as ex:
+                                    logger.warning(
+                                        f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
+                                    )
                     else:
                         with silent_output():
                             model = YOLO(model_path, verbose=False)
@@ -8262,24 +10237,40 @@ class ModelManager:
 
                 # 1. Спроба завантажити як TensorRT або ONNX
                 if backend == "tensorrt" and model_path and os.path.exists(model_path):
-                    try:
-                        if model_path.endswith(".engine"):
-                            logger.info(f"Loading LightGlue TensorRT: {model_path}")
-                            # Для справжнього TRT engine потрібен wrapper.
-                            # Якщо він не передбачений, попереджаємо.
-                            logger.warning("TensorRT engine loading requires specialized wrapper. Falling back.")
-                        elif model_path.endswith(".onnx"):
-                            logger.info(f"Loading LightGlue ONNX: {model_path}")
-                            try:
-                                import onnxruntime as ort
-                                providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-                                # Створюємо сесію
-                                model = ort.InferenceSession(model_path, providers=providers)
-                                logger.success(f"LightGlue ONNX loaded with providers: {model.get_providers()}")
-                            except ImportError:
-                                logger.warning("onnxruntime not installed. Falling back.")
-                    except Exception as e:
-                        logger.warning(f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git.")
+                    if not is_trt_available() and model_path.endswith(".engine"):
+                        logger.warning(
+                            f"TensorRT library not found. Skipping LightGlue engine: {model_path}"
+                        )
+                    else:
+                        try:
+                            if model_path.endswith(".engine"):
+                                logger.info(f"Loading LightGlue TensorRT: {model_path}")
+                                # Для справжнього TRT engine потрібен wrapper.
+                                # Якщо він не передбачений, попереджаємо.
+                                logger.warning(
+                                    "TensorRT engine loading requires specialized wrapper. Falling back."
+                                )
+                            elif model_path.endswith(".onnx"):
+                                logger.info(f"Loading LightGlue ONNX: {model_path}")
+                                try:
+                                    import onnxruntime as ort
+
+                                    providers = [
+                                        "TensorrtExecutionProvider",
+                                        "CUDAExecutionProvider",
+                                        "CPUExecutionProvider",
+                                    ]
+                                    # Створюємо сесію
+                                    model = ort.InferenceSession(model_path, providers=providers)
+                                    logger.success(
+                                        f"LightGlue ONNX loaded with providers: {model.get_providers()}"
+                                    )
+                                except ImportError:
+                                    logger.warning("onnxruntime not installed. Falling back.")
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git."
+                            )
 
                 # 2. Спроба завантажити як TorchScript
                 if model is None and (backend == "torchscript" or backend == "tensorrt"):
@@ -8289,11 +10280,17 @@ class ModelManager:
                             model = torch.jit.load(model_path, map_location=self.device)
                             model.eval()
                         except Exception as e:
-                            logger.warning(f"Failed to load LightGlue TorchScript: {e}. Falling back to Git.")
+                            logger.warning(
+                                f"Failed to load LightGlue TorchScript: {e}. Falling back to Git."
+                            )
                     elif auto_convert:
-                        logger.info(f"TorchScript model not found at {model_path}. Attempting auto-conversion from Git...")
+                        logger.info(
+                            f"TorchScript model not found at {model_path}. Attempting auto-conversion from Git..."
+                        )
                     else:
-                        logger.warning(f"TorchScript model not found at {model_path} and auto_convert is disabled.")
+                        logger.warning(
+                            f"TorchScript model not found at {model_path} and auto_convert is disabled."
+                        )
 
                 # 3. Fallback до Git (бібліотеки) або Auto-conversion
                 if model is None:
@@ -8302,14 +10299,16 @@ class ModelManager:
                             raise ImportError("lightglue.LightGlue library not found")
 
                         logger.info(f"Loading LightGlue ({features}) from library (Git backend)...")
-                        
+
                         # Для RDD використовуємо архітектуру SuperPoint (256-dim), оскільки 'rdd' не є нативним для бібліотеки
                         lg_feature_type = "superpoint" if features == "rdd" else features
                         model = LightGlue(features=lg_feature_type).eval().to(self.device)
 
                         # Якщо вказано кастомні ваги (наприклад, для rdd), завантажуємо їх
                         if model_path and os.path.exists(model_path):
-                            state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+                            state_dict = torch.load(
+                                model_path, map_location=self.device, weights_only=True
+                            )
                             model.load_state_dict(state_dict, strict=False)
                             logger.info(f"Loaded custom LightGlue weights from {model_path}")
 
@@ -8340,13 +10339,13 @@ class ModelManager:
                     "image0": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),
                         "descriptors": torch.zeros((1, 10, dim), device=self.device),
-                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device),
                     },
                     "image1": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),
                         "descriptors": torch.zeros((1, 10, dim), device=self.device),
-                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
-                    }
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device),
+                    },
                 }
 
                 try:
@@ -8356,9 +10355,13 @@ class ModelManager:
                     # strict=False для підтримки динамічних форм у LightGlue
                     traced_model = torch.jit.trace(wrapper, (dummy_data,), strict=False)
                     traced_model.save(str(path))
-                    logger.success(f"Successfully exported LightGlue ({features}) to {model_path} via wrapper")
+                    logger.success(
+                        f"Successfully exported LightGlue ({features}) to {model_path} via wrapper"
+                    )
                 except Exception as e:
-                    logger.warning(f"TorchScript tracing failed for {features}: {e}. Model will run from Git library.")
+                    logger.warning(
+                        f"TorchScript tracing failed for {features}: {e}. Model will run from Git library."
+                    )
         except Exception as e:
             logger.warning(f"Auto-exporting LightGlue failed: {e}")
 
@@ -8476,7 +10479,7 @@ class ModelManager:
         with self._model_lock:
             if name not in self.models:
                 vram_req = get_cfg(self.config, "models.rdd.vram_required_mb", 500.0)
-                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/weights/rdd.pth")
+                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/rdd.pth")
                 max_keypoints = get_cfg(self.config, "models.rdd.max_keypoints", 4096)
 
                 logger.info(f"Loading RDD model (max_keypoints={max_keypoints})...")
@@ -9131,10 +11134,10 @@ class RDDWrapper:
     детекції keypoints та побудови дескрипторів.
 
     Output format ідентичний ALIKED:
-        {\"keypoints\": (1, N, 2), \"descriptors\": (1, N, D)}
+        {"keypoints": (1, N, 2), "descriptors": (1, N, D)}
 
     Usage:
-        wrapper = RDDWrapper(weights_path=\"models/weights/rdd.pth\", device=\"cuda\")
+        wrapper = RDDWrapper(weights_path="models/rdd.pth", device="cuda")
         model = wrapper.model  # Pass to FeatureExtractor as local_model
     """
 
@@ -9267,7 +11270,7 @@ try:
     import tensorrt as trt
 
     _TRT_AVAILABLE = True
-except ImportError:
+except Exception:
     _TRT_AVAILABLE = False
 
 
@@ -11224,6 +13227,39 @@ class CalibrationPropagationWorker(QThread):
                 )
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
+                # Обчислюємо та зберігаємо frame_gps (lat/lon для кожного кадру)
+                # Для мультиджерельної геолокалізації — дозволяє SpatialIndex
+                if self.calibration.converter and self.calibration.converter.is_initialized:
+                    frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
+                    gps_count = 0
+                    for fid in range(num_frames):
+                        if not frame_valid[fid]:
+                            continue
+                        affine = frame_affine[fid]
+                        # Центр кадру в пікселях → metric через affine
+                        center_px = np.array(
+                            [[self.frame_w / 2.0, self.frame_h / 2.0]], dtype=np.float64
+                        )
+                        center_metric = GeometryTransforms.apply_affine(center_px, affine)
+                        if center_metric is not None and len(center_metric) > 0:
+                            try:
+                                lat, lon = self.calibration.converter.metric_to_gps(
+                                    float(center_metric[0, 0]),
+                                    float(center_metric[0, 1]),
+                                )
+                                frame_gps[fid] = [lat, lon]
+                                gps_count += 1
+                            except Exception:
+                                pass
+                    
+                    # Видаляємо старий датасет якщо є
+                    if "frame_gps" in f:
+                        del f["frame_gps"]
+                    f.create_dataset("frame_gps", data=frame_gps, compression="gzip")
+                    logger.info(
+                        f"Saved frame_gps: {gps_count}/{num_frames} frames with GPS coordinates"
+                    )
+
             valid_count = int(np.sum(frame_valid))
             logger.success(
                 f"Graph propagation saved to HDF5 (v3.0, "
@@ -11920,6 +13956,19 @@ class RealtimeTrackingWorker(QThread):
                 )
 
                 last_localization_video_time = current_video_time_sec
+
+                # Мульти-режим: оновлюємо активні бази за поточною GPS-позицією
+                if hasattr(self.localizer, "db_manager") and self.localizer.db_manager is not None:
+                    try:
+                        self.localizer.db_manager.set_active_by_gps(
+                            loc_result["lat"], loc_result["lon"]
+                        )
+                        # Фонова перебудова FAISS-підмножини у GeoAwareRetriever-ах
+                        self.localizer.db_manager.update_retriever_positions(
+                            loc_result["lat"], loc_result["lon"]
+                        )
+                    except Exception as e:
+                        logger.debug(f"set_active_by_gps failed: {e}")
             elif not loc_result.get("success") and loc_result.get("error") != "Not processed":
                 self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 

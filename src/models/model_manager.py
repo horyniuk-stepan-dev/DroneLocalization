@@ -21,11 +21,13 @@ try:
 except ImportError:
     ALIKED = LightGlue = SuperPoint = None
 
+
 class LightGlueExportWrapper(torch.nn.Module):
     """
     Велика частина логіки LightGlue повертає словники зі змішаними типами (Tensors, int),
     що ламає torch.jit.trace. Ця обгортка повертає лише основні тензори матчів.
     """
+
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -35,6 +37,7 @@ class LightGlueExportWrapper(torch.nn.Module):
         # Повертаємо matches0 та matches1 (тензори індексів)
         # Це найбільш стабільний формат для експорту
         return res["matches0"], res["matches1"], res["matching_scores0"]
+
 
 try:
     from src.models.wrappers.trt_dinov2_wrapper import (
@@ -201,7 +204,7 @@ class ModelManager:
                     engine_path = str(model_path).replace(".pt", ".engine")
                     import os
 
-                    if use_trt and self.device == "cuda":
+                    if use_trt and self.device == "cuda" and is_trt_available():
                         if os.path.exists(engine_path):
                             logger.info(f"Found YOLO TRT engine: {engine_path}. Loading...")
                             with silent_output():
@@ -212,24 +215,32 @@ class ModelManager:
                             )
                             model = YOLO(model_path, verbose=False)
                             model.to(self.device)
-                            logger.info(
-                                "Exporting YOLO to TensorRT format (this may take a while)..."
-                            )
-                            try:
-                                # ultralytics automatically places the exported file next to the original
-                                exported_path = model.export(
-                                    format="engine", half=True, dynamic=True, batch=2,
-                                    verbose=False,
-                                )
-                                logger.success(f"YOLO TRT export complete: {exported_path}")
-                                if os.path.exists(exported_path):
-                                    with silent_output():
-                                        model = YOLO(exported_path, verbose=False)
-                                    logger.info("YOLO TensorRT engine loaded successfully.")
-                            except Exception as ex:
+                            if not is_trt_available():
                                 logger.warning(
-                                    f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
+                                    "TensorRT library not found. Skipping YOLO TRT export."
                                 )
+                            else:
+                                logger.info(
+                                    "Exporting YOLO to TensorRT format (this may take a while)..."
+                                )
+                                try:
+                                    # ultralytics automatically places the exported file next to the original
+                                    exported_path = model.export(
+                                        format="engine",
+                                        half=True,
+                                        dynamic=True,
+                                        batch=2,
+                                        verbose=False,
+                                    )
+                                    logger.success(f"YOLO TRT export complete: {exported_path}")
+                                    if os.path.exists(exported_path):
+                                        with silent_output():
+                                            model = YOLO(exported_path, verbose=False)
+                                        logger.info("YOLO TensorRT engine loaded successfully.")
+                                except Exception as ex:
+                                    logger.warning(
+                                        f"YOLO TRT export failed: {ex}. Falling back to PyTorch."
+                                    )
                     else:
                         with silent_output():
                             model = YOLO(model_path, verbose=False)
@@ -350,24 +361,40 @@ class ModelManager:
 
                 # 1. Спроба завантажити як TensorRT або ONNX
                 if backend == "tensorrt" and model_path and os.path.exists(model_path):
-                    try:
-                        if model_path.endswith(".engine"):
-                            logger.info(f"Loading LightGlue TensorRT: {model_path}")
-                            # Для справжнього TRT engine потрібен wrapper.
-                            # Якщо він не передбачений, попереджаємо.
-                            logger.warning("TensorRT engine loading requires specialized wrapper. Falling back.")
-                        elif model_path.endswith(".onnx"):
-                            logger.info(f"Loading LightGlue ONNX: {model_path}")
-                            try:
-                                import onnxruntime as ort
-                                providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-                                # Створюємо сесію
-                                model = ort.InferenceSession(model_path, providers=providers)
-                                logger.success(f"LightGlue ONNX loaded with providers: {model.get_providers()}")
-                            except ImportError:
-                                logger.warning("onnxruntime not installed. Falling back.")
-                    except Exception as e:
-                        logger.warning(f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git.")
+                    if not is_trt_available() and model_path.endswith(".engine"):
+                        logger.warning(
+                            f"TensorRT library not found. Skipping LightGlue engine: {model_path}"
+                        )
+                    else:
+                        try:
+                            if model_path.endswith(".engine"):
+                                logger.info(f"Loading LightGlue TensorRT: {model_path}")
+                                # Для справжнього TRT engine потрібен wrapper.
+                                # Якщо він не передбачений, попереджаємо.
+                                logger.warning(
+                                    "TensorRT engine loading requires specialized wrapper. Falling back."
+                                )
+                            elif model_path.endswith(".onnx"):
+                                logger.info(f"Loading LightGlue ONNX: {model_path}")
+                                try:
+                                    import onnxruntime as ort
+
+                                    providers = [
+                                        "TensorrtExecutionProvider",
+                                        "CUDAExecutionProvider",
+                                        "CPUExecutionProvider",
+                                    ]
+                                    # Створюємо сесію
+                                    model = ort.InferenceSession(model_path, providers=providers)
+                                    logger.success(
+                                        f"LightGlue ONNX loaded with providers: {model.get_providers()}"
+                                    )
+                                except ImportError:
+                                    logger.warning("onnxruntime not installed. Falling back.")
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git."
+                            )
 
                 # 2. Спроба завантажити як TorchScript
                 if model is None and (backend == "torchscript" or backend == "tensorrt"):
@@ -377,11 +404,17 @@ class ModelManager:
                             model = torch.jit.load(model_path, map_location=self.device)
                             model.eval()
                         except Exception as e:
-                            logger.warning(f"Failed to load LightGlue TorchScript: {e}. Falling back to Git.")
+                            logger.warning(
+                                f"Failed to load LightGlue TorchScript: {e}. Falling back to Git."
+                            )
                     elif auto_convert:
-                        logger.info(f"TorchScript model not found at {model_path}. Attempting auto-conversion from Git...")
+                        logger.info(
+                            f"TorchScript model not found at {model_path}. Attempting auto-conversion from Git..."
+                        )
                     else:
-                        logger.warning(f"TorchScript model not found at {model_path} and auto_convert is disabled.")
+                        logger.warning(
+                            f"TorchScript model not found at {model_path} and auto_convert is disabled."
+                        )
 
                 # 3. Fallback до Git (бібліотеки) або Auto-conversion
                 if model is None:
@@ -390,14 +423,16 @@ class ModelManager:
                             raise ImportError("lightglue.LightGlue library not found")
 
                         logger.info(f"Loading LightGlue ({features}) from library (Git backend)...")
-                        
+
                         # Для RDD використовуємо архітектуру SuperPoint (256-dim), оскільки 'rdd' не є нативним для бібліотеки
                         lg_feature_type = "superpoint" if features == "rdd" else features
                         model = LightGlue(features=lg_feature_type).eval().to(self.device)
 
                         # Якщо вказано кастомні ваги (наприклад, для rdd), завантажуємо їх
                         if model_path and os.path.exists(model_path):
-                            state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+                            state_dict = torch.load(
+                                model_path, map_location=self.device, weights_only=True
+                            )
                             model.load_state_dict(state_dict, strict=False)
                             logger.info(f"Loaded custom LightGlue weights from {model_path}")
 
@@ -428,13 +463,13 @@ class ModelManager:
                     "image0": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),
                         "descriptors": torch.zeros((1, 10, dim), device=self.device),
-                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device),
                     },
                     "image1": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),
                         "descriptors": torch.zeros((1, 10, dim), device=self.device),
-                        "image_size": torch.tensor([[1024, 1024]], device=self.device)
-                    }
+                        "image_size": torch.tensor([[1024, 1024]], device=self.device),
+                    },
                 }
 
                 try:
@@ -444,9 +479,13 @@ class ModelManager:
                     # strict=False для підтримки динамічних форм у LightGlue
                     traced_model = torch.jit.trace(wrapper, (dummy_data,), strict=False)
                     traced_model.save(str(path))
-                    logger.success(f"Successfully exported LightGlue ({features}) to {model_path} via wrapper")
+                    logger.success(
+                        f"Successfully exported LightGlue ({features}) to {model_path} via wrapper"
+                    )
                 except Exception as e:
-                    logger.warning(f"TorchScript tracing failed for {features}: {e}. Model will run from Git library.")
+                    logger.warning(
+                        f"TorchScript tracing failed for {features}: {e}. Model will run from Git library."
+                    )
         except Exception as e:
             logger.warning(f"Auto-exporting LightGlue failed: {e}")
 
