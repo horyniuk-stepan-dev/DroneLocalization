@@ -52,12 +52,19 @@ class Localizer:
         config=None,
         ref_frame_width: int = 0,
         ref_frame_height: int = 0,
+        db_manager=None,
+        calib_manager=None,
     ):
         self.database = database
         self.feature_extractor = feature_extractor
         self.matcher = matcher
         self.calibration = calibration
         self.config = config or {}
+
+        # Мультиджерельна підтримка (Phase 3 ТЗ)
+        self.db_manager = db_manager        # MultiDatabaseManager | None
+        self.calib_manager = calib_manager  # MultiCalibrationManager | None
+        self._active_source_id: str | None = None
 
         # Дефолти синхронізовані з APP_CONFIG через get_cfg()
         self.min_matches = get_cfg(self.config, "localization.min_matches", 12)
@@ -79,11 +86,14 @@ class Localizer:
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
-        # Choose correct vector retrieval backend based on database config
-        if hasattr(self.database, "lance_table") and self.database.lance_table is not None:
-            self.retriever = LanceDBRetrieval(self.database.lance_table)
-        else:
-            self.retriever = FastRetrieval(self.database.global_descriptors)
+        # Retriever: при мульти-режимі він у db_manager, тут — для single-mode
+        self.retriever = None
+        if self.db_manager is None:
+            # Single-database mode (зворотна сумісність)
+            if hasattr(self.database, "lance_table") and self.database.lance_table is not None:
+                self.retriever = LanceDBRetrieval(self.database.lance_table)
+            else:
+                self.retriever = FastRetrieval(self.database.global_descriptors)
 
         self.model_manager = self.config.get("_model_manager", None)
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
@@ -202,13 +212,25 @@ class Localizer:
         #   - 4 кути × 14 патчів = 56 зайвих форвард-пасів лише на вибір кута
         #   - patchify-скор (avg cosine по 14 патчах) ≠ DINOv2 CLS-token cosine →
         #     змішування робить порівняння між кутами некоректним
+        best_source_id_per_angle: str | None = None  # для мульти-режиму
+
         for angle in angles_to_try:
             k = angle // 90
             rotated_frame = np.rot90(query_frame, k=k).copy()
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
 
             with Telemetry.profile("retrieval"):
-                candidates = self.retriever.find_similar_frames(global_desc, top_k=top_k)
+                if self.db_manager is not None:
+                    # Мульти-режим: пошук у всіх активних базах
+                    src_id, candidates = self.db_manager.get_best_match(
+                        global_desc, top_k=top_k
+                    )
+                else:
+                    # Single-mode (зворотна сумісність)
+                    candidates = self.retriever.find_similar_frames(
+                        global_desc, top_k=top_k
+                    )
+                    src_id = None
 
             if candidates:
                 top_score = candidates[0][1]
@@ -216,6 +238,7 @@ class Localizer:
                     best_global_score = top_score
                     best_global_angle = angle
                     best_global_candidates = candidates
+                    best_source_id_per_angle = src_id
 
         if not best_global_candidates:
             self._consecutive_failures += 1
@@ -232,6 +255,14 @@ class Localizer:
         logger.info(
             f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
         )
+
+        # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
+        if self.db_manager is not None and best_source_id_per_angle is not None:
+            self._active_source_id = best_source_id_per_angle
+            self.database = self.db_manager.get_database(best_source_id_per_angle)
+            if self.calib_manager is not None:
+                self.calibration = self.calib_manager.get(best_source_id_per_angle)
+            logger.debug(f"Active source switched to '{best_source_id_per_angle}'")
 
         # ── Крок 1.5: Готуємо повернутий кадр для найкращого ракурсу ────────
         k = best_global_angle // 90
@@ -403,6 +434,7 @@ class Localizer:
             "candidate_id": best_candidate_id,
             "inliers": best_inliers,
             "global_angle": best_global_angle,
+            "source_id": self._active_source_id,
         }
 
         # ── Крок 6: Query center → Reference → Metric → GPS ─────────────────
@@ -542,6 +574,7 @@ class Localizer:
             "inliers": int(best_inliers),
             "fov_polygon": gps_corners,
             "sample_spread_m": 0.0,
+            "source_id": self._active_source_id,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -564,6 +597,13 @@ class Localizer:
             or self._last_state["affine"] is None
         ):
             return {"success": False, "error": "No previous state to apply OF"}
+
+        # Відновлюємо database/calibration для збереженого source_id (мульти-режим)
+        last_source_id = self._last_state.get("source_id")
+        if last_source_id is not None and self.db_manager is not None:
+            self.database = self.db_manager.get_database(last_source_id)
+            if self.calib_manager is not None:
+                self.calibration = self.calib_manager.get(last_source_id)
 
         scale = self._last_scale
         angle = self._last_state.get("global_angle", 0)

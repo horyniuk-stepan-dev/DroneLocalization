@@ -305,6 +305,19 @@ class RealtimeTrackingWorker(QThread):
                 )
 
                 last_localization_video_time = current_video_time_sec
+
+                # Мульти-режим: оновлюємо активні бази за поточною GPS-позицією
+                if hasattr(self.localizer, "db_manager") and self.localizer.db_manager is not None:
+                    try:
+                        self.localizer.db_manager.set_active_by_gps(
+                            loc_result["lat"], loc_result["lon"]
+                        )
+                        # Фонова перебудова FAISS-підмножини у GeoAwareRetriever-ах
+                        self.localizer.db_manager.update_retriever_positions(
+                            loc_result["lat"], loc_result["lon"]
+                        )
+                    except Exception as e:
+                        logger.debug(f"set_active_by_gps failed: {e}")
             elif not loc_result.get("success") and loc_result.get("error") != "Not processed":
                 self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 

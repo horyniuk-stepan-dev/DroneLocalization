@@ -4,9 +4,11 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.export_results import ResultExporter
 from src.core.project_registry import ProjectRegistry
 from src.database.database_loader import DatabaseLoader
+from src.database.multi_database_manager import MultiDatabaseManager
 from src.geometry.coordinates import CoordinateConverter
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
@@ -200,6 +202,9 @@ class DatabaseMixin:
 
             if self.database:
                 self.database.close()
+            # Закриваємо попередні мульти-менеджери
+            if hasattr(self, "db_manager") and self.db_manager:
+                self.db_manager.close_all()
 
             # Очищення стану попереднього проєкту
             if hasattr(self, "calibration") and self.calibration:
@@ -214,7 +219,38 @@ class DatabaseMixin:
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
-                self.database = DatabaseLoader(db_path)
+                # Перевіряємо чи проєкт мультиджерельний
+                sources = self.project_manager.settings.get_enabled_sources()
+                is_multi = len(sources) > 1 or any(
+                    s.source_id != "main" for s in sources
+                )
+
+                if is_multi and len(sources) > 0:
+                    # Мультиджерельний режим
+                    project_dir = self.project_manager.project_dir
+                    self.db_manager = MultiDatabaseManager(
+                        sources, project_dir, config=self.config
+                    )
+                    self.calib_manager = MultiCalibrationManager()
+                    self.calib_manager.load_all(sources, project_dir)
+
+                    # self.database — перше джерело для сумісності з UI
+                    first_id = self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                    if first_id:
+                        self.database = self.db_manager.get_database(first_id)
+                        self.calibration = self.calib_manager.get(first_id)
+                    else:
+                        raise RuntimeError("Мультиджерельний проєкт: жодна база не завантажена")
+
+                    logger.info(
+                        f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
+                        f"sources={self.db_manager.all_source_ids}"
+                    )
+                else:
+                    # Single-source режим (зворотна сумісність)
+                    self.db_manager = None
+                    self.calib_manager = None
+                    self.database = DatabaseLoader(db_path)
             finally:
                 QApplication.restoreOverrideCursor()
             self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
@@ -229,10 +265,11 @@ class DatabaseMixin:
                 else "",
             )
 
-            # Завантажити калібрацію якщо є
-            calib_path = self.project_manager.calibration_path
-            if calib_path and Path(calib_path).exists():
-                self.calibration.load(calib_path)
+            # Завантажити калібрацію якщо є (single-mode)
+            if self.calib_manager is None:
+                calib_path = self.project_manager.calibration_path
+                if calib_path and Path(calib_path).exists():
+                    self.calibration.load(calib_path)
 
             # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
             if self.database and self.database.converter is not None:
@@ -424,3 +461,116 @@ class DatabaseMixin:
             num_propagated=num_propagated,
             db_size_mb=db_size_mb,
         )
+
+        # Оновлюємо панель відеоджерел
+        self._refresh_sources_panel()
+
+    def _refresh_sources_panel(self):
+        """Оновлює таблицю відеоджерел у ControlPanel."""
+        if not self.project_manager.is_loaded or not self.project_manager.settings:
+            return
+        sources_raw = self.project_manager.settings.video_sources or []
+        project_dir = str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
+        self.control_panel.update_sources_list(sources_raw, project_dir=project_dir)
+
+    # ── Мультиджерельні слоти ─────────────────────────────────────────────────
+
+    @pyqtSlot()
+    def on_add_video_source(self):
+        """Слот для кнопки 'Додати джерело'."""
+        if not self.project_manager.is_loaded:
+            QMessageBox.warning(self, "Помилка", "Спочатку відкрийте або створіть проєкт!")
+            return
+
+        from src.gui.dialogs.add_video_source_dialog import AddVideoSourceDialog
+
+        # Збираємо існуючі area_id
+        existing_areas = set()
+        for src in (self.project_manager.settings.video_sources or []):
+            area = src.get("area_id", "")
+            if area:
+                existing_areas.add(area)
+
+        dialog = AddVideoSourceDialog(
+            existing_area_ids=sorted(existing_areas), parent=self
+        )
+        if not dialog.exec():
+            return
+
+        new_source = dialog.get_source_config()
+
+        # Перевірка на дублікат
+        if self.project_manager.settings.get_source(new_source.source_id) is not None:
+            QMessageBox.warning(
+                self, "Помилка",
+                f"Джерело з ID '{new_source.source_id}' вже існує в проєкті!"
+            )
+            return
+
+        # Додаємо до проєкту
+        self.project_manager.settings.add_source(new_source)
+        self.project_manager.save_project()
+
+        # Створюємо директорію для джерела
+        source_dir = self.project_manager.project_dir / "sources" / new_source.source_id
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            f"Video source added: {new_source.source_id} "
+            f"(area={new_source.area_id}, video={Path(new_source.video_path).name})"
+        )
+
+        self._refresh_sources_panel()
+        self.status_bar.showMessage(
+            f"Додано відеоджерело '{new_source.source_id}'. "
+            f"Побудуйте БД через контекстне меню таблиці."
+        )
+
+    @pyqtSlot(str, str)
+    def on_source_action(self, source_id: str, action: str):
+        """Обробка дій з контекстного меню таблиці джерел."""
+        if not self.project_manager.is_loaded:
+            return
+
+        settings = self.project_manager.settings
+        source = settings.get_source(source_id)
+        if source is None:
+            QMessageBox.warning(self, "Помилка", f"Джерело '{source_id}' не знайдено!")
+            return
+
+        if action == "build_db":
+            # Генерація БД для конкретного джерела
+            video_path = source.video_path
+            db_path = str(self.project_manager.project_dir / source.database_file)
+            db_dir = Path(db_path).parent
+            db_dir.mkdir(parents=True, exist_ok=True)
+            self._start_database_generation(video_path, db_path)
+
+        elif action == "calibrate":
+            # Поки що — відкриваємо стандартний калібрувальний діалог
+            self.status_bar.showMessage(
+                f"Для калібрування '{source_id}' використовуйте стандартний калібрувальний інструмент."
+            )
+
+        elif action == "toggle":
+            source.enabled = not source.enabled
+            settings.update_source(source)
+            self.project_manager.save_project()
+            self._refresh_sources_panel()
+            state = "увімкнено" if source.enabled else "вимкнено"
+            self.status_bar.showMessage(f"Джерело '{source_id}' {state}")
+
+        elif action == "remove":
+            reply = QMessageBox.question(
+                self,
+                "Видалення джерела",
+                f"Видалити відеоджерело '{source_id}'?\n\n"
+                f"Файли бази та калібрації НЕ будуть видалені з диску.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                settings.remove_source(source_id)
+                self.project_manager.save_project()
+                self._refresh_sources_panel()
+                self.status_bar.showMessage(f"Джерело '{source_id}' видалено з проєкту")
+

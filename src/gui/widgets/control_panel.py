@@ -1,11 +1,18 @@
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QMenu,
     QProgressBar,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -34,6 +41,8 @@ class ControlPanel(QWidget):
     clear_map_clicked = pyqtSignal()
     stop_db_generation_clicked = pyqtSignal()
     toggle_objects_clicked = pyqtSignal(bool)
+    add_source_clicked = pyqtSignal()
+    source_action = pyqtSignal(str, str)  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -170,11 +179,57 @@ class ControlPanel(QWidget):
         status_layout.addWidget(self.lbl_status)
         status_layout.addWidget(self.progress_bar)
 
+        # Video Sources group (мультиджерельна підтримка)
+        self.sources_group = QGroupBox("Відеоджерела")
+        sources_layout = QVBoxLayout(self.sources_group)
+
+        self.sources_table = QTableWidget()
+        self.sources_table.setColumnCount(3)
+        self.sources_table.setHorizontalHeaderLabels(["Source ID", "Area", "Статус"])
+        self.sources_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.sources_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.sources_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.sources_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.sources_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.sources_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.sources_table.setMaximumHeight(120)
+        self.sources_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.sources_table.customContextMenuRequested.connect(
+            self._on_sources_context_menu
+        )
+        self.sources_table.setVisible(False)  # Прихований до відкриття мульти-проєкту
+        sources_layout.addWidget(self.sources_table)
+
+        btn_row = QHBoxLayout()
+        self.btn_add_source = QPushButton("➕ Додати джерело")
+        self.btn_add_source.setToolTip("Додати нове відеоджерело до проєкту")
+        self.btn_add_source.clicked.connect(self.add_source_clicked)
+        self.btn_add_source.setVisible(False)
+        btn_row.addWidget(self.btn_add_source)
+        sources_layout.addLayout(btn_row)
+
+        self.sources_group.setVisible(False)  # Показується тільки для мульти-проєктів
+
         for group in [
             db_group,
             calib_group,
             track_group,
             export_group,
+            self.sources_group,
             self.info_group,
             status_group,
         ]:
@@ -252,3 +307,98 @@ class ControlPanel(QWidget):
         self.lbl_project_info.setText("<br>".join(lines))
         self.lbl_project_info.setStyleSheet("font-size: 11px; color: #000;")
         self.btn_rebuild_db.setEnabled(True)
+
+    # ── Video Sources Panel ──────────────────────────────────────────────────
+
+    def update_sources_list(
+        self,
+        sources: list[dict],
+        project_dir: str = "",
+    ):
+        """Оновлює таблицю відеоджерел.
+
+        Args:
+            sources: Список dict з полями source_id, area_id, enabled,
+                     database_file, calibration_file.
+            project_dir: Шлях до кореня проєкту для перевірки файлів.
+        """
+        is_multi = len(sources) > 1 or any(
+            s.get("source_id") != "main" for s in sources
+        )
+        # Група завжди видима при відкритому проєкті, таблиця — тільки для multi
+        self.sources_group.setVisible(True)
+        self.sources_table.setVisible(is_multi)
+        self.btn_add_source.setVisible(True)
+
+        if not is_multi:
+            return
+
+        self.sources_table.setRowCount(len(sources))
+        for row, src in enumerate(sources):
+            sid = src.get("source_id", "?")
+            area = src.get("area_id", "?")
+            enabled = src.get("enabled", True)
+
+            # Визначаємо статус
+            status = "⏳ Очікує"
+            status_color = QColor("#888")
+            if project_dir:
+                db_exists = (Path(project_dir) / src.get("database_file", "")).exists()
+                cal_exists = (Path(project_dir) / src.get("calibration_file", "")).exists()
+                if db_exists and cal_exists:
+                    status = "✅ Готово"
+                    status_color = QColor("#2e7d32")
+                elif db_exists:
+                    status = "⚠ Без калібр."
+                    status_color = QColor("#e65100")
+                else:
+                    status = "❌ Без БД"
+                    status_color = QColor("#c62828")
+
+            if not enabled:
+                status = "🔇 Вимкнено"
+                status_color = QColor("#999")
+
+            item_sid = QTableWidgetItem(sid)
+            item_area = QTableWidgetItem(area)
+            item_status = QTableWidgetItem(status)
+            item_status.setForeground(status_color)
+
+            # Зберігаємо source_id як data для context menu
+            item_sid.setData(Qt.ItemDataRole.UserRole, sid)
+
+            self.sources_table.setItem(row, 0, item_sid)
+            self.sources_table.setItem(row, 1, item_area)
+            self.sources_table.setItem(row, 2, item_status)
+
+    @pyqtSlot("QPoint")
+    def _on_sources_context_menu(self, pos):
+        """Контекстне меню для таблиці джерел."""
+        row = self.sources_table.rowAt(pos.y())
+        if row < 0:
+            return
+
+        item = self.sources_table.item(row, 0)
+        if item is None:
+            return
+        source_id = item.data(Qt.ItemDataRole.UserRole)
+        if not source_id:
+            return
+
+        menu = QMenu(self)
+        act_build = menu.addAction("🔨 Побудувати базу даних")
+        act_calib = menu.addAction("📐 Калібрувати")
+        menu.addSeparator()
+        act_toggle = menu.addAction("🔇 Увімкнути/Вимкнути")
+        menu.addSeparator()
+        act_remove = menu.addAction("🗑 Видалити")
+
+        action = menu.exec(self.sources_table.viewport().mapToGlobal(pos))
+        if action == act_build:
+            self.source_action.emit(source_id, "build_db")
+        elif action == act_calib:
+            self.source_action.emit(source_id, "calibrate")
+        elif action == act_toggle:
+            self.source_action.emit(source_id, "toggle")
+        elif action == act_remove:
+            self.source_action.emit(source_id, "remove")

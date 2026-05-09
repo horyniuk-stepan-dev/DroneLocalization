@@ -24,6 +24,7 @@ from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
 from config.config import APP_SETTINGS, APP_CONFIG
+# pyrefly: ignore [missing-import]
 from src.core.headless_runner import HeadlessRunner
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging

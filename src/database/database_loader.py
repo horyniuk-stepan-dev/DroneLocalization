@@ -32,6 +32,10 @@ class DatabaseLoader:
         self.frame_disagreement: np.ndarray | None = None  # (N,)   — Розбіжність між гілками
         self.frame_matches: np.ndarray | None = None  # (N,)      — Кількість точок (inliers)
 
+        # GPS-координати кадрів та просторовий індекс (мультиджерельна геолокалізація)
+        self.frame_gps: np.ndarray | None = None  # (N, 2) — [lat, lon] per frame
+        self.spatial_index = None  # SpatialIndex | None
+
         # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
         self._feature_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
@@ -106,6 +110,24 @@ class DatabaseLoader:
                 logger.info(f"Loaded patch descriptors: shape={self.patch_descriptors.shape}")
             else:
                 self.patch_descriptors = None
+
+            # Завантажуємо frame_gps якщо є (мультиджерельна геолокалізація)
+            if "frame_gps" in self.db_file:
+                self.frame_gps = self.db_file["frame_gps"][:]
+                # Перевіряємо чи є non-NaN значення
+                valid_count = int(np.sum(~np.isnan(self.frame_gps[:, 0])))
+                if valid_count > 0:
+                    from src.database.spatial_index import SpatialIndex
+                    self.spatial_index = SpatialIndex(self.frame_gps)
+                    logger.info(
+                        f"Loaded frame_gps: {valid_count}/{len(self.frame_gps)} "
+                        f"frames with GPS. SpatialIndex built."
+                    )
+                else:
+                    logger.info("frame_gps dataset exists but has no valid GPS values.")
+                    self.frame_gps = None
+            else:
+                self.frame_gps = None
 
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()

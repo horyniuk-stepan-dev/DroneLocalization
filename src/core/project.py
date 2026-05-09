@@ -1,8 +1,10 @@
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+from src.core.project_video_source import ProjectVideoSource
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -16,9 +18,12 @@ class ProjectSettings:
     created_at: str
     video_path: str
 
-    # Internal relative paths
+    # Internal relative paths (legacy — для зворотної сумісності)
     database_filename: str = "database.h5"
     calibration_filename: str = "calibration.json"
+
+    # Мультиджерельна конфігурація (список dict для JSON-серіалізації)
+    video_sources: list[dict[str, Any]] = field(default_factory=list)
 
     # Optional mission parameters inherited from NewMissionDialog
     altitude_m: float = 100.0
@@ -38,7 +43,68 @@ class ProjectSettings:
         import dataclasses
         known_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known_fields}
-        return cls(**filtered)
+        instance = cls(**filtered)
+
+        # Авто-міграція: якщо немає video_sources — створюємо з legacy полів
+        if not instance.video_sources and instance.video_path:
+            instance.video_sources = [
+                ProjectVideoSource(
+                    source_id="main",
+                    area_id="area_main",
+                    video_path=instance.video_path,
+                    database_file=instance.database_filename,
+                    calibration_file=instance.calibration_filename,
+                    description="Auto-migrated from legacy project",
+                    enabled=True,
+                    priority=0,
+                ).to_dict()
+            ]
+            logger.info(
+                "Auto-migrated legacy project to video_sources format "
+                "(source_id='main', area_id='area_main')"
+            )
+        return instance
+
+    def source_configs(self) -> list[ProjectVideoSource]:
+        """Повертає список ProjectVideoSource з серіалізованих dicts."""
+        return [ProjectVideoSource.from_dict(d) for d in self.video_sources]
+
+    def get_enabled_sources(self) -> list[ProjectVideoSource]:
+        """Повертає тільки enabled джерела."""
+        return [s for s in self.source_configs() if s.enabled]
+
+    def add_source(self, source: ProjectVideoSource) -> None:
+        """Додає нове джерело. Перевіряє унікальність source_id."""
+        existing_ids = {s["source_id"] for s in self.video_sources}
+        if source.source_id in existing_ids:
+            raise ValueError(f"Source ID '{source.source_id}' already exists in project")
+        self.video_sources.append(source.to_dict())
+        logger.info(f"Added video source: {source.source_id} (area: {source.area_id})")
+
+    def remove_source(self, source_id: str) -> bool:
+        """Видаляє джерело за source_id. Повертає True якщо знайдено."""
+        before = len(self.video_sources)
+        self.video_sources = [s for s in self.video_sources if s.get("source_id") != source_id]
+        removed = len(self.video_sources) < before
+        if removed:
+            logger.info(f"Removed video source: {source_id}")
+        return removed
+
+    def get_source(self, source_id: str) -> ProjectVideoSource | None:
+        """Повертає конфіг за source_id або None."""
+        for d in self.video_sources:
+            if d.get("source_id") == source_id:
+                return ProjectVideoSource.from_dict(d)
+        return None
+
+    def update_source(self, source: ProjectVideoSource) -> None:
+        """Оновлює існуюче джерело (шукає за source_id)."""
+        for i, d in enumerate(self.video_sources):
+            if d.get("source_id") == source.source_id:
+                self.video_sources[i] = source.to_dict()
+                logger.info(f"Updated video source: {source.source_id}")
+                return
+        raise ValueError(f"Source ID '{source.source_id}' not found in project")
 
 
 class ProjectManager:

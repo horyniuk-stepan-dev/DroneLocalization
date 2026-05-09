@@ -38,10 +38,17 @@ class TrackingMixin:
 
         # Передаємо model_manager у конфіг для SuperPoint+LightGlue fallback
         localizer_config = {**self.config, "_model_manager": self.model_manager}
+
+        # Мультиджерельна підтримка: передаємо менеджери якщо вони є
+        db_manager = getattr(self, "db_manager", None)
+        calib_manager = getattr(self, "calib_manager", None)
+
         return Localizer(
             self.database, fe, matcher, self.calibration, config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
             ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
+            db_manager=db_manager,
+            calib_manager=calib_manager,
         )
 
     def _ensure_utm_initialized(self) -> bool:

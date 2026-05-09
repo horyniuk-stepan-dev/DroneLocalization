@@ -6,8 +6,10 @@ from pathlib import Path
 from PyQt6.QtCore import QCoreApplication
 
 from config.config import APP_CONFIG, APP_SETTINGS
+from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader
+from src.database.multi_database_manager import MultiDatabaseManager
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
@@ -34,6 +36,10 @@ class HeadlessRunner:
         self.calibration = MultiAnchorCalibration()
         self.database = None
         self.tracking_worker = None
+
+        # Мультиджерельна підтримка
+        self.db_manager = None
+        self.calib_manager = None
         
         # Вмикаємо network api примусово для headless
         APP_SETTINGS.network_api.enabled = True
@@ -42,18 +48,56 @@ class HeadlessRunner:
     def _setup_project(self):
         """Завантажує БД та калібрування з проекту."""
         logger.info(f"Loading project from {self.project_dir}")
-        db_path = self.project_dir / "database.h5"
-        calib_path = self.project_dir / "calibration.json"
-        
-        if not db_path.exists():
-            raise FileNotFoundError(f"Database not found at {db_path}")
+
+        # Завантажуємо проект через ProjectManager для підтримки multi-source
+        pm = ProjectManager()
+        if pm.load_project(str(self.project_dir)):
+            sources = pm.settings.get_enabled_sources()
+            is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
+
+            if is_multi and len(sources) > 0:
+                # Мультиджерельний режим
+                self.db_manager = MultiDatabaseManager(
+                    sources, self.project_dir, config=APP_CONFIG.model_dump()
+                )
+                self.calib_manager = MultiCalibrationManager()
+                self.calib_manager.load_all(sources, self.project_dir)
+
+                first_id = self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                if first_id:
+                    self.database = self.db_manager.get_database(first_id)
+                    self.calibration = self.calib_manager.get(first_id)
+                else:
+                    raise RuntimeError("Multi-source project: no database loaded")
+
+                logger.info(
+                    f"Multi-source project: {self.db_manager.num_databases} databases, "
+                    f"sources={self.db_manager.all_source_ids}"
+                )
+            else:
+                # Single-source mode
+                db_path = self.project_dir / "database.h5"
+                if not db_path.exists():
+                    raise FileNotFoundError(f"Database not found at {db_path}")
+                self.database = DatabaseLoader(str(db_path))
+
+                calib_path = self.project_dir / "calibration.json"
+                if calib_path.exists():
+                    self.calibration.load(str(calib_path))
+        else:
+            # Fallback: прямий шлях (legacy)
+            db_path = self.project_dir / "database.h5"
+            calib_path = self.project_dir / "calibration.json"
             
-        self.database = DatabaseLoader(str(db_path))
+            if not db_path.exists():
+                raise FileNotFoundError(f"Database not found at {db_path}")
+                
+            self.database = DatabaseLoader(str(db_path))
+            if calib_path.exists():
+                self.calibration.load(str(calib_path))
+
         if not self.database.is_propagated:
             logger.warning("Database is not propagated! Precision will be degraded.")
-            
-        if calib_path.exists():
-            self.calibration.load(str(calib_path))
             
         if not self.calibration.converter.is_initialized:
             ref_gps = self.calibration.converter.reference_gps
@@ -84,6 +128,8 @@ class HeadlessRunner:
             self.database, fe, matcher, self.calibration, config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
             ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
+            db_manager=self.db_manager,
+            calib_manager=self.calib_manager,
         )
 
     def run(self):

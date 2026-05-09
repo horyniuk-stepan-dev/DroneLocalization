@@ -521,6 +521,39 @@ class CalibrationPropagationWorker(QThread):
                 )
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
+                # Обчислюємо та зберігаємо frame_gps (lat/lon для кожного кадру)
+                # Для мультиджерельної геолокалізації — дозволяє SpatialIndex
+                if self.calibration.converter and self.calibration.converter.is_initialized:
+                    frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
+                    gps_count = 0
+                    for fid in range(num_frames):
+                        if not frame_valid[fid]:
+                            continue
+                        affine = frame_affine[fid]
+                        # Центр кадру в пікселях → metric через affine
+                        center_px = np.array(
+                            [[self.frame_w / 2.0, self.frame_h / 2.0]], dtype=np.float64
+                        )
+                        center_metric = GeometryTransforms.apply_affine(center_px, affine)
+                        if center_metric is not None and len(center_metric) > 0:
+                            try:
+                                lat, lon = self.calibration.converter.metric_to_gps(
+                                    float(center_metric[0, 0]),
+                                    float(center_metric[0, 1]),
+                                )
+                                frame_gps[fid] = [lat, lon]
+                                gps_count += 1
+                            except Exception:
+                                pass
+                    
+                    # Видаляємо старий датасет якщо є
+                    if "frame_gps" in f:
+                        del f["frame_gps"]
+                    f.create_dataset("frame_gps", data=frame_gps, compression="gzip")
+                    logger.info(
+                        f"Saved frame_gps: {gps_count}/{num_frames} frames with GPS coordinates"
+                    )
+
             valid_count = int(np.sum(frame_valid))
             logger.success(
                 f"Graph propagation saved to HDF5 (v3.0, "

@@ -63,6 +63,7 @@ class ProjectRegistry:
         """Додати або оновити проєкт у реєстрі."""
         idx = self._find_index(project_dir)
         now = datetime.now().isoformat()
+        p = Path(project_dir)
 
         entry = {
             "name": name,
@@ -70,8 +71,8 @@ class ProjectRegistry:
             "video_path": video_path,
             "created_at": now,
             "last_opened": now,
-            "has_database": (Path(project_dir) / "database.h5").exists(),
-            "has_calibration": (Path(project_dir) / "calibration.json").exists(),
+            "has_database": self._check_has_database(p),
+            "has_calibration": self._check_has_calibration(p),
         }
 
         if idx >= 0:
@@ -104,9 +105,33 @@ class ProjectRegistry:
         idx = self._find_index(project_dir)
         if idx >= 0:
             p = Path(project_dir)
-            self._projects[idx]["has_database"] = (p / "database.h5").exists()
-            self._projects[idx]["has_calibration"] = (p / "calibration.json").exists()
+            self._projects[idx]["has_database"] = self._check_has_database(p)
+            self._projects[idx]["has_calibration"] = self._check_has_calibration(p)
             self._save()
+
+    @staticmethod
+    def _check_has_database(project_dir: Path) -> bool:
+        """Перевіряє наявність БД: у корені (legacy) або в sources/{id}/."""
+        if (project_dir / "database.h5").exists():
+            return True
+        sources_dir = project_dir / "sources"
+        if sources_dir.is_dir():
+            for sub in sources_dir.iterdir():
+                if sub.is_dir() and (sub / "database.h5").exists():
+                    return True
+        return False
+
+    @staticmethod
+    def _check_has_calibration(project_dir: Path) -> bool:
+        """Перевіряє наявність калібрації: у корені (legacy) або в sources/{id}/."""
+        if (project_dir / "calibration.json").exists():
+            return True
+        sources_dir = project_dir / "sources"
+        if sources_dir.is_dir():
+            for sub in sources_dir.iterdir():
+                if sub.is_dir() and (sub / "calibration.json").exists():
+                    return True
+        return False
 
     def get_recent(self, limit: int = 10) -> list[dict]:
         """Повернути останні відкриті проєкти (відсортовані за датою)."""
