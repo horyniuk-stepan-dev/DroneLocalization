@@ -16,15 +16,14 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", category=UserWarning, message="xFormers is not available")
 
+import argparse
 import traceback
 
 import torch
-import argparse
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
-from config.config import APP_SETTINGS, APP_CONFIG
-# pyrefly: ignore [missing-import]
+from config.config import APP_SETTINGS
 from src.core.headless_runner import HeadlessRunner
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
@@ -62,7 +61,7 @@ def main() -> None:
     try:
         log_level = APP_SETTINGS.models.performance.log_level
     except Exception:
-        log_level = "INFO" # Safe default
+        log_level = "INFO"  # Safe default
     setup_logging(log_level=log_level, log_file="logs/app.log")
     logger = get_logger(__name__)
 
@@ -88,11 +87,15 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Drone Topometric Localization")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
-    parser.add_argument("--project", type=str, help="Path to project directory (required for headless)")
-    parser.add_argument("--source", type=str, help="Video source URL or path (required for headless)")
+    parser.add_argument(
+        "--project", type=str, help="Path to project directory (required for headless)"
+    )
+    parser.add_argument(
+        "--source", type=str, help="Video source URL or path (required for headless)"
+    )
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket port")
     parser.add_argument("--rest-port", type=int, default=8080, help="REST API port")
-    
+
     args = parser.parse_args()
 
     try:
@@ -101,10 +104,10 @@ def main() -> None:
             if not args.project or not args.source:
                 logger.error("--project and --source are required in headless mode")
                 sys.exit(1)
-                
+
             APP_SETTINGS.network_api.ws_port = args.ws_port
             APP_SETTINGS.network_api.rest_port = args.rest_port
-            
+
             runner = HeadlessRunner(args.project, args.source)
             runner.run()
             exit_code = 0
@@ -116,17 +119,17 @@ def main() -> None:
             app.setApplicationName("Drone Localization")
             app.setOrganizationName("UAV Systems")
             logger.info("Qt application initialized")
-    
+
             window = MainWindow()
             window.show()
-    
+
             # Запускаємо prewarm у фоновому потоці
             if hasattr(window, "model_manager") and window.model_manager:
                 app._startup_worker = StartupWorker(window.model_manager)
                 app._startup_worker.start()
-    
+
             logger.success("Application startup complete")
-    
+
             exit_code = app.exec()
 
     except Exception as e:

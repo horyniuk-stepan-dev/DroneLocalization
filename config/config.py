@@ -14,7 +14,7 @@ class Dinov2Config(BaseModel):
 
 
 class DatabaseConfig(BaseModel):
-    frame_step: int = 3
+    frame_step: int = 30
     prefetch_queue_size: int = 32
     keypoint_video_scale: float = 0.5
     inter_frame_min_matches: int = 15
@@ -50,9 +50,11 @@ class LocalizationConfig(BaseModel):
     enable_lightglue_fallback: bool = True
     fallback_extractor: str = "aliked"
     confidence: ConfidenceConfig = ConfidenceConfig()
-    use_patchify: bool = True  # Мультимасштабний retrieval через патч-дескриптори DINOv2
+    use_patchify: bool = False  # Мультимасштабний retrieval через патч-дескриптори DINOv2 (14× DINOv2 forward passes — повільно на слабких GPU)
     patchify_grids: list[list[int]] = [[1, 1], [2, 2], [3, 3]]  # 1+4+9 = 14 патчів
-    patchify_batch_size: int = 1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
+    patchify_batch_size: int = (
+        1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
+    )
     patchify_merge_weight: float = 0.4  # Вага патчів при злитті (w_standard = 1 - w_patch)
 
 
@@ -64,6 +66,7 @@ class TrackingConfig(BaseModel):
     max_speed_mps: float = 1000.0
     max_consecutive_outliers: int = 3
     process_fps: float = 1.0
+    keyframe_interval: int = 30  # Кожен N-й кадр — повна локалізація, решта — Optical Flow
 
 
 class PreprocessingConfig(BaseModel):
@@ -202,7 +205,7 @@ class HomographyConfig(BaseModel):
     max_iters: int = 2000
     confidence: float = 0.99
     use_mad_ransac: bool = True  # Адаптивне уточнення порогу через MAD
-    mad_k_factor: float = 2.5   # Чутливість MAD (вищий → м'якший поріг)
+    mad_k_factor: float = 2.5  # Чутливість MAD (вищий → м'якший поріг)
 
 
 class GraphOptimizationConfig(BaseModel):
@@ -235,7 +238,14 @@ class ObjectTrackingConfig(BaseModel):
     track_activation_threshold: float = 0.25
     lost_track_buffer: int = 30
     minimum_matching_threshold: float = 0.8
-    tracked_classes: list[int] = [0, 1, 2, 3, 5, 7]  # COCO: person, bicycle, car, motorcycle, bus, truck
+    tracked_classes: list[int] = [
+        0,
+        1,
+        2,
+        3,
+        5,
+        7,
+    ]  # COCO: person, bicycle, car, motorcycle, bus, truck
     show_on_video: bool = True
     show_on_map: bool = True
     project_to_gps: bool = True
@@ -250,6 +260,7 @@ class LiveStreamConfig(BaseModel):
     reconnect_delay_sec: float = 2.0
     buffer_size: int = 1
 
+
 class NetworkApiConfig(BaseModel):
     enabled: bool = True
     ws_enabled: bool = True
@@ -258,6 +269,7 @@ class NetworkApiConfig(BaseModel):
     rest_enabled: bool = True
     rest_host: str = "0.0.0.0"
     rest_port: int = 8081
+
 
 class AppConfig(BaseModel):
     live_stream: LiveStreamConfig = LiveStreamConfig()

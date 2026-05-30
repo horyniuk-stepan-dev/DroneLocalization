@@ -42,7 +42,9 @@ class ControlPanel(QWidget):
     stop_db_generation_clicked = pyqtSignal()
     toggle_objects_clicked = pyqtSignal(bool)
     add_source_clicked = pyqtSignal()
-    source_action = pyqtSignal(str, str)  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
+    source_action = pyqtSignal(
+        str, str
+    )  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -56,8 +58,8 @@ class ControlPanel(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         # Project group
-        db_group = QGroupBox("Управління проєктом")
-        db_layout = QVBoxLayout(db_group)
+        self.db_group = QGroupBox("Управління проєктом")
+        db_layout = QVBoxLayout(self.db_group)
 
         self.btn_new_mission = QPushButton("Створити новий проєкт")
         self.btn_load_db = QPushButton("Відкрити проєкт")
@@ -91,8 +93,8 @@ class ControlPanel(QWidget):
             db_layout.addWidget(btn)
 
         # Calibration group
-        calib_group = QGroupBox("Калібрування GPS")
-        calib_layout = QVBoxLayout(calib_group)
+        self.calib_group = QGroupBox("Калібрування GPS")
+        calib_layout = QVBoxLayout(self.calib_group)
 
         self.btn_calibrate = QPushButton("Виконати калібрування (Video → Map)")
         self.btn_load_calibrate = QPushButton("Завантажити калібрування (JSON)")
@@ -114,8 +116,8 @@ class ControlPanel(QWidget):
         calib_layout.addWidget(self.btn_clear_map)
 
         # Localization group
-        track_group = QGroupBox("Локалізація")
-        track_layout = QVBoxLayout(track_group)
+        self.track_group = QGroupBox("Локалізація")
+        track_layout = QVBoxLayout(self.track_group)
 
         self.btn_start_tracking = QPushButton("▶  Почати відстеження (Файл)")
         self.btn_start_tracking.setStyleSheet(
@@ -130,7 +132,7 @@ class ControlPanel(QWidget):
             "background:#c62828; color:white; font-weight:bold; padding:8px;"
         )
         self.btn_localize_image = QPushButton("🔍  Локалізувати одне фото")
-        
+
         self.btn_toggle_objects = QPushButton("👀 Показувати об'єкти")
         self.btn_toggle_objects.setCheckable(True)
         self.btn_toggle_objects.setChecked(True)
@@ -148,8 +150,8 @@ class ControlPanel(QWidget):
         track_layout.addWidget(self.btn_toggle_objects)
 
         # Export group
-        export_group = QGroupBox("Результати")
-        export_layout = QVBoxLayout(export_group)
+        self.export_group = QGroupBox("Результати")
+        export_layout = QVBoxLayout(self.export_group)
         self.btn_export = QPushButton("📊 Експорт результатів")
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self.export_results_clicked)
@@ -164,8 +166,8 @@ class ControlPanel(QWidget):
         info_layout.addWidget(self.lbl_project_info)
 
         # Status group
-        status_group = QGroupBox("Статус системи")
-        status_layout = QVBoxLayout(status_group)
+        self.status_group = QGroupBox("Статус системи")
+        status_layout = QVBoxLayout(self.status_group)
 
         self.lbl_status = QLabel("Очікування команди...")
         self.lbl_status.setWordWrap(True)
@@ -195,22 +197,12 @@ class ControlPanel(QWidget):
         self.sources_table.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents
         )
-        self.sources_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.sources_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.sources_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
+        self.sources_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.sources_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.sources_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.sources_table.setMaximumHeight(120)
-        self.sources_table.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        self.sources_table.customContextMenuRequested.connect(
-            self._on_sources_context_menu
-        )
+        self.sources_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sources_table.customContextMenuRequested.connect(self._on_sources_context_menu)
         self.sources_table.setVisible(False)  # Прихований до відкриття мульти-проєкту
         sources_layout.addWidget(self.sources_table)
 
@@ -225,13 +217,13 @@ class ControlPanel(QWidget):
         self.sources_group.setVisible(False)  # Показується тільки для мульти-проєктів
 
         for group in [
-            db_group,
-            calib_group,
-            track_group,
-            export_group,
+            self.db_group,
+            self.calib_group,
+            self.track_group,
+            self.export_group,
             self.sources_group,
             self.info_group,
-            status_group,
+            self.status_group,
         ]:
             layout.addWidget(group)
 
@@ -322,9 +314,7 @@ class ControlPanel(QWidget):
                      database_file, calibration_file.
             project_dir: Шлях до кореня проєкту для перевірки файлів.
         """
-        is_multi = len(sources) > 1 or any(
-            s.get("source_id") != "main" for s in sources
-        )
+        is_multi = len(sources) > 1 or any(s.get("source_id") != "main" for s in sources)
         # Група завжди видима при відкритому проєкті, таблиця — тільки для multi
         self.sources_group.setVisible(True)
         self.sources_table.setVisible(is_multi)

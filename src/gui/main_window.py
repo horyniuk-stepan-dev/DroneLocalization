@@ -27,7 +27,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         self.project_manager = ProjectManager()
         self.database: DatabaseLoader | None = None
         self.calibration = MultiAnchorCalibration()
-        
+
         self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
 
         # Workers
@@ -78,6 +78,38 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         view_menu = menubar.addMenu("Вигляд")
         view_menu.addAction(self.control_dock.toggleViewAction())
         view_menu.addAction(self.map_dock.toggleViewAction())
+        view_menu.addSeparator()
+
+        sections_menu = view_menu.addMenu("Секції панелі управління")
+        cp = self.control_panel
+        sections = [
+            ("Управління проєктом", cp.db_group),
+            ("Калібрування GPS", cp.calib_group),
+            ("Локалізація", cp.track_group),
+            ("Результати", cp.export_group),
+            ("Інформація про проєкт", cp.info_group),
+            ("Статус системи", cp.status_group),
+            ("Відеоджерела", cp.sources_group),
+        ]
+
+        from PyQt6.QtWidgets import QCheckBox, QHBoxLayout, QWidget, QWidgetAction
+
+        for name, widget in sections:
+            action = QWidgetAction(sections_menu)
+            container = QWidget()
+            # Make background transparent to match menu styling
+            container.setStyleSheet("background: transparent;")
+            layout = QHBoxLayout(container)
+            layout.setContentsMargins(30, 4, 10, 4)
+
+            checkbox = QCheckBox(name)
+            checkbox.setChecked(not widget.isHidden())
+            # When checkbox is toggled, update widget visibility
+            checkbox.toggled.connect(widget.setVisible)
+
+            layout.addWidget(checkbox)
+            action.setDefaultWidget(container)
+            sections_menu.addAction(action)
 
     def _connect_signals(self):
         cp = self.control_panel
