@@ -7,10 +7,10 @@ logger = get_logger(__name__)
 
 
 class PatchifyRetrieval:
-    """Мультимасштабний retrieval через патч-дескриптори DINOv2.
+    """Мультимасштабний retrieval через патч-дескриптори DINOv2/DINOv3.
 
     Розбиває зображення на патчі за сітками (1×1, 2×2, 3×3) = 14 патчів,
-    для кожного витягує DINOv2 CLS-token, і шукає найбільш схожі кадри
+    для кожного витягує CLS-token, і шукає найбільш схожі кадри
     за агрегованими патч-скорами.
     """
 
@@ -102,17 +102,13 @@ class PatchifyRetrieval:
 
     @torch.no_grad()
     def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
-        """Батчований DINOv2 інференс для групи патчів."""
-        import torchvision.transforms as T
-
+        """Батчований інференс для групи патчів.
+        
+        Використовує fe.dinov2_transform — нормалізація та розмір вже налаштовані
+        відповідно до активного backend (DINOv2 або DINOv3).
+        """
         fe = self.feature_extractor
         device = fe.device
-
-        dino_size = fe.dino_size
-        transform = T.Compose([
-            T.Resize((dino_size, dino_size), antialias=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
 
         tensors = []
         for patch in patches:
@@ -120,11 +116,12 @@ class PatchifyRetrieval:
             tensors.append(t)
 
         batch_tensor = torch.stack(tensors).to(device, non_blocking=True)
-        batch_input = transform(batch_tensor)
+        # Використовуємо готовий transform з FeatureExtractor (правильні mean/std для активного backend)
+        batch_input = fe.dinov2_transform(batch_tensor)
 
         amp_dtype = fe.amp_dtype
         use_half = fe.use_half
-        
+
         # Визначаємо тип пристрою динамічно для коректного autocast (Fix Bug 2)
         device_type = "cuda" if "cuda" in str(device) else "cpu"
         enabled = use_half and device_type == "cuda"

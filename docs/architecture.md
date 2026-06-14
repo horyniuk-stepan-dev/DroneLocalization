@@ -2,7 +2,7 @@
 
 > **Version:** 1.0.0  
 > **Python:** 3.11 · **PyTorch:** 2.2+ · **GUI:** PyQt6  
-> **Last updated:** 2026-04-18
+> **Last updated:** 2026-06-14
 
 ---
 
@@ -17,6 +17,8 @@ DroneLocalization/
 │   ├── core/                        — Project lifecycle management
 │   │   ├── project.py               — ProjectManager & ProjectSettings (dataclass)
 │   │   ├── project_registry.py      — JSON-based cross-session project registry (~/.drone_localizer/)
+│   │   ├── headless_runner.py       — HeadlessRunner: GUI-less mode with WebSocket + REST API
+│   │   ├── project_video_source.py  — Project-level video source config helper
 │   │   └── export_results.py        — ResultExporter: CSV, GeoJSON, KML output
 │   │
 │   ├── models/                      — AI model loading, VRAM management, TRT integration
@@ -46,14 +48,16 @@ DroneLocalization/
 │   ├── calibration/                 — GPS anchor management & coordinate propagation
 │   │   └── multi_anchor_calibration.py — MultiAnchorCalibration: PCHIP interpolation over anchor affines
 │   │
-│   ├── tracking/                    — Trajectory smoothing & anomaly detection
+│   ├── tracking/                    — Trajectory smoothing, anomaly detection & object tracking
 │   │   ├── kalman_filter.py         — TrajectoryFilter: 4-state Kalman (x, y, vx, vy)
-│   │   └── outlier_detector.py      — OutlierDetector: speed-based Z-score with auto-reset
+│   │   ├── outlier_detector.py      — OutlierDetector: speed-based Z-score with auto-reset
+│   │   ├── object_tracker.py        — ObjectTracker: ByteTrack wrapper (supervision) + TrackedObject dataclass
+│   │   └── object_projector.py      — ObjectProjector: pixel → H → affine → GPS for tracked objects
 │   │
 │   ├── workers/                     — QThread background tasks
 │   │   ├── calibration_propagation_worker.py — Graph-based calibration propagation (5 phases)
 │   │   ├── database_worker.py       — Async database build wrapper
-│   │   ├── tracking_worker.py       — RealtimeTrackingWorker: keyframe + Optical Flow pipeline
+│   │   ├── tracking_worker.py       — RealtimeTrackingWorker: keyframe + Optical Flow + object tracking pipeline
 │   │   ├── panorama_worker.py       — Video → stitched panorama
 │   │   ├── panorama_overlay_worker.py — Panorama → georeferenced map overlay
 │   │   └── video_decode_worker.py   — Decord/OpenCV video frame producer
@@ -69,6 +73,17 @@ DroneLocalization/
 │   │       ├── calibration_dialog.py— Multi-point GPS anchor editor
 │   │       ├── new_mission_dialog.py— Mission creation wizard
 │   │       └── open_project_dialog.py— Recent projects browser
+│   │
+│   ├── depth/                       — Monocular depth estimation
+│   │   └── depth_estimator.py       — DepthEstimator: Depth-Anything-V2 wrapper
+│   │
+│   ├── network/                     — Real-time network API
+│   │   ├── ws_server.py             — WebSocketServer: asyncio push-server (ws://host:port/ws/coords)
+│   │   ├── rest_server.py           — RestApiServer: aiohttp REST API (/api/position, /api/objects, ...)
+│   │   └── coordinates_broker.py   — CoordinatesBroker: Qt-slot → broadcast to WS/REST consumers
+│   │
+│   ├── video/                       — Video source abstraction
+│   │   └── video_source.py          — VideoSource: cv2.VideoCapture wrapper (FILE/RTSP/USB) with auto-reconnect
 │   │
 │   └── utils/                       — Shared utilities
 │       ├── logging_utils.py         — Loguru wrapper (get_logger, setup_logging, silent_output)
@@ -156,15 +171,16 @@ DroneLocalization/
 │          │                                                                  │
 │   ┌──────┴───────────────────────────────────────────────────────────────┐  │
 │   │                     Model Wrappers                                   │  │
-│   │  ┌─────────┐ ┌────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐ ┌─────┐ │  │
-│   │  │DINOv2   │ │XFeat   │ │ALIKED    │ │LightGlue │ │YOLO  │ │CESP │ │  │
-│   │  │(Global) │ │(Local) │ │(Local)   │ │(Matcher) │ │(Mask)│ │(Enh)│ │  │
-│   │  └─────────┘ └────────┘ └──────────┘ └──────────┘ └──────┘ └─────┘ │  │
-│   └──────────────────────────────────────────────────────────────────────┘  │
+│   │  ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────┐ │  │
+│   │  │DINOv2   │ │ALIKED    │ │LightGlue │ │YOLO11-Seg│ │DepthAny  │ │CESP │ │  │
+│   │  │(Global) │ │(Local)   │ │(Matcher) │ │(Seg+Trk) │ │  V2      │ │(Enh)│ │  │
+│   │  └─────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └─────┘ │  │
+│   └──────────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
 │   ┌────────────────────────────────────────────────────────────────────┐    │
 │   │  Storage:  HDF5 (hierarchical features)  ·  LanceDB (ANN search) │    │
 │   │            JSON (project + calibration)  ·  GeoJSON (diagnostics) │    │
+│   │  Network:  WebSocket (push) · REST API (pull) · CoordBroker       │    │
 │   └────────────────────────────────────────────────────────────────────┘    │
 │                                                                             │
 │   ┌────────────────────┐  ┌────────────────────┐  ┌──────────────────────┐ │
@@ -342,10 +358,11 @@ Access pattern: `get_cfg(config, "dot.path", default)` — works with both dicts
 | **Main (GUI)** | Qt Event Loop | UI rendering, signal dispatch, user interaction |
 | **StartupWorker** | `QThread` | Background model prewarm at launch (`main.py:28`) |
 | **DatabaseWorker** | `QThread` | Long-running DB build from video |
-| **RealtimeTrackingWorker** | `QThread` | Frame decode → localize → emit results |
+| **RealtimeTrackingWorker** | `QThread` | Frame decode → localize → object track → emit results |
 | **CalibrationPropagationWorker** | `QThread` | Graph build + LM optimization |
 | **PanoramaWorker** | `QThread` | Video stitching |
 | **PanoramaOverlayWorker** | `QThread` | Georeferenced overlay generation |
+| **HeadlessRunner** | `asyncio` | Headless mode: WS + REST servers + tracking without GUI |
 | **Prefetch (daemon)** | `threading.Thread` | Video frame decode ahead-of-time in `DatabaseBuilder` |
 | **Pre-warm (daemon)** | `threading.Thread` | Load fallback models during tracking start |
 

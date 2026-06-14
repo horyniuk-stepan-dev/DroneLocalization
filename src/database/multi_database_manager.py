@@ -117,6 +117,26 @@ class MultiDatabaseManager:
             f"{len(self._active_source_ids)} active"
         )
 
+    def toggle_source(self, src: 'ProjectVideoSource') -> None:
+        """Вмикає або вимикає джерело. Завантажує або вивантажує БД з пам'яті."""
+        if src.enabled:
+            if src.source_id not in self._databases:
+                self._load_sources([src])
+        else:
+            if src.source_id in self._databases:
+                try:
+                    self._databases[src.source_id].close()
+                except Exception as e:
+                    logger.warning(f"Error closing database '{src.source_id}': {e}")
+                del self._databases[src.source_id]
+            if src.source_id in self._retrievers:
+                del self._retrievers[src.source_id]
+            if src.source_id in self._sources:
+                del self._sources[src.source_id]
+            if src.source_id in self._active_source_ids:
+                self._active_source_ids.remove(src.source_id)
+            logger.info(f"Source '{src.source_id}' disabled and unloaded from memory.")
+
     # ── Retrieval ────────────────────────────────────────────────────────────
 
     def get_best_match(

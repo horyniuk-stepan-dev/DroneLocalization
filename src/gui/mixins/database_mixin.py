@@ -373,10 +373,15 @@ class DatabaseMixin:
 
         # Зберігаємо калібрацію перед перегенерацією
         if self.calibration.is_calibrated:
-            calib_path = self.project_manager.calibration_path
+            calib_path = (
+                self._get_calibration_save_path()
+                if hasattr(self, "_get_calibration_save_path")
+                else self.project_manager.calibration_path
+            )
             if calib_path:
                 self.calibration.save(calib_path)
                 logger.info(f"Calibration saved before rebuild: {calib_path}")
+
 
         self._start_database_generation(video_path, self.project_manager.database_path)
 
@@ -466,12 +471,45 @@ class DatabaseMixin:
         self._refresh_sources_panel()
 
     def _refresh_sources_panel(self):
-        """Оновлює таблицю відеоджерел у ControlPanel."""
+        """Оновлює таблицю відеоджерел та бейдж активного джерела у ControlPanel."""
         if not self.project_manager.is_loaded or not self.project_manager.settings:
             return
         sources_raw = self.project_manager.settings.video_sources or []
         project_dir = str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
-        self.control_panel.update_sources_list(sources_raw, project_dir=project_dir)
+
+        # Визначаємо активне джерело
+        active_id = self._get_current_source_id()
+
+        # Отримуємо video_path для активного джерела
+        video_path = ""
+        for src_dict in sources_raw:
+            if src_dict.get("source_id") == active_id:
+                video_path = src_dict.get("video_path", "")
+                break
+        
+        # Якщо в settings не знайдено, fallback на загальний video_path
+        if not video_path and self.project_manager.settings:
+            video_path = self.project_manager.settings.video_path
+
+        self.control_panel.set_active_source(active_id, video_path or "")
+
+        # Визначаємо які джерела вже мають пропагацію в HDF5
+        # (калібрування може бути вбудоване в HDF5 без окремого calibration.json)
+        propagated_ids: set[str] = set()
+        if hasattr(self, "db_manager") and self.db_manager:
+            for sid in self.db_manager.all_source_ids:
+                db = self.db_manager.get_database(sid)
+                if db and db.is_propagated:
+                    propagated_ids.add(sid)
+        elif hasattr(self, "database") and self.database and self.database.is_propagated:
+            propagated_ids.add("main")
+
+        self.control_panel.update_sources_list(
+            sources_raw,
+            project_dir=project_dir,
+            active_source_id=active_id,
+            propagated_source_ids=propagated_ids,
+        )
 
     # ── Мультиджерельні слоти ─────────────────────────────────────────────────
 
@@ -526,6 +564,28 @@ class DatabaseMixin:
             f"Побудуйте БД через контекстне меню таблиці."
         )
 
+    @pyqtSlot(str)
+    def on_active_source_changed(self, source_id: str):
+        """Обробка зміни активного джерела при кліку в таблиці."""
+        if not self.db_manager:
+            return
+            
+        if source_id not in self.db_manager.all_source_ids:
+            # Джерело вимкнено або не має БД
+            self.database = None
+            self.calibration = None
+            self.status_bar.showMessage(f"Джерело '{source_id}' вимкнено або недоступне")
+            self._update_project_info_panel()
+            return
+
+        self.database = self.db_manager.get_database(source_id)
+        self.calibration = self.calib_manager.get(source_id)
+        logger.info(f"Active source switched to: {source_id}")
+        
+        self.status_bar.showMessage(f"Обрано джерело: {source_id}")
+        self._update_project_info_panel()
+        self._refresh_sources_panel()  # Щоб оновити підсвічування рядка в таблиці
+
     @pyqtSlot(str, str)
     def on_source_action(self, source_id: str, action: str):
         """Обробка дій з контекстного меню таблиці джерел."""
@@ -556,6 +616,20 @@ class DatabaseMixin:
             source.enabled = not source.enabled
             settings.update_source(source)
             self.project_manager.save_project()
+            
+            if hasattr(self, "db_manager") and self.db_manager:
+                self.db_manager.toggle_source(source)
+                
+                # Якщо вимкнули поточне джерело — перемикаємось на перше доступне
+                if not source.enabled and self._get_current_source_id() == source_id:
+                    avail = self.db_manager.all_source_ids
+                    if avail:
+                        self.on_active_source_changed(avail[0])
+                    else:
+                        self.database = None
+                        self.calibration = None
+                        self._update_project_info_panel()
+
             self._refresh_sources_panel()
             state = "увімкнено" if source.enabled else "вимкнено"
             self.status_bar.showMessage(f"Джерело '{source_id}' {state}")

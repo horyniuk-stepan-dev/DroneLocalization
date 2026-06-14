@@ -13,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from config.config import get_cfg
+from config.config import get_cfg, get_active_descriptor_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
@@ -32,7 +32,7 @@ class DatabaseBuilder:
         self.config = config or {}
         self.matcher = matcher
         db_cfg = self.config.get("database", {})
-        self.descriptor_dim = get_cfg(self.config, "dinov2.descriptor_dim", 384)
+        self.descriptor_dim = get_active_descriptor_cfg(self.config).descriptor_dim
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
@@ -144,35 +144,46 @@ class DatabaseBuilder:
         kp_scale = 1.0  # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
         if save_keypoint_video:
             try:
+                import sys, os
                 kp_width = int(width * kp_scale)
                 kp_height = int(height * kp_scale)
-
                 kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
 
-                # Attempt H.264 (avc1)
-                fourcc = cv2.VideoWriter_fourcc(*"avc1")
-                with silent_output():
-                    kp_writer = cv2.VideoWriter(
-                        kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
-                    )
+                # Порядок кодеків:
+                # - Windows: avc1 потребує openh264.dll → пропускаємо, щоб уникнути FFmpeg-шуму
+                # - XVID: надійний cross-platform без сторонніх DLL
+                # - mp4v: абсолютний fallback
+                codecs = []
+                if sys.platform != "win32":
+                    codecs.append("avc1")  # H.264 — тільки на Linux/macOS де є нативна підтримка
+                codecs += ["XVID", "mp4v"]
 
-                if not kp_writer or not kp_writer.isOpened():
-                    logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    with silent_output():
-                        kp_writer = cv2.VideoWriter(
-                            kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                for codec_name in codecs:
+                    fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                    # Пригнічуємо C-рівневий stderr від FFmpeg (fd=2) щоб уникнути OpenH264-шуму
+                    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                    old_stderr_fd = os.dup(2)
+                    os.dup2(devnull_fd, 2)
+                    try:
+                        with silent_output():
+                            kp_writer = cv2.VideoWriter(
+                                kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                            )
+                    finally:
+                        os.dup2(old_stderr_fd, 2)
+                        os.close(old_stderr_fd)
+                        os.close(devnull_fd)
+
+                    if kp_writer and kp_writer.isOpened():
+                        logger.info(
+                            f"Keypoint video: {kp_video_path} | {kp_width}x{kp_height} | codec={codec_name}"
                         )
-
-                if kp_writer and kp_writer.isOpened():
-                    logger.info(
-                        f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})"
-                    )
-                else:
-                    logger.warning(
-                        "Failed to initialize any compatible video codec, keypoint video disabled"
-                    )
+                        break
                     kp_writer = None
+                else:
+                    logger.warning("No compatible video codec found, keypoint video disabled")
+                    kp_writer = None
+
             except Exception as e:
                 logger.warning(f"VideoWriter initialization crashed: {e}")
                 kp_writer = None
@@ -244,7 +255,7 @@ class DatabaseBuilder:
             else:
                 # Use a small dummy tensor directly to save VRAM
                 with torch.no_grad():
-                    dino_size = get_cfg(self.config, "dinov2.input_size", 336)
+                    dino_size = get_active_descriptor_cfg(self.config).input_size
                     dummy_input = torch.zeros((1, 3, dino_size, dino_size)).to(model_manager.device)
                     # Use the same logic as FeatureExtractor
                     if cesp is not None:

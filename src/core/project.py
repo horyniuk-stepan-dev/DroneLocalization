@@ -18,9 +18,10 @@ class ProjectSettings:
     created_at: str
     video_path: str
 
-    # Internal relative paths (legacy — для зворотної сумісності)
-    database_filename: str = "database.h5"
-    calibration_filename: str = "calibration.json"
+    # Відносні шляхи файлів джерела 'main'
+    # Нові проєкти: sources/main/ — всі джерела в єдиній структурі
+    database_filename: str = "sources/main/database.h5"
+    calibration_filename: str = "sources/main/calibration.json"
 
     # Мультиджерельна конфігурація (список dict для JSON-серіалізації)
     video_sources: list[dict[str, Any]] = field(default_factory=list)
@@ -31,21 +32,21 @@ class ProjectSettings:
     sensor_width_mm: float = 8.8
     image_width_px: int = 4000
 
-    # Еталонна роздільна здатність відео, з якого побудована БД.
+    # Еталонна роздільність відео, з якого побудована БД.
     # Заповнюється автоматично при побудові бази даних.
-    # 0 означає "не встановлено" (зворотна сумісність зі старими проєктами).
+    # 0 означає "не встановлено".
     ref_frame_width: int = 0
     ref_frame_height: int = 0
 
     @classmethod
     def from_dict(cls, data: dict):
-        # Фільтруємо тільки відомі поля для зворотної сумісності
+        # Фільтруємо тільки відомі поля
         import dataclasses
         known_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known_fields}
         instance = cls(**filtered)
 
-        # Авто-міграція: якщо немає video_sources — створюємо з legacy полів
+        # Авто-міграція: якщо немає video_sources — створюємо з поточних полів
         if not instance.video_sources and instance.video_path:
             instance.video_sources = [
                 ProjectVideoSource(
@@ -54,14 +55,14 @@ class ProjectSettings:
                     video_path=instance.video_path,
                     database_file=instance.database_filename,
                     calibration_file=instance.calibration_filename,
-                    description="Auto-migrated from legacy project",
+                    description="Auto-migrated from project settings",
                     enabled=True,
                     priority=0,
                 ).to_dict()
             ]
             logger.info(
-                "Auto-migrated legacy project to video_sources format "
-                "(source_id='main', area_id='area_main')"
+                f"Auto-migrated project to video_sources format "
+                f"(source_id='main', db='{instance.database_filename}')"
             )
         return instance
 
@@ -151,7 +152,8 @@ class ProjectManager:
             # Ensure the directory exists
             self.project_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create subfolders for organization
+            # Створюємо стандартні підпапки
+            (self.project_dir / "sources" / "main").mkdir(parents=True, exist_ok=True)
             (self.project_dir / "panoramas").mkdir(exist_ok=True)
             (self.project_dir / "test_photos").mkdir(exist_ok=True)
             (self.project_dir / "test_videos").mkdir(exist_ok=True)
@@ -164,10 +166,25 @@ class ProjectManager:
                 focal_length_mm=mission_data.get("focal_length_mm", 13.2),
                 sensor_width_mm=mission_data.get("sensor_width_mm", 8.8),
                 image_width_px=mission_data.get("image_width_px", 4000),
+                # Залишаємо значення за замовчуванням (вже sources/main/)
             )
 
+            # Авто-створюємо video_sources для джерела main
+            self.settings.video_sources = [
+                ProjectVideoSource(
+                    source_id="main",
+                    area_id="area_main",
+                    video_path=mission_data.get("video_path", ""),
+                    database_file="sources/main/database.h5",
+                    calibration_file="sources/main/calibration.json",
+                    description="Primary video source",
+                    enabled=True,
+                    priority=0,
+                ).to_dict()
+            ]
+
             self.save_project()
-            logger.info(f"Project created successfully at: {self.project_dir}")
+            logger.info(f"Project created at: {self.project_dir} (sources/main/ structure)")
             return True
 
         except Exception as e:

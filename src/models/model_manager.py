@@ -52,6 +52,11 @@ except ImportError:
 
 
 try:
+    from src.models.wrappers.dinov3_wrapper import DINOv3Wrapper
+except ImportError:
+    DINOv3Wrapper = None
+
+try:
     from src.models.wrappers.cesp_module import CESP
 except ImportError:
     CESP = None
@@ -173,7 +178,7 @@ class ModelManager:
         logger.info("Starting centralized model prewarm sequence...")
         local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
         with silent_output():
-            self.load_dinov2()
+            self.load_dinov2()  # loads DINOv3 if backend="dinov3" in config
             self.load_local_extractor()
             lg_features = "rdd" if local_extractor == "rdd" else "aliked"
             self.load_lightglue(features=lg_features)
@@ -505,12 +510,53 @@ class ModelManager:
         return True
 
     def load_dinov2(self):
+        """
+        Завантажує глобальний дескриптор (DINOv2 або DINOv3).
+        Вибір здійснюється через AppConfig.global_descriptor.backend:
+          'dinov2' — torch.hub (ImageNet pretrained)
+          'dinov3' — HuggingFace (493M satellite pretrained)
+        """
         name = "dinov2"
         with self._model_lock:
             if name not in self.models:
-                repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
-                model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
-                vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
+                backend = get_cfg(self.config, "global_descriptor.backend", "dinov2")
+
+                # ── DINOv3 path ──────────────────────────────────────────────
+                if backend == "dinov3":
+                    hf_model_id = get_cfg(
+                        self.config,
+                        "global_descriptor.dinov3.hf_model_id",
+                        "facebook/dinov3-vitl16-pretrain-sat493m",
+                    )
+                    vram_req = get_cfg(
+                        self.config, "global_descriptor.dinov3.vram_required_mb", 1600.0
+                    )
+                    logger.info(f"Loading DINOv3 (satellite-pretrained): {hf_model_id}")
+                    self._ensure_vram_available(vram_req)
+                    try:
+                        if DINOv3Wrapper is None:
+                            raise ImportError(
+                                "DINOv3Wrapper not available — install: pip install transformers"
+                            )
+                        model = DINOv3Wrapper(model_id=hf_model_id, device=self.device)
+                        self.models[name] = model
+                        logger.success(f"DINOv3 loaded: {hf_model_id} on {self.device}")
+                    except Exception as e:
+                        logger.error(f"Failed to load DINOv3: {e}", exc_info=True)
+                        raise
+                    self._register_model_usage(name)
+                    return self.models[name]
+
+                # ── DINOv2 path (torch.hub) ───────────────────────────────────
+                repo = get_cfg(
+                    self.config, "global_descriptor.dinov2.hub_repo", "facebookresearch/dinov2"
+                )
+                model_name = get_cfg(
+                    self.config, "global_descriptor.dinov2.hub_model", "dinov2_vitl14"
+                )
+                vram_req = get_cfg(
+                    self.config, "global_descriptor.dinov2.vram_required_mb", 1600.0
+                )
 
                 logger.info(f"Loading DINOv2 ({model_name}) model...")
                 self._ensure_vram_available(vram_req)

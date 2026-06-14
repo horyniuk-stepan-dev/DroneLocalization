@@ -5,13 +5,16 @@ A professional system for topometric localization and visual navigation of drone
 ## 🎯 Key Features
 
 - **Desktop GUI (PyQt6)**: Multi-threaded graphical interface for Windows, optimized for real-time operation.
+- **Headless Mode**: Server-friendly deployment with WebSocket + REST API for external integrations.
 - **Semantic Global Localization (DINOv2)**: Leverages Meta's Foundation Model for global descriptors resistant to lighting, shadows, and seasonal changes.
 - **Dynamic Object Filtering (YOLOv11-Seg)**: Automatic neural masking of moving objects (cars, people) to ensure anchoring only to stable geometry.
 - **Adaptive Preprocessing (CLAHE)**: Local contrast equalization to extract textures from deep shadows.
-- **Hybrid Feature Matching**: Uses **XFeat** for speed or **SuperPoint + LightGlue** for maximum precision in challenging scenarios.
-- **Multi-Anchor Calibration**: Interactive GPS anchoring with automatic "wave" propagation of coordinates via affine transforms.
+- **Hybrid Feature Matching**: Uses **ALIKED + LightGlue** for high-precision keypoint matching in challenging scenarios.
+- **Depth Estimation (Depth-Anything-V2)**: Monocular depth estimation to support scale-aware localization.
+- **Multi-Anchor Calibration**: Interactive GPS anchoring with automatic \"wave\" propagation of coordinates via pose graph optimization (5-DoF Levenberg-Marquardt).
 - **Intelligent Tracking**: Trajectory smoothing via **Kalman Filter** and anomaly detection using Z-score.
 - **Interactive Map**: Real-time visualization of Drone FOV (Field of View) and path on a Leaflet-based map.
+- **Result Export**: CSV, GeoJSON, and KML export of localization results.
 
 ## 📋 System Requirements
 
@@ -19,11 +22,11 @@ A professional system for topometric localization and visual navigation of drone
 - **GPU**: NVIDIA with CUDA support (minimum **4GB VRAM**, e.g., GTX 1650 or better)
 - **CPU**: 6+ cores
 - **RAM**: 16 GB (32 GB recommended for large databases)
-- **Storage**: SSD (recommended; HDF5 databases take minimal space thanks to the 384-dimensional descriptor size)
+- **Storage**: SSD (recommended)
 
 ### Software Requirements
-- Python 3.11
-- PyTorch 2.2.0 (CUDA 12.1)
+- Python 3.10–3.11
+- PyTorch ≥ 2.2.0 (CUDA 12.x)
 - Windows 10/11 (primary platform)
 
 ## 🚀 Quick Start
@@ -32,31 +35,85 @@ A professional system for topometric localization and visual navigation of drone
 
 ```powershell
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/horyniuk-stepan-dev/DroneLocalization.git
 cd DroneLocalization
 
 # Create a virtual environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# Install dependencies
-pip install -r requirements.txt
+# Install the project and dependencies (editable mode)
+pip install -e .
 
+# (Optional) Install dev dependencies (pytest, ruff, ...)
+pip install -e ".[dev]"
+
+# (Optional) Install TensorRT acceleration for YOLO
+pip install -e ".[tensorrt]"
 ```
+
+### 1.1 Installing RDD (Robust Deformable Detector)
+The RDD source code is already included in the repository under `third_party/rdd/`. It is recommended to compile the custom CUDA operators for performance:
+
+```powershell
+# Install RDD dependencies
+pip install -r third_party/rdd/requirements.txt
+
+# Compile custom CUDA operators (recommended for speed)
+cd third_party/rdd/RDD/models/ops
+pip install -e . --no-build-isolation
+```
+
+### 1.2 Installing Depth-Anything-V2
+The depth estimation module requires cloning Depth-Anything-V2 into `third_party/`:
+
+```powershell
+# Clone Depth-Anything-V2 into third_party
+git clone https://github.com/DepthAnything/Depth-Anything-V2 third_party/Depth-Anything-V2
+
+# Install its dependencies
+pip install -r third_party/Depth-Anything-V2/requirements.txt
+```
+
+### 1.3 Downloading Model Weights
+
+```powershell
+# Download all required model weights automatically
+python scripts/download_models.py
+```
+
+Alternatively, download `models.zip` manually from [Google Drive](https://drive.google.com/drive/folders/1qyO9AtUNkmkHXswvCbNkYcoTv8ChBbyP?usp=sharing) and extract to `models/weights/`.
+
+> **Note:** PyTorch with CUDA support must be installed separately following the
+> [official instructions](https://pytorch.org/get-started/locally/), as the required
+> version depends on your GPU and driver.
 
 ### 2. Running the Application
 
 ```powershell
 # Launch GUI
 python main.py
+
+# Run in headless mode (WebSocket + REST API)
+python main.py --headless --project /path/to/project --source /path/to/video.mp4
+python main.py --headless --project /path/to/project --source rtsp://drone-ip/stream
 ```
+
+**Headless options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--project` | required | Path to the project directory |
+| `--source` | required | Video file path or RTSP/HTTP stream URL |
+| `--ws-port` | 8765 | WebSocket server port |
+| `--rest-port` | 8080 | REST API server port |
 
 ## 📖 Workflow
 
 ### Stage 1: Database Creation
 
 1. Launch the application.
-2. In the app, select "Create New Mission".
+2. Select "Create New Mission".
 3. Load the reference video.
 4. Set the flight altitude (for scaling).
 5. Start processing.
@@ -68,7 +125,7 @@ python main.py
 2. Go to menu "Calibration" → "Add Anchor...".
 3. Find the starting frame of the route, click on 3+ landmarks in the video and enter their real GPS coordinates. Add the anchor.
 4. Repeat the procedure for a frame in the middle of the route and for the final frame.
-5. Click "Done — Run Propagation". The application will automatically calculate coordinates for all thousands of intermediate frames using the LightGlue neural network.
+5. Click "Done — Run Propagation". The application will automatically calculate coordinates for all thousands of intermediate frames using the LightGlue neural network and pose graph optimization.
 
 ### Stage 3: Real-Time Localization
 
@@ -86,15 +143,19 @@ python main.py
 
 ```
 src/
-├── gui/              # PyQt6 GUI and map components
-├── workers/          # QThread background threads (tracking, DB, panoramas)
-├── models/           # AI wrappers (YOLOv11, DINOv2, XFeat, LightGlue)
-├── database/         # HDF5 management (Builder, Loader)
-├── localization/     # Core pipeline (Localizer, Matcher)
-├── geometry/         # Math (Affine, Homography, UTM coordinates)
-├── calibration/      # GPS Calibration and propagation system
+├── core/             # Project lifecycle, headless runner, result export
+├── models/           # AI model wrappers (DINOv2, ALIKED, YOLOv11, LightGlue, TensorRT)
+├── database/         # HDF5 v2 + LanceDB management (Builder, Loader)
+├── localization/     # Core pipeline (Localizer, FeatureMatcher, retrieval)
+├── geometry/         # Math (Affine, Homography, PoseGraph, UTM coordinates)
+├── calibration/      # GPS anchor management and coordinate propagation
 ├── tracking/         # Kalman Filter and Outlier Detector
-└── utils/            # Logging, config, and utility scripts
+├── depth/            # Monocular depth estimation (Depth-Anything-V2)
+├── network/          # WebSocket server, REST API, coordinates broker
+├── video/            # Video frame decoding utilities
+├── workers/          # QThread background tasks (tracking, DB, calibration, panoramas)
+├── gui/              # PyQt6 desktop interface (MainWindow, mixins, widgets, dialogs)
+└── utils/            # Logging (Loguru), config, CLAHE preprocessing, telemetry
 ```
 
 ## 🔧 Development
@@ -102,13 +163,26 @@ src/
 ### Running Tests
 
 ```powershell
+# Requires: pip install -e ".[dev]"
 pytest tests/ -v
+```
+
+### Linting
+
+```powershell
+ruff check src/
+ruff format src/
+```
+
+### Compiling TensorRT Engine
+
+```powershell
+python scripts/compile_dinov2_trt.py
 ```
 
 ### Compiling to .exe
 
 ```powershell
-# PyInstaller
 python scripts/build_executable.py
 ```
 

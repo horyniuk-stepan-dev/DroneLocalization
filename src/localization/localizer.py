@@ -560,8 +560,9 @@ class Localizer:
 
         logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
         logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
+        source_str = f" | source={self._active_source_id}" if self._active_source_id else ""
         logger.success(
-            f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id} | "
+            f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id}{source_str} | "
             f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
         )
 

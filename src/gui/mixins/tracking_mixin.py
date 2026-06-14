@@ -150,7 +150,7 @@ class TrackingMixin:
         self.tracking_worker.objects_detected.connect(self.on_objects_detected)
         self.tracking_worker.objects_gps_updated.connect(self.on_objects_gps_updated)
         self.tracking_worker.finished.connect(self._on_tracking_finished)
-        
+
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
             self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
@@ -161,8 +161,17 @@ class TrackingMixin:
         self._object_tracking_results = []  # Список для результатів трекінгу об'єктів
 
         self.control_panel.set_tracking_enabled(False)
+
+        # Оновлюємо індикатор активного відеоджерела (червона мітка REC + ім'я файлу)
+        self.control_panel.mark_source_tracking(str(video_source))
+        # Тайтл-бар: додаємо ім'я відеофайлу
+        from pathlib import Path as _Path
+        src_name = _Path(str(video_source)).name if not str(video_source).startswith("rtsp") else "RTSP"
+        project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
+        self.setWindowTitle(f"Drone Topometric Localizer - {project_name}  🔴 {src_name}")
+
         self.tracking_worker.start()
-        self.status_bar.showMessage("Відстеження розпочато")
+        self.status_bar.showMessage(f"Відстеження: {src_name}")
 
     @pyqtSlot()
     def on_stop_tracking(self):
@@ -184,6 +193,14 @@ class TrackingMixin:
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.coordinates_broker.set_tracking_active(False)
         self.control_panel.set_tracking_enabled(True)
+        # Скидаємо бейдж з REC → звичайний зелений стан
+        self.control_panel.mark_source_tracking("")
+        # Повертаємо звичайний заголовок вікна
+        project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
+        self.setWindowTitle(
+            f"Drone Topometric Localizer - {project_name}" if project_name
+            else "Drone Topometric Localizer"
+        )
         self.status_bar.showMessage("Відстеження зупинено")
         self.control_panel.update_status("Очікування")
 
@@ -232,8 +249,9 @@ class TrackingMixin:
                 lat, lon = result["lat"], result["lon"]
                 conf = result["confidence"]
                 inliers = result.get("inliers", 0)
-                anchor = result.get("matched_frame", "?")  # ВИПРАВЛЕНО КЛЮЧ
-
+                anchor = result.get("matched_frame", "?")
+                source_id = result.get("source_id", "main")
+                
                 self.map_widget.update_marker(lat, lon)
                 is_fallback = result.get("fallback_mode") == "retrieval_only"
                 status_prefix = "ПРИБЛИЗНА Локалізація" if is_fallback else "Локалізація"
@@ -241,13 +259,10 @@ class TrackingMixin:
                 if "fov_polygon" in result and result["fov_polygon"] is not None:
                     self.map_widget.update_fov(result["fov_polygon"])
 
-                self.status_bar.showMessage(
-                    f"{status_prefix}: {lat:.6f}, {lon:.6f} | "
-                    f"Впевненість: {conf:.2f} | Точок: {inliers} | Якір: {anchor}"
-                )
-                self.control_panel.update_status(
-                    "Фото локалізовано (приблизно)" if is_fallback else "Фото локалізовано"
-                )
+                msg = f"{status_prefix}: {lat:.6f}, {lon:.6f} | Впевненість: {conf:.2f} | Якір: {anchor} | Джерело: {source_id}"
+                self.status_bar.showMessage(msg)
+                self.control_panel.update_status(f"Локалізовано ({conf:.2f})")
+
                 msg_box = QMessageBox(self)
                 msg_title = "⚓ Приблизна локалізація" if is_fallback else "⚓ Успіх"
                 msg_text = (
@@ -258,7 +273,8 @@ class TrackingMixin:
                 msg_text += (
                     f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
                     f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
-                    f"Якір: кадр {anchor}"
+                    f"Якір: кадр {anchor}\n"
+                    f"Джерело: {source_id}"
                 )
 
                 msg_box.setWindowTitle(msg_title)

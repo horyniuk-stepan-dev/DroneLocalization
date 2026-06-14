@@ -47,10 +47,11 @@ class CalibrationDialog(QDialog):
     anchor_confirmed = pyqtSignal(int)  # frame_id actually saved (from MainWindow)
     calibration_complete = pyqtSignal()
 
-    def __init__(self, database_path: str, existing_anchors=None, parent=None):
+    def __init__(self, database_path: str, existing_anchors=None, source_id: str = "main", parent=None):
         super().__init__(parent)
         self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
+        self.source_id = source_id
 
         self.points_2d = []
         self.points_gps = []
@@ -71,7 +72,7 @@ class CalibrationDialog(QDialog):
         self._frame_cache = OrderedDict()
         self._MAX_CACHE_SIZE = 32
 
-        self.setWindowTitle("GPS Калібрування — Мульти-якірний режим")
+        self.setWindowTitle(f"GPS Калібрування [{self.source_id}] — Мульти-якірний режим")
         self.resize(1200, 800)
         self._init_ui()
         self._refresh_anchors_list()

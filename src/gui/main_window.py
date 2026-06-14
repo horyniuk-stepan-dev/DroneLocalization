@@ -130,6 +130,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.toggle_objects_clicked.connect(self.on_toggle_objects)
         cp.add_source_clicked.connect(self.on_add_video_source)
         cp.source_action.connect(self.on_source_action)
+        cp.active_source_changed.connect(self.on_active_source_changed)
         self.map_widget.mapClicked.connect(self._on_map_clicked)
 
     def _on_map_clicked(self, lat: float, lon: float):

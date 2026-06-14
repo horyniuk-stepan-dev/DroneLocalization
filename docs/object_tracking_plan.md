@@ -2,7 +2,10 @@
 
 > **Версія:** 1.0  
 > **Дата:** 2026-04-23  
-> **Статус:** Пропозиція
+> **Статус:** ⚠️ Частково реалізовано (2026-06)
+
+> [!NOTE]
+> **Фази 1–2 виконано:** `src/tracking/object_tracker.py` та `src/tracking/object_projector.py` вже існують. Залежність `supervision` додана в `pyproject.toml`. Фази 3–4 (візуалізація bbox та маркери на карті) в процесі реалізації.
 
 ---
 
@@ -24,7 +27,7 @@
 
 | Компонент | Файл | Опис |
 |---|---|---|
-| YOLO11-seg | `src/models/wrappers/yolo_wrapper.py` | Детекція + сегментація. Зараз використовується **тільки** для створення `static_mask` (маскування динамічних об'єктів). Повертає `detections: list[dict]` з `class_id`, `confidence`, `bbox`. |
+| YOLO11-seg | `src/models/wrappers/yolo_wrapper.py` | Детекція + сегментація. Зараз використовується **тілько** для створення `static_mask` (маскування динамічних об'єктів). Повертає `detections: list[dict]` з `class_id`, `confidence`, `bbox`. |
 | ModelManager | `src/models/model_manager.py` | Завантаження YOLO з підтримкою TensorRT FP16. |
 | TrackingWorker | `src/workers/tracking_worker.py` | Основний цикл обробки відео. Викликає `yolo_wrapper.detect_and_mask()` на ключових кадрах, але **ігнорує** повернені `detections`. |
 | VideoWidget | `src/gui/widgets/video_widget.py` | Відображення кадрів через `QGraphicsView`. Має `draw_numbered_point()` для overlay. |
@@ -200,42 +203,42 @@ class ObjectProjector:
 
 ## 5. Поетапний план імплементації
 
-### Фаза 1: Ядро трекера (без GUI)
+### Фаза 1: Ядро трекера (без GUI) — ✅ Виконано
 
-| # | Задача | Файл |
-|---|---|---|
-| 1.1 | Додати `supervision` у `pyproject.toml` | `pyproject.toml` |
-| 1.2 | Створити `ObjectTracker` з ByteTrack | `src/tracking/object_tracker.py` |
-| 1.3 | Створити `ObjectProjector` | `src/tracking/object_projector.py` |
-| 1.4 | Додати `ObjectTrackingConfig` | `config/config.py` |
-| 1.5 | Unit-тести для `ObjectTracker` | `tests/test_object_tracker.py` |
+| # | Задача | Файл | Статус |
+|---|---|---|---|
+| 1.1 | Додати `supervision` у `pyproject.toml` | `pyproject.toml` | ✅ |
+| 1.2 | Створити `ObjectTracker` з ByteTrack | `src/tracking/object_tracker.py` | ✅ |
+| 1.3 | Створити `ObjectProjector` | `src/tracking/object_projector.py` | ✅ |
+| 1.4 | Додати `ObjectTrackingConfig` | `config/config.py` | ✅ |
+| 1.5 | Unit-тести для `ObjectTracker` | `tests/test_object_tracker.py` | ⏳ Очікується |
 
-### Фаза 2: Інтеграція у TrackingWorker
+### Фаза 2: Інтеграція у TrackingWorker — ✅ Виконано
 
-| # | Задача | Файл |
-|---|---|---|
-| 2.1 | Додати сигнали `objects_detected`, `objects_gps_updated` | `tracking_worker.py` |
-| 2.2 | Створити `ObjectTracker` + `ObjectProjector` у `run()` | `tracking_worker.py` |
-| 2.3 | Обробляти `detections` з `yolo_wrapper` на ключових кадрах | `tracking_worker.py` |
-| 2.4 | GPS-проєкція через `_last_state["H"]` та `_last_state["affine"]` | `tracking_worker.py` |
-| 2.5 | Інтерполяція на OF-кадрах (Kalman predict) | `tracking_worker.py` |
+| # | Задача | Файл | Статус |
+|---|---|---|---|
+| 2.1 | Додати сигнали `objects_detected`, `objects_gps_updated` | `tracking_worker.py` | ✅ |
+| 2.2 | Створити `ObjectTracker` + `ObjectProjector` у `run()` | `tracking_worker.py` | ✅ |
+| 2.3 | Обробляти `detections` з `yolo_wrapper` на ключових кадрах | `tracking_worker.py` | ✅ |
+| 2.4 | GPS-проєкція через `_last_state["H"]` та `_last_state["affine"]` | `tracking_worker.py` | ✅ |
+| 2.5 | Інтерполяція на OF-кадрах (Kalman predict) | `tracking_worker.py` | ✅ |
 
-### Фаза 3: Візуалізація
+### Фаза 3: Візуалізація — ⏳ В планах
 
-| # | Задача | Файл |
-|---|---|---|
-| 3.1 | `draw_tracked_objects()` у VideoWidget | `video_widget.py` |
-| 3.2 | Сигнали в MapBridge для маркерів об'єктів | `map_widget.py` |
-| 3.3 | JavaScript шар для об'єктів у map_template | `map_template.html` |
-| 3.4 | Підключити сигнали у TrackingMixin | `tracking_mixin.py` |
+| # | Задача | Файл | Статус |
+|---|---|---|---|
+| 3.1 | `draw_tracked_objects()` у VideoWidget | `video_widget.py` | ⏳ |
+| 3.2 | Сигнали в MapBridge для маркерів об’єктів | `map_widget.py` | ⏳ |
+| 3.3 | JavaScript шар для об’єктів у map_template | `map_template.html` | ⏳ |
+| 3.4 | Підключити сигнали у TrackingMixin | `tracking_mixin.py` | ⏳ Очікується |
 
-### Фаза 4: Експорт та UI
+### Фаза 4: Експорт та UI — ⏳ В планах
 
-| # | Задача | Файл |
-|---|---|---|
-| 4.1 | Збереження історії об'єктів у `_tracking_results` | `tracking_mixin.py` |
-| 4.2 | Експорт траєкторій об'єктів у CSV/GeoJSON | `export_results.py` |
-| 4.3 | Toggle кнопка "Показати/Сховати об'єкти" у ControlPanel | `control_panel.py` |
+| # | Задача | Файл | Статус |
+|---|---|---|---|
+| 4.1 | Збереження історії об’єктів у `_tracking_results` | `tracking_mixin.py` | ⏳ |
+| 4.2 | Експорт траєкторій об'єктів у CSV/GeoJSON | `export_results.py` | ⏳ |
+| 4.3 | Toggle кнопка "Показати/Сховати об’єкти" у ControlPanel | `control_panel.py` | ⏳ Очікується |
 
 ---
 

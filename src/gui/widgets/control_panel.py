@@ -1,9 +1,10 @@
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -42,6 +43,7 @@ class ControlPanel(QWidget):
     stop_db_generation_clicked = pyqtSignal()
     toggle_objects_clicked = pyqtSignal(bool)
     add_source_clicked = pyqtSignal()
+    active_source_changed = pyqtSignal(str)
     source_action = pyqtSignal(
         str, str
     )  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
@@ -184,7 +186,46 @@ class ControlPanel(QWidget):
         # Video Sources group (мультиджерельна підтримка)
         self.sources_group = QGroupBox("Відеоджерела")
         sources_layout = QVBoxLayout(self.sources_group)
+        sources_layout.setSpacing(6)
 
+        # ── Активне джерело (бейдж, завжди видимий при відкритому проєкті) ──
+        self._active_badge = QFrame()
+        self._active_badge.setFrameShape(QFrame.Shape.StyledPanel)
+        self._active_badge.setStyleSheet(
+            "QFrame { background: #f5f5f5; border: 1px solid #ddd; border-radius: 5px; }"
+        )
+        badge_layout = QHBoxLayout(self._active_badge)
+        badge_layout.setContentsMargins(8, 5, 8, 5)
+        badge_layout.setSpacing(6)
+
+        self._lbl_source_dot = QLabel("●")
+        self._lbl_source_dot.setStyleSheet("color: #bbb; font-size: 13px;")
+        self._lbl_source_dot.setFixedWidth(16)
+
+        self._lbl_source_id = QLabel("Не завантажено")
+        bold = QFont()
+        bold.setBold(True)
+        bold.setPointSize(10)
+        self._lbl_source_id.setFont(bold)
+        self._lbl_source_id.setStyleSheet("color: #333;")
+
+        self._lbl_source_type = QLabel()
+        self._lbl_source_type.setStyleSheet(
+            "color: #777; font-size: 9px; background: #e0e0e0; "
+            "border-radius: 3px; padding: 1px 4px;"
+        )
+
+        badge_layout.addWidget(self._lbl_source_dot)
+        badge_layout.addWidget(self._lbl_source_id, 1)
+        badge_layout.addWidget(self._lbl_source_type)
+        sources_layout.addWidget(self._active_badge)
+
+        self._lbl_source_video = QLabel()
+        self._lbl_source_video.setStyleSheet("font-size: 10px; color: #555; padding-left: 4px;")
+        self._lbl_source_video.setWordWrap(True)
+        sources_layout.addWidget(self._lbl_source_video)
+
+        # ── Таблиця (тільки для мульти-проєктів) ──
         self.sources_table = QTableWidget()
         self.sources_table.setColumnCount(3)
         self.sources_table.setHorizontalHeaderLabels(["Source ID", "Area", "Статус"])
@@ -203,6 +244,7 @@ class ControlPanel(QWidget):
         self.sources_table.setMaximumHeight(120)
         self.sources_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.sources_table.customContextMenuRequested.connect(self._on_sources_context_menu)
+        self.sources_table.itemSelectionChanged.connect(self._on_sources_selection_changed)
         self.sources_table.setVisible(False)  # Прихований до відкриття мульти-проєкту
         sources_layout.addWidget(self.sources_table)
 
@@ -214,7 +256,7 @@ class ControlPanel(QWidget):
         btn_row.addWidget(self.btn_add_source)
         sources_layout.addLayout(btn_row)
 
-        self.sources_group.setVisible(False)  # Показується тільки для мульти-проєктів
+        self.sources_group.setVisible(False)  # Показується тільки при відкритому проєкті
 
         for group in [
             self.db_group,
@@ -306,6 +348,8 @@ class ControlPanel(QWidget):
         self,
         sources: list[dict],
         project_dir: str = "",
+        active_source_id: str | None = None,
+        propagated_source_ids: set[str] | None = None,
     ):
         """Оновлює таблицю відеоджерел.
 
@@ -313,10 +357,15 @@ class ControlPanel(QWidget):
             sources: Список dict з полями source_id, area_id, enabled,
                      database_file, calibration_file.
             project_dir: Шлях до кореня проєкту для перевірки файлів.
+            active_source_id: ID поточного активного джерела (для підсвічування рядка).
+            propagated_source_ids: Множина source_id які вже мають пропагацію
+                                    в HDF5 (навіть без окремого calibration.json).
         """
+        propagated_source_ids = propagated_source_ids or set()
         is_multi = len(sources) > 1 or any(s.get("source_id") != "main" for s in sources)
-        # Група завжди видима при відкритому проєкті, таблиця — тільки для multi
+        # Група завжди видима при відкритому проєкті
         self.sources_group.setVisible(True)
+        # Таблиця — тільки для multi-source проєктів
         self.sources_table.setVisible(is_multi)
         self.btn_add_source.setVisible(True)
 
@@ -333,9 +382,15 @@ class ControlPanel(QWidget):
             status = "⏳ Очікує"
             status_color = QColor("#888")
             if project_dir:
-                db_exists = (Path(project_dir) / src.get("database_file", "")).exists()
-                cal_exists = (Path(project_dir) / src.get("calibration_file", "")).exists()
-                if db_exists and cal_exists:
+                db_path = Path(project_dir) / src.get("database_file", "")
+                cal_path = Path(project_dir) / src.get("calibration_file", "")
+                db_exists = db_path.exists()
+                # Калібрування вважається виконаним якщо:
+                # • існує окремий calibration.json, АБО
+                # • пропагація вже збережена всередині HDF5 (sid in propagated_source_ids)
+                is_calibrated = cal_path.exists() or sid in propagated_source_ids
+
+                if db_exists and is_calibrated:
                     status = "✅ Готово"
                     status_color = QColor("#2e7d32")
                 elif db_exists:
@@ -360,6 +415,83 @@ class ControlPanel(QWidget):
             self.sources_table.setItem(row, 0, item_sid)
             self.sources_table.setItem(row, 1, item_area)
             self.sources_table.setItem(row, 2, item_status)
+
+            # Підсвічуємо активний рядок
+            is_active = sid == active_source_id
+            bg = QColor("#e8f5e9") if is_active else QColor("transparent")
+            for col in range(3):
+                item = self.sources_table.item(row, col)
+                if item:
+                    item.setBackground(bg)
+
+    def set_active_source(
+        self,
+        source_id: str,
+        video_path: str = "",
+        source_type: str = "file",
+    ):
+        """Відображає активне відеоджерело у бейджі секції 'Відеоджерела'.
+
+        Args:
+            source_id: ID активного джерела (напр. 'main', 'area_north').
+            video_path: Повний шлях або URL відео.
+            source_type: 'file' | 'rtsp' | 'usb'
+        """
+        self.sources_group.setVisible(True)
+
+        # Назва файлу
+        if video_path:
+            if source_type == "rtsp":
+                short = video_path
+            elif source_type == "usb":
+                short = f"USB камера ({video_path})"
+            else:
+                short = Path(video_path).name
+        else:
+            short = ""
+
+        type_labels = {"rtsp": "📡 RTSP", "usb": "🔌 USB", "file": "📁 Файл"}
+        self._lbl_source_dot.setStyleSheet("color: #4caf50; font-size: 13px;")
+        self._lbl_source_id.setText(source_id)
+        self._lbl_source_type.setText(type_labels.get(source_type, "📁 Файл"))
+        self._lbl_source_video.setText(short)
+        self._active_badge.setStyleSheet(
+            "QFrame { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 5px; }"
+        )
+
+    def mark_source_tracking(self, video_source: str = ""):
+        """Оновлює бейдж: показує що відбувається активне трекінг-відео.
+
+        Args:
+            video_source: Шлях до файлу або RTSP URL що зараз відстежується.
+                          None/пусто — скинути стан трекінгу.
+        """
+        if not video_source:
+            # Скидаємо до стану проєкту (зелений без мітки REC)
+            self._lbl_source_dot.setStyleSheet("color: #4caf50; font-size: 13px;")
+            self._active_badge.setStyleSheet(
+                "QFrame { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 5px; }"
+            )
+            return
+
+        is_rtsp = str(video_source).lower().startswith("rtsp")
+        is_usb = str(video_source).isdigit() or str(video_source).startswith("usb")
+        if is_rtsp:
+            track_name = video_source
+            type_tag = "📡 RTSP"
+        elif is_usb:
+            track_name = f"USB камера ({video_source})"
+            type_tag = "🔌 USB"
+        else:
+            track_name = Path(str(video_source)).name
+            type_tag = "📁 Файл"
+
+        self._lbl_source_dot.setStyleSheet("color: #f44336; font-size: 13px;")
+        self._lbl_source_type.setText(f"🔴 REC  {type_tag}")
+        self._lbl_source_video.setText(track_name)
+        self._active_badge.setStyleSheet(
+            "QFrame { background: #fff3e0; border: 1px solid #ffcc02; border-radius: 5px; }"
+        )
 
     @pyqtSlot("QPoint")
     def _on_sources_context_menu(self, pos):
@@ -392,3 +524,17 @@ class ControlPanel(QWidget):
             self.source_action.emit(source_id, "toggle")
         elif action == act_remove:
             self.source_action.emit(source_id, "remove")
+
+    @pyqtSlot()
+    def _on_sources_selection_changed(self):
+        """Обробка зміни вибраного рядка таблиці."""
+        selected_items = self.sources_table.selectedItems()
+        if not selected_items:
+            return
+        
+        row = selected_items[0].row()
+        item = self.sources_table.item(row, 0)
+        if item:
+            source_id = item.data(Qt.ItemDataRole.UserRole)
+            if source_id:
+                self.active_source_changed.emit(source_id)

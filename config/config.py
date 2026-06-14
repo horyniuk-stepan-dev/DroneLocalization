@@ -8,9 +8,36 @@ import torch
 from pydantic import BaseModel, Field
 
 
-class Dinov2Config(BaseModel):
+class Dinov2ModelConfig(BaseModel):
+    """DINOv2 ViT-L/14 — ImageNet pretrained, завантажується через torch.hub"""
     descriptor_dim: int = 1024
     input_size: int = 336
+    normalize_mean: list[float] = [0.485, 0.456, 0.406]
+    normalize_std: list[float] = [0.229, 0.224, 0.225]
+    hub_repo: str = "facebookresearch/dinov2"
+    hub_model: str = "dinov2_vitl14"
+    vram_required_mb: float = 1600.0
+
+
+class Dinov3ModelConfig(BaseModel):
+    """DINOv3 ViT-L/16 — pretrained на 493M супутникових знімків, HuggingFace"""
+    descriptor_dim: int = 1024
+    input_size: int = 224
+    normalize_mean: list[float] = [0.430, 0.411, 0.296]
+    normalize_std: list[float] = [0.213, 0.156, 0.143]
+    hf_model_id: str = "facebook/dinov3-vitl16-pretrain-sat493m"
+    vram_required_mb: float = 1600.0
+
+
+class GlobalDescriptorConfig(BaseModel):
+    """Вибір глобального дескриптора: 'dinov2' або 'dinov3'"""
+    backend: str = "dinov3"  # "dinov2" | "dinov3"
+    dinov2: Dinov2ModelConfig = Dinov2ModelConfig()
+    dinov3: Dinov3ModelConfig = Dinov3ModelConfig()
+
+    def active(self) -> Dinov2ModelConfig | Dinov3ModelConfig:
+        """Повертає конфіг активної моделі."""
+        return self.dinov2 if self.backend == "dinov2" else self.dinov3
 
 
 class DatabaseConfig(BaseModel):
@@ -179,9 +206,6 @@ class ModelsConfig(BaseModel):
         model_path="models/RDD_lg-v2.pth",
         auto_convert=False,
     )
-    dinov2: ModelSettings = ModelSettings(
-        hub_repo="facebookresearch/dinov2", hub_model="dinov2_vitl14", vram_required_mb=1600.0
-    )
     cesp: CespConfig = CespConfig()
     vram_management: VramManagementConfig = VramManagementConfig()
     performance: PerformanceConfig = PerformanceConfig()
@@ -275,7 +299,7 @@ class AppConfig(BaseModel):
     live_stream: LiveStreamConfig = LiveStreamConfig()
     network_api: NetworkApiConfig = NetworkApiConfig()
     object_tracking: ObjectTrackingConfig = ObjectTrackingConfig()
-    dinov2: Dinov2Config = Dinov2Config()
+    global_descriptor: GlobalDescriptorConfig = GlobalDescriptorConfig()
     database: DatabaseConfig = DatabaseConfig()
     localization: LocalizationConfig = LocalizationConfig()
     tracking: TrackingConfig = TrackingConfig()
@@ -304,6 +328,30 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
         else:
             return default
     return current
+
+
+def get_active_descriptor_cfg(config: Any) -> "Dinov2ModelConfig | Dinov3ModelConfig":
+    """Повертає конфіг активного глобального дескриптора (DINOv2 або DINOv3).
+
+    Працює як з Pydantic-об'єктом (APP_SETTINGS), так і зі словником (APP_CONFIG).
+    Fallback: DINOv2 за замовчуванням.
+    """
+    gd = get_cfg(config, "global_descriptor")
+    if gd is None:
+        return Dinov2ModelConfig()
+
+    # Pydantic object — використовуємо метод active()
+    if hasattr(gd, "active"):
+        return gd.active()
+
+    # dict — реконструюємо з вкладених словників
+    if isinstance(gd, dict):
+        backend = gd.get("backend", "dinov2")
+        if backend == "dinov3":
+            return Dinov3ModelConfig(**(gd.get("dinov3") or {}))
+        return Dinov2ModelConfig(**(gd.get("dinov2") or {}))
+
+    return Dinov2ModelConfig()
 
 
 # Екземпляр конфігу за замовчуванням

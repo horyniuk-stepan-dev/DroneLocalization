@@ -17,6 +17,7 @@ calibration_mixin.py — ВИПРАВЛЕНА ВЕРСІЯ
 """
 
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
@@ -47,6 +48,7 @@ class CalibrationMixin:
         self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
             existing_anchors=anchors_data,
+            source_id=self._get_current_source_id(),
             parent=self,
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
@@ -232,7 +234,9 @@ class CalibrationMixin:
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=best_M, qa_data=qa_data)
 
             if self.project_manager and self.project_manager.is_loaded:
-                self.calibration.save(self.project_manager.calibration_path)
+                cal_path = self._get_calibration_save_path()
+                if cal_path:
+                    self.calibration.save(cal_path)
 
             if hasattr(self, "_update_project_info_panel"):
                 self._update_project_info_panel()
@@ -282,7 +286,9 @@ class CalibrationMixin:
         try:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
-                    self.calibration.save(self.project_manager.calibration_path)
+                    cal_path = self._get_calibration_save_path()
+                    if cal_path:
+                        self.calibration.save(cal_path)
 
                 if hasattr(self, "_update_project_info_panel"):
                     self._update_project_info_panel()
@@ -567,15 +573,59 @@ class CalibrationMixin:
 
     # ── Save / Load calibration ──────────────────────────────────────────────
 
+    def _get_current_source_id(self) -> str:
+        """Повертає source_id поточного активного джерела (базуючись на db_path)."""
+        if not self.project_manager or not self.project_manager.is_loaded or not self.database:
+            return "main"
+            
+        current_db = str(Path(self.database.db_path).resolve())
+        project_dir = self.project_manager.project_dir
+        for src_dict in (self.project_manager.settings.video_sources or []):
+            db_file = src_dict.get("database_file", "")
+            if db_file and str((project_dir / db_file).resolve()) == current_db:
+                return src_dict.get("source_id", "main")
+        return "main"
+
+    def _get_calibration_save_path(self) -> str | None:
+        """Повертає шлях до calibration.json для поточного активного джерела.
+
+        Принцип: зіставляє `self.database.db_path` з `database_file` кожного
+        джерела в project settings, щоб знайти відповідний `calibration_file`.
+        Fallback: `project_manager.calibration_path` (корінь проєкту).
+        """
+        if not self.project_manager or not self.project_manager.is_loaded:
+            return None
+
+        project_dir = self.project_manager.project_dir
+
+        # Пошук джерела відповідно до поточної БД
+        if self.database and self.project_manager.settings:
+            current_db = str(Path(self.database.db_path).resolve())
+            for src_dict in (self.project_manager.settings.video_sources or []):
+                db_file = src_dict.get("database_file", "")
+                cal_file = src_dict.get("calibration_file", "")
+                if not db_file or not cal_file:
+                    continue
+                if str((project_dir / db_file).resolve()) == current_db:
+                    cal_path = project_dir / cal_file
+                    cal_path.parent.mkdir(parents=True, exist_ok=True)
+                    logger.debug(
+                        f"Calibration path: {cal_path} "
+                        f"(source='{src_dict.get('source_id', '?')}')"
+                    )
+                    return str(cal_path)
+
+        # Fallback — шлях на рівні проєкту
+        return self.project_manager.calibration_path
+
     @pyqtSlot()
     def on_save_calibration(self):
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
 
-        default_path = "calibration.json"
-        if self.project_manager and self.project_manager.is_loaded:
-            default_path = str(self.project_manager.project_dir / default_path)
+        # Дефолтний шлях — папка активного джерела
+        default_path = self._get_calibration_save_path() or "calibration.json"
 
         path, _ = QFileDialog.getSaveFileName(
             self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
@@ -607,17 +657,42 @@ class CalibrationMixin:
             self.calibration.load(path)
             ids = [a.frame_id for a in self.calibration.anchors]
             propagated = self.database and self.database.is_propagated
-            self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
             self.control_panel.update_status("Калібрування завантажено")
+
+            # Автоматично зберігаємо копію в папці поточного джерела
+            # (навіть якщо файл завантажено з іншого місця або скопійовано вручну)
+            source_cal_path = self._get_calibration_save_path()
+            copied_to_source = False
+            if source_cal_path:
+                norm_loaded = str(Path(path).resolve())
+                norm_source = str(Path(source_cal_path).resolve())
+                if norm_loaded != norm_source:
+                    # Файл прийшов не з папки джерела — копіюємо туди
+                    Path(source_cal_path).parent.mkdir(parents=True, exist_ok=True)
+                    self.calibration.save(source_cal_path)
+                    copied_to_source = True
+                    logger.info(
+                        f"Calibration copied to source folder: {source_cal_path}"
+                    )
+                else:
+                    logger.debug("Calibration loaded directly from source folder, no copy needed.")
 
             if hasattr(self, "_update_project_info_panel"):
                 self._update_project_info_panel()
 
+            copy_note = (
+                f"\n\n📋 Також збережено у папці джерела:\n{source_cal_path}"
+                if copied_to_source
+                else ""
+            )
+            self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
             QMessageBox.information(
                 self,
                 "Успіх",
                 f"Завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
-                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}",
+                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}"
+                f"{copy_note}",
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
+

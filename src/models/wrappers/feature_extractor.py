@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 
-from config.config import get_cfg
+from config.config import get_cfg, get_active_descriptor_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
 from src.utils.telemetry import Telemetry
@@ -24,13 +24,16 @@ class FeatureExtractor:
         self.preprocessor = ImagePreprocessor(config)
         self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
 
-        # Трансформації для DINOv2 (ImageNet стандарти)
-        dino_size = get_cfg(self.config, "dinov2.input_size", 336)
+        # Параметри нормалізації та розміру входу — беремо з активного backend (dinov2 або dinov3)
+        _desc_cfg = get_active_descriptor_cfg(self.config)
+        dino_size = _desc_cfg.input_size
+        dino_mean = _desc_cfg.normalize_mean
+        dino_std = _desc_cfg.normalize_std
         self.dino_size = dino_size
         self.dinov2_transform = T.Compose(
             [
                 T.Resize((dino_size, dino_size), antialias=True),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                T.Normalize(mean=dino_mean, std=dino_std),
             ]
         )
 
@@ -46,8 +49,11 @@ class FeatureExtractor:
 
         cesp_status = "with CESP" if cesp_module is not None else "without CESP"
         local_name = type(local_model).__name__
+        global_name = type(global_model).__name__
         logger.info(
-            f"FeatureExtractor initialized with {local_name} and DINOv2 ({cesp_status}) on {device}"
+            f"FeatureExtractor initialized: local={local_name}, global={global_name} "
+            f"({cesp_status}) | input_size={dino_size}, mean={dino_mean}, std={dino_std} "
+            f"| device={device}"
         )
 
         if device == "cuda":
