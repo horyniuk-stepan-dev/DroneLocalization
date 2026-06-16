@@ -13,7 +13,7 @@ class TestGetCfgHelper:
     """Тести для хелпера get_cfg()"""
 
     def test_simple_path(self):
-        assert get_cfg(APP_CONFIG, "dinov2.descriptor_dim") == 1024
+        assert get_cfg(APP_CONFIG, "global_descriptor.dinov2.descriptor_dim") == 1024
 
     def test_nested_path(self):
         assert get_cfg(APP_CONFIG, "localization.confidence.confidence_max_inliers") == 80
@@ -42,7 +42,7 @@ class TestConfigSectionsExist:
     @pytest.mark.parametrize(
         "section",
         [
-            "dinov2",
+            "global_descriptor",
             "database",
             "localization",
             "tracking",

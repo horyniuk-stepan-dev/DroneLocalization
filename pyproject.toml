@@ -104,8 +104,10 @@ ignore = [
     "F841",  # Local variable is assigned to but never used
 ]
 
-[tool.ty]
+[tool.ty.environment]
 python-version = "3.11"
+
+[tool.ty.src]
 exclude = [
     "**/__pycache__",
     "**/.venv",
