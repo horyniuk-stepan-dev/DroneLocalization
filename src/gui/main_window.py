@@ -65,6 +65,8 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("Файл")
+        file_menu.addAction("Налаштування...", self.on_open_config)
+        file_menu.addSeparator()
         file_menu.addAction("Вихід", self.close)
 
         calib_menu = menubar.addMenu("Калібрування")
@@ -138,3 +140,9 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
         self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
         logger.info(f"Map click: {lat=}, {lon=}")
+
+    def on_open_config(self):
+        """Open the configuration editor dialog."""
+        from src.gui.dialogs.config_dialog import ConfigDialog
+        dialog = ConfigDialog(self)
+        dialog.exec()

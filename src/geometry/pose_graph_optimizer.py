@@ -199,6 +199,7 @@ class PoseGraphOptimizer:
         )
 
         # jac_sparsity is ignored by 'lm'. method='trf' with sparse jacobian runs 100x faster.
+        safe_tolerance = max(tolerance, 1e-15)
         result = least_squares(
             fun=self._residuals,
             x0=x0,
@@ -207,9 +208,9 @@ class PoseGraphOptimizer:
             jac="2-point",
             jac_sparsity=jac_sp,
             max_nfev=max_iterations * n_vars,
-            ftol=tolerance,
-            xtol=tolerance,
-            gtol=tolerance,
+            ftol=safe_tolerance,
+            xtol=safe_tolerance,
+            gtol=safe_tolerance,
         )
 
         logger.info(

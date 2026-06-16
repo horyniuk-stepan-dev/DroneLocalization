@@ -23,6 +23,10 @@ def _import_rdd():
         Path(__file__).resolve().parents[3] / "models" / "rdd",       # <project>/models/rdd
     ]
 
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        search_paths.insert(0, Path(sys._MEIPASS) / "third_party" / "rdd")
+        search_paths.insert(0, Path(sys._MEIPASS) / "models" / "rdd")
+
     for rdd_path in search_paths:
         if rdd_path.exists() and (rdd_path / "RDD" / "RDD.py").exists():
             if str(rdd_path) not in sys.path:

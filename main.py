@@ -1,7 +1,36 @@
-#!/usr/bin/env python3
-
 import os
 import sys
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# --- PyInstaller: fix DLL loading & redirect caches for frozen builds ---
+if getattr(sys, "frozen", False):
+    import ctypes
+    import glob
+    from pathlib import Path
+
+    _meipass = getattr(sys, "_MEIPASS", str(Path(sys.executable).parent))
+    _app_dir = str(Path(sys.executable).parent)
+
+    # 1) Fix tensorrt DLL loading if needed
+    _trt_lib = os.path.join(_meipass, "tensorrt_libs")
+    if os.path.isdir(_trt_lib):
+        os.add_dll_directory(_trt_lib)
+        os.environ["PATH"] = _trt_lib + ";" + os.environ.get("PATH", "")
+
+    # 2) Redirect TORCH_HOME / HF_HOME
+    _cache_dir = os.path.join(_meipass, ".cache")
+    if os.path.isdir(_cache_dir):
+        os.environ.setdefault("TORCH_HOME", os.path.join(_cache_dir, "torch"))
+        _hf_hub = os.path.join(_cache_dir, "huggingface", "hub")
+        if os.path.isdir(_hf_hub):
+            os.environ.setdefault("HF_HOME", os.path.join(_cache_dir, "huggingface"))
+            os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _hf_hub)
+
+# WORKAROUND FOR PYINSTALLER + PYTORCH + WINDOWS WinError 1114:
+# Import torch BEFORE anything else to prevent DLL conflicts
+import torch
+
 import warnings
 from pathlib import Path
 
@@ -16,10 +45,11 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", category=UserWarning, message="xFormers is not available")
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import argparse
 import traceback
 
-import torch
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 

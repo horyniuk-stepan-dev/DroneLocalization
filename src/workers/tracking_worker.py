@@ -66,7 +66,11 @@ class RealtimeTrackingWorker(QThread):
             is_tracking_enabled = getattr(self.tracking_config, "enabled", False)
 
         if is_tracking_enabled:
-            tracker_cfg = self.tracking_config if isinstance(self.tracking_config, dict) else self.tracking_config.model_dump()
+            tracker_cfg = (
+                self.tracking_config
+                if isinstance(self.tracking_config, dict)
+                else self.tracking_config.model_dump()
+            )
             try:
                 object_tracker = ObjectTracker(tracker_cfg)
                 object_projector = ObjectProjector(self.localizer.calibration)
@@ -149,7 +153,9 @@ class RealtimeTrackingWorker(QThread):
                 current_video_time_sec = video_src._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                 # Fallback: деякі кодеки повертають 0 — рахуємо за номером кадру
                 if current_video_time_sec <= 0:
-                    current_video_time_sec = video_src._cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
+                    current_video_time_sec = (
+                        video_src._cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
+                    )
 
             # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
             self.frame_ready.emit(frame)
@@ -195,6 +201,9 @@ class RealtimeTrackingWorker(QThread):
                         frame_rgb, static_mask=static_mask, dt=calculated_dt
                     )
                 except Exception as e:
+                    import torch
+
+                    torch.cuda.empty_cache()
                     logger.error(f"Localization exception on keyframe: {e}", exc_info=True)
                     loc_result = {"success": False, "error": str(e)}
 
@@ -225,21 +234,39 @@ class RealtimeTrackingWorker(QThread):
 
                             # Створюємо копії об'єктів з масштабованими координатами
                             from copy import deepcopy
+
                             scaled_tracked_objects = []
                             for obj in tracked_objects:
                                 s_obj = deepcopy(obj)
-                                s_obj.center_px = (obj.center_px[0] * scale, obj.center_px[1] * scale)
+                                s_obj.center_px = (
+                                    obj.center_px[0] * scale,
+                                    obj.center_px[1] * scale,
+                                )
                                 s_obj.bbox = [c * scale for c in obj.bbox]
                                 scaled_tracked_objects.append(s_obj)
 
                             objects_gps = object_projector.project_objects(
-                                scaled_tracked_objects, H, affine, angle,
-                                int(frame.shape[1] * scale), int(frame.shape[0] * scale)
+                                scaled_tracked_objects,
+                                H,
+                                affine,
+                                angle,
+                                int(frame.shape[1] * scale),
+                                int(frame.shape[0] * scale),
                             )
                             if objects_gps:
-                                obj_summary = ", ".join([f"{obj.class_name} #{obj.track_id}" for obj in objects_gps])
-                                logger.info(f"Tracked {len(objects_gps)} objects (KF): {obj_summary}")
+                                obj_summary = ", ".join(
+                                    [f"{obj.class_name} #{obj.track_id}" for obj in objects_gps]
+                                )
+                                logger.info(
+                                    f"Tracked {len(objects_gps)} objects (KF): {obj_summary}"
+                                )
                             self.objects_gps_updated.emit(objects_gps)
+
+                # Fix OOM: Clear PyTorch CUDA cache after heavy keyframe
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 # ====== OPTICAL FLOW TRACKING ======
                 if prev_pts_for_of is not None and len(prev_pts_for_of) > 10:

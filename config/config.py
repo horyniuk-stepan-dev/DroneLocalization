@@ -327,6 +327,16 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
             current = getattr(current, key)
         else:
             return default
+    # PyInstaller runtime path resolution for models/
+    import sys
+    import os
+    if isinstance(current, str) and (current.startswith("models/") or current.startswith("models\\")):
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            meipass_path = os.path.join(sys._MEIPASS, current)
+            # Якщо модель реально є всередині _internal, використовуємо її
+            if os.path.exists(meipass_path):
+                return meipass_path
+
     return current
 
 
@@ -354,7 +364,31 @@ def get_active_descriptor_cfg(config: Any) -> "Dinov2ModelConfig | Dinov3ModelCo
     return Dinov2ModelConfig()
 
 
-# Екземпляр конфігу за замовчуванням
-APP_SETTINGS = AppConfig()
+import json
+import os
+
+CONFIG_FILE_PATH = "user_config.json"
+
+def load_user_config() -> AppConfig:
+    """Завантажує налаштування користувача з файлу, якщо він існує. Інакше повертає дефолтні."""
+    if os.path.exists(CONFIG_FILE_PATH):
+        try:
+            with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return AppConfig(**data)
+        except Exception as e:
+            print(f"Failed to load user config from {CONFIG_FILE_PATH}: {e}. Using defaults.")
+    return AppConfig()
+
+def save_user_config(config: AppConfig):
+    """Зберігає налаштування користувача у файл."""
+    try:
+        with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(config.model_dump_json(indent=4))
+    except Exception as e:
+        print(f"Failed to save user config to {CONFIG_FILE_PATH}: {e}")
+
+# Екземпляр конфігу за замовчуванням (зчитаний з файлу або дефолтний)
+APP_SETTINGS = load_user_config()
 # Також надаємо доступ як до словника для зворотньої сумісності
 APP_CONFIG = APP_SETTINGS.model_dump()

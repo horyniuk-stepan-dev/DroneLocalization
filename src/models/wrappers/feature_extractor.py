@@ -98,6 +98,18 @@ class FeatureExtractor:
         rgb_tensor = torch.from_numpy(enhanced_image).float().div_(255.0)
         rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
 
+        # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
+        max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
+        orig_h, orig_w = rgb_tensor.shape[2], rgb_tensor.shape[3]
+        scale_factor = 1.0
+        if max(orig_h, orig_w) > max_edge:
+            scale_factor = max_edge / float(max(orig_h, orig_w))
+            new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
+            rgb_tensor = torch.nn.functional.interpolate(
+                rgb_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
+            logger.debug(f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
+
         # ALIKED очікує словник зі списком/тензором 'image'
         input_dict = {"image": rgb_tensor}
 
@@ -109,6 +121,9 @@ class FeatureExtractor:
         # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
         keypoints = aliked_out["keypoints"][0].cpu().numpy()
         descriptors = aliked_out["descriptors"][0].cpu().numpy()
+
+        if scale_factor != 1.0:
+            keypoints = keypoints / scale_factor
 
         # Фільтрація точок за маскою динамічних об'єктів (YOLO)
         if static_mask is not None and len(keypoints) > 0:
@@ -176,6 +191,19 @@ class FeatureExtractor:
             rgb = torch.tensor(p_img, pin_memory=True).float().div_(255.0)
             local_tensors.append(rgb.permute(2, 0, 1))
         local_batch = torch.stack(local_tensors).to(self.device, non_blocking=True)
+
+        # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
+        max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
+        orig_h, orig_w = local_batch.shape[2], local_batch.shape[3]
+        scale_factor = 1.0
+        if max(orig_h, orig_w) > max_edge:
+            scale_factor = max_edge / float(max(orig_h, orig_w))
+            new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
+            local_batch = torch.nn.functional.interpolate(
+                local_batch, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
+            logger.debug(f"Downscaled local batch extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
+
         is_xfeat = (
             hasattr(self.local_model, "__class__")
             and "XFeat" in self.local_model.__class__.__name__
@@ -234,6 +262,9 @@ class FeatureExtractor:
         global_descs = out_global.cpu().numpy()
         keypoints_batch = [kp.cpu().numpy() for kp in out_kpts]
         descriptors_batch = [desc.cpu().numpy() for desc in out_descs]
+
+        if scale_factor != 1.0:
+            keypoints_batch = [kp / scale_factor for kp in keypoints_batch]
 
         # Assembly
         results = []
