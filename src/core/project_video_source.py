@@ -1,6 +1,8 @@
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
+
+from dataclasses import asdict, dataclass
 from typing import Any
+
 
 @dataclass
 class ProjectVideoSource:
@@ -13,7 +15,7 @@ class ProjectVideoSource:
     enabled: bool = True
     priority: int = 0
     geo_bounds: tuple[float, float, float, float] | None = None
-    camera_params: dict[str, Any] | None = None  
+    camera_params: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -22,7 +24,7 @@ class ProjectVideoSource:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ProjectVideoSource":
+    def from_dict(cls, data: dict[str, Any]) -> ProjectVideoSource:
         d = dict(data)
         gb = d.get("geo_bounds")
         if gb is not None:

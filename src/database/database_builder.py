@@ -13,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from config.config import get_cfg, get_active_descriptor_cfg
+from config.config import get_active_descriptor_cfg, get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
@@ -144,7 +144,8 @@ class DatabaseBuilder:
         kp_scale = 1.0  # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
         if save_keypoint_video:
             try:
-                import sys, os
+                import os
+                import sys
                 kp_width = int(width * kp_scale)
                 kp_height = int(height * kp_scale)
                 kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"

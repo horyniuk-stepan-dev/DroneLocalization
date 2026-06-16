@@ -1,8 +1,8 @@
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -62,11 +62,11 @@ class RDDWrapper:
         self.max_keypoints = max_keypoints
 
         build_fn, read_config_fn, rdd_path = _import_rdd()
-        
+
         config_path = rdd_path / "configs" / "default.yaml"
         if not config_path.exists():
             raise FileNotFoundError(f"RDD config not found at {config_path}")
-            
+
         rdd_config = read_config_fn(str(config_path))
         rdd_config["device"] = device
         self.model = build_fn(config=rdd_config)

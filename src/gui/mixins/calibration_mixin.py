@@ -577,7 +577,7 @@ class CalibrationMixin:
         """Повертає source_id поточного активного джерела (базуючись на db_path)."""
         if not self.project_manager or not self.project_manager.is_loaded or not self.database:
             return "main"
-            
+
         current_db = str(Path(self.database.db_path).resolve())
         project_dir = self.project_manager.project_dir
         for src_dict in (self.project_manager.settings.video_sources or []):

@@ -60,7 +60,7 @@ class PatchifyRetrieval:
                     f"{ph}×{pw}px (min={MIN_PATCH_PX}px). "
                     f"Image size: {w}×{h}."
                 )
-            
+
             for r in range(rows):
                 for c in range(cols):
                     y1 = r * ph
@@ -103,7 +103,7 @@ class PatchifyRetrieval:
     @torch.no_grad()
     def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
         """Батчований інференс для групи патчів.
-        
+
         Використовує fe.dinov2_transform — нормалізація та розмір вже налаштовані
         відповідно до активного backend (DINOv2 або DINOv3).
         """
@@ -188,7 +188,7 @@ class PatchifyRetrieval:
 
         # Для кожного з num_patches query-патчів знаходимо top-K ref-патчів
         search_k = top_k * 3  # шукаємо більше для кращої агрегації
-        
+
         # Захист: search_k не може бути більше за розмір індексу (Fix Bug 4)
         max_k = self.patch_index.ntotal
         if search_k > max_k:
@@ -208,7 +208,7 @@ class PatchifyRetrieval:
                     continue
                 fid = int(self.patch_frame_ids[ref_idx])
                 score = float(scores[patch_idx, j])
-                
+
                 frame_scores[fid] = frame_scores.get(fid, 0.0) + score
                 frame_hits[fid] = frame_hits.get(fid, 0) + 1
 

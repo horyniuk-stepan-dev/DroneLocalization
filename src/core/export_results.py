@@ -196,7 +196,7 @@ class ResultExporter:
                 },
             )
             features.append(point)
-        
+
         feature_collection = geojson.FeatureCollection(
             features, properties={"exported_at": datetime.now().isoformat()}
         )

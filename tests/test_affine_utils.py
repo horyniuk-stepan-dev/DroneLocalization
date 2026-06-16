@@ -26,7 +26,7 @@ def test_compose_decompose_affine_5dof():
     ty = -50.0
 
     # Compose
-    matrix = compose_affine_5dof(scale_x, scale_y, angle, tx, ty)
+    matrix = compose_affine_5dof(tx=tx, ty=ty, sx=scale_x, sy=scale_y, angle=angle)
     assert matrix.shape == (2, 3)
 
     # Decompose

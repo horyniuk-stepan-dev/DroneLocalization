@@ -6,7 +6,6 @@ add_video_source_dialog.py — Діалог додавання нового ві
 """
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,

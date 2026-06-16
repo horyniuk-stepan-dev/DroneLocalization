@@ -10,10 +10,11 @@
   scale = depth_est.get_relative_scale(frame_rgb)  # float
 """
 
+
+import cv2
 import numpy as np
 import torch
-import cv2
-import contextlib
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -28,7 +29,7 @@ class DepthEstimator:
 
     def get_relative_scale(self, image_rgb: np.ndarray) -> float:
         """Повертає скалярний відносний масштаб (1/median_depth).
-        
+
         Менше значення = об'єкт далі (більша висота) = менший GSD.
         Більше значення = об'єкт ближче (менша висота) = більший GSD.
         """
@@ -38,16 +39,16 @@ class DepthEstimator:
         cx1, cx2 = w // 4, 3 * w // 4
         cy1, cy2 = h // 4, 3 * h // 4
         center_depth = depth[cy1:cy2, cx1:cx2]
-        
+
         # Маска валідних значень (не нулі)
         valid_mask = center_depth > 0
         if not np.any(valid_mask):
             return 1.0
-            
+
         median_d = float(np.median(center_depth[valid_mask]))
         if median_d < 1e-6:
             return 1.0
-            
+
         return 1.0 / median_d  # відносний scale: далі = менше
 
     @staticmethod
@@ -77,15 +78,15 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 from depth_anything_v2.dpt import DepthAnythingV2
             except ImportError:
                 # Шукаємо у third_party/Depth-Anything-V2
-                import sys
                 import os
+                import sys
                 project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
                 local_path = os.path.join(project_root, "third_party", "Depth-Anything-V2")
                 if os.path.exists(local_path):
                     sys.path.append(local_path)
                     from depth_anything_v2.dpt import DepthAnythingV2
                 else:
-                    raise ImportError(f"Depth-Anything-V2 not found in {local_path}")
+                    raise ImportError(f"Depth-Anything-V2 not found in {local_path}") from None
 
             model_configs = {
                 'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -93,25 +94,25 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
                 'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
             }
-            
+
             # Визначаємо тип енкодера (за замовчуванням vits для швидкості)
             encoder = 'vits'
             self._model = DepthAnythingV2(**model_configs[encoder])
-            
+
             import os
             # Шукаємо ваги за різними можливими іменами
             weight_names = [
                 f"depth_anything_v2_{encoder}.pth",
                 "depth_anything_v2_vits.pth"
             ]
-            
+
             weight_paths = []
             for name in weight_names:
                 weight_paths.extend([
                     os.path.join("models", name),
                     os.path.expanduser(f"~/.cache/depth_anything_v2/{name}")
                 ])
-            
+
             for wp in weight_paths:
                 if os.path.exists(wp):
                     self._model.load_state_dict(
@@ -123,7 +124,7 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 logger.warning(
                     f"Depth Anything V2 weights not found. Searched in: {weight_paths}"
                 )
-            
+
             self._model = self._model.to(self.device).eval()
             logger.info(f"Depth Anything V2 ({encoder}) initialized on {self.device}")
         except ImportError:

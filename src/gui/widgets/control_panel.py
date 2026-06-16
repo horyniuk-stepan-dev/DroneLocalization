@@ -531,7 +531,7 @@ class ControlPanel(QWidget):
         selected_items = self.sources_table.selectedItems()
         if not selected_items:
             return
-        
+
         row = selected_items[0].row()
         item = self.sources_table.item(row, 0)
         if item:

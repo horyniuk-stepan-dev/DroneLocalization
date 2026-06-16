@@ -1,5 +1,6 @@
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
 
 try:
     import supervision as sv
@@ -22,7 +23,7 @@ class ObjectTracker:
 
     def __init__(self, config: dict):
         self.config = config
-        
+
         if sv is None:
             raise ImportError("Package 'supervision' is required for ObjectTracker. Run 'pip install supervision'")
 
@@ -32,7 +33,7 @@ class ObjectTracker:
             minimum_matching_threshold=self.config.get("minimum_matching_threshold", 0.8),
             frame_rate=30,  # Default
         )
-        
+
         # COCO class names matching YOLO
         self._class_names = {
             0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
@@ -63,7 +64,7 @@ class ObjectTracker:
         detections: [{"class_id": int, "confidence": float, "bbox": [x1, y1, x2, y2]}, ...]
         """
         tracked_objects = []
-        
+
         if not detections:
             # supervision requires sv.Detections object even if empty to update track states
             sv_detections = sv.Detections.empty()
@@ -72,12 +73,12 @@ class ObjectTracker:
             bboxes = []
             confidences = []
             class_ids = []
-            
+
             for d in detections:
                 bboxes.append(d["bbox"])
                 confidences.append(d["confidence"])
                 class_ids.append(d["class_id"])
-            
+
             sv_detections = sv.Detections(
                 xyxy=np.array(bboxes, dtype=np.float32),
                 confidence=np.array(confidences, dtype=np.float32),
@@ -86,7 +87,7 @@ class ObjectTracker:
 
         # Update tracker
         tracked_sv_detections = self.tracker.update_with_detections(sv_detections)
-        
+
         # Convert back to TrackedObject
         if tracked_sv_detections is not None and len(tracked_sv_detections) > 0:
             for i in range(len(tracked_sv_detections)):
@@ -94,12 +95,12 @@ class ObjectTracker:
                 class_id = tracked_sv_detections.class_id[i]
                 confidence = tracked_sv_detections.confidence[i]
                 track_id = tracked_sv_detections.tracker_id[i]
-                
+
                 class_name = self._class_names.get(class_id, f"Class {class_id}")
-                
+
                 center_x = (xyxy[0] + xyxy[2]) / 2.0
                 center_y = (xyxy[1] + xyxy[3]) / 2.0
-                
+
                 tracked_objects.append(TrackedObject(
                     track_id=int(track_id),
                     class_id=int(class_id),
@@ -108,7 +109,7 @@ class ObjectTracker:
                     confidence=float(confidence),
                     center_px=(float(center_x), float(center_y))
                 ))
-                
+
         return tracked_objects
 
     def reset(self):

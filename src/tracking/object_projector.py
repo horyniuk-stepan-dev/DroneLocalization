@@ -1,7 +1,10 @@
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
+
 from src.geometry.transformations import GeometryTransforms
 from src.tracking.object_tracker import TrackedObject
+
 
 @dataclass
 class ObjectGPS:
@@ -14,10 +17,10 @@ class ObjectGPS:
 
 class ObjectProjector:
     """Проєктує піксельні координати об'єктів у GPS через наявні H та affine матриці."""
-    
+
     def __init__(self, calibration_manager):
         self.calibration_manager = calibration_manager
-        
+
     def _apply_rotation(self, px_x: float, px_y: float, angle: int, frame_w: int, frame_h: int) -> tuple[float, float]:
         """Обертає координати відповідно до повороту кадру (0, 90, 180, 270)."""
         if angle == 0:
@@ -40,34 +43,34 @@ class ObjectProjector:
         frame_h: int
     ) -> list[ObjectGPS]:
         """Трансформує центри bbox: Query px -> Ref px (H) -> Metric (Affine) -> GPS."""
-        
+
         if not objects or H is None or affine is None:
             return []
-        
+
         if not self.calibration_manager.converter.is_initialized:
             return []
-            
+
         objects_gps = []
-        
+
         for obj in objects:
             px_x, px_y = obj.center_px
-            
+
             # 1. Враховуємо обертання кадру
             rx, ry = self._apply_rotation(px_x, px_y, rotation_angle, frame_w, frame_h)
-            
+
             # 2. Query pixels -> Reference pixels (Homography)
             pt_query = np.array([[rx, ry]], dtype=np.float64)
             try:
                 pt_ref = GeometryTransforms.apply_homography(pt_query, H)
-                
+
                 # 3. Reference pixels -> Metric (Affine calibration)
                 pt_metric = GeometryTransforms.apply_affine(pt_ref, affine)
-                
+
                 # 4. Metric -> GPS (WGS84)
                 lat, lon = self.calibration_manager.converter.metric_to_gps(
                     float(pt_metric[0, 0]), float(pt_metric[0, 1])
                 )
-                
+
                 objects_gps.append(ObjectGPS(
                     track_id=obj.track_id,
                     class_name=obj.class_name,
@@ -78,5 +81,5 @@ class ObjectProjector:
             except Exception as e:
                 # В разі виродженої матриці або інших помилок математики
                 continue
-                
+
         return objects_gps

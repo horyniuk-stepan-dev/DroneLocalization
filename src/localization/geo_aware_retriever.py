@@ -24,12 +24,12 @@ logger = get_logger(__name__)
 class GeoAwareRetriever:
     """
     Геозалежний FAISS-ретривер з фоновою перебудовою індексу.
-    
+
     При виклику update_position():
     - Визначає новий набір frame_id через SpatialIndex
     - Якщо набір змінився — перебудовує FAISS у daemon-потоці
     - Під час перебудови поточний індекс залишається активним
-    
+
     Для джерел без frame_gps деградує до GlobalRetriever (повний масив).
     """
 
@@ -92,10 +92,10 @@ class GeoAwareRetriever:
     def update_position(self, lat: float, lon: float, radius_tiles: int = 2) -> bool:
         """
         Оновлює активну підмножину кадрів за GPS-позицією.
-        
+
         Якщо набір frame_id змінився — запускає перебудову FAISS у фоновому потоці.
         Під час перебудови поточний індекс залишається активним.
-        
+
         Returns:
             True якщо набір змінився (перебудова ініційована).
         """
@@ -153,7 +153,7 @@ class GeoAwareRetriever:
     ) -> list[tuple[int, float]]:
         """
         Пошук схожих кадрів у активному індексі.
-        
+
         Returns:
             Список (frame_id, cosine_score). frame_id — реальний ID у вихідній базі.
         """

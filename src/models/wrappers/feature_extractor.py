@@ -1,11 +1,10 @@
 import contextlib
-import cv2
 
 import numpy as np
 import torch
 import torchvision.transforms as T
 
-from config.config import get_cfg, get_active_descriptor_cfg
+from config.config import get_active_descriptor_cfg, get_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
 from src.utils.telemetry import Telemetry

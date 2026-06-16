@@ -154,17 +154,17 @@ class MultiAnchorCalibration:
             scale_corrections = []
             for i in range(len(self.anchors) - 1):
                 a1, a2 = self.anchors[i], self.anchors[i + 1]
-                
+
                 # GPS точки якорів
                 pts_gps_1 = a1.points_gps
                 pts_gps_2 = a2.points_gps
-                
+
                 if pts_gps_1 and pts_gps_2:
                     # Реальна метрична відстань між центрами якорів через GPS
                     m1 = self.converter.gps_to_metric(pts_gps_1[0][0], pts_gps_1[0][1])
                     m2 = self.converter.gps_to_metric(pts_gps_2[0][0], pts_gps_2[0][1])
                     gps_dist = np.linalg.norm(np.array(m1) - np.array(m2))
-                    
+
                     if gps_dist > 0.5:  # мін. 0.5м між якорями для стабільного розрахунку
                         scale_ratio = decomposed[i + 1, 2] / (decomposed[i, 2] + 1e-9)
                         scale_corrections.append(scale_ratio)
@@ -301,7 +301,7 @@ class MultiAnchorCalibration:
         depth_scale: float = 1.0,
     ) -> tuple[float, float] | None:
         """Версія get_metric_position з корекцією масштабу через depth.
-        
+
         depth_scale — відносний масштаб з DepthEstimator.get_relative_scale().
         При depth_scale > 1: об'єкт ближче (нижча висота) → більший pixel scale.
         При depth_scale < 1: об'єкт далі (вища висота) → менший pixel scale.
@@ -309,16 +309,16 @@ class MultiAnchorCalibration:
         result = self.get_metric_position(frame_id, x, y)
         if result is None:
             return None
-        
+
         mx, my = result
-        
+
         # Нормалізуємо depth_scale відносно reference (медіана всіх якорів).
         ref_depth = getattr(self, '_reference_depth_scale', 1.0)
         if ref_depth > 1e-6:
             correction = depth_scale / ref_depth
             # Обмежуємо корекцію: максимум 2x в будь-який бік
             correction = float(np.clip(correction, 0.5, 2.0))
-            
+
             # TODO: У майбутньому тут можна додати зміщення відносно оптичного центру
             # для більш точної компенсації паралаксу. Поки що — логуємо.
             if abs(correction - 1.0) > 0.05:
@@ -326,7 +326,7 @@ class MultiAnchorCalibration:
                     f"Depth scale correction: ref={ref_depth:.3f}, "
                     f"current={depth_scale:.3f}, ratio={correction:.3f}"
                 )
-        
+
         return mx, my
 
     def set_reference_depth_scale(self, depth_scale: float) -> None:

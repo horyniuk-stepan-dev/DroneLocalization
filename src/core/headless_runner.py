@@ -1,23 +1,22 @@
-import sys
-import time
 import signal
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QCoreApplication
 
 from config.config import APP_CONFIG, APP_SETTINGS
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader
 from src.database.multi_database_manager import MultiDatabaseManager
-from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
-from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.model_manager import ModelManager
-from src.workers.tracking_worker import RealtimeTrackingWorker
+from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.network.coordinates_broker import CoordinatesBroker
 from src.utils.logging_utils import get_logger
+from src.workers.tracking_worker import RealtimeTrackingWorker
 
 logger = get_logger(__name__)
 
@@ -31,7 +30,7 @@ class HeadlessRunner:
         self.app = QCoreApplication.instance()
         if not self.app:
             self.app = QCoreApplication(sys.argv)
-            
+
         self.model_manager = ModelManager(config=APP_CONFIG)
         self.calibration = MultiAnchorCalibration()
         self.database = None
@@ -40,7 +39,7 @@ class HeadlessRunner:
         # Мультиджерельна підтримка
         self.db_manager = None
         self.calib_manager = None
-        
+
         # Вмикаємо network api примусово для headless
         APP_SETTINGS.network_api.enabled = True
         self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
@@ -88,17 +87,17 @@ class HeadlessRunner:
             # Fallback: прямий шлях (legacy)
             db_path = self.project_dir / "database.h5"
             calib_path = self.project_dir / "calibration.json"
-            
+
             if not db_path.exists():
                 raise FileNotFoundError(f"Database not found at {db_path}")
-                
+
             self.database = DatabaseLoader(str(db_path))
             if calib_path.exists():
                 self.calibration.load(str(calib_path))
 
         if not self.database.is_propagated:
             logger.warning("Database is not propagated! Precision will be degraded.")
-            
+
         if not self.calibration.converter.is_initialized:
             ref_gps = self.calibration.converter.reference_gps
             if self.calibration.is_calibrated and ref_gps:
@@ -123,7 +122,7 @@ class HeadlessRunner:
 
         matcher = FeatureMatcher(model_manager=self.model_manager, config=APP_CONFIG)
         localizer_config = {**APP_CONFIG.model_dump(), "_model_manager": self.model_manager}
-        
+
         return Localizer(
             self.database, fe, matcher, self.calibration, config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
@@ -142,40 +141,40 @@ class HeadlessRunner:
             sys.exit(1)
 
         localizer = self._build_localizer()
-        
+
         self.tracking_worker = RealtimeTrackingWorker(
             self.video_source,
             localizer,
             model_manager=self.model_manager,
             config=APP_CONFIG,
         )
-        
+
         # Підключаємо брокер координат
         self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
         self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
-        
+
         def on_tracking_finished():
             logger.info("Tracking finished.")
             self.coordinates_broker.set_tracking_active(False)
             self.app.quit()
-            
+
         self.tracking_worker.finished.connect(on_tracking_finished)
-        
+
         def signal_handler(sig, frame):
             logger.info("\nCaught interrupt signal, stopping gracefully...")
             if self.tracking_worker and self.tracking_worker.isRunning():
                 self.tracking_worker.stop()
             else:
                 self.app.quit()
-                
+
         signal.signal(signal.SIGINT, signal_handler)
-        
+
         self.coordinates_broker.set_tracking_active(True)
         self.tracking_worker.start()
-        
+
         logger.info("System is running. Press Ctrl+C to stop.")
         self.app.exec()
-        
+
         # Очищення
         self.coordinates_broker.stop()
         logger.info("Headless runner exited gracefully.")

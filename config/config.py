@@ -4,7 +4,6 @@
 
 from typing import Any
 
-import torch
 from pydantic import BaseModel, Field
 
 
@@ -160,6 +159,7 @@ class PerformanceConfig(BaseModel):
 def get_default_local_extractor() -> str:
     """Визначає дефолтний екстрактор на основі доступної VRAM."""
     try:
+        import torch
         if torch.cuda.is_available():
             total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             if total_vram_gb < 7.5:  # 8GB cards usually show ~7.9GB

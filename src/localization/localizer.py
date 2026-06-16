@@ -150,7 +150,7 @@ class Localizer:
                 logger.info(
                     "Patchify enabled in config but database has no patch_descriptors. "
                 )
-        
+
         # Phase 3.2: GSD integration
         project_manager = self.config.get("_project_manager", None)
         if project_manager and project_manager.settings:
@@ -680,7 +680,7 @@ class Localizer:
         max_results: int | None = None,
     ) -> list[tuple[int, float]]:
         """Об'єднує результати стандартного та патч-retrieval через зважену суму.
-        
+
         Ваги беруться з конфігу (localization.patchify_merge_weight).
         Якщо кадр є в обох джерелах: score = w_std * s + w_patch * p.
         Якщо тільки в одному: беремо скор як є (не штрафуємо за відсутність в іншому).
@@ -696,7 +696,7 @@ class Localizer:
         for fid in all_fids:
             s = standard_dict.get(fid, 0.0)
             p = patch_dict.get(fid, 0.0)
-            
+
             if fid in standard_dict and fid in patch_dict:
                 merged[fid] = w_standard * s + w_patch * p
             elif fid in standard_dict:

@@ -209,11 +209,11 @@ class DatabaseMixin:
             # Очищення стану попереднього проєкту
             if hasattr(self, "calibration") and self.calibration:
                 self.calibration.clear()
-            
+
             if hasattr(self, "map_widget") and self.map_widget:
                 self.map_widget.clear_trajectory()
                 self.map_widget.clear_verification_markers()
-            
+
             if hasattr(self, "_tracking_results"):
                 self._tracking_results = []
 
@@ -486,7 +486,7 @@ class DatabaseMixin:
             if src_dict.get("source_id") == active_id:
                 video_path = src_dict.get("video_path", "")
                 break
-        
+
         # Якщо в settings не знайдено, fallback на загальний video_path
         if not video_path and self.project_manager.settings:
             video_path = self.project_manager.settings.video_path
@@ -569,7 +569,7 @@ class DatabaseMixin:
         """Обробка зміни активного джерела при кліку в таблиці."""
         if not self.db_manager:
             return
-            
+
         if source_id not in self.db_manager.all_source_ids:
             # Джерело вимкнено або не має БД
             self.database = None
@@ -581,7 +581,7 @@ class DatabaseMixin:
         self.database = self.db_manager.get_database(source_id)
         self.calibration = self.calib_manager.get(source_id)
         logger.info(f"Active source switched to: {source_id}")
-        
+
         self.status_bar.showMessage(f"Обрано джерело: {source_id}")
         self._update_project_info_panel()
         self._refresh_sources_panel()  # Щоб оновити підсвічування рядка в таблиці
@@ -616,10 +616,10 @@ class DatabaseMixin:
             source.enabled = not source.enabled
             settings.update_source(source)
             self.project_manager.save_project()
-            
+
             if hasattr(self, "db_manager") and self.db_manager:
                 self.db_manager.toggle_source(source)
-                
+
                 # Якщо вимкнули поточне джерело — перемикаємось на перше доступне
                 if not source.enabled and self._get_current_source_id() == source_id:
                     avail = self.db_manager.all_source_ids

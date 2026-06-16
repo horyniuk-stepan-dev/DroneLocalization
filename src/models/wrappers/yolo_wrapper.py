@@ -49,10 +49,10 @@ class YOLOWrapper:
         # і водночас не генерує масу хибних детекцій, які псують static_mask
         # classes: обмежуємо детекцію лише потрібними класами (люди, авто)
         results = self.model(
-            images, 
-            verbose=False, 
-            half=self.use_half, 
-            conf=0.25, 
+            images,
+            verbose=False,
+            half=self.use_half,
+            conf=0.25,
             classes=list(self.dynamic_classes)
         )
 

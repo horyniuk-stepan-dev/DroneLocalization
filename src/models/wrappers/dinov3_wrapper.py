@@ -18,7 +18,6 @@ Usage (drop-in for model_manager.load_dinov2):
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 

@@ -26,7 +26,7 @@ class MultiDatabaseManager:
     """
     Центральний координаційний клас.
     Замінює прямий доступ до одного DatabaseLoader.
-    
+
     Відповідає за:
     - Завантаження баз для enabled джерел
     - Створення retrievers (FAISS або LanceDB)
@@ -117,7 +117,7 @@ class MultiDatabaseManager:
             f"{len(self._active_source_ids)} active"
         )
 
-    def toggle_source(self, src: 'ProjectVideoSource') -> None:
+    def toggle_source(self, src: ProjectVideoSource) -> None:
         """Вмикає або вимикає джерело. Завантажує або вивантажує БД з пам'яті."""
         if src.enabled:
             if src.source_id not in self._databases:
@@ -146,7 +146,7 @@ class MultiDatabaseManager:
     ) -> tuple[str | None, list[tuple[int, float]]]:
         """
         Виконує vectorний пошук у кожній активній базі.
-        
+
         Returns:
             (source_id, candidates): source_id з найвищим top-1 score,
             candidates — список (frame_id, score). None якщо нічого не знайдено.
@@ -231,7 +231,7 @@ class MultiDatabaseManager:
         """
         Активує джерела, geo_bounds яких містять точку (lat, lon).
         Джерела без geo_bounds завжди залишаються активними.
-        
+
         Returns:
             True якщо набір активних джерел змінився.
         """

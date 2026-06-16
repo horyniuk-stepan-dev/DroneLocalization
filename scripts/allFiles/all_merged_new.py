@@ -949,9 +949,10 @@ class ProjectSettings:
     created_at: str
     video_path: str
 
-    # Internal relative paths (legacy — для зворотної сумісності)
-    database_filename: str = "database.h5"
-    calibration_filename: str = "calibration.json"
+    # Відносні шляхи файлів джерела 'main'
+    # Нові проєкти: sources/main/ — всі джерела в єдиній структурі
+    database_filename: str = "sources/main/database.h5"
+    calibration_filename: str = "sources/main/calibration.json"
 
     # Мультиджерельна конфігурація (список dict для JSON-серіалізації)
     video_sources: list[dict[str, Any]] = field(default_factory=list)
@@ -962,21 +963,21 @@ class ProjectSettings:
     sensor_width_mm: float = 8.8
     image_width_px: int = 4000
 
-    # Еталонна роздільна здатність відео, з якого побудована БД.
+    # Еталонна роздільність відео, з якого побудована БД.
     # Заповнюється автоматично при побудові бази даних.
-    # 0 означає "не встановлено" (зворотна сумісність зі старими проєктами).
+    # 0 означає "не встановлено".
     ref_frame_width: int = 0
     ref_frame_height: int = 0
 
     @classmethod
     def from_dict(cls, data: dict):
-        # Фільтруємо тільки відомі поля для зворотної сумісності
+        # Фільтруємо тільки відомі поля
         import dataclasses
         known_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known_fields}
         instance = cls(**filtered)
 
-        # Авто-міграція: якщо немає video_sources — створюємо з legacy полів
+        # Авто-міграція: якщо немає video_sources — створюємо з поточних полів
         if not instance.video_sources and instance.video_path:
             instance.video_sources = [
                 ProjectVideoSource(
@@ -985,14 +986,14 @@ class ProjectSettings:
                     video_path=instance.video_path,
                     database_file=instance.database_filename,
                     calibration_file=instance.calibration_filename,
-                    description="Auto-migrated from legacy project",
+                    description="Auto-migrated from project settings",
                     enabled=True,
                     priority=0,
                 ).to_dict()
             ]
             logger.info(
-                "Auto-migrated legacy project to video_sources format "
-                "(source_id='main', area_id='area_main')"
+                f"Auto-migrated project to video_sources format "
+                f"(source_id='main', db='{instance.database_filename}')"
             )
         return instance
 
@@ -1082,7 +1083,8 @@ class ProjectManager:
             # Ensure the directory exists
             self.project_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create subfolders for organization
+            # Створюємо стандартні підпапки
+            (self.project_dir / "sources" / "main").mkdir(parents=True, exist_ok=True)
             (self.project_dir / "panoramas").mkdir(exist_ok=True)
             (self.project_dir / "test_photos").mkdir(exist_ok=True)
             (self.project_dir / "test_videos").mkdir(exist_ok=True)
@@ -1095,10 +1097,25 @@ class ProjectManager:
                 focal_length_mm=mission_data.get("focal_length_mm", 13.2),
                 sensor_width_mm=mission_data.get("sensor_width_mm", 8.8),
                 image_width_px=mission_data.get("image_width_px", 4000),
+                # Залишаємо значення за замовчуванням (вже sources/main/)
             )
 
+            # Авто-створюємо video_sources для джерела main
+            self.settings.video_sources = [
+                ProjectVideoSource(
+                    source_id="main",
+                    area_id="area_main",
+                    video_path=mission_data.get("video_path", ""),
+                    database_file="sources/main/database.h5",
+                    calibration_file="sources/main/calibration.json",
+                    description="Primary video source",
+                    enabled=True,
+                    priority=0,
+                ).to_dict()
+            ]
+
             self.save_project()
-            logger.info(f"Project created successfully at: {self.project_dir}")
+            logger.info(f"Project created at: {self.project_dir} (sources/main/ structure)")
             return True
 
         except Exception as e:
@@ -1383,7 +1400,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from config.config import get_cfg
+from config.config import get_cfg, get_active_descriptor_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
@@ -1402,7 +1419,7 @@ class DatabaseBuilder:
         self.config = config or {}
         self.matcher = matcher
         db_cfg = self.config.get("database", {})
-        self.descriptor_dim = get_cfg(self.config, "dinov2.descriptor_dim", 384)
+        self.descriptor_dim = get_active_descriptor_cfg(self.config).descriptor_dim
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
@@ -1514,35 +1531,46 @@ class DatabaseBuilder:
         kp_scale = 1.0  # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
         if save_keypoint_video:
             try:
+                import sys, os
                 kp_width = int(width * kp_scale)
                 kp_height = int(height * kp_scale)
-
                 kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
 
-                # Attempt H.264 (avc1)
-                fourcc = cv2.VideoWriter_fourcc(*"avc1")
-                with silent_output():
-                    kp_writer = cv2.VideoWriter(
-                        kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
-                    )
+                # Порядок кодеків:
+                # - Windows: avc1 потребує openh264.dll → пропускаємо, щоб уникнути FFmpeg-шуму
+                # - XVID: надійний cross-platform без сторонніх DLL
+                # - mp4v: абсолютний fallback
+                codecs = []
+                if sys.platform != "win32":
+                    codecs.append("avc1")  # H.264 — тільки на Linux/macOS де є нативна підтримка
+                codecs += ["XVID", "mp4v"]
 
-                if not kp_writer or not kp_writer.isOpened():
-                    logger.warning("H.264 (avc1) codec not available, falling back to mp4v")
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    with silent_output():
-                        kp_writer = cv2.VideoWriter(
-                            kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                for codec_name in codecs:
+                    fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                    # Пригнічуємо C-рівневий stderr від FFmpeg (fd=2) щоб уникнути OpenH264-шуму
+                    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                    old_stderr_fd = os.dup(2)
+                    os.dup2(devnull_fd, 2)
+                    try:
+                        with silent_output():
+                            kp_writer = cv2.VideoWriter(
+                                kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                            )
+                    finally:
+                        os.dup2(old_stderr_fd, 2)
+                        os.close(old_stderr_fd)
+                        os.close(devnull_fd)
+
+                    if kp_writer and kp_writer.isOpened():
+                        logger.info(
+                            f"Keypoint video: {kp_video_path} | {kp_width}x{kp_height} | codec={codec_name}"
                         )
-
-                if kp_writer and kp_writer.isOpened():
-                    logger.info(
-                        f"Keypoint video will be saved to: {kp_video_path} at {kp_width}x{kp_height} (Scale: {kp_scale})"
-                    )
-                else:
-                    logger.warning(
-                        "Failed to initialize any compatible video codec, keypoint video disabled"
-                    )
+                        break
                     kp_writer = None
+                else:
+                    logger.warning("No compatible video codec found, keypoint video disabled")
+                    kp_writer = None
+
             except Exception as e:
                 logger.warning(f"VideoWriter initialization crashed: {e}")
                 kp_writer = None
@@ -1614,7 +1642,7 @@ class DatabaseBuilder:
             else:
                 # Use a small dummy tensor directly to save VRAM
                 with torch.no_grad():
-                    dino_size = get_cfg(self.config, "dinov2.input_size", 336)
+                    dino_size = get_active_descriptor_cfg(self.config).input_size
                     dummy_input = torch.zeros((1, 3, dino_size, dino_size)).to(model_manager.device)
                     # Use the same logic as FeatureExtractor
                     if cesp is not None:
@@ -2652,6 +2680,26 @@ class MultiDatabaseManager:
             f"MultiDatabaseManager initialized: {len(self._databases)} databases loaded, "
             f"{len(self._active_source_ids)} active"
         )
+
+    def toggle_source(self, src: 'ProjectVideoSource') -> None:
+        """Вмикає або вимикає джерело. Завантажує або вивантажує БД з пам'яті."""
+        if src.enabled:
+            if src.source_id not in self._databases:
+                self._load_sources([src])
+        else:
+            if src.source_id in self._databases:
+                try:
+                    self._databases[src.source_id].close()
+                except Exception as e:
+                    logger.warning(f"Error closing database '{src.source_id}': {e}")
+                del self._databases[src.source_id]
+            if src.source_id in self._retrievers:
+                del self._retrievers[src.source_id]
+            if src.source_id in self._sources:
+                del self._sources[src.source_id]
+            if src.source_id in self._active_source_ids:
+                self._active_source_ids.remove(src.source_id)
+            logger.info(f"Source '{src.source_id}' disabled and unloaded from memory.")
 
     # ── Retrieval ────────────────────────────────────────────────────────────
 
@@ -4382,6 +4430,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.toggle_objects_clicked.connect(self.on_toggle_objects)
         cp.add_source_clicked.connect(self.on_add_video_source)
         cp.source_action.connect(self.on_source_action)
+        cp.active_source_changed.connect(self.on_active_source_changed)
         self.map_widget.mapClicked.connect(self._on_map_clicked)
 
     def _on_map_clicked(self, lat: float, lon: float):
@@ -4706,10 +4755,11 @@ class CalibrationDialog(QDialog):
     anchor_confirmed = pyqtSignal(int)  # frame_id actually saved (from MainWindow)
     calibration_complete = pyqtSignal()
 
-    def __init__(self, database_path: str, existing_anchors=None, parent=None):
+    def __init__(self, database_path: str, existing_anchors=None, source_id: str = "main", parent=None):
         super().__init__(parent)
         self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
+        self.source_id = source_id
 
         self.points_2d = []
         self.points_gps = []
@@ -4730,7 +4780,7 @@ class CalibrationDialog(QDialog):
         self._frame_cache = OrderedDict()
         self._MAX_CACHE_SIZE = 32
 
-        self.setWindowTitle("GPS Калібрування — Мульти-якірний режим")
+        self.setWindowTitle(f"GPS Калібрування [{self.source_id}] — Мульти-якірний режим")
         self.resize(1200, 800)
         self._init_ui()
         self._refresh_anchors_list()
@@ -5789,6 +5839,7 @@ calibration_mixin.py — ВИПРАВЛЕНА ВЕРСІЯ
 """
 
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
@@ -5819,6 +5870,7 @@ class CalibrationMixin:
         self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
             existing_anchors=anchors_data,
+            source_id=self._get_current_source_id(),
             parent=self,
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
@@ -6004,7 +6056,9 @@ class CalibrationMixin:
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=best_M, qa_data=qa_data)
 
             if self.project_manager and self.project_manager.is_loaded:
-                self.calibration.save(self.project_manager.calibration_path)
+                cal_path = self._get_calibration_save_path()
+                if cal_path:
+                    self.calibration.save(cal_path)
 
             if hasattr(self, "_update_project_info_panel"):
                 self._update_project_info_panel()
@@ -6054,7 +6108,9 @@ class CalibrationMixin:
         try:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
-                    self.calibration.save(self.project_manager.calibration_path)
+                    cal_path = self._get_calibration_save_path()
+                    if cal_path:
+                        self.calibration.save(cal_path)
 
                 if hasattr(self, "_update_project_info_panel"):
                     self._update_project_info_panel()
@@ -6339,15 +6395,59 @@ class CalibrationMixin:
 
     # ── Save / Load calibration ──────────────────────────────────────────────
 
+    def _get_current_source_id(self) -> str:
+        """Повертає source_id поточного активного джерела (базуючись на db_path)."""
+        if not self.project_manager or not self.project_manager.is_loaded or not self.database:
+            return "main"
+            
+        current_db = str(Path(self.database.db_path).resolve())
+        project_dir = self.project_manager.project_dir
+        for src_dict in (self.project_manager.settings.video_sources or []):
+            db_file = src_dict.get("database_file", "")
+            if db_file and str((project_dir / db_file).resolve()) == current_db:
+                return src_dict.get("source_id", "main")
+        return "main"
+
+    def _get_calibration_save_path(self) -> str | None:
+        """Повертає шлях до calibration.json для поточного активного джерела.
+
+        Принцип: зіставляє `self.database.db_path` з `database_file` кожного
+        джерела в project settings, щоб знайти відповідний `calibration_file`.
+        Fallback: `project_manager.calibration_path` (корінь проєкту).
+        """
+        if not self.project_manager or not self.project_manager.is_loaded:
+            return None
+
+        project_dir = self.project_manager.project_dir
+
+        # Пошук джерела відповідно до поточної БД
+        if self.database and self.project_manager.settings:
+            current_db = str(Path(self.database.db_path).resolve())
+            for src_dict in (self.project_manager.settings.video_sources or []):
+                db_file = src_dict.get("database_file", "")
+                cal_file = src_dict.get("calibration_file", "")
+                if not db_file or not cal_file:
+                    continue
+                if str((project_dir / db_file).resolve()) == current_db:
+                    cal_path = project_dir / cal_file
+                    cal_path.parent.mkdir(parents=True, exist_ok=True)
+                    logger.debug(
+                        f"Calibration path: {cal_path} "
+                        f"(source='{src_dict.get('source_id', '?')}')"
+                    )
+                    return str(cal_path)
+
+        # Fallback — шлях на рівні проєкту
+        return self.project_manager.calibration_path
+
     @pyqtSlot()
     def on_save_calibration(self):
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
 
-        default_path = "calibration.json"
-        if self.project_manager and self.project_manager.is_loaded:
-            default_path = str(self.project_manager.project_dir / default_path)
+        # Дефолтний шлях — папка активного джерела
+        default_path = self._get_calibration_save_path() or "calibration.json"
 
         path, _ = QFileDialog.getSaveFileName(
             self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
@@ -6379,20 +6479,45 @@ class CalibrationMixin:
             self.calibration.load(path)
             ids = [a.frame_id for a in self.calibration.anchors]
             propagated = self.database and self.database.is_propagated
-            self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
             self.control_panel.update_status("Калібрування завантажено")
+
+            # Автоматично зберігаємо копію в папці поточного джерела
+            # (навіть якщо файл завантажено з іншого місця або скопійовано вручну)
+            source_cal_path = self._get_calibration_save_path()
+            copied_to_source = False
+            if source_cal_path:
+                norm_loaded = str(Path(path).resolve())
+                norm_source = str(Path(source_cal_path).resolve())
+                if norm_loaded != norm_source:
+                    # Файл прийшов не з папки джерела — копіюємо туди
+                    Path(source_cal_path).parent.mkdir(parents=True, exist_ok=True)
+                    self.calibration.save(source_cal_path)
+                    copied_to_source = True
+                    logger.info(
+                        f"Calibration copied to source folder: {source_cal_path}"
+                    )
+                else:
+                    logger.debug("Calibration loaded directly from source folder, no copy needed.")
 
             if hasattr(self, "_update_project_info_panel"):
                 self._update_project_info_panel()
 
+            copy_note = (
+                f"\n\n📋 Також збережено у папці джерела:\n{source_cal_path}"
+                if copied_to_source
+                else ""
+            )
+            self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
             QMessageBox.information(
                 self,
                 "Успіх",
                 f"Завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
-                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}",
+                f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}"
+                f"{copy_note}",
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
+
 
 
 # ================================================================================
@@ -6773,10 +6898,15 @@ class DatabaseMixin:
 
         # Зберігаємо калібрацію перед перегенерацією
         if self.calibration.is_calibrated:
-            calib_path = self.project_manager.calibration_path
+            calib_path = (
+                self._get_calibration_save_path()
+                if hasattr(self, "_get_calibration_save_path")
+                else self.project_manager.calibration_path
+            )
             if calib_path:
                 self.calibration.save(calib_path)
                 logger.info(f"Calibration saved before rebuild: {calib_path}")
+
 
         self._start_database_generation(video_path, self.project_manager.database_path)
 
@@ -6866,12 +6996,45 @@ class DatabaseMixin:
         self._refresh_sources_panel()
 
     def _refresh_sources_panel(self):
-        """Оновлює таблицю відеоджерел у ControlPanel."""
+        """Оновлює таблицю відеоджерел та бейдж активного джерела у ControlPanel."""
         if not self.project_manager.is_loaded or not self.project_manager.settings:
             return
         sources_raw = self.project_manager.settings.video_sources or []
         project_dir = str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
-        self.control_panel.update_sources_list(sources_raw, project_dir=project_dir)
+
+        # Визначаємо активне джерело
+        active_id = self._get_current_source_id()
+
+        # Отримуємо video_path для активного джерела
+        video_path = ""
+        for src_dict in sources_raw:
+            if src_dict.get("source_id") == active_id:
+                video_path = src_dict.get("video_path", "")
+                break
+        
+        # Якщо в settings не знайдено, fallback на загальний video_path
+        if not video_path and self.project_manager.settings:
+            video_path = self.project_manager.settings.video_path
+
+        self.control_panel.set_active_source(active_id, video_path or "")
+
+        # Визначаємо які джерела вже мають пропагацію в HDF5
+        # (калібрування може бути вбудоване в HDF5 без окремого calibration.json)
+        propagated_ids: set[str] = set()
+        if hasattr(self, "db_manager") and self.db_manager:
+            for sid in self.db_manager.all_source_ids:
+                db = self.db_manager.get_database(sid)
+                if db and db.is_propagated:
+                    propagated_ids.add(sid)
+        elif hasattr(self, "database") and self.database and self.database.is_propagated:
+            propagated_ids.add("main")
+
+        self.control_panel.update_sources_list(
+            sources_raw,
+            project_dir=project_dir,
+            active_source_id=active_id,
+            propagated_source_ids=propagated_ids,
+        )
 
     # ── Мультиджерельні слоти ─────────────────────────────────────────────────
 
@@ -6926,6 +7089,28 @@ class DatabaseMixin:
             f"Побудуйте БД через контекстне меню таблиці."
         )
 
+    @pyqtSlot(str)
+    def on_active_source_changed(self, source_id: str):
+        """Обробка зміни активного джерела при кліку в таблиці."""
+        if not self.db_manager:
+            return
+            
+        if source_id not in self.db_manager.all_source_ids:
+            # Джерело вимкнено або не має БД
+            self.database = None
+            self.calibration = None
+            self.status_bar.showMessage(f"Джерело '{source_id}' вимкнено або недоступне")
+            self._update_project_info_panel()
+            return
+
+        self.database = self.db_manager.get_database(source_id)
+        self.calibration = self.calib_manager.get(source_id)
+        logger.info(f"Active source switched to: {source_id}")
+        
+        self.status_bar.showMessage(f"Обрано джерело: {source_id}")
+        self._update_project_info_panel()
+        self._refresh_sources_panel()  # Щоб оновити підсвічування рядка в таблиці
+
     @pyqtSlot(str, str)
     def on_source_action(self, source_id: str, action: str):
         """Обробка дій з контекстного меню таблиці джерел."""
@@ -6956,6 +7141,20 @@ class DatabaseMixin:
             source.enabled = not source.enabled
             settings.update_source(source)
             self.project_manager.save_project()
+            
+            if hasattr(self, "db_manager") and self.db_manager:
+                self.db_manager.toggle_source(source)
+                
+                # Якщо вимкнули поточне джерело — перемикаємось на перше доступне
+                if not source.enabled and self._get_current_source_id() == source_id:
+                    avail = self.db_manager.all_source_ids
+                    if avail:
+                        self.on_active_source_changed(avail[0])
+                    else:
+                        self.database = None
+                        self.calibration = None
+                        self._update_project_info_panel()
+
             self._refresh_sources_panel()
             state = "увімкнено" if source.enabled else "вимкнено"
             self.status_bar.showMessage(f"Джерело '{source_id}' {state}")
@@ -7381,7 +7580,7 @@ class TrackingMixin:
         self.tracking_worker.objects_detected.connect(self.on_objects_detected)
         self.tracking_worker.objects_gps_updated.connect(self.on_objects_gps_updated)
         self.tracking_worker.finished.connect(self._on_tracking_finished)
-        
+
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
             self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
@@ -7392,8 +7591,17 @@ class TrackingMixin:
         self._object_tracking_results = []  # Список для результатів трекінгу об'єктів
 
         self.control_panel.set_tracking_enabled(False)
+
+        # Оновлюємо індикатор активного відеоджерела (червона мітка REC + ім'я файлу)
+        self.control_panel.mark_source_tracking(str(video_source))
+        # Тайтл-бар: додаємо ім'я відеофайлу
+        from pathlib import Path as _Path
+        src_name = _Path(str(video_source)).name if not str(video_source).startswith("rtsp") else "RTSP"
+        project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
+        self.setWindowTitle(f"Drone Topometric Localizer - {project_name}  🔴 {src_name}")
+
         self.tracking_worker.start()
-        self.status_bar.showMessage("Відстеження розпочато")
+        self.status_bar.showMessage(f"Відстеження: {src_name}")
 
     @pyqtSlot()
     def on_stop_tracking(self):
@@ -7415,6 +7623,14 @@ class TrackingMixin:
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.coordinates_broker.set_tracking_active(False)
         self.control_panel.set_tracking_enabled(True)
+        # Скидаємо бейдж з REC → звичайний зелений стан
+        self.control_panel.mark_source_tracking("")
+        # Повертаємо звичайний заголовок вікна
+        project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
+        self.setWindowTitle(
+            f"Drone Topometric Localizer - {project_name}" if project_name
+            else "Drone Topometric Localizer"
+        )
         self.status_bar.showMessage("Відстеження зупинено")
         self.control_panel.update_status("Очікування")
 
@@ -7463,8 +7679,9 @@ class TrackingMixin:
                 lat, lon = result["lat"], result["lon"]
                 conf = result["confidence"]
                 inliers = result.get("inliers", 0)
-                anchor = result.get("matched_frame", "?")  # ВИПРАВЛЕНО КЛЮЧ
-
+                anchor = result.get("matched_frame", "?")
+                source_id = result.get("source_id", "main")
+                
                 self.map_widget.update_marker(lat, lon)
                 is_fallback = result.get("fallback_mode") == "retrieval_only"
                 status_prefix = "ПРИБЛИЗНА Локалізація" if is_fallback else "Локалізація"
@@ -7472,13 +7689,10 @@ class TrackingMixin:
                 if "fov_polygon" in result and result["fov_polygon"] is not None:
                     self.map_widget.update_fov(result["fov_polygon"])
 
-                self.status_bar.showMessage(
-                    f"{status_prefix}: {lat:.6f}, {lon:.6f} | "
-                    f"Впевненість: {conf:.2f} | Точок: {inliers} | Якір: {anchor}"
-                )
-                self.control_panel.update_status(
-                    "Фото локалізовано (приблизно)" if is_fallback else "Фото локалізовано"
-                )
+                msg = f"{status_prefix}: {lat:.6f}, {lon:.6f} | Впевненість: {conf:.2f} | Якір: {anchor} | Джерело: {source_id}"
+                self.status_bar.showMessage(msg)
+                self.control_panel.update_status(f"Локалізовано ({conf:.2f})")
+
                 msg_box = QMessageBox(self)
                 msg_title = "⚓ Приблизна локалізація" if is_fallback else "⚓ Успіх"
                 msg_text = (
@@ -7489,7 +7703,8 @@ class TrackingMixin:
                 msg_text += (
                     f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
                     f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
-                    f"Якір: кадр {anchor}"
+                    f"Якір: кадр {anchor}\n"
+                    f"Джерело: {source_id}"
                 )
 
                 msg_box.setWindowTitle(msg_title)
@@ -7604,9 +7819,10 @@ __all__ = ["CalibrationMixin", "DatabaseMixin", "TrackingMixin", "PanoramaMixin"
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -7645,6 +7861,7 @@ class ControlPanel(QWidget):
     stop_db_generation_clicked = pyqtSignal()
     toggle_objects_clicked = pyqtSignal(bool)
     add_source_clicked = pyqtSignal()
+    active_source_changed = pyqtSignal(str)
     source_action = pyqtSignal(
         str, str
     )  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
@@ -7787,7 +8004,46 @@ class ControlPanel(QWidget):
         # Video Sources group (мультиджерельна підтримка)
         self.sources_group = QGroupBox("Відеоджерела")
         sources_layout = QVBoxLayout(self.sources_group)
+        sources_layout.setSpacing(6)
 
+        # ── Активне джерело (бейдж, завжди видимий при відкритому проєкті) ──
+        self._active_badge = QFrame()
+        self._active_badge.setFrameShape(QFrame.Shape.StyledPanel)
+        self._active_badge.setStyleSheet(
+            "QFrame { background: #f5f5f5; border: 1px solid #ddd; border-radius: 5px; }"
+        )
+        badge_layout = QHBoxLayout(self._active_badge)
+        badge_layout.setContentsMargins(8, 5, 8, 5)
+        badge_layout.setSpacing(6)
+
+        self._lbl_source_dot = QLabel("●")
+        self._lbl_source_dot.setStyleSheet("color: #bbb; font-size: 13px;")
+        self._lbl_source_dot.setFixedWidth(16)
+
+        self._lbl_source_id = QLabel("Не завантажено")
+        bold = QFont()
+        bold.setBold(True)
+        bold.setPointSize(10)
+        self._lbl_source_id.setFont(bold)
+        self._lbl_source_id.setStyleSheet("color: #333;")
+
+        self._lbl_source_type = QLabel()
+        self._lbl_source_type.setStyleSheet(
+            "color: #777; font-size: 9px; background: #e0e0e0; "
+            "border-radius: 3px; padding: 1px 4px;"
+        )
+
+        badge_layout.addWidget(self._lbl_source_dot)
+        badge_layout.addWidget(self._lbl_source_id, 1)
+        badge_layout.addWidget(self._lbl_source_type)
+        sources_layout.addWidget(self._active_badge)
+
+        self._lbl_source_video = QLabel()
+        self._lbl_source_video.setStyleSheet("font-size: 10px; color: #555; padding-left: 4px;")
+        self._lbl_source_video.setWordWrap(True)
+        sources_layout.addWidget(self._lbl_source_video)
+
+        # ── Таблиця (тільки для мульти-проєктів) ──
         self.sources_table = QTableWidget()
         self.sources_table.setColumnCount(3)
         self.sources_table.setHorizontalHeaderLabels(["Source ID", "Area", "Статус"])
@@ -7806,6 +8062,7 @@ class ControlPanel(QWidget):
         self.sources_table.setMaximumHeight(120)
         self.sources_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.sources_table.customContextMenuRequested.connect(self._on_sources_context_menu)
+        self.sources_table.itemSelectionChanged.connect(self._on_sources_selection_changed)
         self.sources_table.setVisible(False)  # Прихований до відкриття мульти-проєкту
         sources_layout.addWidget(self.sources_table)
 
@@ -7817,7 +8074,7 @@ class ControlPanel(QWidget):
         btn_row.addWidget(self.btn_add_source)
         sources_layout.addLayout(btn_row)
 
-        self.sources_group.setVisible(False)  # Показується тільки для мульти-проєктів
+        self.sources_group.setVisible(False)  # Показується тільки при відкритому проєкті
 
         for group in [
             self.db_group,
@@ -7909,6 +8166,8 @@ class ControlPanel(QWidget):
         self,
         sources: list[dict],
         project_dir: str = "",
+        active_source_id: str | None = None,
+        propagated_source_ids: set[str] | None = None,
     ):
         """Оновлює таблицю відеоджерел.
 
@@ -7916,10 +8175,15 @@ class ControlPanel(QWidget):
             sources: Список dict з полями source_id, area_id, enabled,
                      database_file, calibration_file.
             project_dir: Шлях до кореня проєкту для перевірки файлів.
+            active_source_id: ID поточного активного джерела (для підсвічування рядка).
+            propagated_source_ids: Множина source_id які вже мають пропагацію
+                                    в HDF5 (навіть без окремого calibration.json).
         """
+        propagated_source_ids = propagated_source_ids or set()
         is_multi = len(sources) > 1 or any(s.get("source_id") != "main" for s in sources)
-        # Група завжди видима при відкритому проєкті, таблиця — тільки для multi
+        # Група завжди видима при відкритому проєкті
         self.sources_group.setVisible(True)
+        # Таблиця — тільки для multi-source проєктів
         self.sources_table.setVisible(is_multi)
         self.btn_add_source.setVisible(True)
 
@@ -7936,9 +8200,15 @@ class ControlPanel(QWidget):
             status = "⏳ Очікує"
             status_color = QColor("#888")
             if project_dir:
-                db_exists = (Path(project_dir) / src.get("database_file", "")).exists()
-                cal_exists = (Path(project_dir) / src.get("calibration_file", "")).exists()
-                if db_exists and cal_exists:
+                db_path = Path(project_dir) / src.get("database_file", "")
+                cal_path = Path(project_dir) / src.get("calibration_file", "")
+                db_exists = db_path.exists()
+                # Калібрування вважається виконаним якщо:
+                # • існує окремий calibration.json, АБО
+                # • пропагація вже збережена всередині HDF5 (sid in propagated_source_ids)
+                is_calibrated = cal_path.exists() or sid in propagated_source_ids
+
+                if db_exists and is_calibrated:
                     status = "✅ Готово"
                     status_color = QColor("#2e7d32")
                 elif db_exists:
@@ -7963,6 +8233,83 @@ class ControlPanel(QWidget):
             self.sources_table.setItem(row, 0, item_sid)
             self.sources_table.setItem(row, 1, item_area)
             self.sources_table.setItem(row, 2, item_status)
+
+            # Підсвічуємо активний рядок
+            is_active = sid == active_source_id
+            bg = QColor("#e8f5e9") if is_active else QColor("transparent")
+            for col in range(3):
+                item = self.sources_table.item(row, col)
+                if item:
+                    item.setBackground(bg)
+
+    def set_active_source(
+        self,
+        source_id: str,
+        video_path: str = "",
+        source_type: str = "file",
+    ):
+        """Відображає активне відеоджерело у бейджі секції 'Відеоджерела'.
+
+        Args:
+            source_id: ID активного джерела (напр. 'main', 'area_north').
+            video_path: Повний шлях або URL відео.
+            source_type: 'file' | 'rtsp' | 'usb'
+        """
+        self.sources_group.setVisible(True)
+
+        # Назва файлу
+        if video_path:
+            if source_type == "rtsp":
+                short = video_path
+            elif source_type == "usb":
+                short = f"USB камера ({video_path})"
+            else:
+                short = Path(video_path).name
+        else:
+            short = ""
+
+        type_labels = {"rtsp": "📡 RTSP", "usb": "🔌 USB", "file": "📁 Файл"}
+        self._lbl_source_dot.setStyleSheet("color: #4caf50; font-size: 13px;")
+        self._lbl_source_id.setText(source_id)
+        self._lbl_source_type.setText(type_labels.get(source_type, "📁 Файл"))
+        self._lbl_source_video.setText(short)
+        self._active_badge.setStyleSheet(
+            "QFrame { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 5px; }"
+        )
+
+    def mark_source_tracking(self, video_source: str = ""):
+        """Оновлює бейдж: показує що відбувається активне трекінг-відео.
+
+        Args:
+            video_source: Шлях до файлу або RTSP URL що зараз відстежується.
+                          None/пусто — скинути стан трекінгу.
+        """
+        if not video_source:
+            # Скидаємо до стану проєкту (зелений без мітки REC)
+            self._lbl_source_dot.setStyleSheet("color: #4caf50; font-size: 13px;")
+            self._active_badge.setStyleSheet(
+                "QFrame { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 5px; }"
+            )
+            return
+
+        is_rtsp = str(video_source).lower().startswith("rtsp")
+        is_usb = str(video_source).isdigit() or str(video_source).startswith("usb")
+        if is_rtsp:
+            track_name = video_source
+            type_tag = "📡 RTSP"
+        elif is_usb:
+            track_name = f"USB камера ({video_source})"
+            type_tag = "🔌 USB"
+        else:
+            track_name = Path(str(video_source)).name
+            type_tag = "📁 Файл"
+
+        self._lbl_source_dot.setStyleSheet("color: #f44336; font-size: 13px;")
+        self._lbl_source_type.setText(f"🔴 REC  {type_tag}")
+        self._lbl_source_video.setText(track_name)
+        self._active_badge.setStyleSheet(
+            "QFrame { background: #fff3e0; border: 1px solid #ffcc02; border-radius: 5px; }"
+        )
 
     @pyqtSlot("QPoint")
     def _on_sources_context_menu(self, pos):
@@ -7995,6 +8342,20 @@ class ControlPanel(QWidget):
             self.source_action.emit(source_id, "toggle")
         elif action == act_remove:
             self.source_action.emit(source_id, "remove")
+
+    @pyqtSlot()
+    def _on_sources_selection_changed(self):
+        """Обробка зміни вибраного рядка таблиці."""
+        selected_items = self.sources_table.selectedItems()
+        if not selected_items:
+            return
+        
+        row = selected_items[0].row()
+        item = self.sources_table.item(row, 0)
+        if item:
+            source_id = item.data(Qt.ItemDataRole.UserRole)
+            if source_id:
+                self.active_source_changed.emit(source_id)
 
 
 # ================================================================================
@@ -9130,8 +9491,9 @@ class Localizer:
 
         logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
         logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
+        source_str = f" | source={self._active_source_id}" if self._active_source_id else ""
         logger.success(
-            f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id} | "
+            f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id}{source_str} | "
             f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
         )
 
@@ -9665,10 +10027,10 @@ logger = get_logger(__name__)
 
 
 class PatchifyRetrieval:
-    """Мультимасштабний retrieval через патч-дескриптори DINOv2.
+    """Мультимасштабний retrieval через патч-дескриптори DINOv2/DINOv3.
 
     Розбиває зображення на патчі за сітками (1×1, 2×2, 3×3) = 14 патчів,
-    для кожного витягує DINOv2 CLS-token, і шукає найбільш схожі кадри
+    для кожного витягує CLS-token, і шукає найбільш схожі кадри
     за агрегованими патч-скорами.
     """
 
@@ -9760,17 +10122,13 @@ class PatchifyRetrieval:
 
     @torch.no_grad()
     def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
-        """Батчований DINOv2 інференс для групи патчів."""
-        import torchvision.transforms as T
-
+        """Батчований інференс для групи патчів.
+        
+        Використовує fe.dinov2_transform — нормалізація та розмір вже налаштовані
+        відповідно до активного backend (DINOv2 або DINOv3).
+        """
         fe = self.feature_extractor
         device = fe.device
-
-        dino_size = fe.dino_size
-        transform = T.Compose([
-            T.Resize((dino_size, dino_size), antialias=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
 
         tensors = []
         for patch in patches:
@@ -9778,11 +10136,12 @@ class PatchifyRetrieval:
             tensors.append(t)
 
         batch_tensor = torch.stack(tensors).to(device, non_blocking=True)
-        batch_input = transform(batch_tensor)
+        # Використовуємо готовий transform з FeatureExtractor (правильні mean/std для активного backend)
+        batch_input = fe.dinov2_transform(batch_tensor)
 
         amp_dtype = fe.amp_dtype
         use_half = fe.use_half
-        
+
         # Визначаємо тип пристрою динамічно для коректного autocast (Fix Bug 2)
         device_type = "cuda" if "cuda" in str(device) else "cpu"
         enabled = use_half and device_type == "cuda"
@@ -9950,6 +10309,11 @@ except ImportError:
 
 
 try:
+    from src.models.wrappers.dinov3_wrapper import DINOv3Wrapper
+except ImportError:
+    DINOv3Wrapper = None
+
+try:
     from src.models.wrappers.cesp_module import CESP
 except ImportError:
     CESP = None
@@ -10071,7 +10435,7 @@ class ModelManager:
         logger.info("Starting centralized model prewarm sequence...")
         local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
         with silent_output():
-            self.load_dinov2()
+            self.load_dinov2()  # loads DINOv3 if backend="dinov3" in config
             self.load_local_extractor()
             lg_features = "rdd" if local_extractor == "rdd" else "aliked"
             self.load_lightglue(features=lg_features)
@@ -10403,12 +10767,53 @@ class ModelManager:
         return True
 
     def load_dinov2(self):
+        """
+        Завантажує глобальний дескриптор (DINOv2 або DINOv3).
+        Вибір здійснюється через AppConfig.global_descriptor.backend:
+          'dinov2' — torch.hub (ImageNet pretrained)
+          'dinov3' — HuggingFace (493M satellite pretrained)
+        """
         name = "dinov2"
         with self._model_lock:
             if name not in self.models:
-                repo = get_cfg(self.config, "models.dinov2.hub_repo", "facebookresearch/dinov2")
-                model_name = get_cfg(self.config, "models.dinov2.hub_model", "dinov2_vitl14")
-                vram_req = get_cfg(self.config, "models.dinov2.vram_required_mb", 1600.0)
+                backend = get_cfg(self.config, "global_descriptor.backend", "dinov2")
+
+                # ── DINOv3 path ──────────────────────────────────────────────
+                if backend == "dinov3":
+                    hf_model_id = get_cfg(
+                        self.config,
+                        "global_descriptor.dinov3.hf_model_id",
+                        "facebook/dinov3-vitl16-pretrain-sat493m",
+                    )
+                    vram_req = get_cfg(
+                        self.config, "global_descriptor.dinov3.vram_required_mb", 1600.0
+                    )
+                    logger.info(f"Loading DINOv3 (satellite-pretrained): {hf_model_id}")
+                    self._ensure_vram_available(vram_req)
+                    try:
+                        if DINOv3Wrapper is None:
+                            raise ImportError(
+                                "DINOv3Wrapper not available — install: pip install transformers"
+                            )
+                        model = DINOv3Wrapper(model_id=hf_model_id, device=self.device)
+                        self.models[name] = model
+                        logger.success(f"DINOv3 loaded: {hf_model_id} on {self.device}")
+                    except Exception as e:
+                        logger.error(f"Failed to load DINOv3: {e}", exc_info=True)
+                        raise
+                    self._register_model_usage(name)
+                    return self.models[name]
+
+                # ── DINOv2 path (torch.hub) ───────────────────────────────────
+                repo = get_cfg(
+                    self.config, "global_descriptor.dinov2.hub_repo", "facebookresearch/dinov2"
+                )
+                model_name = get_cfg(
+                    self.config, "global_descriptor.dinov2.hub_model", "dinov2_vitl14"
+                )
+                vram_req = get_cfg(
+                    self.config, "global_descriptor.dinov2.vram_required_mb", 1600.0
+                )
 
                 logger.info(f"Loading DINOv2 ({model_name}) model...")
                 self._ensure_vram_available(vram_req)
@@ -10723,6 +11128,118 @@ class CESP(nn.Module):
 
 
 # ================================================================================
+# File: models\wrappers\dinov3_wrapper.py
+# ================================================================================
+"""
+DINOv3 Wrapper for DroneLocalization.
+
+Replaces the standard DINOv2 (torch.hub) with facebook/dinov3-vitl16-pretrain-sat493m
+loaded via HuggingFace Transformers.
+
+Key differences from DINOv2:
+- Loaded via transformers.AutoModel (not torch.hub)
+- input_size: 224 (vs 336 for DINOv2)
+- patch_size: 16 (vs 14)
+- normalization: satellite-domain stats (vs ImageNet)
+- hidden_size: 1024 — SAME → existing databases are fully compatible
+
+Usage (drop-in for model_manager.load_dinov2):
+    wrapper = DINOv3Wrapper("facebook/dinov3-vitl16-pretrain-sat493m", device="cuda")
+    cls_token = wrapper(image_tensor)  # (B, 1024)
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+_HF_MODEL_ID = "facebook/dinov3-vitl16-pretrain-sat493m"
+
+
+class DINOv3Wrapper(nn.Module):
+    """
+    Drop-in wrapper for facebook/dinov3-vitl16-pretrain-sat493m.
+
+    Exposes the same call interface as DINOv2 from torch.hub:
+        forward(pixel_values) -> cls_token  # shape (B, 1024)
+        forward_features(pixel_values) -> dict with 'x_norm_patchtokens' and 'x_norm_clstoken'
+
+    This allows FeatureExtractor and CespModule to work without any changes.
+    """
+
+    def __init__(self, model_id: str = _HF_MODEL_ID, device: str = "cuda"):
+        super().__init__()
+        from transformers import AutoModel
+
+        logger.info(f"Loading DINOv3 from HuggingFace: {model_id} ...")
+        # trust_remote_code needed for custom DINOv3ViTModel architecture
+        self._model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+        self._model = self._model.eval().to(device)
+        self._device = device
+
+        hidden_size = self._model.config.hidden_size
+        logger.info(
+            f"DINOv3 loaded: hidden_size={hidden_size}, "
+            f"image_size={self._model.config.image_size}, "
+            f"patch_size={self._model.config.patch_size}"
+        )
+
+    @torch.no_grad()
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass returning the [CLS] token — identical interface to DINOv2.
+
+        Args:
+            pixel_values: (B, 3, H, W) float tensor, already normalized.
+
+        Returns:
+            cls_token: (B, 1024) float tensor.
+        """
+        outputs = self._model(pixel_values=pixel_values)
+        # HuggingFace ViT models expose last_hidden_state: (B, 1 + num_patches, hidden)
+        # Index 0 is the [CLS] token
+        cls_token = outputs.last_hidden_state[:, 0, :]
+        return cls_token
+
+    @torch.no_grad()
+    def forward_features(self, pixel_values: torch.Tensor) -> dict:
+        """
+        Returns patch tokens and CLS token — compatible with CESP module.
+
+        Returns dict with:
+            'x_norm_clstoken':    (B, 1024)
+            'x_norm_patchtokens': (B, num_patches, 1024)
+        """
+        outputs = self._model(pixel_values=pixel_values)
+        hidden = outputs.last_hidden_state  # (B, 1 + N_patches, 1024)
+        return {
+            "x_norm_clstoken": hidden[:, 0, :],
+            "x_norm_patchtokens": hidden[:, 1:, :],
+        }
+
+    def to(self, *args, **kwargs):
+        self._model = self._model.to(*args, **kwargs)
+        return self
+
+    def eval(self):
+        self._model = self._model.eval()
+        return self
+
+    def train(self, mode: bool = True):
+        # Keep model frozen — DINOv3 is always used in inference mode
+        self._model = self._model.eval()
+        return self
+
+    def parameters(self, recurse: bool = True):
+        return self._model.parameters(recurse=recurse)
+
+
+# ================================================================================
 # File: models\wrappers\feature_extractor.py
 # ================================================================================
 import contextlib
@@ -10732,7 +11249,7 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 
-from config.config import get_cfg
+from config.config import get_cfg, get_active_descriptor_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
 from src.utils.telemetry import Telemetry
@@ -10751,13 +11268,16 @@ class FeatureExtractor:
         self.preprocessor = ImagePreprocessor(config)
         self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
 
-        # Трансформації для DINOv2 (ImageNet стандарти)
-        dino_size = get_cfg(self.config, "dinov2.input_size", 336)
+        # Параметри нормалізації та розміру входу — беремо з активного backend (dinov2 або dinov3)
+        _desc_cfg = get_active_descriptor_cfg(self.config)
+        dino_size = _desc_cfg.input_size
+        dino_mean = _desc_cfg.normalize_mean
+        dino_std = _desc_cfg.normalize_std
         self.dino_size = dino_size
         self.dinov2_transform = T.Compose(
             [
                 T.Resize((dino_size, dino_size), antialias=True),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                T.Normalize(mean=dino_mean, std=dino_std),
             ]
         )
 
@@ -10773,8 +11293,11 @@ class FeatureExtractor:
 
         cesp_status = "with CESP" if cesp_module is not None else "without CESP"
         local_name = type(local_model).__name__
+        global_name = type(global_model).__name__
         logger.info(
-            f"FeatureExtractor initialized with {local_name} and DINOv2 ({cesp_status}) on {device}"
+            f"FeatureExtractor initialized: local={local_name}, global={global_name} "
+            f"({cesp_status}) | input_size={dino_size}, mean={dino_mean}, std={dino_std} "
+            f"| device={device}"
         )
 
         if device == "cuda":

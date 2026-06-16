@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox, QInputDialog
+from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 from config.config import get_cfg
 from src.localization.localizer import Localizer
@@ -122,9 +122,9 @@ class TrackingMixin:
             return
 
         source, ok = QInputDialog.getText(
-            self, 
-            "Живий потік", 
-            "Введіть RTSP URL (rtsp://...) або індекс камери (0, 1, usb:0):", 
+            self,
+            "Живий потік",
+            "Введіть RTSP URL (rtsp://...) або індекс камери (0, 1, usb:0):",
             text="rtsp://"
         )
         if not ok or not source:
@@ -251,7 +251,7 @@ class TrackingMixin:
                 inliers = result.get("inliers", 0)
                 anchor = result.get("matched_frame", "?")
                 source_id = result.get("source_id", "main")
-                
+
                 self.map_widget.update_marker(lat, lon)
                 is_fallback = result.get("fallback_mode") == "retrieval_only"
                 status_prefix = "ПРИБЛИЗНА Локалізація" if is_fallback else "Локалізація"
@@ -349,7 +349,7 @@ class TrackingMixin:
                 'label': f"#{obj.track_id} {obj.class_name}",
                 'class_name': obj.class_name
             })
-            
+
             if not hasattr(self, "_object_tracking_results"):
                 self._object_tracking_results = []
             self._object_tracking_results.append({
@@ -360,7 +360,7 @@ class TrackingMixin:
                 "confidence": obj.confidence,
                 "timestamp": str(np.datetime64("now"))
             })
-            
+
         if hasattr(self.map_widget, "update_object_markers"):
             self.map_widget.update_object_markers(points_to_show)
 

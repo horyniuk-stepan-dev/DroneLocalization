@@ -545,7 +545,7 @@ class CalibrationPropagationWorker(QThread):
                                 gps_count += 1
                             except Exception:
                                 pass
-                    
+
                     # Видаляємо старий датасет якщо є
                     if "frame_gps" in f:
                         del f["frame_gps"]

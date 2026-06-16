@@ -10,6 +10,7 @@ GSD = (altitude * sensor_width) / (focal_length * image_width_px)
 """
 
 from dataclasses import dataclass
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -39,7 +40,7 @@ class GSDCalculator:
 
     def scale_from_altitude(self, actual_altitude_m: float) -> float:
         """Scale factor відносно reference altitude.
-        
+
         Якщо дрон летить нижче reference → scale > 1 (більше пікселів на метр).
         Якщо дрон летить вище reference → scale < 1 (менше пікселів на метр).
         """

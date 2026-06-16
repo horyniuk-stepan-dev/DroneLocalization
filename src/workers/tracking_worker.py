@@ -53,18 +53,18 @@ class RealtimeTrackingWorker(QThread):
         if self.model_manager:
             self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
 
-        from src.tracking.object_tracker import ObjectTracker
         from src.tracking.object_projector import ObjectProjector
-        
+        from src.tracking.object_tracker import ObjectTracker
+
         object_tracker = None
         object_projector = None
-        
+
         is_tracking_enabled = False
         if isinstance(self.tracking_config, dict):
             is_tracking_enabled = self.tracking_config.get("enabled", False)
         else:
             is_tracking_enabled = getattr(self.tracking_config, "enabled", False)
-            
+
         if is_tracking_enabled:
             tracker_cfg = self.tracking_config if isinstance(self.tracking_config, dict) else self.tracking_config.model_dump()
             try:
@@ -97,7 +97,7 @@ class RealtimeTrackingWorker(QThread):
                 return
 
         from src.video.video_source import VideoSource, VideoSourceConfig
-        
+
         if isinstance(self.video_source, VideoSource):
             video_src = self.video_source
         else:
@@ -208,7 +208,7 @@ class RealtimeTrackingWorker(QThread):
                     prev_pts_for_of = cv2.goodFeaturesToTrack(
                         curr_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
                     )
-                    
+
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
                     # ОНОВЛЕНО: Завжди оновлюємо кеш, навіть якщо порожній, щоб об'єкти могли зникати
@@ -218,11 +218,11 @@ class RealtimeTrackingWorker(QThread):
                         H = self.localizer._last_state.get("H")
                         affine = self.localizer._last_state.get("affine")
                         angle = self.localizer._last_state.get("global_angle", 0)
-                        
+
                         if H is not None and affine is not None:
                             # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
                             scale = getattr(self.localizer, "_last_scale", 1.0)
-                            
+
                             # Створюємо копії об'єктів з масштабованими координатами
                             from copy import deepcopy
                             scaled_tracked_objects = []
@@ -231,9 +231,9 @@ class RealtimeTrackingWorker(QThread):
                                 s_obj.center_px = (obj.center_px[0] * scale, obj.center_px[1] * scale)
                                 s_obj.bbox = [c * scale for c in obj.bbox]
                                 scaled_tracked_objects.append(s_obj)
-                            
+
                             objects_gps = object_projector.project_objects(
-                                scaled_tracked_objects, H, affine, angle, 
+                                scaled_tracked_objects, H, affine, angle,
                                 int(frame.shape[1] * scale), int(frame.shape[0] * scale)
                             )
                             if objects_gps:
@@ -274,7 +274,7 @@ class RealtimeTrackingWorker(QThread):
                         # Оновлюємо стан так, щоб OF завжди рахувався ВІД КЛЮЧОВОГО КАДРУ,
                         # Це усуває проблему накопичення помилок (drift).
                         # Тому prev_gray_for_of та prev_pts_for_of не оновлюються тут!
-                        
+
                         # На OF-кадрах: повторно emit останні відомі об'єкти для візуальної
                         # безперервності (YOLO не запускається, тому нових детекцій немає)
                         if object_tracker:
