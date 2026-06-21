@@ -448,8 +448,20 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
     return T
 
 
-# Додаємо аліас, щоб не довелося змінювати назву у worker-і, якщо там досі викликається homography_to_similarity
-homography_to_similarity = homography_to_affine
+def homography_to_similarity(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
+    cx, cy = frame_w / 2.0, frame_h / 2.0
+    d = min(frame_w, frame_h) * 0.25
+    pts = np.array(
+        [[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]],
+        dtype=np.float64,
+    )
+    transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
+    if transformed is None:
+        return None
+    transformed = transformed.reshape(-1, 2).astype(np.float64)
+
+    T, _ = cv2.estimateAffinePartial2D(pts, transformed, method=cv2.LMEDS)
+    return T
 
 
 try:

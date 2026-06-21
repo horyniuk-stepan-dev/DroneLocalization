@@ -50,9 +50,9 @@ class GeometryTransforms:
                     return False
                 M = M / M[2, 2]
 
-                # Check perspective components (should be very small for top-down drone imagery)
-                # If these are large, the corners will fly off to infinity
-                if abs(M[2, 0]) > 0.005 or abs(M[2, 1]) > 0.005:
+                # Check perspective components (drone camera can tilt, so allow up to 0.02)
+                # If these are very large, the corners will fly off to infinity
+                if abs(M[2, 0]) > 0.02 or abs(M[2, 1]) > 0.02:
                     logger.debug(
                         f"Matrix invalid: Extreme perspective warp ({M[2, 0]:.5f}, {M[2, 1]:.5f})"
                     )
@@ -86,18 +86,19 @@ class GeometryTransforms:
                 return False
 
             # 3. Check Aspect Ratio (should be close to 1.0 for drone imagery)
-            # 5-DoF дозволяє анізотропію, але в межах реалістичної геометрії камери (зазвичай між 0.5 та 2.0)
+            # 5-DoF дозволяє анізотропію, але в межах реалістичної геометрії камери (зазвичай 0.75-1.33)
             aspect_ratio = scale_u / (scale_v + 1e-9)
-            if not (0.5 < aspect_ratio < 2.0):
+            if not (0.75 < aspect_ratio < 1.33):
                 logger.debug(
                     f"Matrix invalid: Extreme aspect ratio distortion ({aspect_ratio:.2f})"
                 )
                 return False
 
             # 4. Check Shear (cos of angle between basis vectors)
+            # Drone nadir mapping shouldn't have much shear. Reject if vectors are not ~orthogonal.
             shear = abs(np.dot(u, v) / (scale_u * scale_v + 1e-9))
-            if shear > max_shear:
-                logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
+            if shear > 0.1:  # max_shear = 0.1 means ~84 to 96 degrees
+                logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > 0.1)")
                 return False
 
             # 5. Check Rotation Stability
@@ -198,9 +199,9 @@ class GeometryTransforms:
             if fallback_to_affine:
                 logger.warning(
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
-                    f"Falling back to Full Affine (5 DoF)."
+                    f"Falling back to Partial Affine (4 DoF)."
                 )
-                M, mask = GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
+                M, mask = GeometryTransforms.estimate_affine_partial(src_pts, dst_pts, ransac_threshold)
                 if M is not None:
                     H_fallback = np.vstack([M, [0, 0, 1]])
                     return H_fallback, mask

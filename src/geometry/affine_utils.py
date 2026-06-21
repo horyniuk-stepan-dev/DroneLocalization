@@ -58,10 +58,11 @@ def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, fl
     return tx, ty, sx, sy, angle
 
 
-def compose_affine_5dof(tx: float, ty: float, sx: float, sy: float, angle: float) -> np.ndarray:
+def compose_affine_5dof(tx: float, ty: float, sx: float, sy: float, angle: float, sign: float = 1.0) -> np.ndarray:
     """
     Збирає афінну матрицю 2x3 з незалежними масштабами X та Y.
+    sign = -1.0 додає відображення по осі Y (необхідно для систем координат де Y-вниз мапиться на Y-вверх).
     """
     c = np.cos(angle)
     s = np.sin(angle)
-    return np.array([[c * sx, -s * sy, tx], [s * sx, c * sy, ty]], dtype=np.float64)
+    return np.array([[c * sx, -s * sign * sy, tx], [s * sx, c * sign * sy, ty]], dtype=np.float64)

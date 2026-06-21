@@ -634,6 +634,8 @@ class CalibrationPropagationWorker(QThread):
                     continue
 
                 # ВИКОРИСТОВУЄМО 5-DoF ДЕКОМПОЗИЦІЮ
+                det = np.linalg.det(frame_affine[left][:2, :2])
+                sign = -1.0 if det < 0 else 1.0
                 comp_left = np.array(decompose_affine_5dof(frame_affine[left]), dtype=np.float64)
                 comp_right = np.array(decompose_affine_5dof(frame_affine[right]), dtype=np.float64)
 
@@ -651,9 +653,9 @@ class CalibrationPropagationWorker(QThread):
                     sx = float(np.clip(sx, 1e-6, 1e6))
                     sy = float(np.clip(sy, 1e-6, 1e6))
 
-                    # ВИКОРИСТОВУЄМО 5-DoF КОМПОЗИЦІЮ
+                    # ВИКОРИСТОВУЄМО 5-DoF КОМПОЗИЦІЮ ЗІ ЗБЕРЕЖЕННЯМ ВІДОБРАЖЕННЯ
                     frame_affine[mid] = compose_affine_5dof(
-                        float(tx), float(ty), sx, sy, float(angle)
+                        float(tx), float(ty), sx, sy, float(angle), sign=sign
                     )
                     frame_valid[mid] = True
                     filled += 1

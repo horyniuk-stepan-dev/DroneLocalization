@@ -132,7 +132,11 @@ class DatabaseBuilder:
         )
 
         # Зберігаємо еталонну роздільну здатність у проєкт
-        if self._project_manager and hasattr(self._project_manager, 'settings') and self._project_manager.settings:
+        if (
+            self._project_manager
+            and hasattr(self._project_manager, "settings")
+            and self._project_manager.settings
+        ):
             self._project_manager.settings.ref_frame_width = width
             self._project_manager.settings.ref_frame_height = height
             self._project_manager.save_project()
@@ -146,6 +150,7 @@ class DatabaseBuilder:
             try:
                 import os
                 import sys
+
                 kp_width = int(width * kp_scale)
                 kp_height = int(height * kp_scale)
                 kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
@@ -221,11 +226,16 @@ class DatabaseBuilder:
         patchify = None
         if use_patchify:
             from src.localization.patchify import PatchifyRetrieval
-            patchify_grids = get_cfg(self.config, "localization.patchify_grids", [[1,1],[2,2],[3,3]])
+
+            patchify_grids = get_cfg(
+                self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
+            )
             patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
             patchify = PatchifyRetrieval(
-                feature_extractor, descriptor_dim=self.descriptor_dim,
-                grids=patchify_grids, batch_size=patchify_batch,
+                feature_extractor,
+                descriptor_dim=self.descriptor_dim,
+                grids=patchify_grids,
+                batch_size=patchify_batch,
             )
             logger.info(f"Patchify ENABLED for DB build: {patchify.num_patches} patches per frame")
 
@@ -235,6 +245,7 @@ class DatabaseBuilder:
         if depth_backend != "none":
             try:
                 from src.depth.depth_estimator import DepthEstimator
+
                 self._depth_estimator = DepthEstimator.build(
                     backend=depth_backend, device=model_manager.device
                 )
@@ -294,8 +305,13 @@ class DatabaseBuilder:
 
         # Create empty database structure
         logger.info("Creating HDF5 database structure...")
-        self.create_hdf5_structure(num_frames, width, height, use_patchify=use_patchify,
-                                  num_patches=patchify.num_patches if patchify else 0)
+        self.create_hdf5_structure(
+            num_frames,
+            width,
+            height,
+            use_patchify=use_patchify,
+            num_patches=patchify.num_patches if patchify else 0,
+        )
 
         current_pose = np.eye(3, dtype=np.float32)
         prev_features = None
@@ -514,7 +530,7 @@ class DatabaseBuilder:
                     self.lance_table.create_index(
                         metric="cosine",
                         num_partitions=min(256, saved_count // 8),
-                        num_sub_vectors=32
+                        num_sub_vectors=32,
                     )
 
             # Зберігаємо frame_index_map і actual_num_frames у metadata
@@ -635,7 +651,8 @@ class DatabaseBuilder:
             return None
 
         H, mask = GeometryTransforms.estimate_homography(
-            mkpts_a, mkpts_b,
+            mkpts_a,
+            mkpts_b,
             ransac_threshold=ransac_thresh,
             backend=homography_backend,
             use_mad_ransac=use_mad_ransac,
@@ -674,8 +691,14 @@ class DatabaseBuilder:
         angle_deg = abs(np.degrees(angle_rad))
         return angle_deg >= min_r
 
-    def create_hdf5_structure(self, num_frames: int, width: int, height: int,
-                              use_patchify: bool = False, num_patches: int = 0):
+    def create_hdf5_structure(
+        self,
+        num_frames: int,
+        width: int,
+        height: int,
+        use_patchify: bool = False,
+        num_patches: int = 0,
+    ):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
         chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
@@ -692,10 +715,12 @@ class DatabaseBuilder:
             if lance_path.exists():
                 shutil.rmtree(lance_path)
             db = lancedb.connect(str(lance_path))
-            schema = pa.schema([
-                pa.field("frame_id", pa.int32()),
-                pa.field("vector", pa.list_(pa.float32(), self.descriptor_dim))
-            ])
+            schema = pa.schema(
+                [
+                    pa.field("frame_id", pa.int32()),
+                    pa.field("vector", pa.list_(pa.float32(), self.descriptor_dim)),
+                ]
+            )
             self.lance_table = db.create_table("global_vectors", schema=schema, mode="create")
             self.lance_batch = []
             logger.info(f"LanceDB table created at {lance_path}")
@@ -795,7 +820,9 @@ class DatabaseBuilder:
                 )
                 g3.attrs["use_patchify"] = True
                 g3.attrs["patchify_num_patches"] = num_patches
-                logger.info(f"Patchify HDF5 group created: {num_patches} patches × {self.descriptor_dim}D")
+                logger.info(
+                    f"Patchify HDF5 group created: {num_patches} patches × {self.descriptor_dim}D"
+                )
 
             # Enable SWMR mode for parallel reading while writing
             f.swmr_mode = True
@@ -806,15 +833,14 @@ class DatabaseBuilder:
         """Save extracted data for a single frame via slice assignment (schema v2)"""
         with Telemetry.profile("hdf5_write"):
             if self.use_lancedb:
-                self.lance_batch.append({
-                    "frame_id": frame_id,
-                    "vector": features["global_desc"]
-                })
+                self.lance_batch.append({"frame_id": frame_id, "vector": features["global_desc"]})
                 if len(self.lance_batch) >= self.lance_batch_size:
                     self.lance_table.add(self.lance_batch)
                     self.lance_batch = []
             else:
-                self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+                self.db_file["global_descriptors"]["descriptors"][frame_id] = features[
+                    "global_desc"
+                ]
 
             self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
@@ -834,7 +860,9 @@ class DatabaseBuilder:
 
             # Patchify descriptors
             if "patch_descriptors" in features and "patch_descriptors" in self.db_file:
-                self.db_file["patch_descriptors"]["descriptors"][frame_id] = features["patch_descriptors"]
+                self.db_file["patch_descriptors"]["descriptors"][frame_id] = features[
+                    "patch_descriptors"
+                ]
 
             # Save depth scale
             if "depth_scale" in features:
