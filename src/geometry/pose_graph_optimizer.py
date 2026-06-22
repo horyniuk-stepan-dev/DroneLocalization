@@ -319,7 +319,7 @@ class PoseGraphOptimizer:
         angle_diff = theta_j - theta_i - sign * d['dtheta']
         res_edges[:, 4] = w_rot * np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
         
-        w_reg = 200.0 * d['cx']
+        w_reg = 1.0 * d['cx']
         x_reshaped = x.reshape(-1, 5)
         res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
         

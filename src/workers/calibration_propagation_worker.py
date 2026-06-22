@@ -246,6 +246,7 @@ class CalibrationPropagationWorker(QThread):
                 continue
 
             if last_success_feat is not None and (i - last_success_id) <= self.max_skip_frames:
+                # H maps feat_i → last_success_feat (to→from direction)
                 result = self._match_and_build_edge(feat_i, last_success_feat)
                 if result is not None:
                     H, inliers, rmse_val = result
@@ -381,7 +382,7 @@ class CalibrationPropagationWorker(QThread):
                 if feat_j is None:
                     continue
 
-                # Matching: feat_j → feat_i (H maps j pixels → i pixels)
+                # Matching: feat_j → feat_i (H maps j pixels → i pixels = to→from)
                 result = self._match_and_build_edge(feat_j, feat_i)
                 if result is None:
                     continue
