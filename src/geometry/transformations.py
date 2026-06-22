@@ -86,19 +86,19 @@ class GeometryTransforms:
                 return False
 
             # 3. Check Aspect Ratio (should be close to 1.0 for drone imagery)
-            # 5-DoF дозволяє анізотропію, але в межах реалістичної геометрії камери (зазвичай 0.75-1.33)
+            # Розширюємо межі анізотропії для швидкого польоту з нахилом камери
             aspect_ratio = scale_u / (scale_v + 1e-9)
-            if not (0.75 < aspect_ratio < 1.33):
+            if not (0.5 < aspect_ratio < 2.0):
                 logger.debug(
                     f"Matrix invalid: Extreme aspect ratio distortion ({aspect_ratio:.2f})"
                 )
                 return False
 
             # 4. Check Shear (cos of angle between basis vectors)
-            # Drone nadir mapping shouldn't have much shear. Reject if vectors are not ~orthogonal.
+            # Drone mapping shouldn't have extreme shear. Reject if vectors are not ~orthogonal.
             shear = abs(np.dot(u, v) / (scale_u * scale_v + 1e-9))
-            if shear > 0.1:  # max_shear = 0.1 means ~84 to 96 degrees
-                logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > 0.1)")
+            if shear > max_shear:
+                logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
                 return False
 
             # 5. Check Rotation Stability

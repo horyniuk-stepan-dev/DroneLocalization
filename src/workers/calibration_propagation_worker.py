@@ -173,6 +173,7 @@ class CalibrationPropagationWorker(QThread):
         results = optimizer.optimize(
             max_iterations=self.max_iters,
             tolerance=self.tolerance,
+            progress_callback=lambda msg: self.progress.emit(70, msg)
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
 

@@ -6,6 +6,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -47,7 +49,9 @@ class CalibrationDialog(QDialog):
     anchor_confirmed = pyqtSignal(int)  # frame_id actually saved (from MainWindow)
     calibration_complete = pyqtSignal()
 
-    def __init__(self, database_path: str, existing_anchors=None, source_id: str = "main", parent=None):
+    def __init__(
+        self, database_path: str, existing_anchors=None, source_id: str = "main", parent=None
+    ):
         super().__init__(parent)
         self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
@@ -56,6 +60,7 @@ class CalibrationDialog(QDialog):
         self.points_2d = []
         self.points_gps = []
         self.current_2d_point = None
+        self.editing_point_index = None
         self.last_slider_value = 0
         self._is_video = False
 
@@ -190,12 +195,26 @@ class CalibrationDialog(QDialog):
         coords_row.addWidget(QLabel("Lon:"))
         coords_row.addWidget(self.input_lon)
 
-        self.btn_add_point = QPushButton("➕  Додати точку")
+        self.btn_add_point = QPushButton("Додати точку")
         self.btn_add_point.clicked.connect(self.add_point_pair)
+
+        self.btn_cancel_edit = QPushButton("Скасувати")
+        self.btn_cancel_edit.setVisible(False)
+        self.btn_cancel_edit.clicked.connect(self.cancel_point_edit)
+
+        btn_add_row = QHBoxLayout()
+        btn_add_row.addWidget(self.btn_add_point)
+        btn_add_row.addWidget(self.btn_cancel_edit)
 
         self.points_list = QListWidget()
         self.points_list.setMaximumHeight(110)
         self.points_list.setStyleSheet("font-size: 11px;")
+        self.points_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.points_list.customContextMenuRequested.connect(self.on_points_right_clicked)
+        self.points_list.itemClicked.connect(self.on_point_item_clicked)
+        self.points_list.setToolTip(
+            "Клікніть на точку для редагування, або правою кнопкою для меню"
+        )
 
         self.btn_clear_points = QPushButton("🗑  Очистити поточні точки")
         self.btn_clear_points.setStyleSheet("color: #b71c1c; font-size: 11px;")
@@ -204,7 +223,7 @@ class CalibrationDialog(QDialog):
         pts.addWidget(self.lbl_selected_px)
         pts.addLayout(combined_row)
         pts.addLayout(coords_row)
-        pts.addWidget(self.btn_add_point)
+        pts.addLayout(btn_add_row)
         pts.addWidget(self.points_list)
         pts.addWidget(self.btn_clear_points)
 
@@ -212,7 +231,7 @@ class CalibrationDialog(QDialog):
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color: #ccc;")
 
-        self.btn_add_anchor = QPushButton("⚓  Додати якір для цього кадру")
+        self.btn_add_anchor = QPushButton("Додати якір для цього кадру")
         self.btn_add_anchor.setStyleSheet(
             "background:#1565C0; color:white; font-weight:bold; padding:11px; font-size:13px;"
         )
@@ -223,7 +242,7 @@ class CalibrationDialog(QDialog):
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setWordWrap(True)
 
-        self.btn_done = QPushButton("✅  Готово — запустити пропагацію по всій базі")
+        self.btn_done = QPushButton("Готово — запустити пропагацію по всій базі")
         self.btn_done.setStyleSheet(
             "background:#2e7d32; color:white; font-weight:bold; padding:11px; font-size:13px;"
         )
@@ -331,10 +350,7 @@ class CalibrationDialog(QDialog):
         if pts_2d and pts_gps:
             self.points_2d = [tuple(p) for p in pts_2d]
             self.points_gps = [tuple(p) for p in pts_gps]
-            for i, (p2d, pgps) in enumerate(zip(self.points_2d, self.points_gps)):
-                self.points_list.addItem(
-                    f"  {i + 1}. ({p2d[0]:.1f}, {p2d[1]:.1f}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
-                )
+            self._refresh_points_list()
             self._redraw_points()
         else:
             self.lbl_status.setText(f"⚠ У кадру {frame_id} немає точок для редагування.")
@@ -600,25 +616,35 @@ class CalibrationDialog(QDialog):
             QMessageBox.warning(self, "Помилка", "Введіть числові координати.")
             return
 
-        self.points_2d.append(self.current_2d_point)
-        self.points_gps.append((lat, lon))
-        n = len(self.points_2d)
-        self.points_list.addItem(
-            f"  {n}. ({self.current_2d_point[0]:.1f}, {self.current_2d_point[1]:.1f})"
-            f"  →  {lat:.5f}, {lon:.5f}"
-        )
+        if hasattr(self, "editing_point_index") and self.editing_point_index is not None:
+            self.points_2d[self.editing_point_index] = self.current_2d_point
+            self.points_gps[self.editing_point_index] = (lat, lon)
+            self.editing_point_index = None
+            self.btn_add_point.setText("Додати точку")
+            self.btn_cancel_edit.setVisible(False)
+            self.points_list.clearSelection()
+        else:
+            self.points_2d.append(self.current_2d_point)
+            self.points_gps.append((lat, lon))
+
         self.current_2d_point = None
         self.lbl_selected_px.setText("Клікніть на наступний орієнтир")
         self.input_combined.clear()
         self.input_lat.clear()
         self.input_lon.clear()
+        self._refresh_points_list()
         self._redraw_points()
 
     def clear_current_points(self):
         self.points_2d.clear()
         self.points_gps.clear()
         self.current_2d_point = None
-        self.points_list.clear()
+        self.editing_point_index = None
+        if hasattr(self, "btn_add_point"):
+            self.btn_add_point.setText("Додати точку")
+        if hasattr(self, "btn_cancel_edit"):
+            self.btn_cancel_edit.setVisible(False)
+        self._refresh_points_list()
         self.input_combined.clear()
         self.video_widget.clear_overlays()
         self.lbl_selected_px.setText("Клікніть на орієнтир у відео ↖")
@@ -631,6 +657,71 @@ class CalibrationDialog(QDialog):
             self.video_widget.draw_numbered_point(
                 self.current_2d_point[0], self.current_2d_point[1], "?", QColor(255, 80, 0)
             )
+
+    def _refresh_points_list(self):
+        self.points_list.clear()
+        for i, (p2d, pgps) in enumerate(zip(self.points_2d, self.points_gps)):
+            self.points_list.addItem(
+                f"  {i + 1}. ({p2d[0]:.1f}, {p2d[1]:.1f})  →  {pgps[0]:.5f}, {pgps[1]:.5f}"
+            )
+
+    def on_points_right_clicked(self, pos):
+        item = self.points_list.itemAt(pos)
+        if item is not None:
+            menu = QMenu(self)
+            copy_action = menu.addAction("Копіювати координати")
+            delete_action = menu.addAction("Видалити точку")
+
+            global_pos = self.points_list.mapToGlobal(pos)
+            action = menu.exec(global_pos)
+
+            if action == delete_action:
+                row = self.points_list.row(item)
+                if getattr(self, "editing_point_index", None) == row:
+                    self.editing_point_index = None
+                    self.btn_add_point.setText("Додати точку")
+                    self.btn_cancel_edit.setVisible(False)
+                elif getattr(self, "editing_point_index", None) is not None and row < self.editing_point_index:
+                    self.editing_point_index -= 1
+                self.points_2d.pop(row)
+                self.points_gps.pop(row)
+                self._refresh_points_list()
+                self._redraw_points()
+            elif action == copy_action:
+                row = self.points_list.row(item)
+                lat, lon = self.points_gps[row]
+                QApplication.clipboard().setText(f"{lat}, {lon}")
+
+    def on_point_item_clicked(self, item):
+        row = self.points_list.row(item)
+        if row < 0 or row >= len(self.points_gps):
+            return
+
+        lat, lon = self.points_gps[row]
+        self.input_lat.setText(str(lat))
+        self.input_lon.setText(str(lon))
+        self.input_combined.setText(f"{lat}, {lon}")
+
+        self.current_2d_point = self.points_2d[row]
+        self.editing_point_index = row
+        self.btn_add_point.setText("Оновити точку")
+        self.btn_cancel_edit.setVisible(True)
+        self.lbl_selected_px.setText(
+            f"✔ Обрано піксель: ({self.current_2d_point[0]:.1f}, {self.current_2d_point[1]:.1f})"
+        )
+        self._redraw_points()
+
+    def cancel_point_edit(self):
+        self.editing_point_index = None
+        self.btn_add_point.setText("Додати точку")
+        self.btn_cancel_edit.setVisible(False)
+        self.points_list.clearSelection()
+        self.current_2d_point = None
+        self.lbl_selected_px.setText("Клікніть на орієнтир у відео ↖")
+        self.input_combined.clear()
+        self.input_lat.clear()
+        self.input_lon.clear()
+        self._redraw_points()
 
     # ── Add anchor ───────────────────────────────────────────────────────────
 

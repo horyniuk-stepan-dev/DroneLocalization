@@ -201,20 +201,28 @@
             var points = JSON.parse(pointsJson);
             points.forEach(p => {
                 var m = L.circleMarker([p.lat, p.lon], {
-                    radius: 5,
+                    radius: 4,
                     color: '#ffffff',
                     weight: 1,
                     fillColor: p.color || '#007bff',
                     fillOpacity: 0.8
                 });
-                // Постійний тултіп з номером кадру
-                m.bindTooltip(p.label.toString(), {
-                    permanent: true,
-                    direction: 'top',
-                    className: 'marker-label'
-                });
+                if (p.label && p.label !== "") {
+                    m.bindTooltip(p.label.toString(), {
+                        permanent: true,
+                        direction: 'top',
+                        className: 'marker-label'
+                    });
+                }
                 verificationMarkers.addLayer(m);
             });
+
+            if (points.length > 1) {
+                var lineCoords = points.map(p => [p.lat, p.lon]);
+                var polyline = L.polyline(lineCoords, { color: '#00ff00', weight: 2, opacity: 0.8 });
+                verificationMarkers.addLayer(polyline);
+            }
+
             if (points.length > 0) {
                 var bounds = L.latLngBounds(points.map(p => [p.lat, p.lon]));
                 map.fitBounds(bounds);

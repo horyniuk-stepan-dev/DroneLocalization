@@ -438,7 +438,7 @@ class CalibrationMixin:
         try:
             self.map_widget.clear_verification_markers()
             num_frames = self.database.get_num_frames()
-            step = max(1, num_frames // 30)
+            step = 1  # Відображати всі кадри
 
             rmse_data = getattr(self.database, "frame_rmse", None)
             dis_data = getattr(self.database, "frame_disagreement", None)
@@ -509,44 +509,13 @@ class CalibrationMixin:
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    # ВИПРАВЛЕННЯ: Відмальовуємо координати повного кадру замість затиснутої рамки
-                    pts_px = [
-                        (0, 0),  # Лівий верхній кут
-                        (w, 0),  # Правий верхній кут
-                        (w, h),  # Правий нижній кут
-                        (0, h),  # Лівий нижній кут
-                    ]
-                    for idx_p, (px, py) in enumerate(pts_px):
-                        mx_p, my_p = (
-                            affine[0, 0] * px + affine[0, 1] * py + affine[0, 2],
-                            affine[1, 0] * px + affine[1, 1] * py + affine[1, 2],
-                        )
-                        lat_p, lon_p = self.calibration.converter.metric_to_gps(
-                            float(mx_p), float(my_p)
-                        )
-                        points_to_show.append(
-                            {
-                                "lat": float(lat_p),
-                                "lon": float(lon_p),
-                                "label": f"Кадр {i} Корнер {idx_p}",
-                                "color": "gray",
-                            }
-                        )
-
+                    # Відмальовуємо тільки центр кадру
                     points_to_show.append(
                         {
                             "lat": float(lat_c),
                             "lon": float(lon_c),
-                            "label": f"Кадр {i} (Центр) | RMSE:{rmse:.1f}м | Mat:{matches}",
+                            "label": str(i),
                             "color": color,
-                        }
-                    )
-                    points_to_show.append(
-                        {
-                            "lat": float(lat_b),
-                            "lon": float(lon_b),
-                            "label": f"Кадр {i} (Низ) | RMSE:{rmse:.1f}м",
-                            "color": "blue",
                         }
                     )
 

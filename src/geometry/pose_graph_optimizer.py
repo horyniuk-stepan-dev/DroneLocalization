@@ -160,7 +160,7 @@ class PoseGraphOptimizer:
         )
         return count
 
-    def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6) -> dict[int, np.ndarray]:
+    def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6, progress_callback=None) -> dict[int, np.ndarray]:
         if not self._edges:
             logger.warning("No edges — returning current states as-is")
             return self._export_results()
@@ -199,11 +199,67 @@ class PoseGraphOptimizer:
         )
 
         # jac_sparsity is ignored by 'lm'. method='trf' with sparse jacobian runs 100x faster.
+        import time
+        self._nfev = 0
+        self._start_time = time.time()
+        self._last_cb_time = self._start_time
+
+        # Prepare vectorized data
+        total_nodes = len(self._node_ids)
+        node_id_to_idx = {nid: i for i, nid in enumerate(self._node_ids)}
+        
+        X_fixed = np.zeros((total_nodes, 5), dtype=np.float64)
+        for fid, state in self._fixed_nodes.items():
+            if fid in node_id_to_idx:
+                X_fixed[node_id_to_idx[fid]] = state
+                
+        free_indices_in_full = [node_id_to_idx[fid] for fid in free_ids]
+        edges_from = np.array([node_id_to_idx[e.from_id] for e in valid_edges], dtype=np.int32)
+        edges_to = np.array([node_id_to_idx[e.to_id] for e in valid_edges], dtype=np.int32)
+        
+        d = {
+            'X_full': X_fixed,
+            'free_indices': free_indices_in_full,
+            'edges_from': edges_from,
+            'edges_to': edges_to,
+            'dtx': np.array([e.dtx for e in valid_edges], dtype=np.float64),
+            'dty': np.array([e.dty for e in valid_edges], dtype=np.float64),
+            'log_dsx': np.array([e.log_dsx for e in valid_edges], dtype=np.float64),
+            'log_dsy': np.array([e.log_dsy for e in valid_edges], dtype=np.float64),
+            'dtheta': np.array([e.dtheta for e in valid_edges], dtype=np.float64),
+            'weights': np.array([e.weight for e in valid_edges], dtype=np.float64),
+            'cx': self.cx,
+            'sign': self._sign,
+            'n_edges': n_edges,
+            'callback': progress_callback
+        }
+
+        def residual_wrapper(x, d_dict):
+            self._nfev += 1
+            now = time.time()
+            if d_dict['callback'] and (now - self._last_cb_time > 1.0):
+                elapsed = now - self._start_time
+                rate = self._nfev / elapsed if elapsed > 0 else 0
+                max_evals = max_iterations * n_vars
+                remaining = max_evals - self._nfev
+                
+                if remaining < 0:
+                    msg = f"Глобальна оптимізація: фіналізація... (обчислень: {self._nfev}), швидкість {rate:.0f} it/s"
+                else:
+                    eta = remaining / rate if rate > 0 else 0
+                    m, s = divmod(int(eta), 60)
+                    eta_str = f"{m}хв {s:02d}с" if m > 0 else f"{s}с"
+                    msg = f"Глобальна оптимізація: обчислення {self._nfev}/{max_evals}, швидкість {rate:.0f} it/s, ETA: {eta_str}"
+                    
+                d_dict['callback'](msg)
+                self._last_cb_time = now
+            return self._residuals_vec(x, d_dict)
+
         safe_tolerance = max(tolerance, 1e-15)
         result = least_squares(
-            fun=self._residuals,
+            fun=residual_wrapper,
             x0=x0,
-            args=(valid_edges, id_to_var, n_edges),
+            args=(d,),
             method="trf",
             jac="2-point",
             jac_sparsity=jac_sp,
@@ -225,44 +281,49 @@ class PoseGraphOptimizer:
     def _residuals(
         self, x: np.ndarray, valid_edges: list[GraphEdge], id_to_var: dict[int, int], n_edges: int
     ) -> np.ndarray:
-        n_free = len(id_to_var)
-        residuals = np.zeros(n_edges * 5 + n_free, dtype=np.float64)
+        # Старий не векторний метод (залишено для сумісності, але використовується _residuals_vec)
+        pass
 
-        for k, edge in enumerate(valid_edges):
-            state_i = self._read_state(x, edge.from_id, id_to_var)
-            state_j = self._read_state(x, edge.to_id, id_to_var)
-
-            tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i
-            tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j
-            sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
-            w = edge.weight
-
-            c_i, s_i = np.cos(theta_i), np.sin(theta_i)
-            pred_tx_j = tx_i + c_i * sx_i * edge.dtx - self._sign * s_i * sy_i * edge.dty
-            pred_ty_j = ty_i + s_i * sx_i * edge.dtx + self._sign * c_i * sy_i * edge.dty
-
-            w_trans_x = w / sx_i
-            w_trans_y = w / sy_i
-            w_scale = w * self.cx
-            w_rot = w * self.cx
-
-            base = 5 * k
-            residuals[base + 0] = w_trans_x * (tx_j - pred_tx_j)
-            residuals[base + 1] = w_trans_y * (ty_j - pred_ty_j)
-            residuals[base + 2] = w_scale * (log_sx_j - log_sx_i - edge.log_dsx)
-            residuals[base + 3] = w_scale * (log_sy_j - log_sy_i - edge.log_dsy)
-
-            angle_diff = theta_j - theta_i - self._sign * edge.dtheta
-            residuals[base + 4] = w_rot * np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
-
-        # Square Pixel Constraint
-        w_reg = 200.0 * self.cx
-        for idx, fid in enumerate(id_to_var.keys()):
-            log_sx = x[5 * idx + 2]
-            log_sy = x[5 * idx + 3]
-            residuals[n_edges * 5 + idx] = w_reg * (log_sx - log_sy)
-
-        return residuals
+    def _residuals_vec(self, x: np.ndarray, d: dict) -> np.ndarray:
+        X_full = d['X_full']
+        X_full[d['free_indices']] = x.reshape(-1, 5)
+        
+        state_i = X_full[d['edges_from']]
+        state_j = X_full[d['edges_to']]
+        
+        tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i.T
+        tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j.T
+        
+        sx_i = np.exp(log_sx_i)
+        sy_i = np.exp(log_sy_i)
+        
+        w = d['weights']
+        c_i = np.cos(theta_i)
+        s_i = np.sin(theta_i)
+        sign = d['sign']
+        
+        pred_tx_j = tx_i + c_i * sx_i * d['dtx'] - sign * s_i * sy_i * d['dty']
+        pred_ty_j = ty_i + s_i * sx_i * d['dtx'] + sign * c_i * sy_i * d['dty']
+        
+        w_trans_x = w / sx_i
+        w_trans_y = w / sy_i
+        w_scale = w * d['cx']
+        w_rot = w * d['cx']
+        
+        res_edges = np.zeros((d['n_edges'], 5), dtype=np.float64)
+        res_edges[:, 0] = w_trans_x * (tx_j - pred_tx_j)
+        res_edges[:, 1] = w_trans_y * (ty_j - pred_ty_j)
+        res_edges[:, 2] = w_scale * (log_sx_j - log_sx_i - d['log_dsx'])
+        res_edges[:, 3] = w_scale * (log_sy_j - log_sy_i - d['log_dsy'])
+        
+        angle_diff = theta_j - theta_i - sign * d['dtheta']
+        res_edges[:, 4] = w_rot * np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
+        
+        w_reg = 200.0 * d['cx']
+        x_reshaped = x.reshape(-1, 5)
+        res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
+        
+        return np.concatenate([res_edges.flatten(), res_reg])
 
     def _build_jac_sparsity(self, valid_edges, id_to_var, n_residuals, n_vars, n_edges):
         sp = lil_matrix((n_residuals, n_vars), dtype=np.int8)
