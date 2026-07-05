@@ -89,6 +89,38 @@ class FeatureExtractor:
         return global_desc
 
     @torch.no_grad()
+    def extract_global_descriptors_multi(self, images: list[np.ndarray]) -> np.ndarray:
+        """Глобальні дескриптори для СПИСКУ зображень одним forward-пасом.
+
+        A2: використовується для 4 ротацій кадру при auto_rotation — один
+        батчований ViT-forward замість чотирьох послідовних (~3× швидше на GPU).
+        Зображення можуть мати різні розміри (90°-ротації), тому resize
+        виконується по-кадрово, а батчується вже (B, 3, S, S).
+        """
+        if not images:
+            return np.empty((0, 0), dtype=np.float32)
+
+        with Telemetry.profile("dinov2"):
+            prepped = []
+            for img in images:
+                t = torch.from_numpy(np.ascontiguousarray(img)).float().div_(255.0)
+                t = t.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+                prepped.append(self.dinov2_transform(t)[0])
+            batch = torch.stack(prepped)  # (B, 3, S, S)
+
+            if self.cesp_module is not None:
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                    features = self.global_model.forward_features(batch)
+                patch_tokens = features["x_norm_patchtokens"].float()
+                h_p = w_p = self.dino_size // 14
+                out = self.cesp_module(patch_tokens, h_p, w_p)
+            else:
+                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                    out = self.global_model(batch)
+
+            return out.float().cpu().numpy()
+
+    @torch.no_grad()
     def extract_local_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
         logger.debug(f"Extracting local features (ALIKED) from image: {image.shape}")
 

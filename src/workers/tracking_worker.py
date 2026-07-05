@@ -232,12 +232,13 @@ class RealtimeTrackingWorker(QThread):
                             # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
                             scale = getattr(self.localizer, "_last_scale", 1.0)
 
-                            # Створюємо копії об'єктів з масштабованими координатами
-                            from copy import deepcopy
+                            # Shallow copy достатньо: перезаписуємо лише center_px і bbox
+                            # (deepcopy на кожен об'єкт кожного keyframe — зайвий CPU)
+                            from copy import copy as _shallow_copy
 
                             scaled_tracked_objects = []
                             for obj in tracked_objects:
-                                s_obj = deepcopy(obj)
+                                s_obj = _shallow_copy(obj)
                                 s_obj.center_px = (
                                     obj.center_px[0] * scale,
                                     obj.center_px[1] * scale,
@@ -262,11 +263,10 @@ class RealtimeTrackingWorker(QThread):
                                 )
                             self.objects_gps_updated.emit(objects_gps)
 
-                # Fix OOM: Clear PyTorch CUDA cache after heavy keyframe
-                import torch
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # ВИПРАВЛЕНО (A1): раніше тут був torch.cuda.empty_cache() після
+                # КОЖНОГО keyframe — це синхронізує GPU і повертає блоки драйверу,
+                # через що наступні алокації йдуть повільним cudaMalloc (10–100 мс
+                # "податку" на keyframe). При OOM кеш чиститься у except-гілці вище.
             else:
                 # ====== OPTICAL FLOW TRACKING ======
                 if prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
@@ -282,9 +282,30 @@ class RealtimeTrackingWorker(QThread):
                     good_old = prev_pts_for_of[status == 1]
 
                     if len(good_new) > 10:
-                        # Зсув у пікселях
+                        # Зсув у пікселях (fallback, якщо симілярність не зійдеться)
                         flow_vectors = good_new - good_old
                         dx_px, dy_px = np.median(flow_vectors, axis=0)
+
+                        # B4: повна симілярність (R+T+S) замість чистої трансляції —
+                        # враховує обертання дрона та зміну висоти між keyframe-ами.
+                        # flow_quality (0..1) — чесна оцінка якості OF для Kalman R.
+                        flow_affine = None
+                        flow_quality = None
+                        try:
+                            S_of, of_mask = cv2.estimateAffinePartial2D(
+                                good_old,
+                                good_new,
+                                method=cv2.RANSAC,
+                                ransacReprojThreshold=3.0,
+                            )
+                            if S_of is not None and np.all(np.isfinite(S_of)):
+                                flow_affine = S_of
+                                if of_mask is not None and len(of_mask) > 0:
+                                    inlier_ratio = float(of_mask.sum()) / len(of_mask)
+                                    n_norm = min(1.0, len(good_new) / 120.0)
+                                    flow_quality = inlier_ratio * n_norm
+                        except cv2.error:
+                            pass
 
                         try:
                             loc_result = self.localizer.localize_optical_flow(
@@ -293,6 +314,8 @@ class RealtimeTrackingWorker(QThread):
                                 dt=calculated_dt,
                                 rot_width=frame.shape[1],
                                 rot_height=frame.shape[0],
+                                flow_affine=flow_affine,
+                                flow_quality=flow_quality,
                             )
                         except Exception as e:
                             logger.error(f"OF Localization error: {e}")

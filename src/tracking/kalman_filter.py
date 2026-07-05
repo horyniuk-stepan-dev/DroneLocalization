@@ -33,6 +33,8 @@ class TrajectoryFilter:
         self.kf.H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
 
         self.kf.R = np.array([[measurement_noise, 0.0], [0.0, measurement_noise]])
+        # Базовий R для адаптивного масштабування за confidence локалізації
+        self._base_R = self.kf.R.copy()
 
         self._update_matrices_for_dt(dt)
 
@@ -55,7 +57,11 @@ class TrajectoryFilter:
         self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
         self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
 
-    def update(self, measurement: tuple, dt: float = 1.0) -> tuple:
+    def update(self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0) -> tuple:
+        """noise_scale — адаптивний множник шуму вимірювання (B2):
+        > 1 для слабких/відносних вимірювань (низький confidence, optical flow),
+        1.0 для впевнених. Дозволяє фільтру менше довіряти поганим вимірюванням.
+        """
         z = np.array([[measurement[0]], [measurement[1]]])
 
         if not self.is_initialized:
@@ -63,6 +69,9 @@ class TrajectoryFilter:
             self.is_initialized = True
             logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
             return measurement
+
+        ns = float(np.clip(noise_scale, 0.25, 25.0))
+        self.kf.R = self._base_R * ns
 
         dt = max(0.01, min(dt, 5.0))
         self._update_matrices_for_dt(dt)

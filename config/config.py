@@ -67,7 +67,9 @@ class ConfidenceConfig(BaseModel):
 class LocalizationConfig(BaseModel):
     min_matches: int = 12
     min_inliers_accept: int = 10
-    ratio_threshold: float = 0.85
+    # 0.75 = рекомендація Lowe's ratio test; 0.85 пропускало забагато хибних
+    # збігів (конфіг перекривав фікс "БАГ 4" у matcher.py)
+    ratio_threshold: float = 0.75
     ransac_threshold: float = 3.0
     retrieval_top_k: int = 12
     early_stop_inliers: int = 40
@@ -88,8 +90,12 @@ class TrackingConfig(BaseModel):
     kalman_process_noise: float = 2.0
     kalman_measurement_noise: float = 5.0
     outlier_window: int = 10
-    outlier_threshold_std: float = 150.0
-    max_speed_mps: float = 1000.0
+    # ВИПРАВЛЕНО: 150.0 фактично ВИМИКАЛО Z-score фільтр (z>150 не буває).
+    # 4.0 = класичний статистичний поріг для викидів.
+    outlier_threshold_std: float = 4.0
+    # ВИПРАВЛЕНО: 1000 м/с (3.6 млн км/год) не фільтрувало нічого.
+    # 120 м/с покриває будь-який реальний дрон із запасом.
+    max_speed_mps: float = 120.0
     max_consecutive_outliers: int = 3
     process_fps: float = 1.0
     keyframe_interval: int = 30  # Кожен N-й кадр — повна локалізація, решта — Optical Flow
@@ -213,7 +219,11 @@ class ModelsConfig(BaseModel):
 
 
 class ProjectionConfig(BaseModel):
-    default_mode: str = "WEB_MERCATOR"
+    # UTM: справжні метри. WEB_MERCATOR розтягує відстані у 1/cos(lat)
+    # (~1.5x на широтах України), через що RMSE/пороги/GSD були неузгоджені
+    # з реальними метрами. Існуючі калібрування зберігають свою проєкцію
+    # з файлу — зміна впливає лише на нові.
+    default_mode: str = "UTM"
     strict_projection: bool = True
     fallback_to_webmercator: bool = True
     anchor_rmse_threshold_m: float = 3.0
@@ -249,6 +259,13 @@ class GraphOptimizationConfig(BaseModel):
     # Levenberg-Marquardt оптимізатор
     max_iterations: int = 50
     convergence_tolerance: float = 1e-6
+
+    # Robust loss: 'soft_l1' пригнічує вплив хибних loop closure на всю
+    # траєкторію (чистий L2 дозволяв одному поганому ребру тягнути розв'язок).
+    # 'linear' = стара поведінка. f_scale — межа переходу в robust-режим
+    # (у одиницях зважених резидуалів ≈ пікселі).
+    robust_loss: str = "soft_l1"  # "linear" | "soft_l1" | "huber"
+    robust_f_scale: float = 3.0
 
     # BFS ініціалізація початкового наближення
     use_bfs_initialization: bool = True
@@ -388,7 +405,7 @@ def save_user_config(config: AppConfig):
     except Exception as e:
         print(f"Failed to save user config to {CONFIG_FILE_PATH}: {e}")
 
-# Екземпляр конфігу за замовчуванням (зчитаний з файлу або дефолтний)
+# Екземпляр конфігу за замовчуванням (зчитаний з файлу або дефолтний).
 APP_SETTINGS = load_user_config()
 # Також надаємо доступ як до словника для зворотньої сумісності
 APP_CONFIG = APP_SETTINGS.model_dump()

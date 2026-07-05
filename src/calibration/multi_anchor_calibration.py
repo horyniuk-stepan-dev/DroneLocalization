@@ -21,10 +21,10 @@ logger = get_logger(__name__)
 
 # Єдине джерело — src.geometry.affine_utils (усунення дублювання)
 from src.geometry.affine_utils import (
-    compose_affine as _compose_affine,
+    compose_affine_5dof as _compose_affine_5dof,
 )
 from src.geometry.affine_utils import (
-    decompose_affine as _decompose_affine,
+    decompose_affine_5dof as _decompose_affine_5dof,
 )
 from src.geometry.affine_utils import (
     unwrap_angles as _unwrap_angles,
@@ -117,101 +117,110 @@ class AnchorCalibration:
 class MultiAnchorCalibration:
     """Менеджер декількох якорів калібрування з підтримкою версіонування та проєкцій"""
 
-    VERSION: str = "2.2"
+    VERSION: str = "2.3"
 
     def __init__(self, converter: CoordinateConverter | None = None) -> None:
         self.anchors: list[AnchorCalibration] = []
         self.converter = converter or CoordinateConverter("WEB_MERCATOR")
         self._interp: PchipInterpolator | None = None  # кешований інтерполятор
+        self._interp_sign: float = -1.0  # знак det якірних матриць (Y-flip)
+        self._interp_range: tuple[float, float] | None = None  # [перший, останній] якір
+        self._ref_px: tuple[float, float] = (0.0, 0.0)  # опорний піксель декомпозиції
+        self._frame_size: tuple[int, int] | None = None  # (width, height) кадру
+
+    def set_frame_size(self, width: int, height: int) -> None:
+        """Розмір кадру: інтерполяція параметризується навколо центру кадру."""
+        new_size = (int(width), int(height))
+        if new_size != self._frame_size and new_size[0] > 0 and new_size[1] > 0:
+            self._frame_size = new_size
+            self._rebuild_interpolators()
+
+    def _reference_pixel(self) -> tuple[float, float]:
+        """Опорний піксель для декомпозиції (центр кадру або центроїд точок)."""
+        if self._frame_size:
+            return self._frame_size[0] / 2.0, self._frame_size[1] / 2.0
+        # Fallback: центроїд точок усіх якорів — стабільна точка всередині кадру
+        pts = [p for a in self.anchors for p in (a.points_2d or [])]
+        if pts:
+            arr = np.asarray(pts, dtype=np.float64)
+            return float(arr[:, 0].mean()), float(arr[:, 1].mean())
+        return 0.0, 0.0
 
     def _rebuild_interpolators(self) -> None:
         """
-        Перебудовує PCHIP-інтерполятори на основі ДЕКОМПОЗИЦІЇ афінних матриць.
+        Перебудовує PCHIP-інтерполятор на основі 5-DoF декомпозиції якірних матриць.
 
-        Замість поелементної інтерполяції raw-компонентів матриці (що порушує
-        жорсткість обертання і призводить до артефактів зсуву/shear), кожна
-        матриця розкладається на: (tx, ty, scale, angle).  Кути розгортаються
-        через np.unwrap для уникнення стрибків через ±π.  Для кожного з 4
-        скалярних каналів будується окремий PchipInterpolator.  При запиті
-        (_get_interpolated_matrix) компоненти відновлюються назад у валідну
-        афінну матрицю через _compose_affine.
+        ВИПРАВЛЕНО (критичний баг): попередня 4-DoF декомпозиція (tx, ty, scale,
+        angle) не кодувала віддзеркалення осі Y, а якірні матриці pixel→metric
+        ЗАВЖДИ мають det < 0 (піксельна вісь Y ↓, метрична ↑). Реконструйована
+        матриця виходила з det > 0 — Y-складова дзеркалилась, і позиції між
+        якорями їхали на десятки метрів, тоді як точно на якорі результат був
+        правильним → різкі стрибки біля якорів.
+
+        Тепер: інтерполюються (rx, ry, sx, sy, angle), де (rx, ry) — метрична
+        позиція ОПОРНОГО ПІКСЕЛЯ (центр кадру), а глобальний знак det
+        зберігається окремо і відновлюється при композиції. Параметризація
+        навколо центру кадру (а не пікселя (0,0)) прибирає "гойдання" центру
+        при зміні кута між якорями.
         """
+        self._interp = None
+        self._interp_range = None
         if len(self.anchors) < 2:
-            self._interp = None
             logger.debug(f"Interpolator not built: need ≥2 anchors, have {len(self.anchors)}")
             return
 
+        dets = np.array(
+            [np.linalg.det(a.affine_matrix[:2, :2]) for a in self.anchors], dtype=np.float64
+        )
+        n_neg = int(np.sum(dets < 0))
+        if 0 < n_neg < len(dets):
+            logger.warning(
+                f"Anchors have MIXED determinant signs ({n_neg}/{len(dets)} negative). "
+                f"One of the anchors is likely mirrored (swapped lat/lon?). "
+                f"Interpolation may be unreliable — recheck anchor points."
+            )
+        self._interp_sign = -1.0 if n_neg * 2 >= len(dets) else 1.0
+
+        cx, cy = self._reference_pixel()
+        self._ref_px = (cx, cy)
+
         ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
-        decomposed = np.array(
-            [_decompose_affine(a.affine_matrix) for a in self.anchors],
-            dtype=np.float64,
-        )  # shape (N, 4): tx, ty, scale, angle
-
-        # ── НОВИЙ БЛОК: GPS scale normalization (Phase 1.1) ──────────────────
-        # Для кожної пари сусідніх якорів: обчислюємо реальну GPS відстань
-        # і порівнюємо з пікселевою відстанню через affine.
-        if len(self.anchors) >= 2:
-            scale_corrections = []
-            for i in range(len(self.anchors) - 1):
-                a1, a2 = self.anchors[i], self.anchors[i + 1]
-
-                # GPS точки якорів
-                pts_gps_1 = a1.points_gps
-                pts_gps_2 = a2.points_gps
-
-                if pts_gps_1 and pts_gps_2:
-                    # Реальна метрична відстань між центрами якорів через GPS
-                    m1 = self.converter.gps_to_metric(pts_gps_1[0][0], pts_gps_1[0][1])
-                    m2 = self.converter.gps_to_metric(pts_gps_2[0][0], pts_gps_2[0][1])
-                    gps_dist = np.linalg.norm(np.array(m1) - np.array(m2))
-
-                    if gps_dist > 0.5:  # мін. 0.5м між якорями для стабільного розрахунку
-                        scale_ratio = decomposed[i + 1, 2] / (decomposed[i, 2] + 1e-9)
-                        scale_corrections.append(scale_ratio)
-                        logger.debug(
-                            f"Anchor pair ({a1.frame_id}, {a2.frame_id}): "
-                            f"gps_dist={gps_dist:.1f}m, scale_ratio={scale_ratio:.4f}"
-                        )
-        # ── Кінець блоку аналізу масштабу ─────────────────────────────────────
+        comps = np.zeros((len(self.anchors), 5), dtype=np.float64)
+        for i, a in enumerate(self.anchors):
+            M = a.affine_matrix
+            _, _, sx, sy, angle = _decompose_affine_5dof(M)
+            # Метрична позиція опорного пікселя — інтерполюємо саме її
+            rx = M[0, 0] * cx + M[0, 1] * cy + M[0, 2]
+            ry = M[1, 0] * cx + M[1, 1] * cy + M[1, 2]
+            comps[i] = (rx, ry, sx, sy, angle)
 
         # Розгортаємо кути для коректної інтерполяції через межу ±π
-        decomposed[:, 3] = _unwrap_angles(decomposed[:, 3])
+        comps[:, 4] = _unwrap_angles(comps[:, 4])
 
-        # ── Phase 1.2: Anchor confidence weighting ────────────────────────────
-        # Обчислюємо ваги якорів на основі QA метрик
-        weights = np.array([
-            a.inliers_count / (a.rmse_m + 1e-6)
-            for a in self.anchors
-        ], dtype=np.float64)
-
-        # Нормалізуємо ваги
-        weights = weights / (weights.max() + 1e-9)
-
-        # Логування для діагностики
-        for i, (a, w) in enumerate(zip(self.anchors, weights)):
-            logger.debug(
-                f"Anchor {a.frame_id}: rmse={a.rmse_m:.3f}m, "
-                f"inliers={a.inliers_count}, weight={w:.3f}, "
-                f"quality_flag={a.quality_flag}"
-            )
-
-        self._anchor_weights = weights  # зберегти для подальшого використання
-        # ──────────────────────────────────────────────────────────────────────
-
-        # Один багатоколонковий PCHIP-інтерполятор для всіх 4 каналів
-        self._interp = PchipInterpolator(ids, decomposed, extrapolate=True)
+        # extrapolate=False + clamp у _get_interpolated_matrix:
+        # кубічна екстраполяція за межами діапазону якорів розліталась.
+        self._interp = PchipInterpolator(ids, comps, extrapolate=False)
+        self._interp_range = (float(ids[0]), float(ids[-1]))
 
     def _get_interpolated_matrix(self, frame_id: float) -> np.ndarray | None:
         """Повертає інтерпольовану афінну матрицю 2x3 для заданого frame_id."""
-        if self._interp is None:
+        if self._interp is None or self._interp_range is None:
             return None
-        components = self._interp(frame_id)  # (4,): tx, ty, scale, angle
+        # Clamp: за межами діапазону якорів використовуємо крайній якір
+        fid = float(np.clip(frame_id, self._interp_range[0], self._interp_range[1]))
+        components = self._interp(fid)  # (5,): rx, ry, sx, sy, angle
         if components is None or np.any(np.isnan(components)):
             return None
-        tx, ty, scale, angle = components
+        rx, ry, sx, sy, angle = components
         # Захист від вироджених значень масштабу
-        scale = float(np.clip(scale, 1e-6, 1e6))
-        return _compose_affine(float(tx), float(ty), scale, float(angle))
+        sx = float(np.clip(sx, 1e-6, 1e6))
+        sy = float(np.clip(sy, 1e-6, 1e6))
+        M = _compose_affine_5dof(0.0, 0.0, sx, sy, float(angle), sign=self._interp_sign)
+        # Трансляція: опорний піксель має відобразитись точно у (rx, ry)
+        cx, cy = self._ref_px
+        M[0, 2] = float(rx) - (M[0, 0] * cx + M[0, 1] * cy)
+        M[1, 2] = float(ry) - (M[1, 0] * cx + M[1, 1] * cy)
+        return M
 
     @property
     def is_calibrated(self) -> bool:
@@ -251,6 +260,7 @@ class MultiAnchorCalibration:
         """Очищає всі якорі та скидає стан калібрування."""
         self.anchors.clear()
         self._interp = None
+        self._interp_range = None
         from src.geometry.coordinates import CoordinateConverter
         self.converter = CoordinateConverter("WEB_MERCATOR")
         logger.info("Cleared all anchors and reset calibration state.")
@@ -345,6 +355,7 @@ class MultiAnchorCalibration:
         data = {
             "version": self.VERSION,
             "projection": self.converter.export_metadata(),
+            "frame_size": list(self._frame_size) if self._frame_size else None,
             "anchors": [a.to_dict() for a in self.anchors],
         }
 
@@ -400,6 +411,11 @@ class MultiAnchorCalibration:
             # Новій формат (список якорів)
             for item in data["anchors"]:
                 self.anchors.append(AnchorCalibration.from_dict(item))
+
+        # Відновлення розміру кадру (для параметризації навколо центру)
+        fs = data.get("frame_size")
+        if fs and len(fs) == 2 and int(fs[0]) > 0 and int(fs[1]) > 0:
+            self._frame_size = (int(fs[0]), int(fs[1]))
 
         self.anchors.sort(key=lambda a: a.frame_id)
         self._rebuild_interpolators()

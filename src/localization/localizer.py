@@ -29,17 +29,34 @@ FAILURE_TYPES = {
 # цей словник перераховує його в систему координат повернутого кадру,
 # де побудована гомографія H.
 #
-# Виведення:
-#   k=1 (90° CCW):  x_rot = -y_orig, y_rot = x_orig  →  (dx,dy) → (-dy, dx)
-#   k=2 (180°):     x_rot = -x_orig, y_rot = -y_orig →  (dx,dy) → (-dx,-dy)
-#   k=3 (270° CCW): x_rot = y_orig,  y_rot = -x_orig →  (dx,dy) → (dy, -dx)
+# ВИПРАВЛЕНО: значення для 90° та 270° були переплутані місцями.
+# Верифіковано чисельно на масивах:
+#   np.rot90 k=1 (90°):  A'[r',c'] = A[c', W-1-r'] → точка (x,y) → (y, W-1-x)
+#                        → вектор (dx,dy) → (dy, -dx)
+#   k=2 (180°):          (x,y) → (W-1-x, H-1-y)    → (dx,dy) → (-dx, -dy)
+#   k=3 (270°):          (x,y) → (H-1-y, x)        → (dx,dy) → (-dy, dx)
 _ROTATION_VEC: dict[int, tuple[int, int, int, int]] = {
     # angle: (a, b, c, d) → new_dx = a*dx + b*dy, new_dy = c*dx + d*dy
     0:   ( 1,  0,  0,  1),
-    90:  ( 0, -1,  1,  0),
+    90:  ( 0,  1, -1,  0),
     180: (-1,  0,  0, -1),
-    270: ( 0,  1, -1,  0),
+    270: ( 0, -1,  1,  0),
 }
+
+
+def _rotate_point_np90(x: float, y: float, w: float, h: float, angle: int) -> tuple[float, float]:
+    """Мапінг точки (x, y) кадру w×h у координати np.rot90(frame, k=angle//90).
+
+    Формули верифіковані чисельно (пікселецентрична конвенція):
+      k=1: (x,y) → (y, W-1-x);  k=2: (x,y) → (W-1-x, H-1-y);  k=3: (x,y) → (H-1-y, x)
+    """
+    if angle == 90:
+        return y, (w - 1.0) - x
+    if angle == 180:
+        return (w - 1.0) - x, (h - 1.0) - y
+    if angle == 270:
+        return (h - 1.0) - y, x
+    return x, y
 
 
 class Localizer:
@@ -81,8 +98,8 @@ class Localizer:
         )
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
-            threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 150.0),
-            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 1000.0),
+            threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 4.0),
+            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 120.0),
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
 
@@ -108,6 +125,10 @@ class Localizer:
         # Нормалізація роздільної здатності вхідного кадру до еталонної роздільної здатності БД
         self.normalizer = ResolutionNormalizer(ref_frame_width, ref_frame_height)
         self._last_scale = 1.0
+
+        # A3: темпоральний prior на кут повороту — кут останньої успішної
+        # локалізації; повний скан 4 кутів лише при просіданні score або невдачі
+        self._last_best_angle: int | None = None
 
         # ── Patchify: мультипатч-retrieval ────────────────────────────────────
         # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
@@ -170,6 +191,14 @@ class Localizer:
 
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _retrieve_candidates(self, global_desc, top_k: int):
+        """Retrieval кандидатів: (source_id | None, [(frame_id, score), ...])."""
+        if self.db_manager is not None:
+            # Мульти-режим: пошук у всіх активних базах
+            return self.db_manager.get_best_match(global_desc, top_k=top_k)
+        # Single-mode (зворотна сумісність)
+        return None, self.retriever.find_similar_frames(global_desc, top_k=top_k)
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
@@ -184,6 +213,7 @@ class Localizer:
                 f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
                 f"Resetting counter. The drone may be outside the database coverage area."
             )
+            self._last_best_angle = None  # наступний keyframe — повний скан кутів
             return {
                 "success": False,
                 "error": "out_of_coverage",
@@ -214,31 +244,65 @@ class Localizer:
         #     змішування робить порівняння між кутами некоректним
         best_source_id_per_angle: str | None = None  # для мульти-режиму
 
-        for angle in angles_to_try:
-            k = angle // 90
-            rotated_frame = np.rot90(query_frame, k=k).copy()
+        # A3: темпоральний prior — дрон не обертається на 90° між keyframe-ами.
+        # Спершу пробуємо кут з минулого успіху (1 forward замість 4);
+        # повний скан — лише якщо score < порога або попередня локалізація впала.
+        rescan_min = get_cfg(
+            self.config, "localization.rotation_rescan_min_score", 0.70
+        )
+        prior_angle = self._last_best_angle
+        if (
+            self.enable_auto_rotation
+            and prior_angle is not None
+            and self._consecutive_failures == 0
+        ):
+            rotated_frame = np.ascontiguousarray(
+                np.rot90(query_frame, k=prior_angle // 90)
+            )
             global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
-
             with Telemetry.profile("retrieval"):
-                if self.db_manager is not None:
-                    # Мульти-режим: пошук у всіх активних базах
-                    src_id, candidates = self.db_manager.get_best_match(
-                        global_desc, top_k=top_k
-                    )
-                else:
-                    # Single-mode (зворотна сумісність)
-                    candidates = self.retriever.find_similar_frames(
-                        global_desc, top_k=top_k
-                    )
-                    src_id = None
+                src_id, candidates = self._retrieve_candidates(global_desc, top_k)
+            if candidates and candidates[0][1] >= rescan_min:
+                best_global_score = candidates[0][1]
+                best_global_angle = prior_angle
+                best_global_candidates = candidates
+                best_source_id_per_angle = src_id
+            else:
+                logger.debug(
+                    f"Prior angle {prior_angle}° score too low "
+                    f"({candidates[0][1] if candidates else -1:.3f} < {rescan_min}) — full rescan"
+                )
 
-            if candidates:
-                top_score = candidates[0][1]
-                if top_score > best_global_score:
-                    best_global_score = top_score
-                    best_global_angle = angle
-                    best_global_candidates = candidates
-                    best_source_id_per_angle = src_id
+        if not best_global_candidates:
+            # A2: повний скан — усі ротації ОДНИМ батчованим forward-пасом
+            # (раніше: 4 послідовні ViT-forward — головна вартість keyframe).
+            rotated_frames = [
+                np.ascontiguousarray(np.rot90(query_frame, k=a // 90))
+                for a in angles_to_try
+            ]
+            if len(rotated_frames) > 1 and hasattr(
+                self.feature_extractor, "extract_global_descriptors_multi"
+            ):
+                descs = self.feature_extractor.extract_global_descriptors_multi(
+                    rotated_frames
+                )
+            else:
+                descs = [
+                    self.feature_extractor.extract_global_descriptor(f)
+                    for f in rotated_frames
+                ]
+
+            for angle, global_desc in zip(angles_to_try, descs):
+                with Telemetry.profile("retrieval"):
+                    src_id, candidates = self._retrieve_candidates(global_desc, top_k)
+
+                if candidates:
+                    top_score = candidates[0][1]
+                    if top_score > best_global_score:
+                        best_global_score = top_score
+                        best_global_angle = angle
+                        best_global_candidates = candidates
+                        best_source_id_per_angle = src_id
 
         if not best_global_candidates:
             self._consecutive_failures += 1
@@ -252,7 +316,7 @@ class Localizer:
                 ),
             }
 
-        logger.info(
+        logger.debug(
             f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
         )
 
@@ -474,7 +538,15 @@ class Localizer:
 
         self._consecutive_failures = 0
 
-        filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
+        # Confidence рахуємо ДО фільтрації — B2: адаптивний шум вимірювання,
+        # слабка локалізація впливає на траєкторію менше, впевнена — більше
+        confidence = self._compute_confidence(
+            best_candidate_id, best_inliers, best_total_matches, best_rmse
+        )
+
+        filtered_pt = self.trajectory_filter.update(
+            metric_pt, dt=dt, noise_scale=1.0 / max(confidence, 0.25)
+        )
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
@@ -519,15 +591,17 @@ class Localizer:
             original_poly_px = corners
             logger.debug("FOV projected using full frame Homography matrix.")
 
-        logger.info(f"--- FOV DIAGNOSTICS FOR FRAME {best_candidate_id} ---")
+        # A9: FOV-діагностика в DEBUG — logger.info з f-string форматуванням
+        # на кожному keyframe додавав помітний overhead у hot path
+        logger.debug(f"--- FOV DIAGNOSTICS FOR FRAME {best_candidate_id} ---")
         w_px = np.linalg.norm(original_poly_px[0] - original_poly_px[1])
         h_px = np.linalg.norm(original_poly_px[1] - original_poly_px[2])
-        logger.info(f"[1] Original FOV in Query image: {w_px:.1f} x {h_px:.1f} pixels")
+        logger.debug(f"[1] Original FOV in Query image: {w_px:.1f} x {h_px:.1f} pixels")
 
         if ref_corners is not None:
             w_ref = np.linalg.norm(ref_corners[0] - ref_corners[1])
             h_ref = np.linalg.norm(ref_corners[1] - ref_corners[2])
-            logger.info(
+            logger.debug(
                 f"[2] FOV mapped to Reference via Homography: {w_ref:.1f} x {h_ref:.1f} pixels"
             )
 
@@ -537,8 +611,8 @@ class Localizer:
             if metric_corners is not None:
                 fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
                 fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
-                logger.info(
-                    f"[3] FOV mapped to Web Mercator Metric space: {fov_w:.1f}m x {fov_h:.1f}m"
+                logger.debug(
+                    f"[3] FOV mapped to metric space: {fov_w:.1f}m x {fov_h:.1f}m"
                 )
                 logger.debug(
                     f"FOV dimensions: {fov_w:.1f}m x {fov_h:.1f}m | "
@@ -554,10 +628,6 @@ class Localizer:
                     except Exception:
                         pass
 
-        confidence = self._compute_confidence(
-            best_candidate_id, best_inliers, best_total_matches, best_rmse
-        )
-
         logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
         logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
         source_str = f" | source={self._active_source_id}" if self._active_source_id else ""
@@ -565,6 +635,9 @@ class Localizer:
             f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id}{source_str} | "
             f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
         )
+
+        # A3: запам'ятовуємо кут для темпорального prior наступного keyframe
+        self._last_best_angle = best_global_angle
 
         return {
             "success": True,
@@ -581,7 +654,14 @@ class Localizer:
     # ─────────────────────────────────────────────────────────────────────────
 
     def localize_optical_flow(
-        self, dx_px: float, dy_px: float, dt: float, rot_width: int, rot_height: int
+        self,
+        dx_px: float,
+        dy_px: float,
+        dt: float,
+        rot_width: int,
+        rot_height: int,
+        flow_affine: np.ndarray | None = None,
+        flow_quality: float | None = None,
     ) -> dict:
         """Локалізація на основі піксельного зсуву від Optical Flow.
 
@@ -591,6 +671,11 @@ class Localizer:
           1. Масштабування на _last_scale (нормалізація роздільної здатності).
           2. Swap width↔height при 90° / 270° обертанні.
           3. Обертання вектора зсуву (dx, dy) у систему координат повернутого кадру.
+
+        B4: flow_affine — опційна симілярність 2x3 (original px, KF→current),
+        оцінена по flow-точках. Враховує обертання/зміну масштабу між
+        keyframe-ами (чиста трансляція dx/dy дрейфує на віражах).
+        flow_quality (0..1) — чесна якість OF для адаптивного шуму Kalman.
         """
         if (
             not hasattr(self, "_last_state")
@@ -631,12 +716,35 @@ class Localizer:
             norm_rot_h = rot_height * scale
 
         # ── 3. Центр поточного кадру в системі координат попереднього ────────
-        # Якщо з моменту KF точки змістились на (dx, dy), то центр поточного
-        # дрона відповідає точці (center − displacement) у КС попереднього KF.
-        center_query_shifted = np.array(
-            [[norm_rot_w / 2.0 - rot_sdx, norm_rot_h / 2.0 - rot_sdy]],
-            dtype=np.float64,
-        )
+        center_query_shifted = None
+
+        if flow_affine is not None:
+            # B4: повна симілярність S (original px, KF→current). Точка KF-кадру,
+            # що зараз опинилась у центрі: p0 = S⁻¹ @ center. Далі p0 переводимо
+            # normalized → rotated (та сама трансформація, що й для кадру).
+            try:
+                S3 = np.vstack([np.asarray(flow_affine, dtype=np.float64), [0.0, 0.0, 1.0]])
+                S_inv = np.linalg.inv(S3)
+                cx0, cy0 = rot_width / 2.0, rot_height / 2.0
+                p0x = S_inv[0, 0] * cx0 + S_inv[0, 1] * cy0 + S_inv[0, 2]
+                p0y = S_inv[1, 0] * cx0 + S_inv[1, 1] * cy0 + S_inv[1, 2]
+                # original → normalized
+                p0x *= scale
+                p0y *= scale
+                # normalized → rotated (мапінг точки np.rot90, верифікований)
+                w_n, h_n = rot_width * scale, rot_height * scale
+                rx, ry = _rotate_point_np90(p0x, p0y, w_n, h_n, angle)
+                center_query_shifted = np.array([[rx, ry]], dtype=np.float64)
+            except np.linalg.LinAlgError:
+                center_query_shifted = None  # вироджена S → fallback на трансляцію
+
+        if center_query_shifted is None:
+            # Fallback: чиста трансляція — якщо з моменту KF точки змістились на
+            # (dx, dy), центр відповідає точці (center − displacement) у КС KF.
+            center_query_shifted = np.array(
+                [[norm_rot_w / 2.0 - rot_sdx, norm_rot_h / 2.0 - rot_sdy]],
+                dtype=np.float64,
+            )
 
         pts_in_ref = GeometryTransforms.apply_homography(
             center_query_shifted, self._last_state["H"]
@@ -651,7 +759,16 @@ class Localizer:
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
+        # B2: чесний confidence OF (раніше хардкод 0.8) + більший шум вимірювання
+        # для Kalman (OF — відносне вимірювання, воно дрейфує від KF)
+        if flow_quality is not None:
+            of_conf = 0.5 + 0.35 * float(np.clip(flow_quality, 0.0, 1.0))
+        else:
+            of_conf = 0.7
+
+        filtered_pt = self.trajectory_filter.update(
+            metric_pt, dt=dt, noise_scale=1.5 / max(of_conf, 0.25)
+        )
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
 
         lat, lon = self.calibration.converter.metric_to_gps(
@@ -664,7 +781,7 @@ class Localizer:
             "success": True,
             "lat": lat,
             "lon": lon,
-            "confidence": 0.8,
+            "confidence": round(of_conf, 3),
             "matched_frame": int(self._last_state.get("candidate_id", -1)),
             "inliers": of_inliers,
             "fov_polygon": None,

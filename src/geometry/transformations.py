@@ -199,9 +199,9 @@ class GeometryTransforms:
             if fallback_to_affine:
                 logger.warning(
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
-                    f"Falling back to Partial Affine (4 DoF)."
+                    f"Falling back to Full Affine (5 DoF)."
                 )
-                M, mask = GeometryTransforms.estimate_affine_partial(src_pts, dst_pts, ransac_threshold)
+                M, mask = GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
                 if M is not None:
                     H_fallback = np.vstack([M, [0, 0, 1]])
                     return H_fallback, mask
@@ -272,6 +272,44 @@ class GeometryTransforms:
         points_cv = points.reshape(-1, 1, 2).astype(np.float64)
         transformed_pts_cv = cv2.perspectiveTransform(points_cv, H.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)
+
+    @staticmethod
+    def estimate_affine_lsq(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray | None:
+        """Детермінований least-squares фіт повної афінної матриці (6 DoF).
+
+        Використовує ВСІ точки та завжди дає той самий результат за тих самих
+        вхідних даних. Призначено для калібрувальних якорів (4–8 точок,
+        перевірених користувачем), де RANSAC недоречний: він недетермінований
+        (різні матриці між запусками) і його поріг інтерпретується в одиницях
+        призначення (метрах), через що валідні точки випадково відкидалися.
+        """
+        if src_pts is None or len(src_pts) < 3:
+            logger.debug(
+                f"Cannot LSQ-fit affine: need ≥3 points, got "
+                f"{0 if src_pts is None else len(src_pts)}"
+            )
+            return None
+
+        src = np.asarray(src_pts, dtype=np.float64).reshape(-1, 2)
+        dst = np.asarray(dst_pts, dtype=np.float64).reshape(-1, 2)
+        n = len(src)
+
+        A = np.zeros((2 * n, 6), dtype=np.float64)
+        b = np.zeros(2 * n, dtype=np.float64)
+        A[0::2, 0] = src[:, 0]
+        A[0::2, 1] = src[:, 1]
+        A[0::2, 2] = 1.0
+        A[1::2, 3] = src[:, 0]
+        A[1::2, 4] = src[:, 1]
+        A[1::2, 5] = 1.0
+        b[0::2] = dst[:, 0]
+        b[1::2] = dst[:, 1]
+
+        sol, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
+        if rank < 6:
+            logger.debug("LSQ affine fit degenerate (points nearly collinear?)")
+            return None
+        return sol.reshape(2, 3)
 
     @staticmethod
     def estimate_affine(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):

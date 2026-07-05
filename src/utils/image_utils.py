@@ -11,16 +11,15 @@ def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
     if len(cv_image.shape) == 3:
         height, width, channel = cv_image.shape
         bytes_per_line = 3 * width
-        cv_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
 
-        # ВИПРАВЛЕНО: використовуємо .copy() щоб гарантувати неперервність
-        # буфера в пам'яті та захистити від його знищення GC раніше QPixmap.
-        # Без copy() буфер numpy може стати недійсним до відображення → segfault.
-        cv_rgb = np.ascontiguousarray(cv_rgb)
-        q_img = QImage(cv_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        # A7: Format_BGR888 (Qt ≥ 5.14) читає BGR напряму — прибирає повний
+        # cvtColor(BGR2RGB) кадру на кожен виклик (30 разів/с на GUI-потоці).
+        buf = np.ascontiguousarray(cv_image)
+        q_img = QImage(buf.data, width, height, bytes_per_line, QImage.Format.Format_BGR888)
 
-        # Копіюємо в QPixmap одразу, поки cv_rgb ще існує в цьому scope
-        return QPixmap.fromImage(q_img.copy())
+        # QPixmap.fromImage робить глибоку копію у власне сховище, поки buf
+        # живий у цьому scope — додатковий q_img.copy() був зайвою копією кадру.
+        return QPixmap.fromImage(q_img)
 
     elif len(cv_image.shape) == 2:
         height, width = cv_image.shape
@@ -29,7 +28,7 @@ def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
         gray = np.ascontiguousarray(cv_image)
         q_img = QImage(gray.data, width, height, bytes_per_line, QImage.Format.Format_Grayscale8)
 
-        return QPixmap.fromImage(q_img.copy())
+        return QPixmap.fromImage(q_img)
 
     return QPixmap()
 

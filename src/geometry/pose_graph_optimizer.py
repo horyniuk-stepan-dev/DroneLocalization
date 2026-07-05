@@ -160,7 +160,12 @@ class PoseGraphOptimizer:
         )
         return count
 
-    def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6, progress_callback=None) -> dict[int, np.ndarray]:
+    def optimize(
+        self,
+        max_iterations: int = 50,
+        tolerance: float = 1e-6,
+        progress_callback=None,
+    ) -> dict[int, np.ndarray]:
         if not self._edges:
             logger.warning("No edges — returning current states as-is")
             return self._export_results()
@@ -216,7 +221,10 @@ class PoseGraphOptimizer:
         free_indices_in_full = [node_id_to_idx[fid] for fid in free_ids]
         edges_from = np.array([node_id_to_idx[e.from_id] for e in valid_edges], dtype=np.int32)
         edges_to = np.array([node_id_to_idx[e.to_id] for e in valid_edges], dtype=np.int32)
-        
+
+
+
+
         d = {
             'X_full': X_fixed,
             'free_indices': free_indices_in_full,
@@ -255,7 +263,6 @@ class PoseGraphOptimizer:
                 self._last_cb_time = now
             return self._residuals_vec(x, d_dict)
 
-        safe_tolerance = max(tolerance, 1e-15)
         result = least_squares(
             fun=residual_wrapper,
             x0=x0,
@@ -264,9 +271,9 @@ class PoseGraphOptimizer:
             jac="2-point",
             jac_sparsity=jac_sp,
             max_nfev=max_iterations * n_vars,
-            ftol=safe_tolerance,
-            xtol=safe_tolerance,
-            gtol=safe_tolerance,
+            ftol=tolerance,
+            xtol=tolerance,
+            gtol=tolerance,
         )
 
         logger.info(
@@ -319,7 +326,7 @@ class PoseGraphOptimizer:
         angle_diff = theta_j - theta_i - sign * d['dtheta']
         res_edges[:, 4] = w_rot * np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
         
-        w_reg = 1.0 * d['cx']
+        w_reg = 200.0 * d['cx']
         x_reshaped = x.reshape(-1, 5)
         res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
         
@@ -509,20 +516,8 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
     return T
 
 
-def homography_to_similarity(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
-    cx, cy = frame_w / 2.0, frame_h / 2.0
-    d = min(frame_w, frame_h) * 0.25
-    pts = np.array(
-        [[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]],
-        dtype=np.float64,
-    )
-    transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
-    if transformed is None:
-        return None
-    transformed = transformed.reshape(-1, 2).astype(np.float64)
-
-    T, _ = cv2.estimateAffinePartial2D(pts, transformed, method=cv2.LMEDS)
-    return T
+# Додаємо аліас, щоб не довелося змінювати назву у worker-і, якщо там досі викликається homography_to_similarity
+homography_to_similarity = homography_to_affine
 
 
 try:

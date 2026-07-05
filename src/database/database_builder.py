@@ -311,6 +311,8 @@ class DatabaseBuilder:
             height,
             use_patchify=use_patchify,
             num_patches=patchify.num_patches if patchify else 0,
+            frame_step=frame_step,
+            source_total_frames=total_frames,
         )
 
         current_pose = np.eye(3, dtype=np.float32)
@@ -413,14 +415,20 @@ class DatabaseBuilder:
                     features["patch_descriptors"] = patchify.compute_patch_descriptors(p_frame_rgb)
 
                 # Phase 2.2: Depth estimation for scale recovery
-                features["depth_scale"] = np.float32(1.0)
+                # A6: скаляр depth_scale змінюється повільно (висота польоту) —
+                # повний інференс Depth-Anything на КОЖНОМУ кадрі був марнотратним.
+                # Рахуємо кожен depth_every_n-й кадр, між ними реюзаємо останнє значення.
+                features["depth_scale"] = np.float32(getattr(self, "_last_depth_scale", 1.0))
                 if self._depth_estimator is not None:
-                    try:
-                        features["depth_scale"] = np.float32(
-                            self._depth_estimator.get_relative_scale(p_frame_rgb)
-                        )
-                    except Exception as e:
-                        logger.warning(f"Depth estimation failed for frame {p_idx}: {e}")
+                    depth_every = max(1, int(get_cfg(self.config, "database.depth_every_n", 10)))
+                    if p_idx % depth_every == 0 or not hasattr(self, "_last_depth_scale"):
+                        try:
+                            self._last_depth_scale = float(
+                                self._depth_estimator.get_relative_scale(p_frame_rgb)
+                            )
+                            features["depth_scale"] = np.float32(self._last_depth_scale)
+                        except Exception as e:
+                            logger.warning(f"Depth estimation failed for frame {p_idx}: {e}")
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
@@ -507,7 +515,10 @@ class DatabaseBuilder:
                             saved_count,
                             frame_index_map,
                         )
-                        if torch.cuda.is_available():
+                        # A1: empty_cache() після КОЖНОГО кадру синхронізував GPU і
+                        # змушував наступні алокації йти повільним cudaMalloc —
+                        # головний гальмівний фактор збудови. Гігієнічно чистимо рідко.
+                        if torch.cuda.is_available() and p_idx % 500 == 0 and p_idx > 0:
                             torch.cuda.empty_cache()
                     if idx == -1:
                         break
@@ -698,6 +709,8 @@ class DatabaseBuilder:
         height: int,
         use_patchify: bool = False,
         num_patches: int = 0,
+        frame_step: int = 1,
+        source_total_frames: int = 0,
     ):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
@@ -796,6 +809,10 @@ class DatabaseBuilder:
             g3.attrs["descriptor_dim"] = self.descriptor_dim
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
+            # Крок семплінгу відео: DB slot i = кадр відео i * frame_step.
+            # Критично для калібрування — діалог конвертує номери кадрів відео у слоти БД.
+            g3.attrs["frame_step"] = int(frame_step)
+            g3.attrs["source_total_frames"] = int(source_total_frames)
 
             # Phase 2.2: Dataset for depth scales
             g3.create_dataset(

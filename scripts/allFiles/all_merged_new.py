@@ -168,17 +168,17 @@ class MultiAnchorCalibration:
             scale_corrections = []
             for i in range(len(self.anchors) - 1):
                 a1, a2 = self.anchors[i], self.anchors[i + 1]
-                
+
                 # GPS точки якорів
                 pts_gps_1 = a1.points_gps
                 pts_gps_2 = a2.points_gps
-                
+
                 if pts_gps_1 and pts_gps_2:
                     # Реальна метрична відстань між центрами якорів через GPS
                     m1 = self.converter.gps_to_metric(pts_gps_1[0][0], pts_gps_1[0][1])
                     m2 = self.converter.gps_to_metric(pts_gps_2[0][0], pts_gps_2[0][1])
                     gps_dist = np.linalg.norm(np.array(m1) - np.array(m2))
-                    
+
                     if gps_dist > 0.5:  # мін. 0.5м між якорями для стабільного розрахунку
                         scale_ratio = decomposed[i + 1, 2] / (decomposed[i, 2] + 1e-9)
                         scale_corrections.append(scale_ratio)
@@ -315,7 +315,7 @@ class MultiAnchorCalibration:
         depth_scale: float = 1.0,
     ) -> tuple[float, float] | None:
         """Версія get_metric_position з корекцією масштабу через depth.
-        
+
         depth_scale — відносний масштаб з DepthEstimator.get_relative_scale().
         При depth_scale > 1: об'єкт ближче (нижча висота) → більший pixel scale.
         При depth_scale < 1: об'єкт далі (вища висота) → менший pixel scale.
@@ -323,16 +323,16 @@ class MultiAnchorCalibration:
         result = self.get_metric_position(frame_id, x, y)
         if result is None:
             return None
-        
+
         mx, my = result
-        
+
         # Нормалізуємо depth_scale відносно reference (медіана всіх якорів).
         ref_depth = getattr(self, '_reference_depth_scale', 1.0)
         if ref_depth > 1e-6:
             correction = depth_scale / ref_depth
             # Обмежуємо корекцію: максимум 2x в будь-який бік
             correction = float(np.clip(correction, 0.5, 2.0))
-            
+
             # TODO: У майбутньому тут можна додати зміщення відносно оптичного центру
             # для більш точної компенсації паралаксу. Поки що — логуємо.
             if abs(correction - 1.0) > 0.05:
@@ -340,7 +340,7 @@ class MultiAnchorCalibration:
                     f"Depth scale correction: ref={ref_depth:.3f}, "
                     f"current={depth_scale:.3f}, ratio={correction:.3f}"
                 )
-        
+
         return mx, my
 
     def set_reference_depth_scale(self, depth_scale: float) -> None:
@@ -731,7 +731,7 @@ class ResultExporter:
                 },
             )
             features.append(point)
-        
+
         feature_collection = geojson.FeatureCollection(
             features, properties={"exported_at": datetime.now().isoformat()}
         )
@@ -743,26 +743,25 @@ class ResultExporter:
 # ================================================================================
 # File: core\headless_runner.py
 # ================================================================================
-import sys
-import time
 import signal
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QCoreApplication
 
 from config.config import APP_CONFIG, APP_SETTINGS
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader
 from src.database.multi_database_manager import MultiDatabaseManager
-from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
-from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.model_manager import ModelManager
-from src.workers.tracking_worker import RealtimeTrackingWorker
+from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.network.coordinates_broker import CoordinatesBroker
 from src.utils.logging_utils import get_logger
+from src.workers.tracking_worker import RealtimeTrackingWorker
 
 logger = get_logger(__name__)
 
@@ -776,7 +775,7 @@ class HeadlessRunner:
         self.app = QCoreApplication.instance()
         if not self.app:
             self.app = QCoreApplication(sys.argv)
-            
+
         self.model_manager = ModelManager(config=APP_CONFIG)
         self.calibration = MultiAnchorCalibration()
         self.database = None
@@ -785,7 +784,7 @@ class HeadlessRunner:
         # Мультиджерельна підтримка
         self.db_manager = None
         self.calib_manager = None
-        
+
         # Вмикаємо network api примусово для headless
         APP_SETTINGS.network_api.enabled = True
         self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
@@ -833,17 +832,17 @@ class HeadlessRunner:
             # Fallback: прямий шлях (legacy)
             db_path = self.project_dir / "database.h5"
             calib_path = self.project_dir / "calibration.json"
-            
+
             if not db_path.exists():
                 raise FileNotFoundError(f"Database not found at {db_path}")
-                
+
             self.database = DatabaseLoader(str(db_path))
             if calib_path.exists():
                 self.calibration.load(str(calib_path))
 
         if not self.database.is_propagated:
             logger.warning("Database is not propagated! Precision will be degraded.")
-            
+
         if not self.calibration.converter.is_initialized:
             ref_gps = self.calibration.converter.reference_gps
             if self.calibration.is_calibrated and ref_gps:
@@ -868,7 +867,7 @@ class HeadlessRunner:
 
         matcher = FeatureMatcher(model_manager=self.model_manager, config=APP_CONFIG)
         localizer_config = {**APP_CONFIG.model_dump(), "_model_manager": self.model_manager}
-        
+
         return Localizer(
             self.database, fe, matcher, self.calibration, config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
@@ -887,40 +886,40 @@ class HeadlessRunner:
             sys.exit(1)
 
         localizer = self._build_localizer()
-        
+
         self.tracking_worker = RealtimeTrackingWorker(
             self.video_source,
             localizer,
             model_manager=self.model_manager,
             config=APP_CONFIG,
         )
-        
+
         # Підключаємо брокер координат
         self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
         self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
-        
+
         def on_tracking_finished():
             logger.info("Tracking finished.")
             self.coordinates_broker.set_tracking_active(False)
             self.app.quit()
-            
+
         self.tracking_worker.finished.connect(on_tracking_finished)
-        
+
         def signal_handler(sig, frame):
             logger.info("\nCaught interrupt signal, stopping gracefully...")
             if self.tracking_worker and self.tracking_worker.isRunning():
                 self.tracking_worker.stop()
             else:
                 self.app.quit()
-                
+
         signal.signal(signal.SIGINT, signal_handler)
-        
+
         self.coordinates_broker.set_tracking_active(True)
         self.tracking_worker.start()
-        
+
         logger.info("System is running. Press Ctrl+C to stop.")
         self.app.exec()
-        
+
         # Очищення
         self.coordinates_broker.stop()
         logger.info("Headless runner exited gracefully.")
@@ -1341,8 +1340,10 @@ class ProjectRegistry:
 # File: core\project_video_source.py
 # ================================================================================
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
+
+from dataclasses import asdict, dataclass
 from typing import Any
+
 
 @dataclass
 class ProjectVideoSource:
@@ -1355,7 +1356,7 @@ class ProjectVideoSource:
     enabled: bool = True
     priority: int = 0
     geo_bounds: tuple[float, float, float, float] | None = None
-    camera_params: dict[str, Any] | None = None  
+    camera_params: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -1364,7 +1365,7 @@ class ProjectVideoSource:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ProjectVideoSource":
+    def from_dict(cls, data: dict[str, Any]) -> ProjectVideoSource:
         d = dict(data)
         gb = d.get("geo_bounds")
         if gb is not None:
@@ -1400,7 +1401,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from config.config import get_cfg, get_active_descriptor_cfg
+from config.config import get_active_descriptor_cfg, get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
@@ -1531,7 +1532,8 @@ class DatabaseBuilder:
         kp_scale = 1.0  # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
         if save_keypoint_video:
             try:
-                import sys, os
+                import os
+                import sys
                 kp_width = int(width * kp_scale)
                 kp_height = int(height * kp_scale)
                 kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
@@ -2590,7 +2592,7 @@ class MultiDatabaseManager:
     """
     Центральний координаційний клас.
     Замінює прямий доступ до одного DatabaseLoader.
-    
+
     Відповідає за:
     - Завантаження баз для enabled джерел
     - Створення retrievers (FAISS або LanceDB)
@@ -2681,7 +2683,7 @@ class MultiDatabaseManager:
             f"{len(self._active_source_ids)} active"
         )
 
-    def toggle_source(self, src: 'ProjectVideoSource') -> None:
+    def toggle_source(self, src: ProjectVideoSource) -> None:
         """Вмикає або вимикає джерело. Завантажує або вивантажує БД з пам'яті."""
         if src.enabled:
             if src.source_id not in self._databases:
@@ -2710,7 +2712,7 @@ class MultiDatabaseManager:
     ) -> tuple[str | None, list[tuple[int, float]]]:
         """
         Виконує vectorний пошук у кожній активній базі.
-        
+
         Returns:
             (source_id, candidates): source_id з найвищим top-1 score,
             candidates — список (frame_id, score). None якщо нічого не знайдено.
@@ -2795,7 +2797,7 @@ class MultiDatabaseManager:
         """
         Активує джерела, geo_bounds яких містять точку (lat, lon).
         Джерела без geo_bounds завжди залишаються активними.
-        
+
         Returns:
             True якщо набір активних джерел змінився.
         """
@@ -2883,11 +2885,11 @@ logger = get_logger(__name__)
 class SpatialIndex:
     """
     Тайловий просторовий індекс для швидкої геофільтрації кадрів.
-    
+
     Територія розбивається на рівні прямокутні тайли за формулою:
         tile_key = (int(lat / tile_deg), int(lon / tile_deg))
     де tile_deg ≈ 0.005° ≈ 500 метрів.
-    
+
     Для кожного тайлу зберігається список frame_id кадрів,
     GPS-координати яких потрапляють у цей тайл.
     """
@@ -2939,15 +2941,15 @@ class SpatialIndex:
     ) -> list[int]:
         """
         Повертає об'єднаний список frame_id з квадрата тайлів навколо точки.
-        
+
         При radius_tiles=2 та tile_deg=0.005° це дає покриття
         ≈ 2.5 км у кожному напрямку.
-        
+
         Args:
             lat:           Широта центру пошуку.
             lon:           Довгота центру пошуку.
             radius_tiles:  Радіус пошуку у тайлах.
-            
+
         Returns:
             Список frame_id кадрів у радіусі.
         """
@@ -3008,10 +3010,11 @@ class SpatialIndex:
   scale = depth_est.get_relative_scale(frame_rgb)  # float
 """
 
+
+import cv2
 import numpy as np
 import torch
-import cv2
-import contextlib
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -3026,7 +3029,7 @@ class DepthEstimator:
 
     def get_relative_scale(self, image_rgb: np.ndarray) -> float:
         """Повертає скалярний відносний масштаб (1/median_depth).
-        
+
         Менше значення = об'єкт далі (більша висота) = менший GSD.
         Більше значення = об'єкт ближче (менша висота) = більший GSD.
         """
@@ -3036,16 +3039,16 @@ class DepthEstimator:
         cx1, cx2 = w // 4, 3 * w // 4
         cy1, cy2 = h // 4, 3 * h // 4
         center_depth = depth[cy1:cy2, cx1:cx2]
-        
+
         # Маска валідних значень (не нулі)
         valid_mask = center_depth > 0
         if not np.any(valid_mask):
             return 1.0
-            
+
         median_d = float(np.median(center_depth[valid_mask]))
         if median_d < 1e-6:
             return 1.0
-            
+
         return 1.0 / median_d  # відносний scale: далі = менше
 
     @staticmethod
@@ -3075,15 +3078,15 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 from depth_anything_v2.dpt import DepthAnythingV2
             except ImportError:
                 # Шукаємо у third_party/Depth-Anything-V2
-                import sys
                 import os
+                import sys
                 project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
                 local_path = os.path.join(project_root, "third_party", "Depth-Anything-V2")
                 if os.path.exists(local_path):
                     sys.path.append(local_path)
                     from depth_anything_v2.dpt import DepthAnythingV2
                 else:
-                    raise ImportError(f"Depth-Anything-V2 not found in {local_path}")
+                    raise ImportError(f"Depth-Anything-V2 not found in {local_path}") from None
 
             model_configs = {
                 'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -3091,25 +3094,25 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
                 'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
             }
-            
+
             # Визначаємо тип енкодера (за замовчуванням vits для швидкості)
             encoder = 'vits'
             self._model = DepthAnythingV2(**model_configs[encoder])
-            
+
             import os
             # Шукаємо ваги за різними можливими іменами
             weight_names = [
                 f"depth_anything_v2_{encoder}.pth",
                 "depth_anything_v2_vits.pth"
             ]
-            
+
             weight_paths = []
             for name in weight_names:
                 weight_paths.extend([
                     os.path.join("models", name),
                     os.path.expanduser(f"~/.cache/depth_anything_v2/{name}")
                 ])
-            
+
             for wp in weight_paths:
                 if os.path.exists(wp):
                     self._model.load_state_dict(
@@ -3121,7 +3124,7 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 logger.warning(
                     f"Depth Anything V2 weights not found. Searched in: {weight_paths}"
                 )
-            
+
             self._model = self._model.to(self.device).eval()
             logger.info(f"Depth Anything V2 ({encoder}) initialized on {self.device}")
         except ImportError:
@@ -3405,6 +3408,7 @@ GSD = (altitude * sensor_width) / (focal_length * image_width_px)
 """
 
 from dataclasses import dataclass
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -3434,7 +3438,7 @@ class GSDCalculator:
 
     def scale_from_altitude(self, actual_altitude_m: float) -> float:
         """Scale factor відносно reference altitude.
-        
+
         Якщо дрон летить нижче reference → scale > 1 (більше пікселів на метр).
         Якщо дрон летить вище reference → scale < 1 (менше пікселів на метр).
         """
@@ -3659,6 +3663,7 @@ class PoseGraphOptimizer:
         )
 
         # jac_sparsity is ignored by 'lm'. method='trf' with sparse jacobian runs 100x faster.
+        safe_tolerance = max(tolerance, 1e-15)
         result = least_squares(
             fun=self._residuals,
             x0=x0,
@@ -3667,9 +3672,9 @@ class PoseGraphOptimizer:
             jac="2-point",
             jac_sparsity=jac_sp,
             max_nfev=max_iterations * n_vars,
-            ftol=tolerance,
-            xtol=tolerance,
-            gtol=tolerance,
+            ftol=safe_tolerance,
+            xtol=safe_tolerance,
+            gtol=safe_tolerance,
         )
 
         logger.info(
@@ -4365,6 +4370,8 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("Файл")
+        file_menu.addAction("Налаштування...", self.on_open_config)
+        file_menu.addSeparator()
         file_menu.addAction("Вихід", self.close)
 
         calib_menu = menubar.addMenu("Калібрування")
@@ -4439,6 +4446,12 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
         logger.info(f"Map click: {lat=}, {lon=}")
 
+    def on_open_config(self):
+        """Open the configuration editor dialog."""
+        from src.gui.dialogs.config_dialog import ConfigDialog
+        dialog = ConfigDialog(self)
+        dialog.exec()
+
 
 # ================================================================================
 # File: gui\__init__.py
@@ -4457,7 +4470,6 @@ add_video_source_dialog.py — Діалог додавання нового ві
 """
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -5421,6 +5433,302 @@ class CalibrationDialog(QDialog):
         self._cleanup_worker()
         self._frame_cache.clear()
         super().reject()
+
+
+# ================================================================================
+# File: gui\dialogs\config_dialog.py
+# ================================================================================
+import json
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
+    QTabWidget, QWidget, QFormLayout, QLineEdit, QCheckBox, 
+    QDoubleSpinBox, QSpinBox, QComboBox, QScrollArea, QLabel
+)
+from PyQt6.QtCore import Qt
+from pydantic import BaseModel, ValidationError
+
+from config.config import APP_SETTINGS, APP_CONFIG
+
+
+# Відомі варіанти вибору (домени) для специфічних полів
+COMBO_OPTIONS = {
+    "backend": {
+        "global_descriptor": ["dinov3", "dinov2"],
+        "homography": ["poselib", "opencv"],
+        "lightglue": ["git", "torchscript", "tensorrt"],
+        "lightglue_superpoint": ["git", "torchscript", "tensorrt"],
+        "lightglue_rdd": ["git", "torchscript", "tensorrt"]
+    },
+    "masking_strategy": ["yolo", "none"],
+    "local_extractor": ["rdd", "aliked", "superpoint", "xfeat"],
+    "dtype": ["float16", "float32"],
+    "default_mode": ["WEB_MERCATOR", "WGS84"],
+    "verify_display_mode": ["center", "center_corners", "full"],
+    "verify_label_mode": ["number", "number_rmse", "full"],
+    "source_type": ["file", "rtsp", "usb"],
+}
+
+class ConfigDialog(QDialog):
+    """Інтерактивне діалогове вікно для редагування конфігурації (APP_SETTINGS)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Налаштування програми")
+        self.resize(700, 600)
+        self.field_widgets = {}  # { (group, field_name): widget }
+        self._setup_ui()
+        self._load_config()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Створюємо вкладки на основі APP_SETTINGS
+        for group_name, group_model in APP_SETTINGS:
+            if isinstance(group_model, BaseModel):
+                self._create_tab(group_name, group_model)
+
+        btn_layout = QHBoxLayout()
+        self.btn_reset = QPushButton("Скасувати зміни")
+        self.btn_reset.clicked.connect(self._load_config)
+        btn_layout.addWidget(self.btn_reset)
+
+        self.btn_factory_reset = QPushButton("Скинути до стандартних")
+        self.btn_factory_reset.clicked.connect(self._load_defaults)
+        btn_layout.addWidget(self.btn_factory_reset)
+
+        btn_layout.addStretch()
+
+        self.btn_cancel = QPushButton("Закрити")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_cancel)
+
+        self.btn_save = QPushButton("Застосувати")
+        self.btn_save.clicked.connect(self._save_config)
+        self.btn_save.setDefault(True)
+        btn_layout.addWidget(self.btn_save)
+
+        layout.addLayout(btn_layout)
+
+    def _create_tab(self, group_name: str, model: BaseModel):
+        """Створює форму для однієї групи налаштувань."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
+        container = QWidget()
+        form_layout = QFormLayout(container)
+        
+        # Перебір всіх полів у Pydantic моделі
+        # Support for Pydantic V2 model_fields or fallback to dict
+        fields = getattr(model, "model_fields", model.__dict__)
+        
+        for field_name in fields:
+            val = getattr(model, field_name)
+            
+            # Рекурсивна підтримка вкладених моделей (наприклад models.yolo)
+            if isinstance(val, BaseModel):
+                form_layout.addRow(QLabel(f"<b>{field_name.upper()}</b>"))
+                sub_fields = getattr(val, "model_fields", val.__dict__)
+                for sub_name in sub_fields:
+                    sub_val = getattr(val, sub_name)
+                    widget = self._create_widget(group_name, f"{field_name}.{sub_name}", sub_val)
+                    form_layout.addRow(f"  {sub_name}:", widget)
+                    self.field_widgets[(group_name, f"{field_name}.{sub_name}")] = widget
+                form_layout.addRow(QLabel("")) # Spacer
+                continue
+
+            widget = self._create_widget(group_name, field_name, val)
+            form_layout.addRow(f"{field_name}:", widget)
+            self.field_widgets[(group_name, field_name)] = widget
+            
+        scroll.setWidget(container)
+        self.tabs.addTab(scroll, group_name.replace("_", " ").title())
+
+    def _create_widget(self, group_name: str, field_name: str, value):
+        """Створює відповідний віджет (QSpinBox, QComboBox і т.д.) на основі типу значення."""
+        # Перевірка на ComboBox (наперед задані варіанти)
+        combo_options = None
+        base_field = field_name.split('.')[-1]
+        
+        if base_field in COMBO_OPTIONS:
+            opts = COMBO_OPTIONS[base_field]
+            if isinstance(opts, dict):
+                # Наприклад backend залежить від батьківської групи
+                parent_prefix = field_name.split('.')[0] if '.' in field_name else group_name
+                if parent_prefix in opts:
+                    combo_options = opts[parent_prefix]
+            else:
+                combo_options = opts
+
+        if combo_options is not None:
+            cb = QComboBox()
+            cb.addItems(combo_options)
+            if str(value) in combo_options:
+                cb.setCurrentText(str(value))
+            return cb
+
+        # Стандартні типи
+        if isinstance(value, bool):
+            chk = QCheckBox()
+            chk.setChecked(value)
+            return chk
+        elif isinstance(value, int):
+            sp = QSpinBox()
+            sp.setRange(-999999, 999999)
+            sp.setValue(value)
+            return sp
+        elif isinstance(value, float):
+            sp = QDoubleSpinBox()
+            sp.setRange(-999999.0, 999999.0)
+            sp.setDecimals(8)
+            sp.setValue(value)
+            return sp
+        elif isinstance(value, list):
+            le = QLineEdit()
+            import json
+            le.setText(json.dumps(value))
+            return le
+        else:
+            le = QLineEdit()
+            le.setText(str(value) if value is not None else "")
+            return le
+
+    def _get_widget_value(self, widget, original_value):
+        """Зчитує значення з віджета та конвертує до оригінального типу."""
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        elif isinstance(widget, QCheckBox):
+            return widget.isChecked()
+        elif isinstance(widget, QSpinBox):
+            return widget.value()
+        elif isinstance(widget, QDoubleSpinBox):
+            return widget.value()
+        elif isinstance(widget, QLineEdit):
+            text = widget.text()
+            if isinstance(original_value, list):
+                if not text.strip():
+                    return []
+                import json
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    # Якщо не валідний JSON, пробуємо просто розбити по комах
+                    return [x.strip() for x in text.split(",")]
+            if original_value is None and not text:
+                return None
+            return text
+        return None
+
+    def _load_defaults(self):
+        """Скидає всі поля до заводських налаштувань (визначених у коді)."""
+        from config.config import AppConfig
+        default_config = AppConfig()
+        
+        # Оновлюємо значення в UI на основі дефолтних
+        for group_name, group_model in default_config:
+            if not isinstance(group_model, BaseModel):
+                continue
+            
+            for field_name in getattr(group_model, "model_fields", group_model.__dict__):
+                val = getattr(group_model, field_name)
+                
+                if isinstance(val, BaseModel):
+                    for sub_name in getattr(val, "model_fields", val.__dict__):
+                        sub_val = getattr(val, sub_name)
+                        w = self.field_widgets.get((group_name, f"{field_name}.{sub_name}"))
+                        if w:
+                            self._set_widget_value(w, sub_val)
+                else:
+                    w = self.field_widgets.get((group_name, field_name))
+                    if w:
+                        self._set_widget_value(w, val)
+
+    def _load_config(self):
+        """Оновлює віджети з поточного APP_SETTINGS."""
+        for group_name, group_model in APP_SETTINGS:
+            if not isinstance(group_model, BaseModel):
+                continue
+            
+            for field_name in getattr(group_model, "model_fields", group_model.__dict__):
+                val = getattr(group_model, field_name)
+                
+                if isinstance(val, BaseModel):
+                    for sub_name in getattr(val, "model_fields", val.__dict__):
+                        sub_val = getattr(val, sub_name)
+                        w = self.field_widgets.get((group_name, f"{field_name}.{sub_name}"))
+                        if w:
+                            self._set_widget_value(w, sub_val)
+                else:
+                    w = self.field_widgets.get((group_name, field_name))
+                    if w:
+                        self._set_widget_value(w, val)
+
+    def _set_widget_value(self, widget, value):
+        if isinstance(widget, QComboBox):
+            widget.setCurrentText(str(value))
+        elif isinstance(widget, QCheckBox):
+            widget.setChecked(bool(value))
+        elif isinstance(widget, QSpinBox) or isinstance(widget, QDoubleSpinBox):
+            widget.setValue(value)
+        elif isinstance(widget, QLineEdit):
+            if isinstance(value, list):
+                import json
+                widget.setText(json.dumps(value))
+            else:
+                widget.setText(str(value) if value is not None else "")
+
+    def _save_config(self):
+        """Зберігає дані з форми назад у APP_SETTINGS та APP_CONFIG."""
+        try:
+            # Створюємо словник оновлень
+            updates = {}
+            for group_name, group_model in APP_SETTINGS:
+                if not isinstance(group_model, BaseModel):
+                    continue
+                
+                group_dict = group_model.model_dump()
+                
+                for field_name in getattr(group_model, "model_fields", group_model.__dict__):
+                    val = getattr(group_model, field_name)
+                    
+                    if isinstance(val, BaseModel):
+                        for sub_name in getattr(val, "model_fields", val.__dict__):
+                            w = self.field_widgets.get((group_name, f"{field_name}.{sub_name}"))
+                            if w:
+                                orig = getattr(val, sub_name)
+                                group_dict[field_name][sub_name] = self._get_widget_value(w, orig)
+                    else:
+                        w = self.field_widgets.get((group_name, field_name))
+                        if w:
+                            group_dict[field_name] = self._get_widget_value(w, val)
+                            
+                # Валідуємо і створюємо новий об'єкт групи з усіма вкладеними моделями
+                new_group_model = group_model.__class__.model_validate(group_dict)
+                setattr(APP_SETTINGS, group_name, new_group_model)
+
+            # Оновлюємо глобальний словник
+            APP_CONFIG.clear()
+            APP_CONFIG.update(APP_SETTINGS.model_dump())
+
+            # Зберігаємо на диск
+            from config.config import save_user_config
+            save_user_config(APP_SETTINGS)
+            
+            QMessageBox.information(
+                self, 
+                "Успіх", 
+                "Налаштування успішно збережено.\n\n"
+                "Деякі зміни (наприклад, завантаження моделей) "
+                "почнуть діяти лише після перезапуску програми або трекінгу."
+            )
+            self.accept()
+            
+        except ValidationError as e:
+            QMessageBox.warning(self, "Помилка валідації", f"Неправильні параметри:\n{e}")
+        except Exception as e:
+            QMessageBox.critical(self, "Помилка", f"Невідома помилка:\n{e}")
 
 
 # ================================================================================
@@ -6399,7 +6707,7 @@ class CalibrationMixin:
         """Повертає source_id поточного активного джерела (базуючись на db_path)."""
         if not self.project_manager or not self.project_manager.is_loaded or not self.database:
             return "main"
-            
+
         current_db = str(Path(self.database.db_path).resolve())
         project_dir = self.project_manager.project_dir
         for src_dict in (self.project_manager.settings.video_sources or []):
@@ -6734,11 +7042,11 @@ class DatabaseMixin:
             # Очищення стану попереднього проєкту
             if hasattr(self, "calibration") and self.calibration:
                 self.calibration.clear()
-            
+
             if hasattr(self, "map_widget") and self.map_widget:
                 self.map_widget.clear_trajectory()
                 self.map_widget.clear_verification_markers()
-            
+
             if hasattr(self, "_tracking_results"):
                 self._tracking_results = []
 
@@ -7011,7 +7319,7 @@ class DatabaseMixin:
             if src_dict.get("source_id") == active_id:
                 video_path = src_dict.get("video_path", "")
                 break
-        
+
         # Якщо в settings не знайдено, fallback на загальний video_path
         if not video_path and self.project_manager.settings:
             video_path = self.project_manager.settings.video_path
@@ -7094,7 +7402,7 @@ class DatabaseMixin:
         """Обробка зміни активного джерела при кліку в таблиці."""
         if not self.db_manager:
             return
-            
+
         if source_id not in self.db_manager.all_source_ids:
             # Джерело вимкнено або не має БД
             self.database = None
@@ -7106,7 +7414,7 @@ class DatabaseMixin:
         self.database = self.db_manager.get_database(source_id)
         self.calibration = self.calib_manager.get(source_id)
         logger.info(f"Active source switched to: {source_id}")
-        
+
         self.status_bar.showMessage(f"Обрано джерело: {source_id}")
         self._update_project_info_panel()
         self._refresh_sources_panel()  # Щоб оновити підсвічування рядка в таблиці
@@ -7141,10 +7449,10 @@ class DatabaseMixin:
             source.enabled = not source.enabled
             settings.update_source(source)
             self.project_manager.save_project()
-            
+
             if hasattr(self, "db_manager") and self.db_manager:
                 self.db_manager.toggle_source(source)
-                
+
                 # Якщо вимкнули поточне джерело — перемикаємось на перше доступне
                 if not source.enabled and self._get_current_source_id() == source_id:
                     avail = self.db_manager.all_source_ids
@@ -7431,7 +7739,7 @@ class PanoramaMixin:
 import cv2
 import numpy as np
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox, QInputDialog
+from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 from config.config import get_cfg
 from src.localization.localizer import Localizer
@@ -7552,9 +7860,9 @@ class TrackingMixin:
             return
 
         source, ok = QInputDialog.getText(
-            self, 
-            "Живий потік", 
-            "Введіть RTSP URL (rtsp://...) або індекс камери (0, 1, usb:0):", 
+            self,
+            "Живий потік",
+            "Введіть RTSP URL (rtsp://...) або індекс камери (0, 1, usb:0):",
             text="rtsp://"
         )
         if not ok or not source:
@@ -7681,7 +7989,7 @@ class TrackingMixin:
                 inliers = result.get("inliers", 0)
                 anchor = result.get("matched_frame", "?")
                 source_id = result.get("source_id", "main")
-                
+
                 self.map_widget.update_marker(lat, lon)
                 is_fallback = result.get("fallback_mode") == "retrieval_only"
                 status_prefix = "ПРИБЛИЗНА Локалізація" if is_fallback else "Локалізація"
@@ -7779,7 +8087,7 @@ class TrackingMixin:
                 'label': f"#{obj.track_id} {obj.class_name}",
                 'class_name': obj.class_name
             })
-            
+
             if not hasattr(self, "_object_tracking_results"):
                 self._object_tracking_results = []
             self._object_tracking_results.append({
@@ -7790,7 +8098,7 @@ class TrackingMixin:
                 "confidence": obj.confidence,
                 "timestamp": str(np.datetime64("now"))
             })
-            
+
         if hasattr(self.map_widget, "update_object_markers"):
             self.map_widget.update_object_markers(points_to_show)
 
@@ -8349,7 +8657,7 @@ class ControlPanel(QWidget):
         selected_items = self.sources_table.selectedItems()
         if not selected_items:
             return
-        
+
         row = selected_items[0].row()
         item = self.sources_table.item(row, 0)
         if item:
@@ -8622,7 +8930,7 @@ class VideoWidget(QGraphicsView):
         self.clear_object_overlays()
         if not self._show_objects:
             return
-        
+
         COLOR_MAP = {
             0: QColor(255, 100, 100),   # person
             2: QColor(100, 200, 255),   # car
@@ -8630,17 +8938,17 @@ class VideoWidget(QGraphicsView):
             5: QColor(50, 255, 100),    # bus
             7: QColor(255, 150, 50),    # truck
         }
-        
+
         dpr = self._dpr()
-        
+
         for obj in objects:
             color = COLOR_MAP.get(obj.class_id, QColor(200, 200, 200))
-            
+
             lx1 = obj.bbox[0] / dpr
             ly1 = obj.bbox[1] / dpr
             lx2 = obj.bbox[2] / dpr
             ly2 = obj.bbox[3] / dpr
-            
+
             rect = self._scene.addRect(
                 lx1, ly1,
                 lx2 - lx1,
@@ -8648,18 +8956,18 @@ class VideoWidget(QGraphicsView):
                 QPen(color, 2)
             )
             self._object_overlay_items.append(rect)
-            
+
             label = f"#{obj.track_id} {obj.class_name} {obj.confidence:.0%}"
             text = self._scene.addText(label)
             text.setDefaultTextColor(QColor(255, 255, 255))
-            
+
             font = text.font()
             font.setBold(True)
             img_width = self._video_item.boundingRect().width()
             pixel_size = max(10, int(img_width) // 100)
             font.setPixelSize(pixel_size)
             text.setFont(font)
-            
+
             text.setPos(lx1, ly1 - pixel_size - 4)
             self._object_overlay_items.append(text)
 
@@ -8764,12 +9072,12 @@ logger = get_logger(__name__)
 class GeoAwareRetriever:
     """
     Геозалежний FAISS-ретривер з фоновою перебудовою індексу.
-    
+
     При виклику update_position():
     - Визначає новий набір frame_id через SpatialIndex
     - Якщо набір змінився — перебудовує FAISS у daemon-потоці
     - Під час перебудови поточний індекс залишається активним
-    
+
     Для джерел без frame_gps деградує до GlobalRetriever (повний масив).
     """
 
@@ -8832,10 +9140,10 @@ class GeoAwareRetriever:
     def update_position(self, lat: float, lon: float, radius_tiles: int = 2) -> bool:
         """
         Оновлює активну підмножину кадрів за GPS-позицією.
-        
+
         Якщо набір frame_id змінився — запускає перебудову FAISS у фоновому потоці.
         Під час перебудови поточний індекс залишається активним.
-        
+
         Returns:
             True якщо набір змінився (перебудова ініційована).
         """
@@ -8893,7 +9201,7 @@ class GeoAwareRetriever:
     ) -> list[tuple[int, float]]:
         """
         Пошук схожих кадрів у активному індексі.
-        
+
         Returns:
             Список (frame_id, cosine_score). frame_id — реальний ID у вихідній базі.
         """
@@ -9081,7 +9389,7 @@ class Localizer:
                 logger.info(
                     "Patchify enabled in config but database has no patch_descriptors. "
                 )
-        
+
         # Phase 3.2: GSD integration
         project_manager = self.config.get("_project_manager", None)
         if project_manager and project_manager.settings:
@@ -9611,7 +9919,7 @@ class Localizer:
         max_results: int | None = None,
     ) -> list[tuple[int, float]]:
         """Об'єднує результати стандартного та патч-retrieval через зважену суму.
-        
+
         Ваги беруться з конфігу (localization.patchify_merge_weight).
         Якщо кадр є в обох джерелах: score = w_std * s + w_patch * p.
         Якщо тільки в одному: беремо скор як є (не штрафуємо за відсутність в іншому).
@@ -9627,7 +9935,7 @@ class Localizer:
         for fid in all_fids:
             s = standard_dict.get(fid, 0.0)
             p = patch_dict.get(fid, 0.0)
-            
+
             if fid in standard_dict and fid in patch_dict:
                 merged[fid] = w_standard * s + w_patch * p
             elif fid in standard_dict:
@@ -9730,6 +10038,7 @@ class Localizer:
                 f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
         except Exception as e:
             logger.error(f"Failed to log to localization_failures.csv: {e}")
+
 
 # ================================================================================
 # File: localization\matcher.py
@@ -10080,7 +10389,7 @@ class PatchifyRetrieval:
                     f"{ph}×{pw}px (min={MIN_PATCH_PX}px). "
                     f"Image size: {w}×{h}."
                 )
-            
+
             for r in range(rows):
                 for c in range(cols):
                     y1 = r * ph
@@ -10123,7 +10432,7 @@ class PatchifyRetrieval:
     @torch.no_grad()
     def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
         """Батчований інференс для групи патчів.
-        
+
         Використовує fe.dinov2_transform — нормалізація та розмір вже налаштовані
         відповідно до активного backend (DINOv2 або DINOv3).
         """
@@ -10208,7 +10517,7 @@ class PatchifyRetrieval:
 
         # Для кожного з num_patches query-патчів знаходимо top-K ref-патчів
         search_k = top_k * 3  # шукаємо більше для кращої агрегації
-        
+
         # Захист: search_k не може бути більше за розмір індексу (Fix Bug 4)
         max_k = self.patch_index.ntotal
         if search_k > max_k:
@@ -10228,7 +10537,7 @@ class PatchifyRetrieval:
                     continue
                 fid = int(self.patch_frame_ids[ref_idx])
                 score = float(scores[patch_idx, j])
-                
+
                 frame_scores[fid] = frame_scores.get(fid, 0.0) + score
                 frame_hits[fid] = frame_hits.get(fid, 0) + 1
 
@@ -11150,7 +11459,6 @@ Usage (drop-in for model_manager.load_dinov2):
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -11243,13 +11551,12 @@ class DINOv3Wrapper(nn.Module):
 # File: models\wrappers\feature_extractor.py
 # ================================================================================
 import contextlib
-import cv2
 
 import numpy as np
 import torch
 import torchvision.transforms as T
 
-from config.config import get_cfg, get_active_descriptor_cfg
+from config.config import get_active_descriptor_cfg, get_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
 from src.utils.telemetry import Telemetry
@@ -11343,6 +11650,18 @@ class FeatureExtractor:
         rgb_tensor = torch.from_numpy(enhanced_image).float().div_(255.0)
         rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
 
+        # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
+        max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
+        orig_h, orig_w = rgb_tensor.shape[2], rgb_tensor.shape[3]
+        scale_factor = 1.0
+        if max(orig_h, orig_w) > max_edge:
+            scale_factor = max_edge / float(max(orig_h, orig_w))
+            new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
+            rgb_tensor = torch.nn.functional.interpolate(
+                rgb_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
+            logger.debug(f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
+
         # ALIKED очікує словник зі списком/тензором 'image'
         input_dict = {"image": rgb_tensor}
 
@@ -11354,6 +11673,9 @@ class FeatureExtractor:
         # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
         keypoints = aliked_out["keypoints"][0].cpu().numpy()
         descriptors = aliked_out["descriptors"][0].cpu().numpy()
+
+        if scale_factor != 1.0:
+            keypoints = keypoints / scale_factor
 
         # Фільтрація точок за маскою динамічних об'єктів (YOLO)
         if static_mask is not None and len(keypoints) > 0:
@@ -11421,6 +11743,19 @@ class FeatureExtractor:
             rgb = torch.tensor(p_img, pin_memory=True).float().div_(255.0)
             local_tensors.append(rgb.permute(2, 0, 1))
         local_batch = torch.stack(local_tensors).to(self.device, non_blocking=True)
+
+        # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
+        max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
+        orig_h, orig_w = local_batch.shape[2], local_batch.shape[3]
+        scale_factor = 1.0
+        if max(orig_h, orig_w) > max_edge:
+            scale_factor = max_edge / float(max(orig_h, orig_w))
+            new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
+            local_batch = torch.nn.functional.interpolate(
+                local_batch, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
+            logger.debug(f"Downscaled local batch extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
+
         is_xfeat = (
             hasattr(self.local_model, "__class__")
             and "XFeat" in self.local_model.__class__.__name__
@@ -11479,6 +11814,9 @@ class FeatureExtractor:
         global_descs = out_global.cpu().numpy()
         keypoints_batch = [kp.cpu().numpy() for kp in out_kpts]
         descriptors_batch = [desc.cpu().numpy() for desc in out_descs]
+
+        if scale_factor != 1.0:
+            keypoints_batch = [kp / scale_factor for kp in keypoints_batch]
 
         # Assembly
         results = []
@@ -11630,8 +11968,8 @@ def create_masking_strategy(
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -11651,6 +11989,10 @@ def _import_rdd():
         Path(__file__).resolve().parents[3] / "third_party" / "rdd",  # <project>/third_party/rdd
         Path(__file__).resolve().parents[3] / "models" / "rdd",       # <project>/models/rdd
     ]
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        search_paths.insert(0, Path(sys._MEIPASS) / "third_party" / "rdd")
+        search_paths.insert(0, Path(sys._MEIPASS) / "models" / "rdd")
 
     for rdd_path in search_paths:
         if rdd_path.exists() and (rdd_path / "RDD" / "RDD.py").exists():
@@ -11691,11 +12033,11 @@ class RDDWrapper:
         self.max_keypoints = max_keypoints
 
         build_fn, read_config_fn, rdd_path = _import_rdd()
-        
+
         config_path = rdd_path / "configs" / "default.yaml"
         if not config_path.exists():
             raise FileNotFoundError(f"RDD config not found at {config_path}")
-            
+
         rdd_config = read_config_fn(str(config_path))
         rdd_config["device"] = device
         self.model = build_fn(config=rdd_config)
@@ -11976,10 +12318,10 @@ class YOLOWrapper:
         # і водночас не генерує масу хибних детекцій, які псують static_mask
         # classes: обмежуємо детекцію лише потрібними класами (люди, авто)
         results = self.model(
-            images, 
-            verbose=False, 
-            half=self.use_half, 
-            conf=0.25, 
+            images,
+            verbose=False,
+            half=self.use_half,
+            conf=0.25,
             classes=list(self.dynamic_classes)
         )
 
@@ -12045,11 +12387,12 @@ import asyncio
 import threading
 import time
 from collections import deque
+
 from PyQt6.QtCore import QObject, pyqtSlot
 
 from config.config import NetworkApiConfig
-from src.network.ws_server import WebSocketServer
 from src.network.rest_server import RestApiServer
+from src.network.ws_server import WebSocketServer
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -12057,50 +12400,50 @@ logger = get_logger(__name__)
 
 class CoordinatesBroker(QObject):
     """Централізований брокер координат для всіх споживачів."""
-    
+
     def __init__(self, config: NetworkApiConfig):
         super().__init__()
         self.config = config
-        
+
         self._last_position: dict | None = None
         self._last_objects: list[dict] = []
         self._history: deque = deque(maxlen=1000)
-        
+
         self._tracking_start_time: float = 0.0
         self.is_tracking_active: bool = False
-        
+
         self._ws_server = None
         self._rest_server = None
-        
+
         self._loop = None
         self._loop_thread = None
-        
+
         if self.config.enabled:
             self._start_network_services()
-            
+
     def _start_network_services(self):
         """Запускає asyncio event loop у фоновому потоці для WS/REST."""
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
         self._loop_thread.start()
-        
+
     def _run_event_loop(self):
         asyncio.set_event_loop(self._loop)
-        
+
         tasks = []
         if self.config.ws_enabled:
             self._ws_server = WebSocketServer(host=self.config.ws_host, port=self.config.ws_port)
             tasks.append(self._ws_server.start())
-            
+
         if self.config.rest_enabled:
             self._rest_server = RestApiServer(broker=self, host=self.config.rest_host, port=self.config.rest_port)
             tasks.append(self._rest_server.start())
-            
+
         if tasks:
             self._loop.run_until_complete(asyncio.gather(*tasks))
             # Запускаємо безкінечний цикл для обробки підключень
             self._loop.run_forever()
-            
+
     def stop(self):
         self.is_tracking_active = False
         if self._loop and self._loop.is_running():
@@ -12109,7 +12452,7 @@ class CoordinatesBroker(QObject):
             # Чекаємо трохи і зупиняємо loop
             time.sleep(0.5)
             self._loop.call_soon_threadsafe(self._loop.stop)
-            
+
     async def _stop_servers(self):
         if self._ws_server:
             await self._ws_server.stop()
@@ -12120,7 +12463,7 @@ class CoordinatesBroker(QObject):
         self.is_tracking_active = active
         if active:
             self._tracking_start_time = time.time()
-            
+
     def get_uptime(self) -> float:
         if self.is_tracking_active:
             return time.time() - self._tracking_start_time
@@ -12128,10 +12471,10 @@ class CoordinatesBroker(QObject):
 
     def get_last_position(self) -> dict | None:
         return self._last_position
-        
+
     def get_last_objects(self) -> list[dict]:
         return self._last_objects
-        
+
     def get_history(self, limit: int = 100) -> list[dict]:
         history_list = list(self._history)
         return history_list[-limit:]
@@ -12142,7 +12485,7 @@ class CoordinatesBroker(QObject):
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
         msg = {
             "type": "position",
-            "lat": lat, 
+            "lat": lat,
             "lon": lon,
             "confidence": confidence,
             "inliers": inliers,
@@ -12151,17 +12494,17 @@ class CoordinatesBroker(QObject):
         self._last_position = msg
         self._history.append(msg)
         self._broadcast(msg)
-    
+
     @pyqtSlot(object)
     def on_objects_gps_updated(self, objects_gps: list):
         msg = {
             "type": "objects",
             "objects": [
                 {
-                    "track_id": o.track_id, 
+                    "track_id": o.track_id,
                     "class": o.class_name,
-                    "lat": o.lat, 
-                    "lon": o.lon, 
+                    "lat": o.lat,
+                    "lon": o.lon,
                     "conf": o.confidence
                 }
                 for o in objects_gps
@@ -12170,7 +12513,7 @@ class CoordinatesBroker(QObject):
         }
         self._last_objects = msg["objects"]
         self._broadcast(msg)
-    
+
     def _broadcast(self, msg: dict):
         if self._ws_server and self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._ws_server.broadcast(msg), self._loop)
@@ -12180,13 +12523,14 @@ class CoordinatesBroker(QObject):
 # File: network\rest_server.py
 # ================================================================================
 from aiohttp import web
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 class RestApiServer:
     """Легкий HTTP-сервер для REST API координат."""
-    
+
     def __init__(self, broker, host="0.0.0.0", port=8080):
         self.broker = broker
         self.host = host
@@ -12194,46 +12538,46 @@ class RestApiServer:
         self.app = web.Application()
         self.runner = None
         self.site = None
-        
+
         self.app.add_routes([
             web.get('/api/position', self.get_position),
             web.get('/api/objects', self.get_objects),
             web.get('/api/trajectory', self.get_trajectory),
             web.get('/api/status', self.get_status)
         ])
-        
+
     async def get_position(self, request):
         pos = self.broker.get_last_position()
         if pos:
             return web.json_response(pos)
         return web.json_response({"error": "No position data yet"}, status=404)
-        
+
     async def get_objects(self, request):
         objects = self.broker.get_last_objects()
         return web.json_response(objects)
-        
+
     async def get_trajectory(self, request):
         try:
             limit = int(request.query.get('limit', '100'))
         except ValueError:
             limit = 100
-            
+
         history = self.broker.get_history(limit)
         return web.json_response(history)
-        
+
     async def get_status(self, request):
         return web.json_response({
             "state": "tracking" if self.broker.is_tracking_active else "idle",
             "uptime_sec": self.broker.get_uptime()
         })
-        
+
     async def start(self):
         logger.info(f"Starting REST API server on {self.host}:{self.port}...")
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, self.host, self.port)
         await self.site.start()
-        
+
     async def stop(self):
         if self.runner:
             logger.info("Stopping REST API server...")
@@ -12245,27 +12589,29 @@ class RestApiServer:
 # ================================================================================
 import asyncio
 import json
+
 import websockets
 from websockets.server import WebSocketServerProtocol
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 class WebSocketServer:
     """Асинхронний WebSocket-сервер для розсилки координат."""
-    
+
     def __init__(self, host="0.0.0.0", port=8765):
         self.host = host
         self.port = port
         self.clients: set[WebSocketServerProtocol] = set()
         self.server = None
-        
+
     async def handler(self, websocket: WebSocketServerProtocol):
         path = getattr(websocket.request, "path", "") if hasattr(websocket, "request") else ""
         if path and path != "/ws/coords":
             await websocket.close()
             return
-            
+
         logger.info(f"WebSocket client connected: {websocket.remote_address}")
         self.clients.add(websocket)
         try:
@@ -12277,22 +12623,22 @@ class WebSocketServer:
         finally:
             self.clients.remove(websocket)
             logger.info(f"WebSocket client disconnected: {websocket.remote_address}")
-            
+
     async def start(self):
         logger.info(f"Starting WebSocket server on {self.host}:{self.port}...")
         self.server = await websockets.serve(self.handler, self.host, self.port)
-        
+
     async def stop(self):
         if self.server:
             logger.info("Stopping WebSocket server...")
             self.server.close()
             await self.server.wait_closed()
-            
+
     async def broadcast(self, message: dict):
         if not self.clients:
             return
-        
-        try:    
+
+        try:
             msg_str = json.dumps(message)
             # Розсилаємо повідомлення всім підключеним клієнтам
             await asyncio.gather(*[client.send(msg_str) for client in self.clients], return_exceptions=True)
@@ -12395,10 +12741,13 @@ class TrajectoryFilter:
 # ================================================================================
 # File: tracking\object_projector.py
 # ================================================================================
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
+
 from src.geometry.transformations import GeometryTransforms
 from src.tracking.object_tracker import TrackedObject
+
 
 @dataclass
 class ObjectGPS:
@@ -12411,10 +12760,10 @@ class ObjectGPS:
 
 class ObjectProjector:
     """Проєктує піксельні координати об'єктів у GPS через наявні H та affine матриці."""
-    
+
     def __init__(self, calibration_manager):
         self.calibration_manager = calibration_manager
-        
+
     def _apply_rotation(self, px_x: float, px_y: float, angle: int, frame_w: int, frame_h: int) -> tuple[float, float]:
         """Обертає координати відповідно до повороту кадру (0, 90, 180, 270)."""
         if angle == 0:
@@ -12437,34 +12786,34 @@ class ObjectProjector:
         frame_h: int
     ) -> list[ObjectGPS]:
         """Трансформує центри bbox: Query px -> Ref px (H) -> Metric (Affine) -> GPS."""
-        
+
         if not objects or H is None or affine is None:
             return []
-        
+
         if not self.calibration_manager.converter.is_initialized:
             return []
-            
+
         objects_gps = []
-        
+
         for obj in objects:
             px_x, px_y = obj.center_px
-            
+
             # 1. Враховуємо обертання кадру
             rx, ry = self._apply_rotation(px_x, px_y, rotation_angle, frame_w, frame_h)
-            
+
             # 2. Query pixels -> Reference pixels (Homography)
             pt_query = np.array([[rx, ry]], dtype=np.float64)
             try:
                 pt_ref = GeometryTransforms.apply_homography(pt_query, H)
-                
+
                 # 3. Reference pixels -> Metric (Affine calibration)
                 pt_metric = GeometryTransforms.apply_affine(pt_ref, affine)
-                
+
                 # 4. Metric -> GPS (WGS84)
                 lat, lon = self.calibration_manager.converter.metric_to_gps(
                     float(pt_metric[0, 0]), float(pt_metric[0, 1])
                 )
-                
+
                 objects_gps.append(ObjectGPS(
                     track_id=obj.track_id,
                     class_name=obj.class_name,
@@ -12475,15 +12824,16 @@ class ObjectProjector:
             except Exception as e:
                 # В разі виродженої матриці або інших помилок математики
                 continue
-                
+
         return objects_gps
 
 
 # ================================================================================
 # File: tracking\object_tracker.py
 # ================================================================================
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
 
 try:
     import supervision as sv
@@ -12506,7 +12856,7 @@ class ObjectTracker:
 
     def __init__(self, config: dict):
         self.config = config
-        
+
         if sv is None:
             raise ImportError("Package 'supervision' is required for ObjectTracker. Run 'pip install supervision'")
 
@@ -12516,7 +12866,7 @@ class ObjectTracker:
             minimum_matching_threshold=self.config.get("minimum_matching_threshold", 0.8),
             frame_rate=30,  # Default
         )
-        
+
         # COCO class names matching YOLO
         self._class_names = {
             0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
@@ -12547,7 +12897,7 @@ class ObjectTracker:
         detections: [{"class_id": int, "confidence": float, "bbox": [x1, y1, x2, y2]}, ...]
         """
         tracked_objects = []
-        
+
         if not detections:
             # supervision requires sv.Detections object even if empty to update track states
             sv_detections = sv.Detections.empty()
@@ -12556,12 +12906,12 @@ class ObjectTracker:
             bboxes = []
             confidences = []
             class_ids = []
-            
+
             for d in detections:
                 bboxes.append(d["bbox"])
                 confidences.append(d["confidence"])
                 class_ids.append(d["class_id"])
-            
+
             sv_detections = sv.Detections(
                 xyxy=np.array(bboxes, dtype=np.float32),
                 confidence=np.array(confidences, dtype=np.float32),
@@ -12570,7 +12920,7 @@ class ObjectTracker:
 
         # Update tracker
         tracked_sv_detections = self.tracker.update_with_detections(sv_detections)
-        
+
         # Convert back to TrackedObject
         if tracked_sv_detections is not None and len(tracked_sv_detections) > 0:
             for i in range(len(tracked_sv_detections)):
@@ -12578,12 +12928,12 @@ class ObjectTracker:
                 class_id = tracked_sv_detections.class_id[i]
                 confidence = tracked_sv_detections.confidence[i]
                 track_id = tracked_sv_detections.tracker_id[i]
-                
+
                 class_name = self._class_names.get(class_id, f"Class {class_id}")
-                
+
                 center_x = (xyxy[0] + xyxy[2]) / 2.0
                 center_y = (xyxy[1] + xyxy[3]) / 2.0
-                
+
                 tracked_objects.append(TrackedObject(
                     track_id=int(track_id),
                     class_id=int(class_id),
@@ -12592,7 +12942,7 @@ class ObjectTracker:
                     confidence=float(confidence),
                     center_px=(float(center_x), float(center_y))
                 ))
-                
+
         return tracked_objects
 
     def reset(self):
@@ -13112,10 +13462,12 @@ def _save_telemetry_on_exit():
 # File: video\video_source.py
 # ================================================================================
 import time
+from dataclasses import dataclass
+from enum import Enum
+
 import cv2
 import numpy as np
-from enum import Enum
-from dataclasses import dataclass
+
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -13138,13 +13490,13 @@ class VideoSourceConfig:
 
 class VideoSource:
     """Обгортка над cv2.VideoCapture з auto-reconnect та type detection."""
-    
+
     def __init__(self, config: VideoSourceConfig):
         self.config = config
         self._cap = None
         self._fps = 30.0
         self._is_open = False
-        
+
         # Визначаємо тип джерела, якщо він не вказаний явно
         if self.config.source_type == VideoSourceType.FILE:
             source_lower = str(self.config.source).lower()
@@ -13166,48 +13518,48 @@ class VideoSource:
         """Підключається до джерела. Якщо це live, налаштовує розмір буфера."""
         if self._cap is not None:
             self._cap.release()
-            
+
         source_val = int(self.config.source) if self.config.source_type == VideoSourceType.USB else self.config.source
-        
+
         logger.info(f"Connecting to video source: {source_val} (Type: {self.config.source_type.name})")
-        
+
         self._cap = cv2.VideoCapture(source_val)
-        
+
         if not self._cap.isOpened():
             self._is_open = False
             logger.error(f"Failed to open video source: {source_val}")
             return
-            
+
         self._is_open = True
-        
+
         # Для live-потоків мінімізуємо буферизацію
         if self.is_live:
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config.buffer_size)
-            
+
         # Зчитуємо FPS
         fps = self._cap.get(cv2.CAP_PROP_FPS)
         if fps > 0 and fps < 120:
             self._fps = fps
         else:
             self._fps = 30.0  # Фолбек
-            
+
         logger.info(f"Successfully connected to video source. FPS: {self._fps:.2f}")
 
     @property
     def is_live(self) -> bool:
         """True для RTSP/RTMP/USB/HTTP (немає кінця потоку, немає sync-sleep)."""
         return self.config.source_type in [
-            VideoSourceType.RTSP, 
-            VideoSourceType.RTMP, 
-            VideoSourceType.USB, 
+            VideoSourceType.RTSP,
+            VideoSourceType.RTMP,
+            VideoSourceType.USB,
             VideoSourceType.HTTP
         ]
-    
+
     @property
     def fps(self) -> float:
         """FPS потоку (для live — з метаданих, для файлу — з заголовку)."""
         return self._fps
-        
+
     @property
     def is_opened(self) -> bool:
         return self._is_open
@@ -13216,9 +13568,9 @@ class VideoSource:
         """Читає кадр з auto-reconnect при втраті з'єднання."""
         if not self._is_open:
             return False, None
-            
+
         ret, frame = self._cap.read()
-        
+
         if not ret and self.is_live:
             # Для live-потоків: пробуємо перепідключитися
             logger.warning("Connection lost to live stream. Attempting to reconnect...")
@@ -13231,11 +13583,11 @@ class VideoSource:
                     if ret:
                         logger.success("Reconnected successfully.")
                         return True, frame
-            
+
             logger.error("Failed to reconnect after multiple attempts.")
             self._is_open = False
             return False, None
-            
+
         return ret, frame
 
     def release(self):
@@ -13796,7 +14148,7 @@ class CalibrationPropagationWorker(QThread):
                                 gps_count += 1
                             except Exception:
                                 pass
-                    
+
                     # Видаляємо старий датасет якщо є
                     if "frame_gps" in f:
                         del f["frame_gps"]
@@ -14249,20 +14601,24 @@ class RealtimeTrackingWorker(QThread):
         if self.model_manager:
             self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
 
-        from src.tracking.object_tracker import ObjectTracker
         from src.tracking.object_projector import ObjectProjector
-        
+        from src.tracking.object_tracker import ObjectTracker
+
         object_tracker = None
         object_projector = None
-        
+
         is_tracking_enabled = False
         if isinstance(self.tracking_config, dict):
             is_tracking_enabled = self.tracking_config.get("enabled", False)
         else:
             is_tracking_enabled = getattr(self.tracking_config, "enabled", False)
-            
+
         if is_tracking_enabled:
-            tracker_cfg = self.tracking_config if isinstance(self.tracking_config, dict) else self.tracking_config.model_dump()
+            tracker_cfg = (
+                self.tracking_config
+                if isinstance(self.tracking_config, dict)
+                else self.tracking_config.model_dump()
+            )
             try:
                 object_tracker = ObjectTracker(tracker_cfg)
                 object_projector = ObjectProjector(self.localizer.calibration)
@@ -14293,7 +14649,7 @@ class RealtimeTrackingWorker(QThread):
                 return
 
         from src.video.video_source import VideoSource, VideoSourceConfig
-        
+
         if isinstance(self.video_source, VideoSource):
             video_src = self.video_source
         else:
@@ -14345,7 +14701,9 @@ class RealtimeTrackingWorker(QThread):
                 current_video_time_sec = video_src._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                 # Fallback: деякі кодеки повертають 0 — рахуємо за номером кадру
                 if current_video_time_sec <= 0:
-                    current_video_time_sec = video_src._cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
+                    current_video_time_sec = (
+                        video_src._cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
+                    )
 
             # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
             self.frame_ready.emit(frame)
@@ -14391,6 +14749,9 @@ class RealtimeTrackingWorker(QThread):
                         frame_rgb, static_mask=static_mask, dt=calculated_dt
                     )
                 except Exception as e:
+                    import torch
+
+                    torch.cuda.empty_cache()
                     logger.error(f"Localization exception on keyframe: {e}", exc_info=True)
                     loc_result = {"success": False, "error": str(e)}
 
@@ -14404,7 +14765,7 @@ class RealtimeTrackingWorker(QThread):
                     prev_pts_for_of = cv2.goodFeaturesToTrack(
                         curr_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
                     )
-                    
+
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
                     # ОНОВЛЕНО: Завжди оновлюємо кеш, навіть якщо порожній, щоб об'єкти могли зникати
@@ -14414,28 +14775,46 @@ class RealtimeTrackingWorker(QThread):
                         H = self.localizer._last_state.get("H")
                         affine = self.localizer._last_state.get("affine")
                         angle = self.localizer._last_state.get("global_angle", 0)
-                        
+
                         if H is not None and affine is not None:
                             # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
                             scale = getattr(self.localizer, "_last_scale", 1.0)
-                            
+
                             # Створюємо копії об'єктів з масштабованими координатами
                             from copy import deepcopy
+
                             scaled_tracked_objects = []
                             for obj in tracked_objects:
                                 s_obj = deepcopy(obj)
-                                s_obj.center_px = (obj.center_px[0] * scale, obj.center_px[1] * scale)
+                                s_obj.center_px = (
+                                    obj.center_px[0] * scale,
+                                    obj.center_px[1] * scale,
+                                )
                                 s_obj.bbox = [c * scale for c in obj.bbox]
                                 scaled_tracked_objects.append(s_obj)
-                            
+
                             objects_gps = object_projector.project_objects(
-                                scaled_tracked_objects, H, affine, angle, 
-                                int(frame.shape[1] * scale), int(frame.shape[0] * scale)
+                                scaled_tracked_objects,
+                                H,
+                                affine,
+                                angle,
+                                int(frame.shape[1] * scale),
+                                int(frame.shape[0] * scale),
                             )
                             if objects_gps:
-                                obj_summary = ", ".join([f"{obj.class_name} #{obj.track_id}" for obj in objects_gps])
-                                logger.info(f"Tracked {len(objects_gps)} objects (KF): {obj_summary}")
+                                obj_summary = ", ".join(
+                                    [f"{obj.class_name} #{obj.track_id}" for obj in objects_gps]
+                                )
+                                logger.info(
+                                    f"Tracked {len(objects_gps)} objects (KF): {obj_summary}"
+                                )
                             self.objects_gps_updated.emit(objects_gps)
+
+                # Fix OOM: Clear PyTorch CUDA cache after heavy keyframe
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 # ====== OPTICAL FLOW TRACKING ======
                 if prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
@@ -14470,7 +14849,7 @@ class RealtimeTrackingWorker(QThread):
                         # Оновлюємо стан так, щоб OF завжди рахувався ВІД КЛЮЧОВОГО КАДРУ,
                         # Це усуває проблему накопичення помилок (drift).
                         # Тому prev_gray_for_of та prev_pts_for_of не оновлюються тут!
-                        
+
                         # На OF-кадрах: повторно emit останні відомі об'єкти для візуальної
                         # безперервності (YOLO не запускається, тому нових детекцій немає)
                         if object_tracker:

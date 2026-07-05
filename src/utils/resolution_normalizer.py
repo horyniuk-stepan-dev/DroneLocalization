@@ -54,7 +54,9 @@ class ResolutionNormalizer:
             )
             self._logged_once = True
 
-        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LANCZOS4
+        # A9: CUBIC замість LANCZOS4 для upscale — у рази швидше, різниця
+        # для фіч-екстракторів невідчутна
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
         resized = cv2.resize(frame, (new_w, new_h), interpolation=interpolation)
         return resized, scale
 

@@ -33,9 +33,13 @@ class VideoWidget(QGraphicsView):
 
     def display_frame(self, pixmap: QPixmap):
         self._video_item.setPixmap(pixmap)
-        self._scene.setSceneRect(self._video_item.boundingRect())
-        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        logger.debug(f"Frame: {pixmap.width()}×{pixmap.height()}")
+        # A7: fitInView — лише при зміні розміру контенту. Щокадровий виклик
+        # (30 разів/с) перераховував трансформацію в'ю і навантажував GUI-потік.
+        rect = self._video_item.boundingRect()
+        if rect != getattr(self, "_last_scene_rect", None):
+            self._scene.setSceneRect(rect)
+            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+            self._last_scene_rect = rect
 
     # ── Overlays ─────────────────────────────────────────────────────────────
 

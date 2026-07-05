@@ -22,7 +22,8 @@ COMBO_OPTIONS = {
     "masking_strategy": ["yolo", "none"],
     "local_extractor": ["rdd", "aliked", "superpoint", "xfeat"],
     "dtype": ["float16", "float32"],
-    "default_mode": ["WEB_MERCATOR", "WGS84"],
+    # ВИПРАВЛЕНО: "WGS84" не є режимом конвертера (підтримуються UTM/WEB_MERCATOR)
+    "default_mode": ["UTM", "WEB_MERCATOR"],
     "verify_display_mode": ["center", "center_corners", "full"],
     "verify_label_mode": ["number", "number_rmse", "full"],
     "source_type": ["file", "rtsp", "usb"],

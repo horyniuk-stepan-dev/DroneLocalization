@@ -45,11 +45,28 @@ class CalibrationMixin:
 
         anchors_data = [a.to_dict() for a in self.calibration.anchors]
 
+        # Параметри відповідності кадрів відео ↔ слотів БД.
+        # Без них діалог не може конвертувати номери кадрів і якорі
+        # прив'язуються до неправильних слотів (див. BUGREPORT №1).
+        db_num_frames = self.database.get_num_frames()
+        frame_step = int(self.database.metadata.get("frame_step", 0) or 0)
+        if frame_step < 1:
+            # Старі БД без frame_step у метаданих — беремо з конфіга (може не збігатися!)
+            frame_step = int(get_cfg(self.config, "database.frame_step", 30))
+            logger.warning(
+                f"DB metadata has no 'frame_step' — falling back to config value {frame_step}. "
+                f"If the DB was built with a different step, anchor frame ids may be wrong."
+            )
+        kp_video_path = str(Path(self.database.db_path).with_suffix("")) + "_keypoints.mp4"
+
         self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
             existing_anchors=anchors_data,
             source_id=self._get_current_source_id(),
             parent=self,
+            db_num_frames=db_num_frames,
+            frame_step=frame_step,
+            keypoints_video_path=kp_video_path,
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
         self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)
@@ -69,11 +86,21 @@ class CalibrationMixin:
                 QMessageBox.warning(self, "Помилка", "Потрібно мінімум 4 точки для якоря!")
                 return
 
-            # Налаштування проєкції, якщо вона ще не ініціалізована
-            if not self.calibration.converter._initialized:
-                mode = get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")
-                reference_gps = points_gps[0] if mode == "UTM" else None
+            # ВИПРАВЛЕНО: WEB_MERCATOR-конвертер за замовчуванням завжди
+            # "_initialized", тому налаштований projection.default_mode (напр. UTM)
+            # мовчки ігнорувався. Перемикаємо режим, поки якорів ще немає.
+            mode = str(get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")).upper()
+            conv = self.calibration.converter
+            if not conv._initialized or (not self.calibration.anchors and conv._mode != mode):
+                reference_gps = tuple(points_gps[0]) if mode == "UTM" else None
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
+                logger.info(f"Projection initialized for calibration: {mode}")
+
+            # Розмір кадру — потрібен для інтерполяції якорів навколо центру кадру
+            fw = int(self.database.metadata.get("frame_width", 0) or 0)
+            fh = int(self.database.metadata.get("frame_height", 0) or 0)
+            if fw > 0 and fh > 0 and hasattr(self.calibration, "set_frame_size"):
+                self.calibration.set_frame_size(fw, fh)
 
             pts_2d_np = np.array(points_2d, dtype=np.float64)
             pts_metric = [
@@ -91,103 +118,85 @@ class CalibrationMixin:
                     proj.tolist(),
                 )
 
-            # ── ВИПРАВЛЕННЯ БАГ 2: логіка вибору трансформації ─────────────────
+            # ── ВИПРАВЛЕНО: детермінований фіт якоря ────────────────────────────
             #
-            # Система координат pixel vs UTM:
-            #   - Піксельна: вісь Y спрямована ВНИЗ (0 = верх кадру)
-            #   - UTM:       вісь Y спрямована ВГОРУ (на північ)
-            # Тому правильна матриця pixel→UTM ЗАВЖДИ має від'ємний детермінант
-            # (вона містить дзеркальне відображення). estimate_affine_partial (4-DoF)
-            # генерує лише матриці вигляду [s*cos -s*sin; s*sin s*cos], детермінант = s² > 0.
-            # Вона фізично не може відобразити такий простір.
+            # Раніше: cv2.estimateAffine2D з RANSAC та порогом 3.0, який
+            # інтерпретується в одиницях ПРИЗНАЧЕННЯ (метрах!). Кліки з похибкою
+            # 1–3 м опинялися на межі порогу, і недетермінований RANSAC давав
+            # РІЗНІ матриці за тих самих точок між запусками → "нестабільний
+            # крок калібрації". Для 4–8 перевірених користувачем точок RANSAC
+            # недоречний — використовуємо least-squares по всіх точках.
             #
-            # Рішення: при UTM-проекції завжди пробуємо estimate_affine (6-DoF) першою.
-            # При WEB_MERCATOR зберігаємо стару логіку (partial як пріоритет).
+            # Система координат: піксельна вісь Y ↓, метрична (UTM/Mercator) Y ↑,
+            # тому фізично коректна матриця pixel→metric ЗАВЖДИ має det < 0.
+            best_M = GeometryTransforms.estimate_affine_lsq(pts_2d_np, pts_metric_np)
+            best_type = "affine_full_lsq"
 
-            is_utm = self.calibration.converter._mode == "UTM"
-
-            best_M = None
-            best_type = "unknown"
-            rmse_p = float("inf")
-            median_p = 0.0
-            max_p = 0.0
-            proj_p = []
-
-            if is_utm:
-                # UTM: пріоритет — повна афінна (6-DoF), яка підтримує від'ємний детермінант
-                M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
-                if M_full is not None:
-                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
-                    logger.info(f"Full affine determinant for anchor {frame_id}: {det:.6f}")
-                    if det > 0:
-                        # Від'ємний детермінант очікується; якщо позитивний — попередження
-                        logger.warning(
-                            f"Anchor {frame_id}: full affine determinant is POSITIVE ({det:.4f}). "
-                            "Pixel→UTM should have negative det (Y-axis flip). "
-                            "Check point ordering or projection setup."
-                        )
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
-                    best_M = M_full
-                    best_type = "affine_full"
-                    logger.info(
-                        f"UTM mode: using full affine for anchor {frame_id} (RMSE: {rmse_p:.2f}m, det={det:.4f})"
-                    )
-
-                # Fallback до partial якщо full не вийшла (дуже мала к-сть точок або збій)
-                if best_M is None:
-                    logger.warning(
-                        f"Anchor {frame_id}: estimate_affine failed for UTM. "
-                        "Falling back to affine_partial — metric accuracy will be degraded."
-                    )
-                    M_partial, _ = GeometryTransforms.estimate_affine_partial(
-                        pts_2d_np, pts_metric_np
-                    )
-                    if M_partial is not None:
-                        rmse_p, median_p, max_p, proj_p = calc_metrics(
-                            M_partial, pts_2d_np, pts_metric_np
-                        )
-                        best_M = M_partial
-                        best_type = "affine_partial (UTM fallback)"
-
-            else:
-                # WEB_MERCATOR: ТАКОЖ потребує від'ємного детермінанта (Y-flip)
-                # Причина: pixel Y ↓ але metric Y (EPSG:3857) ↑
-                M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
-                if M_full is not None:
-                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
-                    if det > 0:
-                        logger.warning(
-                            f"Anchor {frame_id}: full affine det is POSITIVE ({det:.4f}). "
-                            "WEB_MERCATOR pixel→metric should have negative det (Y-flip). "
-                            "Check point ordering or projection setup."
-                        )
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
-                    best_M = M_full
-                    best_type = "affine_full"
-
-                # Fallback до partial тільки якщо full не вийшла
-                if best_M is None:
-                    logger.warning(
-                        f"Anchor {frame_id}: estimate_affine failed for WEB_MERCATOR. "
-                        "Falling back to affine_partial — Y-flip will NOT be modeled correctly!"
-                    )
-                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
-                    if M_partial is not None:
-                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
-                        best_M = M_partial
-                        best_type = "affine_partial (WEB_MERCATOR fallback — degraded)"
-
-            if best_M is None:
+            if best_M is None or not GeometryTransforms.is_matrix_valid(best_M):
                 QMessageBox.critical(
                     self,
                     "Помилка",
-                    "Не вдалося обчислити матрицю. Спробуйте іншу комбінацію точок.",
+                    "Не вдалося обчислити коректну матрицю за цими точками.\n\n"
+                    "Найчастіша причина — точки лежать майже на одній прямій.\n"
+                    "Розставте 4–6 точок якомога ширше по всьому кадру.",
                 )
                 return
+
+            det = float(best_M[0, 0] * best_M[1, 1] - best_M[0, 1] * best_M[1, 0])
+            logger.info(f"Anchor {frame_id} affine determinant: {det:.6f}")
+            if det > 0:
+                # det > 0 фізично неможливий для pixel→map: означає дзеркально
+                # переплутані вхідні дані. Раніше тут був лише warning у лог, і
+                # такий якір ламав глобальний sign у графовій оптимізації.
+                QMessageBox.critical(
+                    self,
+                    "Помилка калібрування",
+                    f"Матриця має додатний детермінант ({det:.4f}) — це фізично "
+                    f"неможливо для переходу пікселі → карта (вісь Y має "
+                    f"віддзеркалюватися).\n\n"
+                    f"Перевірте: чи не переплутані широта/довгота у точках, "
+                    f"чи правильним орієнтирам призначені координати.",
+                )
+                return
+
+            rmse_p, median_p, max_p, proj_p = calc_metrics(best_M, pts_2d_np, pts_metric_np)
 
             # ── Перевірка порогів якості ────────────────────────────────────────
             rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
             max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
+
+            # ── B6: Leave-one-out перевірка точок ────────────────────────────────
+            # Фітимо матрицю без кожної точки по черзі й міряємо, наскільки
+            # "викинута" точка не узгоджується з рештою. Сумарний RMSE маскує
+            # одну криву точку (неправильний клік / переплутана координата) —
+            # LOO показує її явно.
+            suspicious_points: list[tuple[int, float]] = []
+            if 5 <= len(pts_2d_np) <= 12:
+                loo_errors: list[float] = []
+                all_idx = np.arange(len(pts_2d_np))
+                for j in range(len(pts_2d_np)):
+                    idx = all_idx[all_idx != j]
+                    M_loo = GeometryTransforms.estimate_affine_lsq(
+                        pts_2d_np[idx], pts_metric_np[idx]
+                    )
+                    if M_loo is None:
+                        loo_errors.append(float("nan"))
+                        continue
+                    proj_j = GeometryTransforms.apply_affine(
+                        pts_2d_np[j].reshape(1, 2), M_loo
+                    )[0]
+                    loo_errors.append(float(np.linalg.norm(proj_j - pts_metric_np[j])))
+
+                finite = [e for e in loo_errors if np.isfinite(e)]
+                if finite:
+                    med_loo = float(np.median(finite))
+                    for j, e in enumerate(loo_errors):
+                        if np.isfinite(e) and e > max(3.0 * med_loo, 2.0 * rmse_threshold):
+                            suspicious_points.append((j, e))
+                    logger.info(
+                        f"Anchor {frame_id} LOO errors (m): "
+                        + ", ".join(f"pt{j + 1}={e:.2f}" for j, e in enumerate(loo_errors))
+                    )
 
             severity_color = "green"
             if rmse_p > rmse_threshold:
@@ -204,12 +213,21 @@ class CalibrationMixin:
                 f"Макс. похибка: <b>{max_p:.2f} м</b> (поріг: {max_err_threshold}м)<br>"
             )
 
-            if rmse_p > rmse_threshold or max_p > max_err_threshold:
-                qa_summary += "<br><span style='color:red'>⚠ Увага: Якість прив'язки нижча за рекомендовану!</span>"
+            if suspicious_points:
+                pts_txt = ", ".join(f"№{j + 1} ({e:.1f} м)" for j, e in suspicious_points)
+                qa_summary += (
+                    f"<br><span style='color:red'>⚠ Підозрілі точки (leave-one-out): "
+                    f"{pts_txt}.<br>Ймовірно, неправильний клік або переплутана "
+                    f"координата — перевірте ці точки.</span>"
+                )
+
+            if rmse_p > rmse_threshold or max_p > max_err_threshold or suspicious_points:
+                if rmse_p > rmse_threshold or max_p > max_err_threshold:
+                    qa_summary += "<br><span style='color:red'>⚠ Увага: Якість прив'язки нижча за рекомендовану!</span>"
                 reply = QMessageBox.warning(
                     self,
                     "Якість калібрування",
-                    qa_summary + "<br><br>Зберегти цей якір попри високу похибку?",
+                    qa_summary + "<br><br>Зберегти цей якір попри зауваження?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.No:
@@ -274,7 +292,10 @@ class CalibrationMixin:
             self.status_bar.showMessage(f"Додано якір (кадр {frame_id}, RMSE: {rmse_p:.2f}м)")
 
             if hasattr(self, "_calib_dialog") and self._calib_dialog is not None:
-                self._calib_dialog.on_anchor_confirmed(frame_id)
+                saved_anchor = self.calibration.get_anchor(frame_id)
+                self._calib_dialog.on_anchor_confirmed(
+                    frame_id, saved_anchor.to_dict() if saved_anchor else None
+                )
 
         except Exception as e:
             logger.error(f"Failed to add anchor: {e}", exc_info=True)
@@ -391,17 +412,19 @@ class CalibrationMixin:
 
         rmse_thresh = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
 
+        # УВАГА: frame_rmse з пропагації — це ПІКСЕЛІ репроєкції матчів між
+        # кадрами, а не метри (раніше підпис "м" вводив в оману)
         report = (
             f"<b>Пропагація завершена!</b><br><br>"
             f"Валідних кадрів: <b>{valid_count} / {num_frames}</b> ({valid_count / num_frames * 100:.1f}%)<br>"
-            f"Середній RMSE (grid): <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} м</b><br>"
+            f"Середній RMSE матчингу: <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} px</b><br>"
             f"Середній матчинг: <b>{avg_matches:.1f} точок</b><br>"
         )
 
         log_msg = (
             f"Пропагація завершена. "
             f"Валідних: {valid_count}/{num_frames} ({valid_count / num_frames * 100:.1f}%), "
-            f"RMSE: {avg_rmse:.3f}м, "
+            f"RMSE: {avg_rmse:.3f}px, "
             f"Матчинг: {avg_matches:.1f} точок"
         )
         if avg_dis > 0:
@@ -419,7 +442,7 @@ class CalibrationMixin:
 
         QMessageBox.information(self, "Пропагація", report)
         self.status_bar.showMessage(
-            f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}м, Mat: {avg_matches:.0f}"
+            f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}px, Mat: {avg_matches:.0f}"
         )
 
         if hasattr(self, "_update_project_info_panel"):
@@ -438,7 +461,9 @@ class CalibrationMixin:
         try:
             self.map_widget.clear_verification_markers()
             num_frames = self.database.get_num_frames()
-            step = 1  # Відображати всі кадри
+            # A8: тисячі Leaflet-маркерів одним JSON вішають QWebEngine —
+            # обмежуємо кількість точок до ~600 із рівномірним кроком
+            step = max(1, num_frames // 600)
 
             rmse_data = getattr(self.database, "frame_rmse", None)
             dis_data = getattr(self.database, "frame_disagreement", None)
@@ -526,7 +551,7 @@ class CalibrationMixin:
                 valid_rmse = rmse_data[valid_mask]
                 if len(valid_rmse) > 0:
                     avg_rmse = float(np.mean(valid_rmse))
-                    self.status_bar.showMessage(f"Пропагація: Середній RMSE = {avg_rmse:.3f} м")
+                    self.status_bar.showMessage(f"Пропагація: Середній RMSE = {avg_rmse:.3f} px")
 
         except Exception as e:
             logger.error(f"Error in on_verify_propagation: {e}", exc_info=True)

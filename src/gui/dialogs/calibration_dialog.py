@@ -1,5 +1,6 @@
 import re
 from collections import OrderedDict
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -50,12 +51,27 @@ class CalibrationDialog(QDialog):
     calibration_complete = pyqtSignal()
 
     def __init__(
-        self, database_path: str, existing_anchors=None, source_id: str = "main", parent=None
+        self,
+        database_path: str,
+        existing_anchors=None,
+        source_id: str = "main",
+        parent=None,
+        db_num_frames: int | None = None,
+        frame_step: int = 1,
+        keypoints_video_path: str | None = None,
     ):
         super().__init__(parent)
         self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
         self.source_id = source_id
+
+        # Відповідність кадрів відео ↔ слотів БД.
+        # БД індексується як video_frame // frame_step, тому діалог МУСИТЬ
+        # конвертувати номери кадрів, інакше якорі прив'язуються до чужих кадрів.
+        self.db_num_frames = int(db_num_frames) if db_num_frames else None
+        self.frame_step = max(1, int(frame_step))
+        self.keypoints_video_path = keypoints_video_path
+        self._index_mode = "db"  # "db" | "video" | "unknown"
 
         self.points_2d = []
         self.points_gps = []
@@ -81,6 +97,11 @@ class CalibrationDialog(QDialog):
         self.resize(1200, 800)
         self._init_ui()
         self._refresh_anchors_list()
+
+        # Автозавантаження keypoints-відео: воно має 1 кадр = 1 слот БД,
+        # тож нумерація збігається без конвертації.
+        if self.keypoints_video_path and Path(self.keypoints_video_path).exists():
+            self._load_video(self.keypoints_video_path)
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
@@ -156,7 +177,8 @@ class CalibrationDialog(QDialog):
         frame_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         fg = QHBoxLayout(frame_group)
         self.spinbox_frame_id = QSpinBox()
-        self.spinbox_frame_id.setRange(0, _UNKNOWN_FRAME_COUNT)
+        max_id = (self.db_num_frames - 1) if self.db_num_frames else _UNKNOWN_FRAME_COUNT
+        self.spinbox_frame_id.setRange(0, max_id)
         self.spinbox_frame_id.setValue(0)
         self.spinbox_frame_id.setToolTip(
             "При роботі з відео — заповнюється автоматично зі слайдера."
@@ -291,7 +313,7 @@ class CalibrationDialog(QDialog):
                 rmse = anchor.get("qa_data", {}).get("rmse_m", 0.0)
 
                 label = f"⚓ Кадр {fid} | {n_pts} точок"
-                if n_pts > 0:
+                if n_pts > 0 and rmse > 0:
                     label += f" | RMSE: {rmse:.2f}м"
 
                 item = QListWidgetItem(label)
@@ -334,12 +356,13 @@ class CalibrationDialog(QDialog):
 
         self.btn_delete_anchor.setEnabled(True)
 
-        # Перехід на кадр
+        # Перехід на кадр (frame_id якоря — це ID слота БД)
         if self._is_video:
+            video_fid = self._from_db_frame_id(frame_id)
             self.slider.blockSignals(True)
-            self.slider.setValue(frame_id)
+            self.slider.setValue(video_fid)
             self.slider.blockSignals(False)
-            self.video_worker.seek(frame_id)
+            self.video_worker.seek(video_fid)
 
         # Завантаження точок
         self.clear_current_points()
@@ -384,28 +407,25 @@ class CalibrationDialog(QDialog):
 
     # _jump_to_frame замінено сигналами від VideoDecodeWorker
 
-    def on_anchor_confirmed(self, frame_id: int):
-        """Called by MainWindow after affine matrix is successfully computed."""
-        # Отримуємо оновлені дані з MainWindow (опціонально, але MainWindow і так оновлює calibration в пам'яті)
-        # У MIXIN ми вже додали якір в self.calibration. Тут ми просто хочемо оновити UI діалогу.
+    def on_anchor_confirmed(self, frame_id: int, anchor_dict: dict | None = None):
+        """Called by MainWindow after affine matrix is successfully computed.
 
-        # Перевіримо, чи це оновлення існуючого
+        anchor_dict — повний AnchorCalibration.to_dict() з реальними QA-метриками
+        (RMSE тощо). Якщо не переданий — fallback на локальні точки діалогу.
+        """
         existing = next((a for a in self.existing_anchors if a.get("frame_id") == frame_id), None)
 
-        # Оскільки діалог не має прямого доступу до об'єкта calibration з MainWindow,
-        # нам треба або передати сюди новий dict, абоMainWindow сам оновить список при наступному відкритті.
-        # Але ми хочемо оновити список ЗАРАЗ.
-
-        # ХАК: оскільки ми щойно додали/оновили якір, але діалог не знає НОВІ точки (він знає лише ті, що в self.points_2d),
-        # ми можемо "імітувати" оновлення об'єкта в списку діалогу.
-        new_data = {
-            "frame_id": frame_id,
-            "qa_data": {
-                "points_2d": list(self.points_2d),
-                "points_gps": list(self.points_gps),
-                "rmse_m": 0.0,  # Буде оновлено при наступному відкритті або якщо MainWindow надішле повний об'єкт
-            },
-        }
+        if anchor_dict is not None:
+            new_data = anchor_dict
+        else:
+            # Fallback без QA-метрик (RMSE невідомий діалогу)
+            new_data = {
+                "frame_id": frame_id,
+                "qa_data": {
+                    "points_2d": list(self.points_2d),
+                    "points_gps": list(self.points_gps),
+                },
+            }
 
         if existing:
             idx = self.existing_anchors.index(existing)
@@ -455,6 +475,8 @@ class CalibrationDialog(QDialog):
         if total <= 0:
             total = _UNKNOWN_FRAME_COUNT
 
+        self._detect_index_mode(total)
+
         self.slider.blockSignals(True)
         self.slider.setEnabled(True)
         self.slider.setRange(0, total - 1)
@@ -464,11 +486,61 @@ class CalibrationDialog(QDialog):
         for btn in [self.btn_play, self.btn_step_back, self.btn_step]:
             btn.setEnabled(True)
 
-        self.spinbox_frame_id.setMaximum(total - 1)
+        # Спінбокс завжди показує ID слота БД (не кадр відео!)
+        max_id = (self.db_num_frames - 1) if self.db_num_frames else (total - 1)
+        self.spinbox_frame_id.setMaximum(max_id)
         self.spinbox_frame_id.setValue(0)
-        self.lbl_frame_id_warning.setText("")
         self.last_slider_value = 0
         self.video_worker.seek(0)
+
+    # ── Frame index mapping (video ↔ DB slots) ───────────────────────────────
+
+    def _detect_index_mode(self, total_video_frames: int):
+        """Визначає відповідність кадрів завантаженого відео слотам БД."""
+        n_db = self.db_num_frames
+        step = self.frame_step
+
+        if not n_db or total_video_frames >= _UNKNOWN_FRAME_COUNT:
+            self._index_mode = "unknown"
+            self.lbl_frame_id_warning.setText(
+                "⚠ Невідома кількість кадрів БД/відео — перевірте ID кадру вручну."
+            )
+            return
+
+        if total_video_frames == n_db:
+            # keypoints-відео: кадр = слот БД
+            self._index_mode = "db"
+            self.lbl_frame_id_warning.setText("")
+            return
+
+        expected_slots = (total_video_frames + step - 1) // step
+        if step > 1 and abs(expected_slots - n_db) <= 2:
+            # Оригінальне відео польоту — конвертуємо N → N//step
+            self._index_mode = "video"
+            self.lbl_frame_id_warning.setText(
+                f"ℹ Оригінальне відео: кадр N відео → слот БД N//{step}. "
+                f"Поле «Кадр №» показує вже конвертований ID слота БД."
+            )
+            return
+
+        self._index_mode = "unknown"
+        self.lbl_frame_id_warning.setText(
+            f"⚠ Кадри відео ({total_video_frames}) не відповідають БД "
+            f"({n_db} слотів, крок {step}). Якорі можуть прив'язатися до "
+            f"неправильних кадрів! Рекомендовано відкрити файл *_keypoints.mp4."
+        )
+
+    def _to_db_frame_id(self, video_frame: int) -> int:
+        """Кадр завантаженого відео → ID слота БД."""
+        if self._index_mode == "video":
+            return video_frame // self.frame_step
+        return video_frame
+
+    def _from_db_frame_id(self, db_frame_id: int) -> int:
+        """ID слота БД → кадр завантаженого відео (для переходу по якорях)."""
+        if self._index_mode == "video":
+            return db_frame_id * self.frame_step
+        return db_frame_id
 
     def _load_image(self, path: str):
         self._is_video = False
@@ -548,7 +620,7 @@ class CalibrationDialog(QDialog):
             self.slider.setValue(frame_id)
             self.slider.blockSignals(False)
 
-            self.spinbox_frame_id.setValue(frame_id)
+            self.spinbox_frame_id.setValue(self._to_db_frame_id(frame_id))
             self.video_widget.display_frame(pixmap)
             self.lbl_frame_info.setText(f"Кадр: {frame_id} / {self.slider.maximum()}")
 
@@ -565,7 +637,7 @@ class CalibrationDialog(QDialog):
         if value in self._frame_cache:
             self._display_cached_frame(value)
         else:
-            self.spinbox_frame_id.setValue(value)
+            self.spinbox_frame_id.setValue(self._to_db_frame_id(value))
             self.lbl_frame_info.setText(f"Кадр: {value} / {self.slider.maximum()}")
 
     def on_slider_released(self):
@@ -736,9 +808,22 @@ class CalibrationDialog(QDialog):
             )
             return
 
-        frame_id = self.spinbox_frame_id.value()
+        frame_id = self.spinbox_frame_id.value()  # завжди ID слота БД
 
-        if frame_id in self.existing_anchors:
+        # Валідація діапазону БД — інакше пропагація мовчки викине якір
+        if self.db_num_frames is not None and frame_id >= self.db_num_frames:
+            QMessageBox.critical(
+                self,
+                "Кадр поза межами БД",
+                f"Кадр {frame_id} виходить за межі бази даних "
+                f"({self.db_num_frames} слотів).\n\n"
+                f"Ймовірно, завантажене відео не відповідає базі даних. "
+                f"Відкрийте файл *_keypoints.mp4 поруч із базою.",
+            )
+            return
+
+        # ВИПРАВЛЕНО: existing_anchors — список dict'ів, перевірка "in" завжди була False
+        if any(a.get("frame_id") == frame_id for a in self.existing_anchors):
             reply = QMessageBox.question(
                 self,
                 "Якір існує",

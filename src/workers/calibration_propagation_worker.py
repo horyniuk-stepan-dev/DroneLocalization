@@ -85,6 +85,8 @@ class CalibrationPropagationWorker(QThread):
         )
         self.max_iters = get_cfg(self.config, "graph_optimization.max_iterations", 50)
         self.tolerance = get_cfg(self.config, "graph_optimization.convergence_tolerance", 1e-6)
+        self.robust_loss = get_cfg(self.config, "graph_optimization.robust_loss", "soft_l1")
+        self.robust_f_scale = get_cfg(self.config, "graph_optimization.robust_f_scale", 3.0)
         self.use_bfs = get_cfg(self.config, "graph_optimization.use_bfs_initialization", True)
         self.export_geojson = get_cfg(self.config, "graph_optimization.export_geojson", True)
 
@@ -112,6 +114,18 @@ class CalibrationPropagationWorker(QThread):
         num_frames = self.database.get_num_frames()
         all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
         anchors = [a for a in all_anchors if a.frame_id < num_frames]
+
+        # ВИПРАВЛЕНО: раніше якорі поза межами БД викидалися МОВЧКИ (тільки лог),
+        # і користувач не знав, що половина його якорів не використовується.
+        dropped = [a.frame_id for a in all_anchors if a.frame_id >= num_frames]
+        if dropped:
+            self.error.emit(
+                f"Якорі для кадрів {dropped} виходять за межі бази даних "
+                f"({num_frames} слотів). Ймовірно, вони були створені за номерами "
+                f"кадрів оригінального відео, а не слотів БД (кадр_відео // frame_step). "
+                f"Видаліть ці якорі та додайте заново через діалог калібрування."
+            )
+            return
 
         if not anchors:
             self.error.emit("Немає якорів калібрування")
@@ -148,6 +162,34 @@ class CalibrationPropagationWorker(QThread):
         # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
         self.progress.emit(60, "Фіксація GPS-якорів (Local Origin)...")
 
+        # ВИПРАВЛЕНО: якір міг потрапити на порожній слот (keyframe selection
+        # пропустила кадр) — тоді fix_node створював ізольований вузол без ребер,
+        # і якір мовчки ігнорувався оптимізацією. Снапимо до найближчого кадру
+        # з фічами: рух між сусідніми слотами в такому гепі нижчий за пороги
+        # keyframe selection, тому похибка снапу мізерна.
+        feature_ids = np.array(sorted(all_features.keys()), dtype=np.int64)
+        if len(feature_ids) == 0:
+            self.error.emit("У базі даних немає жодного кадру з фічами")
+            return
+
+        anchor_nodes: dict[int, object] = {}
+        for anchor in anchors:
+            fid = anchor.frame_id
+            if fid not in all_features:
+                nearest = int(feature_ids[np.argmin(np.abs(feature_ids - fid))])
+                logger.warning(
+                    f"Anchor frame {fid} has no features (non-keyframe slot). "
+                    f"Snapping to nearest keyframe {nearest} (Δ={abs(nearest - fid)} slots)."
+                )
+                fid = nearest
+            if fid in anchor_nodes:
+                logger.warning(
+                    f"Two anchors mapped to the same node {fid} after snapping; "
+                    f"keeping the first one."
+                )
+                continue
+            anchor_nodes[fid] = anchor
+
         # Визначаємо локальну опорну точку для математичної стабільності (Local Center)
         # Використовуємо метричну трансляцію першого якоря
         ref_anchor = anchors[0]
@@ -155,12 +197,12 @@ class CalibrationPropagationWorker(QThread):
         origin_ty = float(ref_anchor.affine_matrix[1, 2])
         logger.info(f"Local Origin established at: ({origin_tx:.2f}, {origin_ty:.2f})")
 
-        for anchor in anchors:
+        for fid, anchor in anchor_nodes.items():
             # Створюємо копію матриці з відносною трансляцією
             local_affine = anchor.affine_matrix.copy().astype(np.float64)
             local_affine[0, 2] -= origin_tx
             local_affine[1, 2] -= origin_ty
-            optimizer.fix_node(anchor.frame_id, local_affine)
+            optimizer.fix_node(fid, local_affine)
 
         if self.use_bfs:
             bfs_count = optimizer.initialize_from_bfs()
@@ -173,7 +215,7 @@ class CalibrationPropagationWorker(QThread):
         results = optimizer.optimize(
             max_iterations=self.max_iters,
             tolerance=self.tolerance,
-            progress_callback=lambda msg: self.progress.emit(70, msg)
+            progress_callback=lambda msg: self.progress.emit(70, msg),
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
 
@@ -245,7 +287,18 @@ class CalibrationPropagationWorker(QThread):
             if feat_i is None:
                 continue
 
-            if last_success_feat is not None and (i - last_success_id) <= self.max_skip_frames:
+            if last_success_feat is not None:
+                # ВИПРАВЛЕНО: раніше ребро будувалося лише якщо геп ≤ max_skip_frames
+                # СЛОТІВ. Але keyframe selection лишає довгі порожні гепи саме там,
+                # де дрон висить на місці (least motion) — і ланцюг рвався без причини.
+                # Тепер завжди з'єднуємо сусідні кадри-з-фічами: валідність ребра
+                # гарантують min_matches + перевірка гомографії.
+                gap = i - last_success_id
+                if gap > self.max_skip_frames:
+                    logger.debug(
+                        f"Temporal edge across keyframe gap: {last_success_id} → {i} "
+                        f"({gap} slots)"
+                    )
                 # H maps feat_i → last_success_feat (to→from direction)
                 result = self._match_and_build_edge(feat_i, last_success_feat)
                 if result is not None:
