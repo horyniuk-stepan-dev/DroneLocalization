@@ -9,19 +9,48 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 class WebSocketServer:
-    """Асинхронний WebSocket-сервер для розсилки координат."""
+    """Асинхронний WebSocket-сервер для розсилки координат.
 
-    def __init__(self, host="0.0.0.0", port=8765):
+    Безпека: дефолт — 127.0.0.1 (лише локальні клієнти). Для доступу з мережі
+    задайте host="0.0.0.0" явно та api_token — телеметрія дрона не має бути
+    відкритою в чужому Wi-Fi.
+    """
+
+    def __init__(self, host="127.0.0.1", port=8765, api_token: str | None = None):
         self.host = host
         self.port = port
+        self.api_token = api_token
         self.clients: set[WebSocketServerProtocol] = set()
         self.server = None
 
+        if host not in ("127.0.0.1", "localhost", "::1") and not api_token:
+            logger.warning(
+                f"WebSocket server binds to '{host}' WITHOUT api_token — "
+                f"drone telemetry will be readable by anyone on the network. "
+                f"Set network.api_token or use 127.0.0.1."
+            )
+
     async def handler(self, websocket: WebSocketServerProtocol):
         path = getattr(websocket.request, "path", "") if hasattr(websocket, "request") else ""
-        if path and path != "/ws/coords":
+        if path and not path.startswith("/ws/coords"):
             await websocket.close()
             return
+
+        # Токен: ?token=... у query або заголовок Authorization: Bearer ...
+        if self.api_token:
+            supplied = None
+            if "token=" in path:
+                supplied = path.split("token=", 1)[1].split("&", 1)[0]
+            headers = getattr(getattr(websocket, "request", None), "headers", {}) or {}
+            auth = headers.get("Authorization", "") if hasattr(headers, "get") else ""
+            if auth.startswith("Bearer "):
+                supplied = auth[7:]
+            if supplied != self.api_token:
+                logger.warning(
+                    f"WebSocket auth failed from {websocket.remote_address} — closing"
+                )
+                await websocket.close(code=4401, reason="Unauthorized")
+                return
 
         logger.info(f"WebSocket client connected: {websocket.remote_address}")
         self.clients.add(websocket)

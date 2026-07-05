@@ -1,0 +1,30 @@
+# Нормалізація закінчень рядків: без цього кожен clone/checkout на Windows
+# генерує CRLF-шторми (реальний випадок: diff на 183 файли / ~50k рядків,
+# де реальні зміни тонуть у перекодуванні).
+* text=auto eol=lf
+
+# Windows-специфічні скрипти лишаємо з CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
+
+# Бінарні файли — ніколи не чіпати
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.h5 binary
+*.hdf5 binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.engine binary
+*.dll binary
+*.exe binary
+*.pyc binary
+*.mp4 binary
+*.avi binary
+*.pak binary

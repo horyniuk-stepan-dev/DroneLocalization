@@ -85,8 +85,6 @@ class CalibrationPropagationWorker(QThread):
         )
         self.max_iters = get_cfg(self.config, "graph_optimization.max_iterations", 50)
         self.tolerance = get_cfg(self.config, "graph_optimization.convergence_tolerance", 1e-6)
-        self.robust_loss = get_cfg(self.config, "graph_optimization.robust_loss", "soft_l1")
-        self.robust_f_scale = get_cfg(self.config, "graph_optimization.robust_f_scale", 3.0)
         self.use_bfs = get_cfg(self.config, "graph_optimization.use_bfs_initialization", True)
         self.export_geojson = get_cfg(self.config, "graph_optimization.export_geojson", True)
 
@@ -542,7 +540,11 @@ class CalibrationPropagationWorker(QThread):
                     frame_disagreement[fid] = float(np.std(predictions_tx))
 
         # --- Збереження в HDF5 ---
+        # Тримаємо лок БД на весь цикл close → write → reload: інакше
+        # конкурентний get_local_features із GUI/трекінгу впаде на закритому
+        # h5py-хендлі (RuntimeError у кращому разі, сегфолт у гіршому).
         db_path = self.database.db_path
+        self.database.lock.acquire()
         self.database.close()
         try:
             with h5py.File(db_path, "a") as f:
@@ -616,7 +618,10 @@ class CalibrationPropagationWorker(QThread):
                 f"{valid_count}/{num_frames} valid frames)"
             )
         finally:
-            self.database._load_hot_data()
+            try:
+                self.database._load_hot_data()
+            finally:
+                self.database.lock.release()
 
         return int(np.sum(frame_valid))
 

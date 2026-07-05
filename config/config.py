@@ -25,6 +25,10 @@ class Dinov3ModelConfig(BaseModel):
     normalize_mean: list[float] = [0.430, 0.411, 0.296]
     normalize_std: list[float] = [0.213, 0.156, 0.143]
     hf_model_id: str = "facebook/dinov3-vitl16-pretrain-sat493m"
+    # БЕЗПЕКА: модель вантажиться з trust_remote_code=True. Зафіксуйте commit
+    # hash репозиторію HF, щоб підміна upstream-коду не стала виконанням
+    # чужого коду на вашій машині. Порожньо = latest (з warning у лог).
+    hf_revision: str = ""
     vram_required_mb: float = 1600.0
 
 
@@ -50,6 +54,9 @@ class DatabaseConfig(BaseModel):
     keyframe_always_save_first: bool = True
     use_decord: bool = True
     decode_batch_size: int = 32
+    # A6: Depth-Anything на кожному K-му кадрі збудови (масштаб змінюється
+    # повільно, повний інференс на кожен кадр — марна трата 20-35% часу)
+    depth_every_n: int = 10
     use_lancedb: bool = True
     lancedb_batch_size: int = 64
     lancedb_index_min_frames: int = 256
@@ -75,6 +82,10 @@ class LocalizationConfig(BaseModel):
     early_stop_inliers: int = 40
     retrieval_only_min_score: float = 0.90
     auto_rotation: bool = True
+    # A3: темпоральний prior кута — пробуємо лише останній вдалий кут
+    # (1 DINO-forward замість 4). Якщо retrieval-score prior-кута нижчий за цей
+    # поріг — повний батчований скан 4 кутів.
+    rotation_rescan_min_score: float = 0.70
     enable_lightglue_fallback: bool = True
     fallback_extractor: str = "aliked"
     confidence: ConfidenceConfig = ConfidenceConfig()
@@ -104,7 +115,9 @@ class TrackingConfig(BaseModel):
 class PreprocessingConfig(BaseModel):
     clahe_clip_limit: float = 3.0
     clahe_tile_grid: list[int] = [8, 8]
-    histogram_matching: bool = True
+    # УВАГА: histogram matching ще НЕ реалізований в ImagePreprocessor
+    # (працює лише CLAHE). Прапорець вимкнено, щоб не вводити в оману.
+    histogram_matching: bool = False
     reference_image_path: str = "config/reference_style.png"
     masking_strategy: str = "yolo"  # "yolo" | "none" (підготовка до EfficientViT-SAM)
 
@@ -260,12 +273,10 @@ class GraphOptimizationConfig(BaseModel):
     max_iterations: int = 50
     convergence_tolerance: float = 1e-6
 
-    # Robust loss: 'soft_l1' пригнічує вплив хибних loop closure на всю
-    # траєкторію (чистий L2 дозволяв одному поганому ребру тягнути розв'язок).
-    # 'linear' = стара поведінка. f_scale — межа переходу в robust-режим
-    # (у одиницях зважених резидуалів ≈ пікселі).
-    robust_loss: str = "soft_l1"  # "linear" | "soft_l1" | "huber"
-    robust_f_scale: float = 3.0
+    # ПРИМІТКА: robust loss (soft_l1) прибрано свідомо: spatial-ребра
+    # (loop closures) мають природно великі резидуали, і robust loss
+    # пригнічував саме їх — якорі тримали свої кадри, а решта "пливла".
+    # Чистий L2 дає loop closures повний вплив і стягує граф у форму.
 
     # BFS ініціалізація початкового наближення
     use_bfs_initialization: bool = True
@@ -305,11 +316,17 @@ class LiveStreamConfig(BaseModel):
 class NetworkApiConfig(BaseModel):
     enabled: bool = True
     ws_enabled: bool = True
-    ws_host: str = "0.0.0.0"
+    # БЕЗПЕКА: дефолт — лише локальні клієнти. Телеметрія дрона на 0.0.0.0
+    # без токена читається будь-ким у тій самій мережі. Для зовнішнього
+    # доступу задайте 0.0.0.0 явно РАЗОМ з api_token.
+    ws_host: str = "127.0.0.1"
     ws_port: int = 8765
     rest_enabled: bool = True
-    rest_host: str = "0.0.0.0"
+    rest_host: str = "127.0.0.1"
     rest_port: int = 8081
+    # Спільний токен для WS (?token=... або Authorization: Bearer) і REST
+    # (Authorization: Bearer). Порожній = без автентифікації (тільки локально!)
+    api_token: str = ""
 
 
 class AppConfig(BaseModel):

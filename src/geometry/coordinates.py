@@ -35,6 +35,11 @@ class CoordinateConverter:
         """Повертає опорні GPS-координати, використані для UTM проєкції."""
         return self._reference_gps
 
+    @property
+    def mode(self) -> str:
+        """Режим проєкції: "UTM" або "WEB_MERCATOR" (публічний доступ замість _mode)."""
+        return self._mode
+
     def _initialize_projection(self, lat: float, lon: float) -> None:
         wgs84_crs = CRS("EPSG:4326")
 

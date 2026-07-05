@@ -45,13 +45,22 @@ class CoordinatesBroker(QObject):
     def _run_event_loop(self):
         asyncio.set_event_loop(self._loop)
 
+        token = getattr(self.config, "api_token", "") or None
+
         tasks = []
         if self.config.ws_enabled:
-            self._ws_server = WebSocketServer(host=self.config.ws_host, port=self.config.ws_port)
+            self._ws_server = WebSocketServer(
+                host=self.config.ws_host, port=self.config.ws_port, api_token=token
+            )
             tasks.append(self._ws_server.start())
 
         if self.config.rest_enabled:
-            self._rest_server = RestApiServer(broker=self, host=self.config.rest_host, port=self.config.rest_port)
+            self._rest_server = RestApiServer(
+                broker=self,
+                host=self.config.rest_host,
+                port=self.config.rest_port,
+                api_token=token,
+            )
             tasks.append(self._rest_server.start())
 
         if tasks:

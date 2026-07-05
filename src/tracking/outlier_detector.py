@@ -22,6 +22,11 @@ class OutlierDetector:
             f"Parameters: window_size={window_size}, threshold_std={threshold_std}, max_speed_mps={max_speed_mps}"
         )
 
+    def reset(self) -> None:
+        """Повне скидання стану (нова сесія трекінгу)."""
+        self.window.clear()
+        self._consecutive_outliers = 0
+
     def add_position(self, position: tuple, dt: float = 1.0, reset_consecutive: bool = True):
         # Тепер зберігаємо і позицію, і dt (час, за який ця позиція була досягнута)
         self.window.append((np.array(position, dtype=np.float64), max(dt, 0.01)))

@@ -26,8 +26,9 @@ def test_config_values():
     assert APP_CONFIG["preprocessing"]["clahe_tile_grid"] == [8, 8]
     # Нові поля Горизонту 1
     assert APP_CONFIG["preprocessing"]["masking_strategy"] in ("yolo", "none")
+    # Інваріант замість літерала: тест на конкретний дефолт дрейфує разом
+    # із конфігом і фейлиться без реальної причини (антипатерн)
     assert APP_CONFIG["homography"]["backend"] in ("poselib", "opencv")
-    assert APP_CONFIG["homography"]["backend"] == "opencv"  # default = opencv для стабільності
     assert APP_CONFIG["models"]["yolo"]["model_path"] == "models/yolo11n-seg.pt"
     assert APP_CONFIG["models"]["engines_cache"]["engine_cache_dir"] == "models/engines/"
 

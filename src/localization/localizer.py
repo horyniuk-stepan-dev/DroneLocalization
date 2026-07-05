@@ -199,6 +199,26 @@ class Localizer:
         # Single-mode (зворотна сумісність)
         return None, self.retriever.find_similar_frames(global_desc, top_k=top_k)
 
+    @property
+    def last_state(self) -> dict | None:
+        """Останній успішний стан локалізації (H, affine, кут, source_id) або None.
+
+        Публічний доступ замість читання приватного _last_state ззовні.
+        """
+        return getattr(self, "_last_state", None)
+
+    def reset_session(self) -> None:
+        """Скидає стан сесії трекінгу (фільтри, лічильники, кутовий prior).
+
+        Викликати при старті нового відстеження, щоб уникнути хибних
+        передбачень на основі попередньої сесії.
+        """
+        self.trajectory_filter.reset()
+        self.outlier_detector.reset()
+        self._consecutive_failures = 0
+        self._last_best_angle = None
+        self._last_state = None
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
@@ -422,7 +442,7 @@ class Localizer:
                         )
 
             if best_inliers >= early_stop:
-                logger.info(
+                logger.debug(
                     f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
                 )
                 break
@@ -677,11 +697,8 @@ class Localizer:
         keyframe-ами (чиста трансляція dx/dy дрейфує на віражах).
         flow_quality (0..1) — чесна якість OF для адаптивного шуму Kalman.
         """
-        if (
-            not hasattr(self, "_last_state")
-            or self._last_state["H"] is None
-            or self._last_state["affine"] is None
-        ):
+        state = self.last_state
+        if state is None or state.get("H") is None or state.get("affine") is None:
             return {"success": False, "error": "No previous state to apply OF"}
 
         # Відновлюємо database/calibration для збереженого source_id (мульти-режим)

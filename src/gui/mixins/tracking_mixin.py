@@ -76,6 +76,17 @@ class TrackingMixin:
         if not self.database:
             QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
             return
+        # Взаємне виключення з пропагацією: вона перезаписує HDF5
+        # (close→write→reload), конкурентний трекінг читав би з перехідного хендла.
+        pw = getattr(self, "propagation_worker", None)
+        if pw is not None and pw.isRunning():
+            QMessageBox.warning(
+                self,
+                "Увага",
+                "Дочекайтеся завершення пропагації калібрування — "
+                "вона перезаписує базу даних, яку використовує трекінг.",
+            )
+            return
         if not self.calibration.is_calibrated and not (
             self.database and self.database.is_propagated
         ):

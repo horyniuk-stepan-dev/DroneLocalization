@@ -1,4 +1,5 @@
 import json
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,18 @@ from src.geometry.coordinates import CoordinateConverter
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _synchronized(method):
+    """Декоратор: виконує метод під self._lock (RLock — реентерабельний)."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class DatabaseLoader:
@@ -36,6 +49,13 @@ class DatabaseLoader:
         self.frame_gps: np.ndarray | None = None  # (N, 2) — [lat, lon] per frame
         self.spatial_index = None  # SpatialIndex | None
 
+        # Потокобезпека: h5py-хендл і кеші читаються з GUI-потоку та воркерів
+        # одночасно (h5py не потокобезпечний, OrderedDict-кеш мутується).
+        # RLock — бо публічні методи викликають один одного.
+        # ЗОВНІШНІЙ код (напр. пропагація при перезаписі HDF5) може взяти
+        # self.lock на весь цикл close → write → reload.
+        self._lock = threading.RLock()
+
         # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
         self._feature_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
@@ -46,6 +66,12 @@ class DatabaseLoader:
         logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
 
+    @property
+    def lock(self) -> threading.RLock:
+        """Публічний лок для зовнішніх критичних секцій (напр. перезапис HDF5)."""
+        return self._lock
+
+    @_synchronized
     def _load_hot_data(self) -> None:
         """Load global descriptors (DINOv2), poses and propagation data into RAM"""
         logger.info(f"Loading hot data into RAM from: {self.db_path}")
@@ -224,6 +250,7 @@ class DatabaseLoader:
     def is_propagated(self) -> bool:
         return self.frame_affine is not None
 
+    @_synchronized
     def get_frame_affine(self, frame_id: int) -> np.ndarray | None:
         """Повертає афінну матрицю для конкретного кадру"""
         if not self.is_propagated or self.frame_affine is None or self.frame_valid is None:
@@ -234,6 +261,7 @@ class DatabaseLoader:
             return None
         return self.frame_affine[frame_id]
 
+    @_synchronized
     def get_frame_size(self, frame_id: int) -> tuple[int, int]:
         """Повертає (height, width) для вказаного кадру"""
         if frame_id in self._size_cache:
@@ -269,6 +297,7 @@ class DatabaseLoader:
         self._size_cache[frame_id] = res
         return res
 
+    @_synchronized
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
         """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         if frame_id in self._feature_cache:
@@ -316,6 +345,7 @@ class DatabaseLoader:
         """Повертає кількість кадрів у БД (pre-allocated slots для v2)."""
         return int(self.metadata.get("num_frames", 0))
 
+    @_synchronized
     def close(self) -> None:
         if self.db_file is not None:
             self.db_file.close()

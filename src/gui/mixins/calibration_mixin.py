@@ -91,7 +91,7 @@ class CalibrationMixin:
             # мовчки ігнорувався. Перемикаємо режим, поки якорів ще немає.
             mode = str(get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")).upper()
             conv = self.calibration.converter
-            if not conv._initialized or (not self.calibration.anchors and conv._mode != mode):
+            if not conv.is_initialized or (not self.calibration.anchors and conv.mode != mode):
                 reference_gps = tuple(points_gps[0]) if mode == "UTM" else None
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
                 logger.info(f"Projection initialized for calibration: {mode}")
@@ -242,7 +242,7 @@ class CalibrationMixin:
                 "max_err_m": max_p,
                 "inliers_count": len(pts_2d_np),
                 "transform_type": best_type,
-                "projection_mode": self.calibration.converter._mode,
+                "projection_mode": self.calibration.converter.mode,
                 "created_at": datetime.now().isoformat(),
                 "points_2d": points_2d,
                 "points_gps": points_gps,
@@ -331,6 +331,14 @@ class CalibrationMixin:
             return
         if not self.database:
             QMessageBox.warning(self, "Увага", "База даних не завантажена!")
+            return
+        # Взаємне виключення з трекінгом: пропагація перезаписує HDF5.
+        tw = getattr(self, "tracking_worker", None)
+        if tw is not None and tw.isRunning():
+            QMessageBox.warning(
+                self, "Увага", "Зупиніть трекінг перед запуском пропагації — "
+                "вони використовують одну базу даних."
+            )
             return
 
         try:
@@ -689,4 +697,3 @@ class CalibrationMixin:
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
-

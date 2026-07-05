@@ -39,13 +39,24 @@ class DINOv3Wrapper(nn.Module):
     This allows FeatureExtractor and CespModule to work without any changes.
     """
 
-    def __init__(self, model_id: str = _HF_MODEL_ID, device: str = "cuda"):
+    def __init__(
+        self, model_id: str = _HF_MODEL_ID, device: str = "cuda", revision: str | None = None
+    ):
         super().__init__()
         from transformers import AutoModel
 
-        logger.info(f"Loading DINOv3 from HuggingFace: {model_id} ...")
-        # trust_remote_code needed for custom DINOv3ViTModel architecture
-        self._model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+        logger.info(f"Loading DINOv3 from HuggingFace: {model_id} (rev={revision or 'latest'})")
+        # trust_remote_code=True виконує код із репозиторію моделі. Без
+        # зафіксованого revision підміна репозиторію = виконання чужого коду.
+        if not revision:
+            logger.warning(
+                "DINOv3 loaded with trust_remote_code=True WITHOUT pinned revision — "
+                "set models.global_descriptor.dinov3.hf_revision to a commit hash "
+                "to protect against upstream repo tampering."
+            )
+        self._model = AutoModel.from_pretrained(
+            model_id, trust_remote_code=True, revision=revision or None
+        )
         self._model = self._model.eval().to(device)
         self._device = device
 

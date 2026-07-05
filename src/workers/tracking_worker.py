@@ -41,14 +41,9 @@ class RealtimeTrackingWorker(QThread):
         self.tracking_config = get_cfg(self.config, "object_tracking", {})
 
     def run(self):
-        # Fix #3: Скидаємо стан трекера при кожному новому старті сесії
-        if hasattr(self.localizer, "trajectory_filter"):
-            self.localizer.trajectory_filter.reset()
-        if hasattr(self.localizer, "outlier_detector"):
-            self.localizer.outlier_detector.window.clear()
-            self.localizer.outlier_detector._consecutive_outliers = 0
-        if hasattr(self.localizer, "_consecutive_failures"):
-            self.localizer._consecutive_failures = 0
+        # Fix #3: скидаємо стан сесії через публічний API (без приватних полів)
+        if hasattr(self.localizer, "reset_session"):
+            self.localizer.reset_session()
 
         if self.model_manager:
             self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
@@ -149,13 +144,11 @@ class RealtimeTrackingWorker(QThread):
             if video_src.is_live:
                 current_video_time_sec = time.time() - stream_start_time
             else:
-                # Отримуємо поточний час САМОГО ВІДЕО у секундах
-                current_video_time_sec = video_src._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                # Отримуємо поточний час САМОГО ВІДЕО у секундах (публічний API)
+                current_video_time_sec = video_src.pos_msec / 1000.0
                 # Fallback: деякі кодеки повертають 0 — рахуємо за номером кадру
                 if current_video_time_sec <= 0:
-                    current_video_time_sec = (
-                        video_src._cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
-                    )
+                    current_video_time_sec = video_src.pos_frames * frame_duration_sec
 
             # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
             self.frame_ready.emit(frame)
@@ -223,10 +216,11 @@ class RealtimeTrackingWorker(QThread):
                     # ОНОВЛЕНО: Завжди оновлюємо кеш, навіть якщо порожній, щоб об'єкти могли зникати
                     last_tracked_objects = tracked_objects
                     self.objects_detected.emit(tracked_objects)
-                    if object_projector and getattr(self.localizer, "_last_state", None):
-                        H = self.localizer._last_state.get("H")
-                        affine = self.localizer._last_state.get("affine")
-                        angle = self.localizer._last_state.get("global_angle", 0)
+                    loc_state = getattr(self.localizer, "last_state", None)
+                    if object_projector and loc_state:
+                        H = loc_state.get("H")
+                        affine = loc_state.get("affine")
+                        angle = loc_state.get("global_angle", 0)
 
                         if H is not None and affine is not None:
                             # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
@@ -258,7 +252,7 @@ class RealtimeTrackingWorker(QThread):
                                 obj_summary = ", ".join(
                                     [f"{obj.class_name} #{obj.track_id}" for obj in objects_gps]
                                 )
-                                logger.info(
+                                logger.debug(
                                     f"Tracked {len(objects_gps)} objects (KF): {obj_summary}"
                                 )
                             self.objects_gps_updated.emit(objects_gps)

@@ -166,6 +166,7 @@ class PoseGraphOptimizer:
         tolerance: float = 1e-6,
         progress_callback=None,
     ) -> dict[int, np.ndarray]:
+
         if not self._edges:
             logger.warning("No edges — returning current states as-is")
             return self._export_results()
@@ -221,8 +222,6 @@ class PoseGraphOptimizer:
         free_indices_in_full = [node_id_to_idx[fid] for fid in free_ids]
         edges_from = np.array([node_id_to_idx[e.from_id] for e in valid_edges], dtype=np.int32)
         edges_to = np.array([node_id_to_idx[e.to_id] for e in valid_edges], dtype=np.int32)
-
-
 
 
         d = {
@@ -316,7 +315,7 @@ class PoseGraphOptimizer:
         w_trans_y = w / sy_i
         w_scale = w * d['cx']
         w_rot = w * d['cx']
-        
+
         res_edges = np.zeros((d['n_edges'], 5), dtype=np.float64)
         res_edges[:, 0] = w_trans_x * (tx_j - pred_tx_j)
         res_edges[:, 1] = w_trans_y * (ty_j - pred_ty_j)
@@ -500,7 +499,7 @@ def _predict_inverse(state_j: np.ndarray, edge: GraphEdge, sign: float) -> np.nd
 
 
 def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
-    """Для сумісності з воркером, що використовує назву homography_to_affine (або homography_to_similarity)"""
+    """Проєктує гомографію на афінну модель через 5 опорних точок навколо центру."""
     cx, cy = frame_w / 2.0, frame_h / 2.0
     d = min(frame_w, frame_h) * 0.25
     pts = np.array(
@@ -516,47 +515,9 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
     return T
 
 
-# Додаємо аліас, щоб не довелося змінювати назву у worker-і, якщо там досі викликається homography_to_similarity
+# Аліас для сумісності з worker-ом (використовує назву homography_to_similarity)
 homography_to_similarity = homography_to_affine
 
 
-try:
-    import gtsam
-
-    GTSAM_AVAILABLE = True
-except ImportError:
-    GTSAM_AVAILABLE = False
-
-
-class GtsamPoseGraphOptimizer(PoseGraphOptimizer):
-    """
-    GTSAM-based PoseGraphOptimizer.
-
-    This optimizer aims to replace SciPy LM. However, the exact 5-DoF anisotropic model
-    requires `gtsam.CustomFactor` implemented in Python, which defeats the C++ speedup,
-    or simplifying the model to an isotropic `Similarity2` (4-DoF).
-
-    NOTE: In the base `PoseGraphOptimizer`, the scipy method has been switched from 'lm' to 'trf'
-    which correctly utilizes the `jac_sparsity` mapping. This switch already provides a ~100x
-    performance improvement on large graphs, often matching GTSAM's speed while preserving
-    the exact 5-DoF anisotropic mathematics.
-    """
-
-    def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6) -> dict[int, np.ndarray]:
-        if not GTSAM_AVAILABLE:
-            logger.warning(
-                "GTSAM is not installed (`pip install gtsam`). Falling back to optimized SciPy TRF."
-            )
-            return super().optimize(max_iterations, tolerance)
-
-        # NOTE: Full GTSAM implementation requires validation of the Similarity2 assumption:
-        logger.info("Initializing GTSAM nonlinear factor graph (Sim2)...")
-        graph = gtsam.NonlinearFactorGraph()
-        initial_estimates = gtsam.Values()
-
-        # We will fallback to scipy TRF for now because scipy TRF provides the exact math
-        # much faster without requiring structural changes or dropping anisotropic scales.
-        logger.warning(
-            "GTSAM 5-DoF factor graph is currently mapped to SciPy TRF for exact anisotropic stability."
-        )
-        return super().optimize(max_iterations, tolerance)
+# GtsamPoseGraphOptimizer видалено (senior review, п.9): клас був заглушкою,
+# яка в усіх гілках делегувала в SciPy TRF і губила progress_callback/loss/f_scale.

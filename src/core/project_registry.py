@@ -40,9 +40,13 @@ class ProjectRegistry:
     def _save(self):
         """Зберегти реєстр на диск."""
         try:
+            from src.utils.atomic_io import atomic_write_text
+
             self._registry_dir.mkdir(parents=True, exist_ok=True)
-            with open(self._registry_path, "w", encoding="utf-8") as f:
-                json.dump({"projects": self._projects}, f, indent=2, ensure_ascii=False)
+            atomic_write_text(
+                str(self._registry_path),
+                json.dumps({"projects": self._projects}, indent=2, ensure_ascii=False),
+            )
         except Exception as e:
             logger.error(
                 f"Failed to save project registry: {e} | "

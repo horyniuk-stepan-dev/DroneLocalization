@@ -123,3 +123,8 @@ models/*
 third_party/Depth-Anything-V2
 KnowledgeBase/*
 models.zip
+
+# Особистий робочий простір розробника — не код продукту
+scratch/
+.complexipy_cache/
+.pytest_cache/

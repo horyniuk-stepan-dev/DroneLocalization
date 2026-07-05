@@ -243,9 +243,12 @@ class ProjectManager:
             return False
 
         try:
+            from src.utils.atomic_io import atomic_write_text
+
             json_file = self.project_dir / "project.json"
-            with open(json_file, "w", encoding="utf-8") as f:
-                json.dump(asdict(self.settings), f, indent=4, ensure_ascii=False)
+            atomic_write_text(
+                str(json_file), json.dumps(asdict(self.settings), indent=4, ensure_ascii=False)
+            )
             return True
         except Exception as e:
             logger.error(

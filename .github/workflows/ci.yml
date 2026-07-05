@@ -1,0 +1,47 @@
+# CI: лінт + юніт-тести без GPU-залежностей.
+# Важкі тести (torch/ultralytics/PyQt6/бенчмарки) виключені — вони потребують
+# GPU/дисплей і запускаються локально: pytest tests/
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install "ruff>=0.1.9"
+      - name: Ruff check
+        run: ruff check src/ config/ tests/
+      - name: Ruff format check
+        run: ruff format --check src/ config/ tests/
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies (CPU-only, без torch)
+        run: |
+          pip install numpy'<2.0.0' scipy opencv-python-headless pyproj \
+            pydantic loguru orjson filterpy pytest pytest-cov
+      - name: Run unit tests
+        run: |
+          pytest tests/ -q \
+            --ignore=tests/benchmarks \
+            --ignore=tests/integration \
+            --ignore=tests/unit \
+            --ignore=tests/test_localization.py \
+            --ignore=tests/test_rdd.py \
+            --ignore=tests/test_object_tracker.py \
+            -p no:cacheprovider

@@ -538,7 +538,14 @@ class ModelManager:
                             raise ImportError(
                                 "DINOv3Wrapper not available — install: pip install transformers"
                             )
-                        model = DINOv3Wrapper(model_id=hf_model_id, device=self.device)
+                        hf_revision = get_cfg(
+                            self.config, "global_descriptor.dinov3.hf_revision", ""
+                        )
+                        model = DINOv3Wrapper(
+                            model_id=hf_model_id,
+                            device=self.device,
+                            revision=hf_revision or None,
+                        )
                         self.models[name] = model
                         logger.success(f"DINOv3 loaded: {hf_model_id} on {self.device}")
                     except Exception as e:

@@ -359,16 +359,20 @@ class MultiAnchorCalibration:
             "anchors": [a.to_dict() for a in self.anchors],
         }
 
+        # Атомарний запис: калібрування — критичні дані, обрізаний JSON
+        # при краші/конкурентному збереженні означає втрату всіх якорів.
+        from src.utils.atomic_io import atomic_write_bytes
+
         if _USE_ORJSON:
             raw = _json_lib.dumps(
                 data,
                 option=_json_lib.OPT_INDENT_2 | getattr(_json_lib, "OPT_NON_STR_KEYS", 0),
             )
-            with open(path, "wb") as f:
-                f.write(raw)
+            atomic_write_bytes(path, raw)
         else:
-            with open(path, "w", encoding="utf-8") as f:
-                _json_lib.dump(data, f, indent=2, ensure_ascii=False)
+            atomic_write_bytes(
+                path, _json_lib.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            )
         logger.success(
             f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)"
         )

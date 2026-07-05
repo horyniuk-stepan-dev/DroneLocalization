@@ -101,6 +101,20 @@ class VideoSource:
     def is_opened(self) -> bool:
         return self._is_open
 
+    @property
+    def pos_msec(self) -> float:
+        """Поточна позиція відео у мс (0.0 якщо кодек не повідомляє/закрито)."""
+        if self._cap is None:
+            return 0.0
+        return float(self._cap.get(cv2.CAP_PROP_POS_MSEC))
+
+    @property
+    def pos_frames(self) -> float:
+        """Поточний номер кадру (0.0 якщо закрито)."""
+        if self._cap is None:
+            return 0.0
+        return float(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
+
     def read(self) -> tuple[bool, np.ndarray | None]:
         """Читає кадр з auto-reconnect при втраті з'єднання."""
         if not self._is_open:

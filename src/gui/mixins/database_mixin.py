@@ -274,7 +274,7 @@ class DatabaseMixin:
             # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
             if self.database and self.database.converter is not None:
                 self.calibration.converter = self.database.converter
-            elif self.calibration.converter and self.calibration.converter._initialized:
+            elif self.calibration.converter and self.calibration.converter.is_initialized:
                 pass  # конвертер вже завантажений з calibration.json
 
             if self.database.is_propagated:
