@@ -128,6 +128,9 @@ class FeatureMatcher:
 
         logger.info(f"FeatureMatcher ratio_threshold = {self.ratio_threshold:.2f}")
 
+        # Для warn-once логування несумісних розмірностей дескрипторів
+        self._dim_mismatch_warned: set = set()
+
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         """
         Dynamically routes to LightGlue (for 256-dim SuperPoint)
@@ -136,6 +139,25 @@ class FeatureMatcher:
         desc_dim = (
             query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
         )
+        ref_dim = (
+            ref_features["descriptors"].shape[1] if len(ref_features["descriptors"]) > 0 else 0
+        )
+
+        # ЗАХИСТ: різні розмірності дескрипторів (напр. query=128 ALIKED,
+        # ref=256 RDD/SuperPoint зі старої бази) неможливо матчити взагалі —
+        # ні LightGlue, ні L2. База цього джерела збудована іншим екстрактором
+        # і потребує перегенерації.
+        if desc_dim and ref_dim and desc_dim != ref_dim:
+            key = (desc_dim, ref_dim)
+            if key not in self._dim_mismatch_warned:
+                self._dim_mismatch_warned.add(key)
+                logger.error(
+                    f"Descriptor dimension mismatch: query={desc_dim}, ref={ref_dim}. "
+                    f"Reference database was built with a different local extractor. "
+                    f"Rebuild that source's database with the current extractor. "
+                    f"Skipping all matches for this dim pair (logged once)."
+                )
+            return np.empty((0, 2)), np.empty((0, 2))
 
         # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED) або 256 (RDD/SuperPoint)
         if self.lightglue is not None and desc_dim in (128, 256):

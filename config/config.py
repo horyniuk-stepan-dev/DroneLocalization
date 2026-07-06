@@ -284,6 +284,28 @@ class GraphOptimizationConfig(BaseModel):
     # Діагностика
     export_geojson: bool = True
 
+    # ── Швидкість (Етап 4). Дефолти = ПОТОЧНА поведінка (2-point FD, BFS). ──
+    # Аналітичний якобіан звірено з FD (‖J_a−J_fd‖<1e-5); вмикати після бенчмарка.
+    use_analytic_jacobian: bool = False
+    warm_start: bool = False  # тепла ініціалізація з попереднього розв'язку замість BFS
+
+    # ── Гейтинг ребер ДО оптимізації (Етап 2). Майстер-прапорець off = ПОТОЧНА ──
+    # поведінка (жодне ребро не відсіюється). Дефолти гейтів м'які.
+    edge_gate_enabled: bool = False
+    edge_gate_max_rotation_deg: float = 40.0     # |dtheta| spatial-ребра
+    edge_gate_max_scale_ratio: float = 1.6       # висота не стрибає вдвічі: |log_ds|≤log(1.6)
+    edge_gate_min_inlier_ratio: float = 0.25
+    edge_gate_mutual_check: bool = True          # взаємність retrieval (j теж бачить i у top-k)
+    edge_gate_cluster_consistency: bool = True   # самотнє loop closure без підтримки → вага ×0.5
+
+    # ── Two-stage prune L2→prune→L2 (Етап 3). Дефолт off. ──
+    two_stage_prune: bool = False
+    prune_mad_k: float = 5.0                     # поріг = median + k·1.4826·MAD (у класі spatial)
+    prune_max_spatial_frac: float = 0.2          # не більше 20% spatial за прохід
+
+    # ── Вага spatial × DINOv2-подібність (Етап 4.3). Дефолт off. w *= 0.5+0.5·sim ──
+    spatial_weight_use_similarity: bool = False
+
 
 class ObjectTrackingConfig(BaseModel):
     enabled: bool = True
@@ -362,8 +384,8 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
         else:
             return default
     # PyInstaller runtime path resolution for models/
-    import sys
     import os
+    import sys
     if isinstance(current, str) and (current.startswith("models/") or current.startswith("models\\")):
         if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
             meipass_path = os.path.join(sys._MEIPASS, current)
@@ -407,7 +429,7 @@ def load_user_config() -> AppConfig:
     """Завантажує налаштування користувача з файлу, якщо він існує. Інакше повертає дефолтні."""
     if os.path.exists(CONFIG_FILE_PATH):
         try:
-            with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
+            with open(CONFIG_FILE_PATH, encoding="utf-8") as f:
                 data = json.load(f)
             return AppConfig(**data)
         except Exception as e:

@@ -91,6 +91,25 @@ class CalibrationPropagationWorker(QThread):
         # Скільки кадрів можна "перестрибнути" при побудові temporal ребер
         self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 3)
 
+        # ── Нові опції (Етапи 2/3/4). Дефолти off = поточна поведінка. ──
+        go = "graph_optimization."
+        self.use_analytic_jac = get_cfg(self.config, go + "use_analytic_jacobian", False)
+        self.warm_start = get_cfg(self.config, go + "warm_start", False)
+        self.two_stage_prune = get_cfg(self.config, go + "two_stage_prune", False)
+        self.prune_mad_k = get_cfg(self.config, go + "prune_mad_k", 5.0)
+        self.prune_max_spatial_frac = get_cfg(self.config, go + "prune_max_spatial_frac", 0.2)
+        self.edge_gate_enabled = get_cfg(self.config, go + "edge_gate_enabled", False)
+        self.edge_gate_max_rot = get_cfg(self.config, go + "edge_gate_max_rotation_deg", 40.0)
+        self.edge_gate_max_scale = get_cfg(self.config, go + "edge_gate_max_scale_ratio", 1.6)
+        self.edge_gate_min_inlier_ratio = get_cfg(
+            self.config, go + "edge_gate_min_inlier_ratio", 0.25
+        )
+        self.edge_gate_mutual = get_cfg(self.config, go + "edge_gate_mutual_check", True)
+        self.edge_gate_cluster = get_cfg(self.config, go + "edge_gate_cluster_consistency", True)
+        self.spatial_weight_use_sim = get_cfg(
+            self.config, go + "spatial_weight_use_similarity", False
+        )
+
     def stop(self):
         self._is_running = False
 
@@ -202,6 +221,20 @@ class CalibrationPropagationWorker(QThread):
             local_affine[1, 2] -= origin_ty
             optimizer.fix_node(fid, local_affine)
 
+        # Warm start (Етап 4.2): x0 з попереднього розв'язку замість BFS з нуля.
+        # BFS нижче лишається для першого запуску та як fallback (заповнює лише
+        # вузли БЕЗ стану).
+        if self.warm_start:
+            prev = self._load_previous_affines()
+            if prev:
+                local_prev = {}
+                for fid, aff in prev.items():
+                    a = np.asarray(aff, dtype=np.float64).copy()
+                    a[0, 2] -= origin_tx
+                    a[1, 2] -= origin_ty
+                    local_prev[fid] = a
+                optimizer.warm_start_from_affines(local_prev)
+
         if self.use_bfs:
             bfs_count = optimizer.initialize_from_bfs()
             logger.info(f"Phase 3 complete: {bfs_count} nodes initialized via BFS")
@@ -214,8 +247,18 @@ class CalibrationPropagationWorker(QThread):
             max_iterations=self.max_iters,
             tolerance=self.tolerance,
             progress_callback=lambda msg: self.progress.emit(70, msg),
+            use_analytic_jac=self.use_analytic_jac,
+            two_stage_prune=self.two_stage_prune,
+            prune_mad_k=self.prune_mad_k,
+            prune_max_spatial_frac=self.prune_max_spatial_frac,
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
+
+        # Звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших, anchor stress
+        try:
+            logger.info("Звіт пропагації:\n" + optimizer.format_diagnostics())
+        except Exception as diag_err:
+            logger.warning(f"Diagnostics report failed: {diag_err}")
 
         # Відновлюємо абсолютні координати (додаємо Local Origin назад)
         for fid in results:
@@ -300,7 +343,7 @@ class CalibrationPropagationWorker(QThread):
                 # H maps feat_i → last_success_feat (to→from direction)
                 result = self._match_and_build_edge(feat_i, last_success_feat)
                 if result is not None:
-                    H, inliers, rmse_val = result
+                    H, inliers, rmse_val, _n_matches = result
                     similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
                     if similarity is not None:
                         weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
@@ -381,41 +424,33 @@ class CalibrationPropagationWorker(QThread):
             faiss_index.add(np.array(mat, dtype=np.float32))
             logger.info(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
 
-        count = 0
+        # ── Pass 1: retrieval top-k для всіх кадрів (для взаємної перевірки 2.2) ──
+        retrieval: dict[int, list[tuple[int, float]]] = {}
+        for i in range(num_frames):
+            if not self._is_running:
+                break
+            feat_i = features.get(i)
+            if feat_i is None or i not in normed_dict:
+                continue
+            retrieval[i] = self._retrieve_candidates(
+                normed_dict[i], has_lancedb, lance_table, faiss_index, faiss_id_map
+            )
+        topk_sets = {fid: {int(j) for j, _ in cands} for fid, cands in retrieval.items()}
+
+        # ── Pass 2: збір spatial-кандидатів + гейти (Етап 2) ──
         already_matched: set[tuple[int, int]] = set()
+        specs: list[dict] = []
+        n_gated_phys = 0
+        n_gated_mutual = 0
 
         for i in range(num_frames):
             if not self._is_running:
                 break
-
             feat_i = features.get(i)
-            if feat_i is None or i not in normed_dict:
+            if feat_i is None or i not in retrieval:
                 continue
 
-            q = normed_dict[i]
-
-            candidates = []
-            if has_lancedb:
-                try:
-                    res = (
-                        lance_table.search(q.astype(np.float32))
-                        .metric("cosine")
-                        .limit(self.lc_top_k + 1)
-                        .select(["frame_id", "_distance"])
-                        .to_list()
-                    )
-                    for r in res:
-                        candidates.append((r["frame_id"], max(0.0, 1.0 - r["_distance"])))
-                except Exception:
-                    pass
-            else:
-                q_batch = np.array([q], dtype=np.float32)
-                scores, ids = faiss_index.search(q_batch, self.lc_top_k + 1)
-                for raw_idx, sim_score in zip(ids[0], scores[0]):
-                    if raw_idx != -1:
-                        candidates.append((faiss_id_map[raw_idx], float(sim_score)))
-
-            for j, sim_score in candidates:
+            for j, sim_score in retrieval[i]:
                 j = int(j)
                 if j == i or j == -1:
                     continue
@@ -429,6 +464,12 @@ class CalibrationPropagationWorker(QThread):
                     continue
                 already_matched.add(edge_key)
 
+                # 2.2 взаємність retrieval: j теж має бачити i у своєму top-k
+                if self.edge_gate_enabled and self.edge_gate_mutual:
+                    if i not in topk_sets.get(j, ()):
+                        n_gated_mutual += 1
+                        continue
+
                 feat_j = features.get(j)
                 if feat_j is None:
                     continue
@@ -438,7 +479,7 @@ class CalibrationPropagationWorker(QThread):
                 if result is None:
                     continue
 
-                H, inliers, rmse_val = result
+                H, inliers, rmse_val, n_matches = result
                 if inliers < self.lc_min_inliers:
                     continue
 
@@ -446,25 +487,111 @@ class CalibrationPropagationWorker(QThread):
                 if similarity is None:
                     continue
 
-                weight = self._compute_weight(inliers, rmse_val, self.spatial_base_w)
-                optimizer.add_edge(
-                    from_id=i,
-                    to_id=j,
-                    relative_affine_2x3=similarity,
-                    weight=weight,
-                    edge_type="spatial",
-                    inliers=inliers,
-                    rmse=rmse_val,
-                )
-                count += 1
+                # 2.1 фізичні межі відносної трансформації
+                if self.edge_gate_enabled and not self._passes_physical_gate(
+                    similarity, inliers, n_matches
+                ):
+                    n_gated_phys += 1
+                    continue
+
+                specs.append({
+                    "i": i, "j": j, "similarity": similarity,
+                    "inliers": inliers, "rmse": rmse_val, "sim": float(sim_score),
+                })
 
             if i % 200 == 0:
                 self.progress.emit(
                     30 + int(i / num_frames * 28),
-                    f"Loop closure: {count} знайдено (кадр {i}/{num_frames})",
+                    f"Loop closure: {len(specs)} кандидатів (кадр {i}/{num_frames})",
                 )
 
-        return count
+        # ── Pass 3: кластерна узгодженість (2.3) + фінальні ваги + додавання ──
+        cluster_factor = (
+            self._cluster_consistency_factors(specs)
+            if (self.edge_gate_enabled and self.edge_gate_cluster)
+            else None
+        )
+        for idx, spec in enumerate(specs):
+            weight = self._compute_weight(spec["inliers"], spec["rmse"], self.spatial_base_w)
+            if self.spatial_weight_use_sim:  # 4.3: w *= 0.5 + 0.5·sim
+                weight *= 0.5 + 0.5 * max(0.0, min(1.0, spec["sim"]))
+            if cluster_factor is not None:  # 2.3: самотнє ребро → ×0.5
+                weight *= cluster_factor[idx]
+            optimizer.add_edge(
+                from_id=spec["i"],
+                to_id=spec["j"],
+                relative_affine_2x3=spec["similarity"],
+                weight=weight,
+                edge_type="spatial",
+                inliers=spec["inliers"],
+                rmse=spec["rmse"],
+            )
+
+        if self.edge_gate_enabled:
+            logger.info(
+                f"Edge gating: {n_gated_phys} відсіяно фізично, "
+                f"{n_gated_mutual} за взаємністю retrieval"
+            )
+        return len(specs)
+
+    # ─── Гейти ребер (Етап 2) ────────────────────────────────────────────────
+
+    def _retrieve_candidates(
+        self, q, has_lancedb, lance_table, faiss_index, faiss_id_map
+    ) -> list[tuple[int, float]]:
+        """top-k схожих кадрів (id, similarity). Логіка ідентична попередній."""
+        candidates: list[tuple[int, float]] = []
+        if has_lancedb:
+            try:
+                res = (
+                    lance_table.search(q.astype(np.float32))
+                    .metric("cosine")
+                    .limit(self.lc_top_k + 1)
+                    .select(["frame_id", "_distance"])
+                    .to_list()
+                )
+                for r in res:
+                    candidates.append((int(r["frame_id"]), max(0.0, 1.0 - r["_distance"])))
+            except Exception:
+                pass
+        else:
+            q_batch = np.array([q], dtype=np.float32)
+            scores, ids = faiss_index.search(q_batch, self.lc_top_k + 1)
+            for raw_idx, sim_score in zip(ids[0], scores[0]):
+                if raw_idx != -1:
+                    candidates.append((int(faiss_id_map[raw_idx]), float(sim_score)))
+        return candidates
+
+    def _passes_physical_gate(self, similarity, inliers: int, n_matches: int) -> bool:
+        """Фізичні межі відносної трансформації хибного loop closure (2.1)."""
+        _, _, sx, sy, angle = decompose_affine_5dof(similarity)
+        if abs(np.degrees(angle)) > self.edge_gate_max_rot:
+            return False
+        max_log = np.log(max(self.edge_gate_max_scale, 1.0 + 1e-9))
+        if abs(np.log(max(sx, 1e-9))) > max_log or abs(np.log(max(sy, 1e-9))) > max_log:
+            return False
+        if n_matches > 0 and (inliers / n_matches) < self.edge_gate_min_inlier_ratio:
+            return False
+        return True
+
+    def _cluster_consistency_factors(self, specs: list[dict], window: int = 3) -> list[float]:
+        """Самотнє loop closure без сусіда з близькими кінцями → вага ×0.5 (2.3)."""
+        factors = [1.0] * len(specs)
+        for a in range(len(specs)):
+            ia, ja = specs[a]["i"], specs[a]["j"]
+            supported = False
+            for b in range(len(specs)):
+                if b == a:
+                    continue
+                ib, jb = specs[b]["i"], specs[b]["j"]
+                d1 = abs(ia - ib) + abs(ja - jb)
+                d2 = abs(ia - jb) + abs(ja - ib)
+                if min(d1, d2) <= 2 * window:
+                    supported = True
+                    break
+            if not supported:
+                factors[a] = 0.5
+        return factors
 
     # ─── Phase 5: Save to HDF5 ───────────────────────────────────────────────
 
@@ -627,10 +754,23 @@ class CalibrationPropagationWorker(QThread):
 
     # ─── Допоміжні методи ────────────────────────────────────────────────────
 
+    def _load_previous_affines(self) -> dict[int, np.ndarray]:
+        """Завантажує frame_affine попереднього калібрування з HDF5 (warm start)."""
+        try:
+            with h5py.File(self.database.db_path, "r") as f:
+                if "calibration" not in f or "frame_affine" not in f["calibration"]:
+                    return {}
+                fa = f["calibration"]["frame_affine"][:]
+                fv = f["calibration"]["frame_valid"][:].astype(bool)
+            return {i: fa[i] for i in range(len(fa)) if fv[i]}
+        except Exception as e:
+            logger.warning(f"Warm start: не вдалось прочитати попередній розв'язок: {e}")
+            return {}
+
     def _match_and_build_edge(
         self, features_a: dict, features_b: dict
-    ) -> tuple[np.ndarray, int, float] | None:
-        """Матчить дві фічі та повертає (H, inliers, rmse) або None.
+    ) -> tuple[np.ndarray, int, float, int] | None:
+        """Матчить дві фічі та повертає (H, inliers, rmse, n_matches) або None.
 
         H maps features_a (src) → features_b (dst).
         """
@@ -660,7 +800,7 @@ class CalibrationPropagationWorker(QThread):
             pts_b_in = mkpts_b[inlier_mask]
             rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
 
-            return H, inliers, rmse
+            return H, inliers, rmse, int(len(mkpts_a))
         except Exception:
             return None
 

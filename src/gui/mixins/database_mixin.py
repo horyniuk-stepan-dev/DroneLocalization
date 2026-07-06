@@ -58,6 +58,27 @@ class DatabaseMixin:
 
     # ── Генерація бази ────────────────────────────────────────────────────────
 
+    def _find_source_id_by_db_path(self, db_path: str) -> str | None:
+        """Знаходить source_id, чий database_file відповідає db_path."""
+        if not self.project_manager.is_loaded or not self.project_manager.settings:
+            return None
+        project_dir = self.project_manager.project_dir
+        try:
+            target = Path(db_path).resolve()
+        except OSError:
+            return None
+        for src in self.project_manager.settings.video_sources or []:
+            sid = src.get("source_id") if isinstance(src, dict) else src.source_id
+            db_file = src.get("database_file") if isinstance(src, dict) else src.database_file
+            if not sid or not db_file:
+                continue
+            try:
+                if (Path(project_dir) / db_file).resolve() == target:
+                    return sid
+            except OSError:
+                continue
+        return None
+
     def _start_database_generation(self, video_path: str, save_path: str):
         # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
         # UTM-конвертер буде ініціалізований автоматично після отримання першого
@@ -85,6 +106,14 @@ class DatabaseMixin:
             except Exception as e:
                 logger.warning(f"Could not close database: {e}")
         self.database = None
+
+        # CRITICAL: Вивантажуємо це джерело і з мульти-менеджера, інакше його
+        # retriever триматиме stale handle на vectors.lance, який зараз буде
+        # перезаписано (→ "LanceDB query failed: Not found" при трекінгу).
+        if getattr(self, "db_manager", None):
+            sid = self._find_source_id_by_db_path(save_path)
+            if sid:
+                self.db_manager.unload_source(sid)
 
         self.db_worker = DatabaseGenerationWorker(
             video_path=video_path,
@@ -125,7 +154,23 @@ class DatabaseMixin:
             self.database.close()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.database = DatabaseLoader(db_path)
+            # У мульти-режимі перезавантажуємо джерело всередині db_manager,
+            # щоб retriever отримав СВІЖИЙ LanceDB handle (stale handle після
+            # перезапису vectors.lance ламає весь vector search).
+            reloaded = False
+            if getattr(self, "db_manager", None):
+                sid = self._find_source_id_by_db_path(db_path)
+                src = (
+                    self.project_manager.settings.get_source(sid)
+                    if sid and self.project_manager.settings
+                    else None
+                )
+                if src is not None and self.db_manager.reload_source(src):
+                    self.database = self.db_manager.get_database(sid)
+                    reloaded = True
+
+            if not reloaded:
+                self.database = DatabaseLoader(db_path)
         finally:
             QApplication.restoreOverrideCursor()
         self.control_panel.update_progress(100)

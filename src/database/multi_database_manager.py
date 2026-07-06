@@ -117,6 +117,40 @@ class MultiDatabaseManager:
             f"{len(self._active_source_ids)} active"
         )
 
+    def unload_source(self, source_id: str) -> None:
+        """
+        Закриває та вивантажує джерело з пам'яті (без вимкнення).
+        ОБОВ'ЯЗКОВО викликати перед перегенерацією БД джерела, інакше
+        retriever триматиме stale handle на видалені файли vectors.lance.
+        """
+        if source_id in self._databases:
+            try:
+                self._databases[source_id].close()
+            except Exception as e:
+                logger.warning(f"Error closing database '{source_id}': {e}")
+            del self._databases[source_id]
+        self._retrievers.pop(source_id, None)
+        self._sources.pop(source_id, None)
+        self._active_source_ids.discard(source_id)
+        logger.info(f"Source '{source_id}' unloaded (e.g. pending rebuild)")
+
+    def reload_source(self, src: ProjectVideoSource) -> bool:
+        """
+        Перезавантажує джерело після перегенерації БД: закриває старі handles
+        (HDF5 + LanceDB table) і створює новий loader та retriever.
+
+        Returns:
+            True якщо джерело успішно перезавантажено.
+        """
+        self.unload_source(src.source_id)
+        self._load_sources([src])
+        ok = src.source_id in self._databases
+        if ok:
+            logger.success(f"Source '{src.source_id}' reloaded after rebuild")
+        else:
+            logger.error(f"Failed to reload source '{src.source_id}' after rebuild")
+        return ok
+
     def toggle_source(self, src: ProjectVideoSource) -> None:
         """Вмикає або вимикає джерело. Завантажує або вивантажує БД з пам'яті."""
         if src.enabled:
