@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from config.config import get_cfg
+from config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)

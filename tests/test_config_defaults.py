@@ -1,4 +1,4 @@
-from config.config import APP_CONFIG
+from config import APP_CONFIG
 
 
 def test_config_structure():

@@ -1,7 +1,7 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QDockWidget, QMainWindow, QStatusBar
 
-from config.config import APP_CONFIG, APP_SETTINGS
+from config import APP_CONFIG, APP_SETTINGS
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader

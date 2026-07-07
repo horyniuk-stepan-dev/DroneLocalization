@@ -13,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from config.config import get_active_descriptor_cfg, get_cfg
+from config import get_active_descriptor_cfg, get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor

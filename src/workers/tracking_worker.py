@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from config.config import get_cfg
+from config import get_cfg
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 

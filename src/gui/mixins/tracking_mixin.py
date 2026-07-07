@@ -3,7 +3,7 @@ import numpy as np
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
-from config.config import get_cfg
+from config import get_cfg
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor

@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from pydantic import BaseModel, ValidationError
 
-from config.config import APP_SETTINGS, APP_CONFIG
+from config import APP_SETTINGS, APP_CONFIG
 
 
 # Відомі варіанти вибору (домени) для специфічних полів
@@ -184,7 +184,7 @@ class ConfigDialog(QDialog):
 
     def _load_defaults(self):
         """Скидає всі поля до заводських налаштувань (визначених у коді)."""
-        from config.config import AppConfig
+        from config import AppConfig
         default_config = AppConfig()
         
         # Оновлюємо значення в UI на основі дефолтних
@@ -274,7 +274,7 @@ class ConfigDialog(QDialog):
             APP_CONFIG.update(APP_SETTINGS.model_dump())
 
             # Зберігаємо на диск
-            from config.config import save_user_config
+            from config import save_user_config
             save_user_config(APP_SETTINGS)
             
             QMessageBox.information(

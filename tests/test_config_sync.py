@@ -6,7 +6,7 @@
 
 import pytest
 
-from config.config import APP_CONFIG, get_cfg
+from config import APP_CONFIG, get_cfg
 
 
 class TestGetCfgHelper:

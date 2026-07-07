@@ -13,7 +13,7 @@ import faiss
 import numpy as np
 import torch
 
-from config.config import get_cfg
+from config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)

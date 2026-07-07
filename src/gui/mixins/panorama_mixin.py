@@ -6,7 +6,7 @@ import torch
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
-from config.config import get_cfg
+from config import get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher

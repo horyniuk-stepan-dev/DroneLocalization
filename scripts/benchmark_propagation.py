@@ -180,7 +180,7 @@ def run_pipeline(dataset_dir: Path, gt: dict) -> dict[int, np.ndarray]:
     Використовує реальні класи проєкту. Викидає зрозумілу помилку, якщо чогось
     бракує (модель/відео) — бенчмарк не має «тихо» деградувати.
     """
-    from config.config import APP_CONFIG
+    from config import APP_CONFIG
     from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
     from src.database.database_builder import DatabaseBuilder  # noqa: F401  (реальний білдер)
     from src.database.database_loader import DatabaseLoader

@@ -1,9 +1,4 @@
-"""Backward-compatible re-export.
-
-Implementation moved to the :mod:`src.geometry.pose_graph` package
-(see docs/IMPROVEMENT_PLAN.md, item 1.2). Import paths are preserved:
-``from src.geometry.pose_graph_optimizer import PoseGraphOptimizer`` still works.
-"""
+"""5-DoF pose-graph optimizer, split into model / optimizer / pruning / diagnostics."""
 
 from src.geometry.pose_graph.model_5dof import (
     GraphEdge,

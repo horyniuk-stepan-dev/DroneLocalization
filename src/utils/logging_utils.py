@@ -59,7 +59,7 @@ def silent_output(force: bool = False):
     """
     import io
 
-    from config.config import APP_SETTINGS
+    from config import APP_SETTINGS
 
     # Determine if we should be truly silent (FD-level) or just Python-silent
     # We use FD-level only if debug_mode is False to avoid the previous "permanent silence" issues

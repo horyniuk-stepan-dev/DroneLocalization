@@ -23,7 +23,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
-from config.config import get_cfg
+from config import get_cfg
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog

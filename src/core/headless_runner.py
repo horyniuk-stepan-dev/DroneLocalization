@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QCoreApplication
 
-from config.config import APP_CONFIG, APP_SETTINGS
+from config import APP_CONFIG, APP_SETTINGS
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.project import ProjectManager

@@ -18,7 +18,7 @@ import h5py
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from config.config import get_cfg
+from config import get_cfg
 from src.geometry.affine_utils import (
     compose_affine_5dof,
     decompose_affine,

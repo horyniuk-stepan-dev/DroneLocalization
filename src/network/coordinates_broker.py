@@ -5,7 +5,7 @@ from collections import deque
 
 from PyQt6.QtCore import QObject, pyqtSlot
 
-from config.config import NetworkApiConfig
+from config import NetworkApiConfig
 from src.network.rest_server import RestApiServer
 from src.network.ws_server import WebSocketServer
 from src.utils.logging_utils import get_logger

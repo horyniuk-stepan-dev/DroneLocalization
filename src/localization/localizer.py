@@ -3,7 +3,7 @@ import time
 
 import numpy as np
 
-from config.config import get_cfg
+from config import get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.tracking.kalman_filter import TrajectoryFilter

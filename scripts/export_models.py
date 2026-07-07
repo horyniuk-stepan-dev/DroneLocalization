@@ -13,7 +13,7 @@ import torch
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config.config import APP_SETTINGS
+from config import APP_SETTINGS
 from src.models.model_manager import ModelManager
 from src.utils.logging_utils import get_logger
 

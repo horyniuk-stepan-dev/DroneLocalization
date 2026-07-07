@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from config.config import APP_CONFIG
+from config import APP_CONFIG
 from src.database.database_builder import DatabaseBuilder
 from src.models.model_manager import ModelManager
 
