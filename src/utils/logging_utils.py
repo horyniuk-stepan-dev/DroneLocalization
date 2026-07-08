@@ -1,5 +1,6 @@
 import os
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -50,7 +51,7 @@ def get_logger(name: str | None = None) -> Any:
 
 
 @contextmanager
-def silent_output(force: bool = False):
+def silent_output(force: bool = False) -> Iterator[None]:
     """
     Context manager to suppress output (stdout/stderr).
     By default, it uses a safe Python-level override.

@@ -7,10 +7,15 @@
   - src.geometry.pose_graph_optimizer
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
+from numpy.typing import NDArray
 
 
-def decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
+def decompose_affine(M: NDArray[np.float64]) -> tuple[float, float, float, float]:
     """
     Розкладає афінну матрицю 2x3 на компоненти:
     (tx, ty, scale, angle_rad).
@@ -33,19 +38,19 @@ def decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
     return tx, ty, scale, angle
 
 
-def compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
+def compose_affine(tx: float, ty: float, scale: float, angle: float) -> NDArray[np.float64]:
     """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
     c = np.cos(angle) * scale
     s = np.sin(angle) * scale
     return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float64)
 
 
-def unwrap_angles(angles: np.ndarray) -> np.ndarray:
+def unwrap_angles(angles: NDArray[np.floating[Any]]) -> NDArray[np.floating[Any]]:
     """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
     return np.unwrap(angles)
 
 
-def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, float]:
+def decompose_affine_5dof(M: NDArray[np.float64]) -> tuple[float, float, float, float, float]:
     """
     Розкладає афінну матрицю 2x3 на 5 компонентів для збереження анізотропії:
     (tx, ty, sx, sy, angle_rad).
@@ -58,7 +63,7 @@ def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, fl
     return tx, ty, sx, sy, angle
 
 
-def compose_affine_5dof(tx: float, ty: float, sx: float, sy: float, angle: float, sign: float = 1.0) -> np.ndarray:
+def compose_affine_5dof(tx: float, ty: float, sx: float, sy: float, angle: float, sign: float = 1.0) -> NDArray[np.float64]:
     """
     Збирає афінну матрицю 2x3 з незалежними масштабами X та Y.
     sign = -1.0 додає відображення по осі Y (необхідно для систем координат де Y-вниз мапиться на Y-вверх).

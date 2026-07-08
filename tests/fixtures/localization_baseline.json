@@ -1,0 +1,103 @@
+{
+  "after_reset": {
+    "confidence": 0.724999994,
+    "fov_polygon": [
+      [
+        50.0002,
+        30.0004
+      ],
+      [
+        50.0002,
+        30.0068
+      ],
+      [
+        50.005,
+        30.0068
+      ],
+      [
+        50.005,
+        30.0004
+      ]
+    ],
+    "inliers": 25,
+    "lat": 50.0026,
+    "lon": 30.0036,
+    "matched_frame": 4,
+    "sample_spread_m": 0.0,
+    "source_id": null,
+    "success": true
+  },
+  "extractor_calls_second_keyframe": 2,
+  "frame1": {
+    "confidence": 0.724999994,
+    "fov_polygon": [
+      [
+        50.0001,
+        30.0002
+      ],
+      [
+        50.0001,
+        30.0066
+      ],
+      [
+        50.0049,
+        30.0066
+      ],
+      [
+        50.0049,
+        30.0002
+      ]
+    ],
+    "inliers": 25,
+    "lat": 50.0025,
+    "lon": 30.0034,
+    "matched_frame": 2,
+    "sample_spread_m": 0.0,
+    "source_id": null,
+    "success": true
+  },
+  "frame1_repeat": {
+    "confidence": 0.724999994,
+    "fov_polygon": [
+      [
+        50.0001,
+        30.0002
+      ],
+      [
+        50.0001,
+        30.0066
+      ],
+      [
+        50.0049,
+        30.0066
+      ],
+      [
+        50.0049,
+        30.0002
+      ]
+    ],
+    "inliers": 25,
+    "lat": 50.0025,
+    "lon": 30.0034,
+    "matched_frame": 2,
+    "sample_spread_m": 0.0,
+    "source_id": null,
+    "success": true
+  },
+  "last_state": {
+    "candidate_id": 2,
+    "global_angle": 180,
+    "inliers": 25,
+    "source_id": null
+  },
+  "optical_flow": {
+    "confidence": 0.7,
+    "fov_polygon": null,
+    "inliers": 20,
+    "is_of": true,
+    "lat": 50.002529391,
+    "lon": 30.003448985,
+    "matched_frame": 2,
+    "success": true
+  }
+}

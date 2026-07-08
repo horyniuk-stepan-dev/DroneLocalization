@@ -121,4 +121,11 @@ exclude = [
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
-files = ["config", "src/exceptions.py", "src/interfaces.py"]
+files = [
+    "config",
+    "src/exceptions.py",
+    "src/interfaces.py",
+    "src/geometry/affine_utils.py",
+    "src/geometry/gsd_calculator.py",
+    "src/utils/logging_utils.py",
+]

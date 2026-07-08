@@ -48,7 +48,7 @@ class GSDCalculator:
             return 1.0
         return self.altitude_m / actual_altitude_m
 
-    def log_summary(self):
+    def log_summary(self) -> None:
         gsd = self.gsd_m_per_px
         logger.info(
             f"GSD Configuration: altitude={self.altitude_m}m, "

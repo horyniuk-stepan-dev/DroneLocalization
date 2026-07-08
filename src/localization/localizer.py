@@ -1,11 +1,13 @@
-import os
-import time
-
 import numpy as np
 
 from config import get_cfg
 from src.geometry.transformations import GeometryTransforms
+from src.localization.candidate_retriever import CandidateRetriever
+from src.localization.failure_log import FAILURE_TYPES, FailureLogger
+from src.localization.geometric_verifier import GeometricVerifier
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
+from src.localization.result_builder import ResultBuilder
+from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
@@ -13,50 +15,6 @@ from src.utils.resolution_normalizer import ResolutionNormalizer
 from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
-
-FAILURE_TYPES = {
-    "out_of_coverage": "out_of_coverage",
-    "No candidates": "no_retrieval_candidates",
-    "Not enough valid inliers": "insufficient_inliers",
-    "No propagated calibration": "no_propagated_affine",
-    "Outlier detected": "trajectory_outlier",
-    "Coordinate transformation": "transform_error",
-}
-
-# Матриці обертання вектора зсуву для кожного кута повороту кадру.
-# np.rot90(frame, k=K) повертає кадр проти годинникової стрілки на K*90°.
-# Якщо трекер обчислив зсув (dx, dy) в оригінальній системі координат,
-# цей словник перераховує його в систему координат повернутого кадру,
-# де побудована гомографія H.
-#
-# ВИПРАВЛЕНО: значення для 90° та 270° були переплутані місцями.
-# Верифіковано чисельно на масивах:
-#   np.rot90 k=1 (90°):  A'[r',c'] = A[c', W-1-r'] → точка (x,y) → (y, W-1-x)
-#                        → вектор (dx,dy) → (dy, -dx)
-#   k=2 (180°):          (x,y) → (W-1-x, H-1-y)    → (dx,dy) → (-dx, -dy)
-#   k=3 (270°):          (x,y) → (H-1-y, x)        → (dx,dy) → (-dy, dx)
-_ROTATION_VEC: dict[int, tuple[int, int, int, int]] = {
-    # angle: (a, b, c, d) → new_dx = a*dx + b*dy, new_dy = c*dx + d*dy
-    0:   ( 1,  0,  0,  1),
-    90:  ( 0,  1, -1,  0),
-    180: (-1,  0,  0, -1),
-    270: ( 0, -1,  1,  0),
-}
-
-
-def _rotate_point_np90(x: float, y: float, w: float, h: float, angle: int) -> tuple[float, float]:
-    """Мапінг точки (x, y) кадру w×h у координати np.rot90(frame, k=angle//90).
-
-    Формули верифіковані чисельно (пікселецентрична конвенція):
-      k=1: (x,y) → (y, W-1-x);  k=2: (x,y) → (W-1-x, H-1-y);  k=3: (x,y) → (H-1-y, x)
-    """
-    if angle == 90:
-        return y, (w - 1.0) - x
-    if angle == 180:
-        return (w - 1.0) - x, (h - 1.0) - y
-    if angle == 270:
-        return (h - 1.0) - y, x
-    return x, y
 
 
 class Localizer:
@@ -77,6 +35,7 @@ class Localizer:
         self.matcher = matcher
         self.calibration = calibration
         self.config = config or {}
+        self._failure_logger = FailureLogger()
 
         # Мультиджерельна підтримка (Phase 3 ТЗ)
         self.db_manager = db_manager        # MultiDatabaseManager | None
@@ -172,6 +131,16 @@ class Localizer:
                     "Patchify enabled in config but database has no patch_descriptors. "
                 )
 
+        self._candidate_retriever = CandidateRetriever(
+            self.db_manager, self.retriever, self.patchify_retrieval, self.config
+        )
+        self._geometric_verifier = GeometricVerifier(
+            self.matcher, self.min_matches, self.ransac_thresh,
+            self.homography_backend, self.use_mad_ransac, self.mad_k_factor,
+            self.early_stop_inliers,
+        )
+        self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
+
         # Phase 3.2: GSD integration
         project_manager = self.config.get("_project_manager", None)
         if project_manager and project_manager.settings:
@@ -192,12 +161,7 @@ class Localizer:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _retrieve_candidates(self, global_desc, top_k: int):
-        """Retrieval кандидатів: (source_id | None, [(frame_id, score), ...])."""
-        if self.db_manager is not None:
-            # Мульти-режим: пошук у всіх активних базах
-            return self.db_manager.get_best_match(global_desc, top_k=top_k)
-        # Single-mode (зворотна сумісність)
-        return None, self.retriever.find_similar_frames(global_desc, top_k=top_k)
+        return self._candidate_retriever.retrieve(global_desc, top_k)
 
     @property
     def last_state(self) -> dict | None:
@@ -359,93 +323,34 @@ class Localizer:
         # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
         # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
         # (наприклад, при зміні висоти польоту).
-        if self.patchify_retrieval is not None:
-            try:
-                with Telemetry.profile("patchify_retrieval"):
-                    patch_descs = self.patchify_retrieval.compute_patch_descriptors(
-                        best_rotated_frame
-                    )
-                    patch_candidates = self.patchify_retrieval.search(
-                        patch_descs, top_k=top_k
-                    )
-                if patch_candidates:
-                    # Об'єднуємо: max_results обмежує список, щоб не збільшувати час матчінгу
-                    merged = self._merge_candidates(
-                        best_global_candidates,
-                        patch_candidates,
-                        max_results=top_k * 2,
-                    )
-                    logger.debug(
-                        f"Patchify expanded candidates: "
-                        f"{len(best_global_candidates)} → {len(merged)} "
-                        f"(top patchify score: {patch_candidates[0][1]:.3f})"
-                    )
-                    best_global_candidates = merged
-            except Exception as e:
-                logger.warning(f"Patchify retrieval failed, using standard candidates: {e}")
+        best_global_candidates = self._candidate_retriever.expand(
+            best_rotated_frame, best_global_candidates, top_k
+        )
 
         # ── Крок 2: Локальна екстракція (ALIKED/RDD) для найкращого ракурсу ─
         best_query_features = self.feature_extractor.extract_local_features(
             best_rotated_frame, static_mask=best_rotated_mask
         )
 
-        best_inliers = 0
-        best_candidate_id = -1
-        best_H_query_to_ref = None
-        best_mkpts_q_inliers = None
-        best_mkpts_r_inliers = None
-        best_total_matches = 0
-        best_rmse = 999.0
-
-        early_stop = self.early_stop_inliers
-
-        # ── Крок 3: Локальний матчинг + RANSAC ──────────────────────────────
-        for candidate_id, score in best_global_candidates:
-            logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
-            ref_features = self.database.get_local_features(candidate_id)
-
-            with Telemetry.profile("match"):
-                mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
-
-            if len(mkpts_q) >= self.min_matches:
-                with Telemetry.profile("ransac_homography"):
-                    H_eval, mask = GeometryTransforms.estimate_homography(
-                        mkpts_q,
-                        mkpts_r,
-                        ransac_threshold=self.ransac_thresh,
-                        backend=self.homography_backend,
-                        use_mad_ransac=self.use_mad_ransac,
-                        mad_k_factor=self.mad_k_factor,
-                    )
-
-                if H_eval is not None:
-                    inlier_mask = mask.ravel().astype(bool)
-                    inliers = int(np.sum(inlier_mask))
-                    pts_q_in = mkpts_q[inlier_mask]
-                    pts_r_in = mkpts_r[inlier_mask]
-
-                    pts_q_transformed = GeometryTransforms.apply_homography(pts_q_in, H_eval)
-                    rmse = float(
-                        np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
-                    )
-
-                    if inliers > best_inliers and inliers >= self.min_matches:
-                        best_inliers = inliers
-                        best_candidate_id = candidate_id
-                        best_H_query_to_ref = H_eval
-                        best_mkpts_q_inliers = pts_q_in
-                        best_mkpts_r_inliers = pts_r_in
-                        best_total_matches = len(mkpts_q)
-                        best_rmse = rmse
-                        logger.debug(
-                            f"Homography for {candidate_id}: {inliers} inliers, RMSE: {rmse:.2f}"
-                        )
-
-            if best_inliers >= early_stop:
-                logger.debug(
-                    f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
-                )
-                break
+        ver = self._geometric_verifier.verify(
+            best_query_features, best_global_candidates, self.database
+        )
+        if ver is not None:
+            best_inliers = ver.inliers
+            best_candidate_id = ver.candidate_id
+            best_H_query_to_ref = ver.H_query_to_ref
+            best_mkpts_q_inliers = ver.mkpts_q_in
+            best_mkpts_r_inliers = ver.mkpts_r_in
+            best_total_matches = ver.total_matches
+            best_rmse = ver.rmse
+        else:
+            best_inliers = 0
+            best_candidate_id = -1
+            best_H_query_to_ref = None
+            best_mkpts_q_inliers = None
+            best_mkpts_r_inliers = None
+            best_total_matches = 0
+            best_rmse = 999.0
 
         if (
             best_inliers < self.min_matches
@@ -574,79 +479,10 @@ class Localizer:
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
         # ── Крок 8: Розрахунок FOV ───────────────────────────────────────────
-        corners = np.array(
-            [[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]],
-            dtype=np.float32,
+        gps_corners = self._result_builder.build_fov(
+            M_query_to_ref, affine_ref, rot_width, rot_height, best_mkpts_q_inliers,
+            self.calibration.converter, dx, dy, mx, my, filtered_pt, best_candidate_id,
         )
-        ref_corners = GeometryTransforms.apply_homography(corners, M_query_to_ref)
-
-        is_exploded = False
-        if ref_corners is not None:
-            max_coord = np.max(np.abs(ref_corners))
-            if max_coord > 50000:
-                is_exploded = True
-
-        if is_exploded and best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
-            logger.warning(
-                f"Homography exploded the FOV (max_coord={max_coord:.0f}px > 50000px threshold). "
-                f"Cause: perspective distortion from locally-clustered ALIKED matches. "
-                f"Falling back to inliers bounding box for safe FOV estimation."
-            )
-            pts = best_mkpts_q_inliers
-            min_x, min_y = np.min(pts, axis=0)
-            max_x, max_y = np.max(pts, axis=0)
-            pad_x, pad_y = (max_x - min_x) * 0.1, (max_y - min_y) * 0.1
-            safe_corners = np.array(
-                [
-                    [max(0, min_x - pad_x), max(0, min_y - pad_y)],
-                    [min(rot_width, max_x + pad_x), max(0, min_y - pad_y)],
-                    [min(rot_width, max_x + pad_x), min(rot_height, max_y + pad_y)],
-                    [max(0, min_x - pad_x), min(rot_height, max_y + pad_y)],
-                ],
-                dtype=np.float32,
-            )
-            ref_corners = GeometryTransforms.apply_homography(safe_corners, M_query_to_ref)
-            original_poly_px = safe_corners
-        else:
-            original_poly_px = corners
-            logger.debug("FOV projected using full frame Homography matrix.")
-
-        # A9: FOV-діагностика в DEBUG — logger.info з f-string форматуванням
-        # на кожному keyframe додавав помітний overhead у hot path
-        logger.debug(f"--- FOV DIAGNOSTICS FOR FRAME {best_candidate_id} ---")
-        w_px = np.linalg.norm(original_poly_px[0] - original_poly_px[1])
-        h_px = np.linalg.norm(original_poly_px[1] - original_poly_px[2])
-        logger.debug(f"[1] Original FOV in Query image: {w_px:.1f} x {h_px:.1f} pixels")
-
-        if ref_corners is not None:
-            w_ref = np.linalg.norm(ref_corners[0] - ref_corners[1])
-            h_ref = np.linalg.norm(ref_corners[1] - ref_corners[2])
-            logger.debug(
-                f"[2] FOV mapped to Reference via Homography: {w_ref:.1f} x {h_ref:.1f} pixels"
-            )
-
-        gps_corners = []
-        if ref_corners is not None:
-            metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
-            if metric_corners is not None:
-                fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
-                fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
-                logger.debug(
-                    f"[3] FOV mapped to metric space: {fov_w:.1f}m x {fov_h:.1f}m"
-                )
-                logger.debug(
-                    f"FOV dimensions: {fov_w:.1f}m x {fov_h:.1f}m | "
-                    f"Center metric: ({mx:.1f}, {my:.1f}) | "
-                    f"Filtered: ({filtered_pt[0]:.1f}, {filtered_pt[1]:.1f})"
-                )
-                for cx, cy in metric_corners:
-                    try:
-                        clat, clon = self.calibration.converter.metric_to_gps(
-                            float(cx + dx), float(cy + dy)
-                        )
-                        gps_corners.append((clat, clon))
-                    except Exception:
-                        pass
 
         logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
         logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
@@ -813,123 +649,17 @@ class Localizer:
         patches: list[tuple[int, float]],
         max_results: int | None = None,
     ) -> list[tuple[int, float]]:
-        """Об'єднує результати стандартного та патч-retrieval через зважену суму.
-
-        Ваги беруться з конфігу (localization.patchify_merge_weight).
-        Якщо кадр є в обох джерелах: score = w_std * s + w_patch * p.
-        Якщо тільки в одному: беремо скор як є (не штрафуємо за відсутність в іншому).
-        """
-        w_patch = get_cfg(self.config, "localization.patchify_merge_weight", 0.4)
-        w_standard = 1.0 - w_patch
-
-        standard_dict = dict(standard)
-        patch_dict = dict(patches)
-        all_fids = set(standard_dict.keys()) | set(patch_dict.keys())
-
-        merged = {}
-        for fid in all_fids:
-            s = standard_dict.get(fid, 0.0)
-            p = patch_dict.get(fid, 0.0)
-
-            if fid in standard_dict and fid in patch_dict:
-                merged[fid] = w_standard * s + w_patch * p
-            elif fid in standard_dict:
-                merged[fid] = s
-            else:
-                merged[fid] = p
-
-        sorted_results = sorted(merged.items(), key=lambda x: x[1], reverse=True)
-
-        if max_results is not None:
-            sorted_results = sorted_results[:max_results]
-
-        return sorted_results
+        return self._candidate_retriever.merge(standard, patches, max_results)
 
     def _compute_confidence(
         self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
     ) -> float:
-        """Обчислює впевненість на основі QA бази даних та кількості інлаєрів."""
-        max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
-        rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
-        diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
-        w_inlier = get_cfg(self.config, "localization.confidence.inlier_weight", 0.7)
-        w_stability = get_cfg(self.config, "localization.confidence.stability_weight", 0.3)
-
-        inlier_score = min(1.0, best_inliers / max_inliers)
-
-        rmse = (
-            self.database.frame_rmse[best_candidate_id]
-            if self.database.frame_rmse is not None
-            else 0.0
+        return self._result_builder.compute_confidence(
+            best_candidate_id, best_inliers, total_matches, rmse_val, self.database
         )
-        disagreement = (
-            self.database.frame_disagreement[best_candidate_id]
-            if self.database.frame_disagreement is not None
-            else 0.0
-        )
-
-        stability_score = 1.0 - (
-            min(rmse, rmse_norm) / rmse_norm * 0.5
-            + min(disagreement, diag_norm) / diag_norm * 0.5
-        )
-        stability_score = float(np.clip(stability_score, 0.0, 1.0))
-
-        ratio_score = float(best_inliers / (total_matches + 1e-6))
-        rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
-        match_score = ratio_score * 0.5 + rmse_score_val * 0.5
-
-        final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
-        return float(np.clip(final_conf, 0.05, 1.0))
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
-        """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)."""
-        if frame_id == -1:
-            return None
+        return self._result_builder.fallback(frame_id, score, self.database, self.calibration)
 
-        threshold = get_cfg(self.config, "localization.retrieval_only_min_score", 0.90)
-        if score < threshold:
-            logger.debug(
-                f"Retrieval-only fallback rejected: score {score:.3f} < threshold {threshold:.3f} | "
-                f"frame={frame_id}"
-            )
-            return None
-
-        affine_ref = self.database.get_frame_affine(frame_id)
-        if affine_ref is None:
-            logger.debug(
-                f"Retrieval-only fallback failed: no affine matrix for frame {frame_id}. "
-                f"Frame not reached during calibration propagation."
-            )
-            return None
-
-        ref_h, ref_w = self.database.get_frame_size(frame_id)
-        center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float64)
-        metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
-
-        lat, lon = self.calibration.converter.metric_to_gps(metric_pt[0], metric_pt[1])
-
-        return {
-            "success": True,
-            "lat": lat,
-            "lon": lon,
-            "confidence": 0.3,
-            "inliers": 0,
-            "matched_frame": frame_id,
-            "fallback_mode": "retrieval_only",
-            "global_score": score,
-            "fov_polygon": None,
-        }
-
-    def _log_failure(self, error_type: str, inliers: int = 0, details: str = ""):
-        try:
-            csv_path = "logs/localization_failures.csv"
-            write_header = not os.path.exists(csv_path)
-            os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-            with open(csv_path, "a", encoding="utf-8") as f:
-                if write_header:
-                    f.write("timestamp,error_type,inliers,details\n")
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                safe_details = details.replace('"', '""')
-                f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
-        except Exception as e:
-            logger.error(f"Failed to log to localization_failures.csv: {e}")
+    def _log_failure(self, error_type: str, inliers: int = 0, details: str = "") -> None:
+        self._failure_logger.log(error_type, inliers, details)
