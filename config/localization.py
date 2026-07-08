@@ -35,6 +35,17 @@ class LocalizationConfig(BaseModel):
         1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
     )
     patchify_merge_weight: float = 0.4
+    # ── Scale-invariance (ScaleManager) ──
+    # GSD-ratio pyramid for altitude-invariant localization (r = query_alt / db_alt).
+    # Scanned when no temporal prior exists (bootstrap / out-of-coverage).
+    scale_pyramid: list[float] = [0.5, 0.7, 1.0, 1.4, 2.0]
+    # Minimum retrieval score on the prior-scale level to accept it;
+    # below this → full pyramid rescan (analogous to rotation_rescan_min_score).
+    scale_rescan_min_score: float = 0.65
+    # EMA smoothing factor for the temporal scale prior (higher = faster tracking).
+    scale_prior_ema: float = 0.7
+    # Use DepthAnythingV2 depth_scales (if available in DB) to reorder the pyramid.
+    scale_use_depth_hint: bool = True
 
 
 class TrackingConfig(BaseModel):

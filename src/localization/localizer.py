@@ -8,11 +8,12 @@ from src.localization.geometric_verifier import GeometricVerifier
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.localization.result_builder import ResultBuilder
 from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
+from src.localization.rotation_selector import RotationSelector
+from src.localization.scale_manager import ScaleManager
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
 from src.utils.resolution_normalizer import ResolutionNormalizer
-from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
 
@@ -89,6 +90,9 @@ class Localizer:
         # локалізації; повний скан 4 кутів лише при просіданні score або невдачі
         self._last_best_angle: int | None = None
 
+        # ── ScaleManager: GSD-ratio estimation for altitude-invariant localization ─
+        self._scale_manager = ScaleManager(self.config)
+
         # ── Patchify: мультипатч-retrieval ────────────────────────────────────
         # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
         #   1. Увімкнено через конфіг
@@ -140,6 +144,9 @@ class Localizer:
             self.early_stop_inliers,
         )
         self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
+        self._rotation_selector = RotationSelector(
+            self.feature_extractor, self._candidate_retriever, self.config
+        )
 
         # Phase 3.2: GSD integration
         project_manager = self.config.get("_project_manager", None)
@@ -160,9 +167,6 @@ class Localizer:
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _retrieve_candidates(self, global_desc, top_k: int):
-        return self._candidate_retriever.retrieve(global_desc, top_k)
-
     @property
     def last_state(self) -> dict | None:
         """Останній успішний стан локалізації (H, affine, кут, source_id) або None.
@@ -182,6 +186,7 @@ class Localizer:
         self._consecutive_failures = 0
         self._last_best_angle = None
         self._last_state = None
+        self._scale_manager.reset()
 
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
@@ -198,6 +203,7 @@ class Localizer:
                 f"Resetting counter. The drone may be outside the database coverage area."
             )
             self._last_best_angle = None  # наступний keyframe — повний скан кутів
+            self._scale_manager.invalidate()  # повний скан масштабів теж
             return {
                 "success": False,
                 "error": "out_of_coverage",
@@ -214,81 +220,17 @@ class Localizer:
 
         angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
 
-        best_global_score = -1.0
-        best_global_angle = 0
-        best_global_candidates = []
-
         top_k = self.retrieval_top_k
 
-        # ── Крок 1: Вибір найкращого ракурсу за стандартним DINOv2 ──────────
-        # ТІЛЬКИ стандартний retrieval — patchify тут не запускається, бо:
-        #   - compute_patch_descriptors = 14 DINOv2 forward-пасів (для grids 1+4+9)
-        #   - 4 кути × 14 патчів = 56 зайвих форвард-пасів лише на вибір кута
-        #   - patchify-скор (avg cosine по 14 патчах) ≠ DINOv2 CLS-token cosine →
-        #     змішування робить порівняння між кутами некоректним
-        best_source_id_per_angle: str | None = None  # для мульти-режиму
-
-        # A3: темпоральний prior — дрон не обертається на 90° між keyframe-ами.
-        # Спершу пробуємо кут з минулого успіху (1 forward замість 4);
-        # повний скан — лише якщо score < порога або попередня локалізація впала.
-        rescan_min = get_cfg(
-            self.config, "localization.rotation_rescan_min_score", 0.70
+        rot = self._rotation_selector.select(
+            query_frame,
+            self._last_best_angle,
+            self.enable_auto_rotation and self._consecutive_failures == 0,
+            angles_to_try,
+            top_k,
+            scale_manager=self._scale_manager,
         )
-        prior_angle = self._last_best_angle
-        if (
-            self.enable_auto_rotation
-            and prior_angle is not None
-            and self._consecutive_failures == 0
-        ):
-            rotated_frame = np.ascontiguousarray(
-                np.rot90(query_frame, k=prior_angle // 90)
-            )
-            global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
-            with Telemetry.profile("retrieval"):
-                src_id, candidates = self._retrieve_candidates(global_desc, top_k)
-            if candidates and candidates[0][1] >= rescan_min:
-                best_global_score = candidates[0][1]
-                best_global_angle = prior_angle
-                best_global_candidates = candidates
-                best_source_id_per_angle = src_id
-            else:
-                logger.debug(
-                    f"Prior angle {prior_angle}° score too low "
-                    f"({candidates[0][1] if candidates else -1:.3f} < {rescan_min}) — full rescan"
-                )
-
-        if not best_global_candidates:
-            # A2: повний скан — усі ротації ОДНИМ батчованим forward-пасом
-            # (раніше: 4 послідовні ViT-forward — головна вартість keyframe).
-            rotated_frames = [
-                np.ascontiguousarray(np.rot90(query_frame, k=a // 90))
-                for a in angles_to_try
-            ]
-            if len(rotated_frames) > 1 and hasattr(
-                self.feature_extractor, "extract_global_descriptors_multi"
-            ):
-                descs = self.feature_extractor.extract_global_descriptors_multi(
-                    rotated_frames
-                )
-            else:
-                descs = [
-                    self.feature_extractor.extract_global_descriptor(f)
-                    for f in rotated_frames
-                ]
-
-            for angle, global_desc in zip(angles_to_try, descs):
-                with Telemetry.profile("retrieval"):
-                    src_id, candidates = self._retrieve_candidates(global_desc, top_k)
-
-                if candidates:
-                    top_score = candidates[0][1]
-                    if top_score > best_global_score:
-                        best_global_score = top_score
-                        best_global_angle = angle
-                        best_global_candidates = candidates
-                        best_source_id_per_angle = src_id
-
-        if not best_global_candidates:
+        if rot is None:
             self._consecutive_failures += 1
             self._log_failure(FAILURE_TYPES["No candidates"])
             return {
@@ -299,9 +241,15 @@ class Localizer:
                     f"Image {width}x{height} may not match any frame in the database."
                 ),
             }
+        best_global_score = rot.score
+        best_global_angle = rot.angle
+        best_global_candidates = rot.candidates
+        best_source_id_per_angle = rot.source_id
+        best_scale = rot.best_scale
 
         logger.debug(
-            f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
+            f"Selected rotation {best_global_angle}° scale {best_scale:.2f} "
+            f"with global score {best_global_score:.3f}"
         )
 
         # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
@@ -318,6 +266,23 @@ class Localizer:
         best_rotated_mask = (
             np.rot90(static_mask, k=k).copy() if static_mask is not None else None
         )
+
+        # ── Крок 1.5b: GSD-нормалізація (ScaleManager) ────────────────────────
+        # Normalize the rotated frame to match DB's GSD before feature extraction.
+        # In steady-state best_scale ≈ 1.0 and this is a no-op.
+        _crop_info = None
+        if abs(best_scale - 1.0) > 0.15:
+            best_rotated_frame, _crop_info = self._scale_manager.normalize(
+                best_rotated_frame, best_scale
+            )
+            if best_rotated_mask is not None:
+                best_rotated_mask, _ = self._scale_manager.normalize(
+                    best_rotated_mask, best_scale
+                )
+            logger.debug(
+                f"GSD-normalized frame for scale {best_scale:.2f}: "
+                f"{best_rotated_frame.shape[1]}x{best_rotated_frame.shape[0]}"
+            )
 
         # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
         # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
@@ -495,6 +460,11 @@ class Localizer:
         # A3: запам'ятовуємо кут для темпорального prior наступного keyframe
         self._last_best_angle = best_global_angle
 
+        # Scale prior: extract scale from H for the next keyframe
+        self._scale_manager.update_from_homography(
+            M_query_to_ref, rot_width, rot_height
+        )
+
         return {
             "success": True,
             "lat": lat,
@@ -642,14 +612,6 @@ class Localizer:
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-
-    def _merge_candidates(
-        self,
-        standard: list[tuple[int, float]],
-        patches: list[tuple[int, float]],
-        max_results: int | None = None,
-    ) -> list[tuple[int, float]]:
-        return self._candidate_retriever.merge(standard, patches, max_results)
 
     def _compute_confidence(
         self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
