@@ -27,10 +27,43 @@ class GraphOptimizationConfig(BaseModel):
     loop_closure_min_frame_gap: int = 3
     loop_closure_min_inliers: int = 15
 
+    # Авто min_frame_gap із геометрії місії (Етап 2.1). off = явна константа вище.
+    # gap_min = ceil(overlap_factor · frame_diag_px / median_disp_px) з temporal-ребер.
+    loop_closure_auto_min_gap: bool = False
+    loop_closure_overlap_factor: float = 1.0
+
+    # Дистанційний префільтр кандидатів (Етап 2.2). off = усі пари матчаться.
+    # Якщо прикидка |Δцентрів| (BFS temporal від якорів) > margin×діагональ_кадру_м
+    # → LightGlue не запускається (відсікає аліасинг полів ДО матчингу, пришвидшує).
+    loop_closure_dist_prefilter: bool = False
+    loop_closure_dist_margin: float = 2.0
+
+    # Odometry-consistency (PCM-lite, Етап 2.3). off = лише «сусідський» cluster-гейт.
+    # spatial-ребро, несумісне з temporal-ланцюгом (передбачення центру j через ребро
+    # vs через ланцюг, допуск росте з довжиною), отримує вагу ×factor (не викидання).
+    # Ловить аліасні МІЖ СОБОЮ узгоджені ребра (паралельні ряди), які cluster пропускає.
+    loop_closure_odometry_check: bool = False
+    odometry_consistency_margin: float = 1.5
+    odometry_drift_frac: float = 0.25
+    odometry_inconsistency_factor: float = 0.3
+
     # Вагові коефіцієнти ребер
     temporal_edge_base_weight: float = 1.0
     spatial_edge_base_weight: float = 2.0
     anchor_weight: float = 1e6
+
+    # ── М'які якорі (Етап 1.1). Дефолт off = fix_node (жорсткий, поточна поведінка). ──
+    # Якір стає унарним фактором w_a·(state−anchor), w_a = anchor_base_w/max(σ, floor).
+    # σ береться з rmse_m якоря. GT-якорі симулятора (σ≈0) → floor → практично
+    # жорсткі (сим-бенчмарк не змінюється); реальні якорі (RMSE 5–10 м) стають
+    # м'якими й можуть бути «переголосовані» узгодженим ланцюгом temporal-ребер.
+    soft_anchors: bool = False
+    anchor_base_w: float = 200.0
+    anchor_sigma_floor_m: float = 0.05
+
+    # LOO-валідація якорів (Етап 1.2, read-only): ланцюг сусідніх якорів
+    # передбачає стан якоря; розбіжність > поріг → warning у звіті пропагації.
+    anchor_loo_threshold_m: float = 5.0
 
     # Levenberg-Marquardt оптимізатор
     max_iterations: int = 50

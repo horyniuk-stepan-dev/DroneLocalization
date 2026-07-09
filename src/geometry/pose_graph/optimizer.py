@@ -47,6 +47,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         # Ребра, викинуті two-stage prune (Етап 3). Порожньо = prune не спрацював.
         self._pruned_edges: list[GraphEdge] = []
 
+        # М'які якорі (Етап 1.1): frame_id → (state_anchor 5-вектор, w_a). Порожньо
+        # = поведінка як раніше (жорсткі fix_node). Заповнюється add_anchor().
+        self._anchor_priors: dict[int, tuple[np.ndarray, float]] = {}
+
     @property
     def num_nodes(self) -> int:
         return len(self._node_ids)
@@ -86,6 +90,70 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         self._initialized_nodes.add(frame_id)
         self._free_nodes.pop(frame_id, None)
 
+    def add_anchor(
+        self,
+        frame_id: int,
+        affine_2x3: np.ndarray,
+        sigma_m: float,
+        base_w: float = 200.0,
+        sigma_floor: float = 0.05,
+    ) -> None:
+        """М'який якір як унарний фактор (Етап 1.1) — альтернатива fix_node.
+
+        Вузол ЛИШАЄТЬСЯ ВІЛЬНИМ, але отримує пріор w_a·(state − state_anchor),
+        де w_a = base_w / max(sigma_m, sigma_floor). σ→floor (GT-якорі симулятора,
+        rmse≈0) → величезна вага → практично жорсткий (сим-бенчмарк не змінюється).
+        Реальний якір (RMSE 5–10 м) стає м'яким: узгоджений ланцюг ребер може його
+        «переголосувати», тоді як хибний ручний якір більше не гне граф.
+
+        Вузол ініціалізується станом якоря (лишається стартом BFS), знак det
+        встановлюється як у fix_node.
+        """
+        affine_2x3 = np.asarray(affine_2x3, dtype=np.float64)
+        det = affine_2x3[0, 0] * affine_2x3[1, 1] - affine_2x3[0, 1] * affine_2x3[1, 0]
+        if det < 0:
+            self._sign = -1.0
+
+        state = _affine_to_state(affine_2x3, self.cx, self.cy)
+        w_a = float(base_w) / max(float(sigma_m), float(sigma_floor))
+        self._anchor_priors[frame_id] = (state, w_a)
+
+        self._free_nodes[frame_id] = state.copy()
+        self._node_ids.add(frame_id)
+        self._initialized_nodes.add(frame_id)
+        self._fixed_nodes.pop(frame_id, None)
+
+    def _build_graph_edge(
+        self,
+        from_id: int,
+        to_id: int,
+        relative_affine_2x3: np.ndarray,
+        weight: float,
+        edge_type: str,
+        inliers: int,
+        rmse: float,
+    ) -> GraphEdge:
+        """Будує GraphEdge із відносної афінної (спільне для add_edge та
+        odometry-consistency 2.3, який рахує ефемерні ребра без додавання в граф)."""
+        M = relative_affine_2x3
+        tx, ty, sx, sy, angle = decompose_affine_5dof(M)
+
+        c_x_local = M[0, 0] * self.cx + M[0, 1] * self.cy + tx
+        c_y_local = M[1, 0] * self.cx + M[1, 1] * self.cy + ty
+        return GraphEdge(
+            from_id=from_id,
+            to_id=to_id,
+            dtx=c_x_local - self.cx,
+            dty=c_y_local - self.cy,
+            log_dsx=np.log(max(sx, 1e-9)),
+            log_dsy=np.log(max(sy, 1e-9)),
+            dtheta=angle,
+            weight=weight,
+            edge_type=edge_type,
+            inliers=inliers,
+            rmse=rmse,
+        )
+
     def add_edge(
         self,
         from_id: int,
@@ -96,34 +164,17 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         inliers: int = 0,
         rmse: float = 0.0,
     ) -> None:
-        M = relative_affine_2x3
-        tx, ty, sx, sy, angle = decompose_affine_5dof(M)
-
-        c_x_local = M[0, 0] * self.cx + M[0, 1] * self.cy + tx
-        c_y_local = M[1, 0] * self.cx + M[1, 1] * self.cy + ty
-        dtx = c_x_local - self.cx
-        dty = c_y_local - self.cy
-
-        edge = GraphEdge(
-            from_id=from_id,
-            to_id=to_id,
-            dtx=dtx,
-            dty=dty,
-            log_dsx=np.log(max(sx, 1e-9)),
-            log_dsy=np.log(max(sy, 1e-9)),
-            dtheta=angle,
-            weight=weight,
-            edge_type=edge_type,
-            inliers=inliers,
-            rmse=rmse,
+        edge = self._build_graph_edge(
+            from_id, to_id, relative_affine_2x3, weight, edge_type, inliers, rmse
         )
         self._edges.append(edge)
         self._node_ids.add(from_id)
         self._node_ids.add(to_id)
 
     def initialize_from_bfs(self) -> int:
-        if not self._fixed_nodes:
-            logger.warning("No fixed nodes for BFS initialization")
+        seeds = set(self._fixed_nodes) | set(self._anchor_priors)
+        if not seeds:
+            logger.warning("No fixed/anchor nodes for BFS initialization")
             return 0
 
         adj: dict[int, list[tuple[int, GraphEdge]]] = {}
@@ -131,7 +182,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             adj.setdefault(edge.from_id, []).append((edge.to_id, edge))
             adj.setdefault(edge.to_id, []).append((edge.from_id, edge))
 
-        queue: deque[int] = deque(self._fixed_nodes.keys())
+        queue: deque[int] = deque(seeds)
         count = 0
 
         while queue:
@@ -153,7 +204,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 count += 1
 
         logger.info(
-            f"BFS initialization: {count} nodes initialized from {len(self._fixed_nodes)} anchors"
+            f"BFS initialization: {count} nodes initialized from {len(seeds)} seeds"
         )
         return count
 
@@ -175,6 +226,131 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             count += 1
         logger.info(f"Warm start: {count} nodes seeded from previous solution")
         return count
+
+    def preliminary_states(
+        self, seed_affines: dict[int, np.ndarray]
+    ) -> dict[int, np.ndarray]:
+        """Прикидка ПОВНИХ станів вузлів BFS-ланцюгом ЛИШЕ по temporal-ребрах від
+        заданих якірних матриць (Етапи 2.2/2.3 — ДО матчингу/оптимізації).
+
+        Відстані/пози інваріантні до Local Origin, тож беремо абсолютні матриці
+        якорів. Не мутує стан оптимізатора. Повертає {fid → state[5]}.
+        """
+        seeds = {}
+        for fid, aff in seed_affines.items():
+            if fid in self._node_ids:
+                seeds[fid] = _affine_to_state(np.asarray(aff, dtype=np.float64),
+                                              self.cx, self.cy)
+        if not seeds:
+            return {}
+
+        adj: dict[int, list] = {}
+        for e in self._edges:
+            if e.edge_type != "temporal":
+                continue
+            adj.setdefault(e.from_id, []).append((e.to_id, e))
+            adj.setdefault(e.to_id, []).append((e.from_id, e))
+
+        states: dict[int, np.ndarray] = dict(seeds)
+        queue = deque(seeds)
+        while queue:
+            cur = queue.popleft()
+            cur_state = states[cur]
+            for nb, e in adj.get(cur, []):
+                if nb in states:
+                    continue
+                states[nb] = (
+                    _predict_forward(cur_state, e, self._sign)
+                    if e.from_id == cur
+                    else _predict_inverse(cur_state, e, self._sign)
+                )
+                queue.append(nb)
+        return states
+
+    def preliminary_centers(
+        self, seed_affines: dict[int, np.ndarray]
+    ) -> dict[int, np.ndarray]:
+        """Прикидка метричних центрів (Етап 2.2, дистанційний префільтр) —
+        тонка обгортка над preliminary_states."""
+        return {fid: st[:2].copy() for fid, st in self.preliminary_states(seed_affines).items()}
+
+    def odometry_consistency_factors(
+        self,
+        specs: list,
+        prelim_states: dict[int, np.ndarray],
+        frame_w: int,
+        frame_h: int,
+        margin: float = 1.5,
+        drift_frac: float = 0.25,
+        factor: float = 0.3,
+    ) -> list:
+        """Odometry-consistency (PCM-lite, Етап 2.3): вага ×factor для spatial-ребер,
+        несумісних із temporal-ланцюгом.
+
+        Для кожного кандидата (i, j, similarity): передбачити центр j із вузла i
+        ЧЕРЕЗ РЕБРО (predict_forward на прикидці стану i) і порівняти з тим, куди
+        j ставить temporal-ланцюг (prelim center). Допуск росте з довжиною ланцюга
+        |i−j| (компенсація дрейфу). Несумісне ребро (аліас паралельних рядів посівів,
+        що узгоджені МІЖ СОБОЮ й проходять cluster-гейт) → вага ×factor. НЕ викидання.
+
+        specs — список dict із ключами 'i','j','similarity'. Повертає list факторів.
+        """
+        n = len(specs)
+        factors = [1.0] * n
+        if not prelim_states or n == 0:
+            return factors
+
+        # Медіанний метричний рух за слот (для компенсації дрейфу довгих ланцюгів).
+        ids = sorted(prelim_states)
+        consec = [
+            float(np.linalg.norm(prelim_states[b][:2] - prelim_states[a][:2]))
+            / max(b - a, 1)
+            for a, b in zip(ids, ids[1:])
+            if b - a <= 3
+        ]
+        per_slot_disp_m = float(np.median(consec)) if consec else 0.0
+        frame_diag_px = float(np.hypot(frame_w, frame_h))
+
+        for k, spec in enumerate(specs):
+            i, j = int(spec["i"]), int(spec["j"])
+            si = prelim_states.get(i)
+            sj = prelim_states.get(j)
+            if si is None or sj is None:
+                continue  # без прикидки судити не можемо — лишаємо повну вагу
+            edge = self._build_graph_edge(i, j, spec["similarity"], 1.0, "spatial", 0, 0.0)
+            pred = _predict_forward(si, edge, self._sign)
+            inconsistency = float(np.linalg.norm(pred[:2] - sj[:2]))
+            scale_i = float(np.exp(si[2]))
+            frame_diag_m = frame_diag_px * scale_i
+            allowed = frame_diag_m * margin + per_slot_disp_m * abs(i - j) * drift_frac
+            if inconsistency > allowed:
+                factors[k] = factor
+        return factors
+
+    def estimate_min_loop_gap(
+        self, frame_w: int, frame_h: int, k_overlap: float = 1.0
+    ) -> int | None:
+        """Авто min_frame_gap для loop closure з геометрії руху (Етап 2.1).
+
+        Медіанний рух центру за слот у px беремо з temporal-ребер (dtx, dty
+        нормовані на span ребра). Мінімальний геп БЕЗ фізичного перекриття:
+        gap_min = ceil(k_overlap · frame_diag_px / median_disp_px). Нижче цього
+        гепа два кадри ще перекриваються в часі (не loop closure); вище —
+        збіг фіч означає справжній повторний прохід. None, якщо temporal-ребер
+        нема або рух вироджений (виклик тоді лишає явну константу).
+        """
+        disps = [
+            np.hypot(e.dtx, e.dty) / max(abs(e.to_id - e.from_id), 1)
+            for e in self._edges
+            if e.edge_type == "temporal"
+        ]
+        if not disps:
+            return None
+        median_disp = float(np.median(disps))
+        if median_disp < 1e-6:
+            return None
+        frame_diag = float(np.hypot(frame_w, frame_h))
+        return int(np.ceil(max(k_overlap, 1e-6) * frame_diag / median_disp))
 
     def optimize(
         self,
@@ -217,8 +393,23 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             return self._export_results()
 
         n_edges = len(valid_edges)
-        n_residuals = n_edges * 5 + len(free_ids)
-        jac_sp = self._build_jac_sparsity(valid_edges, id_to_var, n_residuals, n_vars, n_edges)
+
+        # М'які якорі (Етап 1.1): унарні пріори тільки для вільних анкер-вузлів.
+        # Порожньо (soft_anchors off) → n_anch=0 → усі гілки нижче — no-op.
+        anchor_var_idx: list[int] = []
+        anchor_states_list: list[np.ndarray] = []
+        anchor_w_list: list[float] = []
+        for fid, (a_state, a_w) in self._anchor_priors.items():
+            if fid in id_to_var:
+                anchor_var_idx.append(id_to_var[fid])
+                anchor_states_list.append(a_state)
+                anchor_w_list.append(a_w)
+        n_anch = len(anchor_var_idx)
+
+        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5
+        jac_sp = self._build_jac_sparsity(
+            valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx
+        )
 
         logger.info(
             f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), {n_residuals} residuals, {len(self._fixed_nodes)} anchors"
@@ -268,6 +459,13 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             'n_free': len(free_ids),
             'edge_from_free': edge_from_free,
             'edge_to_free': edge_to_free,
+            'anchor_var_idx': np.array(anchor_var_idx, dtype=np.int64),
+            'anchor_states': (
+                np.array(anchor_states_list, dtype=np.float64)
+                if anchor_states_list else np.zeros((0, 5), dtype=np.float64)
+            ),
+            'anchor_w': np.array(anchor_w_list, dtype=np.float64),
+            'n_anch': n_anch,
             'callback': progress_callback
         }
 
@@ -352,6 +550,17 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         x_reshaped = x.reshape(-1, 5)
         res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
 
+        if d.get('n_anch', 0) > 0:
+            # Унарний пріор якоря: w_a·(state − state_anchor), кут SO(2)-safe.
+            ap = x_reshaped[d['anchor_var_idx']]          # (n_anch, 5)
+            diff = ap - d['anchor_states']
+            ang = np.arctan2(np.sin(diff[:, 4]), np.cos(diff[:, 4]))
+            aw = d['anchor_w'][:, None]
+            res_anchor = (
+                aw * np.column_stack([diff[:, 0], diff[:, 1], diff[:, 2], diff[:, 3], ang])
+            ).ravel()
+            return np.concatenate([res_edges.flatten(), res_reg, res_anchor])
+
         return np.concatenate([res_edges.flatten(), res_reg])
 
     def _jacobian_vec(self, x: np.ndarray, d: dict):
@@ -406,6 +615,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
 
         n_edges = d['n_edges']
         n_free = d['n_free']
+        n_anch = int(d.get('n_anch', 0))
         ff = d['edge_from_free']
         ft = d['edge_to_free']
         base_r = 5 * np.arange(n_edges)
@@ -452,14 +662,25 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             add(reg_row, 5 * p_idx + 2, np.full(n_free, w_reg))
             add(reg_row, 5 * p_idx + 3, np.full(n_free, -w_reg))
 
+        # М'які якорі (Етап 1.1): d(w_a·Δstate)/d(state) = w_a·I по 5 компонентах
+        # (похідна atan2(sin dθ, cos dθ) по θ = 1). Блок діагональний.
+        if n_anch > 0:
+            av = d['anchor_var_idx']
+            aw = d['anchor_w']
+            base_a = 5 * n_edges + n_free
+            a_rows = base_a + 5 * np.arange(n_anch)
+            for comp in range(5):
+                add(a_rows + comp, 5 * av + comp, aw)
+
         rows = np.concatenate(rows)
         cols = np.concatenate(cols)
         data = np.concatenate(data)
         J = coo_matrix((data, (rows, cols)),
-                       shape=(5 * n_edges + n_free, 5 * n_free), dtype=np.float64)
+                       shape=(5 * n_edges + n_free + 5 * n_anch, 5 * n_free), dtype=np.float64)
         return J.tocsr()
 
-    def _build_jac_sparsity(self, valid_edges, id_to_var, n_residuals, n_vars, n_edges):
+    def _build_jac_sparsity(self, valid_edges, id_to_var, n_residuals, n_vars, n_edges,
+                            anchor_var_idx=None):
         # COO-конструктор (rows/cols списками) швидший за поелементний lil на
         # великих графах. Патерн розрідженості ІДЕНТИЧНИЙ попередньому.
         rows: list[int] = []
@@ -484,11 +705,19 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 rows += [base_r + 0, base_r + 1, base_r + 2, base_r + 3, base_r + 4]
                 cols += [bj + 0, bj + 1, bj + 2, bj + 3, bj + 4]
 
-        for idx in range(len(id_to_var)):
+        n_free = len(id_to_var)
+        for idx in range(n_free):
             row = n_edges * 5 + idx
             bi = 5 * idx
             rows += [row, row]
             cols += [bi + 2, bi + 3]
+
+        # М'які якорі (Етап 1.1): 5 діагональних входів на анкер-вузол.
+        for a, v in enumerate(anchor_var_idx or []):
+            base = n_edges * 5 + n_free + 5 * a
+            for comp in range(5):
+                rows.append(base + comp)
+                cols.append(5 * v + comp)
 
         data = np.ones(len(rows), dtype=np.int8)
         sp = coo_matrix((data, (rows, cols)), shape=(n_residuals, n_vars), dtype=np.int8)

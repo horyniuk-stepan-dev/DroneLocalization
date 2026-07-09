@@ -74,6 +74,33 @@ class CalibrationPropagationWorker(QThread):
             self.config, "graph_optimization.loop_closure_min_similarity", 0.75
         )
         self.lc_min_gap = get_cfg(self.config, "graph_optimization.loop_closure_min_frame_gap", 3)
+        self.lc_auto_min_gap = get_cfg(
+            self.config, "graph_optimization.loop_closure_auto_min_gap", False
+        )
+        self.lc_overlap_factor = get_cfg(
+            self.config, "graph_optimization.loop_closure_overlap_factor", 1.0
+        )
+        self.lc_dist_prefilter = get_cfg(
+            self.config, "graph_optimization.loop_closure_dist_prefilter", False
+        )
+        self.lc_dist_margin = get_cfg(
+            self.config, "graph_optimization.loop_closure_dist_margin", 2.0
+        )
+        self.lc_odometry_check = get_cfg(
+            self.config, "graph_optimization.loop_closure_odometry_check", False
+        )
+        self.odometry_margin = get_cfg(
+            self.config, "graph_optimization.odometry_consistency_margin", 1.5
+        )
+        self.odometry_drift_frac = get_cfg(
+            self.config, "graph_optimization.odometry_drift_frac", 0.25
+        )
+        self.odometry_inconsistency_factor = get_cfg(
+            self.config, "graph_optimization.odometry_inconsistency_factor", 0.3
+        )
+        self._prelim_states: dict[int, object] = {}
+        self._prelim_centers: dict[int, object] = {}
+        self._prelim_dist_threshold = 0.0
         self.lc_min_inliers = get_cfg(
             self.config, "graph_optimization.loop_closure_min_inliers", 15
         )
@@ -109,6 +136,12 @@ class CalibrationPropagationWorker(QThread):
         self.spatial_weight_use_sim = get_cfg(
             self.config, go + "spatial_weight_use_similarity", False
         )
+
+        # М'які якорі (Етап 1.1). off = fix_node (жорсткий, поточна поведінка).
+        self.soft_anchors = get_cfg(self.config, go + "soft_anchors", False)
+        self.anchor_base_w = get_cfg(self.config, go + "anchor_base_w", 200.0)
+        self.anchor_sigma_floor_m = get_cfg(self.config, go + "anchor_sigma_floor_m", 0.05)
+        self.anchor_loo_threshold_m = get_cfg(self.config, go + "anchor_loo_threshold_m", 5.0)
 
     def stop(self):
         self._is_running = False
@@ -167,6 +200,47 @@ class CalibrationPropagationWorker(QThread):
         temporal_count = self._build_temporal_edges(optimizer, all_features, num_frames)
         logger.info(f"Phase 1 complete: {temporal_count} temporal edges")
 
+        # Авто min_frame_gap (Етап 2.1): з медіанного руху за слот. Замінює ручну
+        # константу; працює в парі з odometry-consistency (2.3), що ловить
+        # аліасні same-leg замикання в зоні поза фізичним перекриттям.
+        if self.lc_auto_min_gap:
+            auto_gap = optimizer.estimate_min_loop_gap(
+                self.frame_w, self.frame_h, self.lc_overlap_factor
+            )
+            if auto_gap is not None:
+                logger.info(
+                    f"Auto min_frame_gap: {auto_gap} слотів (було {self.lc_min_gap})"
+                )
+                self.lc_min_gap = auto_gap
+
+        # Дистанційний префільтр (Етап 2.2): прикидка центрів BFS-ланцюгом temporal
+        # від якорів → поріг margin×діагональ_кадру у метрах. Далекі пари не матчаться.
+        self._prelim_states = {}
+        self._prelim_centers = {}
+        self._prelim_dist_threshold = 0.0
+        if self.lc_dist_prefilter or self.lc_odometry_check:
+            seed_affines = {
+                a.frame_id: a.affine_matrix for a in anchors if a.frame_id in all_features
+            }
+            self._prelim_states = optimizer.preliminary_states(seed_affines)
+            self._prelim_centers = {
+                fid: st[:2] for fid, st in self._prelim_states.items()
+            }
+            if self.lc_dist_prefilter and self._prelim_centers:
+                scales = [
+                    float(np.sqrt(abs(np.linalg.det(np.asarray(a.affine_matrix)[:2, :2]))))
+                    for a in anchors
+                ]
+                scale_m_per_px = float(np.median(scales)) if scales else 0.0
+                frame_diag_px = float(np.hypot(self.frame_w, self.frame_h))
+                self._prelim_dist_threshold = (
+                    self.lc_dist_margin * frame_diag_px * scale_m_per_px
+                )
+                logger.info(
+                    f"Dist prefilter: поріг {self._prelim_dist_threshold:.1f} м, "
+                    f"{len(self._prelim_centers)} прикидок центрів"
+                )
+
         # ── Phase 2: Loop closure detection ──────────────────────────────────
         self.progress.emit(30, "Пошук просторових замикань (loop closure)...")
         spatial_count = self._detect_loop_closures(optimizer, all_features, num_frames)
@@ -219,7 +293,16 @@ class CalibrationPropagationWorker(QThread):
             local_affine = anchor.affine_matrix.copy().astype(np.float64)
             local_affine[0, 2] -= origin_tx
             local_affine[1, 2] -= origin_ty
-            optimizer.fix_node(fid, local_affine)
+            if self.soft_anchors:
+                # σ = rmse_m якоря: GT (≈0)→floor→жорсткий; реальний (5–10 м)→м'який
+                optimizer.add_anchor(
+                    fid, local_affine,
+                    sigma_m=float(getattr(anchor, "rmse_m", 0.0)),
+                    base_w=self.anchor_base_w,
+                    sigma_floor=self.anchor_sigma_floor_m,
+                )
+            else:
+                optimizer.fix_node(fid, local_affine)
 
         # Warm start (Етап 4.2): x0 з попереднього розв'язку замість BFS з нуля.
         # BFS нижче лишається для першого запуску та як fallback (заповнює лише
@@ -256,7 +339,10 @@ class CalibrationPropagationWorker(QThread):
 
         # Звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших, anchor stress
         try:
-            logger.info("Звіт пропагації:\n" + optimizer.format_diagnostics())
+            logger.info(
+                "Звіт пропагації:\n"
+                + optimizer.format_diagnostics(loo_threshold_m=self.anchor_loo_threshold_m)
+            )
         except Exception as diag_err:
             logger.warning(f"Diagnostics report failed: {diag_err}")
 
@@ -442,6 +528,7 @@ class CalibrationPropagationWorker(QThread):
         specs: list[dict] = []
         n_gated_phys = 0
         n_gated_mutual = 0
+        n_gated_dist = 0
 
         for i in range(num_frames):
             if not self._is_running:
@@ -468,6 +555,17 @@ class CalibrationPropagationWorker(QThread):
                 if self.edge_gate_enabled and self.edge_gate_mutual:
                     if i not in topk_sets.get(j, ()):
                         n_gated_mutual += 1
+                        continue
+
+                # 2.2 дистанційний префільтр: якщо прикидки центрів далеко — не матчимо
+                if self.lc_dist_prefilter and self._prelim_dist_threshold > 0:
+                    ci = self._prelim_centers.get(i)
+                    cj = self._prelim_centers.get(j)
+                    if ci is not None and cj is not None and (
+                        float(np.linalg.norm(np.asarray(ci) - np.asarray(cj)))
+                        > self._prelim_dist_threshold
+                    ):
+                        n_gated_dist += 1
                         continue
 
                 feat_j = features.get(j)
@@ -511,12 +609,27 @@ class CalibrationPropagationWorker(QThread):
             if (self.edge_gate_enabled and self.edge_gate_cluster)
             else None
         )
+        # 2.3 odometry-consistency: несумісні з temporal-ланцюгом spatial-ребра → ×factor
+        odometry_factor = (
+            optimizer.odometry_consistency_factors(
+                specs, self._prelim_states, self.frame_w, self.frame_h,
+                margin=self.odometry_margin, drift_frac=self.odometry_drift_frac,
+                factor=self.odometry_inconsistency_factor,
+            )
+            if (self.lc_odometry_check and self._prelim_states)
+            else None
+        )
+        n_odo_down = (
+            sum(1 for f in odometry_factor if f < 1.0) if odometry_factor else 0
+        )
         for idx, spec in enumerate(specs):
             weight = self._compute_weight(spec["inliers"], spec["rmse"], self.spatial_base_w)
             if self.spatial_weight_use_sim:  # 4.3: w *= 0.5 + 0.5·sim
                 weight *= 0.5 + 0.5 * max(0.0, min(1.0, spec["sim"]))
-            if cluster_factor is not None:  # 2.3: самотнє ребро → ×0.5
+            if cluster_factor is not None:  # 2.3 (cluster): самотнє ребро → ×0.5
                 weight *= cluster_factor[idx]
+            if odometry_factor is not None:  # 2.3 (odometry): несумісне ребро → ×factor
+                weight *= odometry_factor[idx]
             optimizer.add_edge(
                 from_id=spec["i"],
                 to_id=spec["j"],
@@ -527,10 +640,12 @@ class CalibrationPropagationWorker(QThread):
                 rmse=spec["rmse"],
             )
 
-        if self.edge_gate_enabled:
+        if self.edge_gate_enabled or self.lc_dist_prefilter or self.lc_odometry_check:
             logger.info(
                 f"Edge gating: {n_gated_phys} відсіяно фізично, "
-                f"{n_gated_mutual} за взаємністю retrieval"
+                f"{n_gated_mutual} за взаємністю retrieval, "
+                f"{n_gated_dist} дистанційним префільтром; "
+                f"{n_odo_down} ребер ×odometry-factor (несумісні з ланцюгом)"
             )
         return len(specs)
 

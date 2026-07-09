@@ -5,7 +5,14 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from src.geometry.pose_graph.model_5dof import GraphEdge, edge_residual
+from collections import deque
+
+from src.geometry.pose_graph.model_5dof import (
+    GraphEdge,
+    _predict_forward,
+    _predict_inverse,
+    edge_residual,
+)
 
 
 class DiagnosticsMixin:
@@ -91,12 +98,83 @@ class DiagnosticsMixin:
             stress[fid] = mean_r / med if med > 0 else mean_r
         return stress
 
-    def diagnostics_report(self, top_n: int = 5) -> dict:
+    def leave_one_out_anchor_check(self, threshold_m: float = 5.0) -> dict:
+        """LOO-валідація якорів (Етап 1.2, read-only).
+
+        Для кожного якоря: спрогнозувати його стан temporal-ланцюгом від
+        НАЙБЛИЖЧОГО якоря з кожного боку (менший / більший frame_id), окремо.
+        disagreement = MIN по доступних боках → якір, що конфліктує з ОБОМА
+        сусідами (крива точка), спливає, а добрий сусід кривого лишається
+        normal (бо збігається зі своїм другим, добрим боком). Той самий
+        forward/inverse-предикт, що в BFS; anchor-stress лишається як пост-фактум.
+
+        Не мутує стан оптимізатора. {fid → {reachable, disagreement_m, flag}}.
+        Працює і з жорсткими (fix_node), і з м'якими (add_anchor) якорями.
+        """
+        anchors: dict[int, np.ndarray] = dict(self._fixed_nodes)
+        for fid, (st, _w) in getattr(self, "_anchor_priors", {}).items():
+            anchors.setdefault(fid, st)
+        if len(anchors) < 2:
+            return {}
+
+        adj: dict[int, list] = {}
+        for e in self._edges:
+            adj.setdefault(e.from_id, []).append((e.to_id, e))
+            adj.setdefault(e.to_id, []).append((e.from_id, e))
+
+        def predict_from(seed: int, target: int):
+            """Чиста одометрична проєкція стану target від одного якоря seed
+            уздовж ребер (BFS, перше досягнення). None, якщо недосяжно."""
+            pred = {seed: anchors[seed]}
+            visited = {seed}
+            queue = deque([seed])
+            while queue:
+                cur = queue.popleft()
+                cur_state = pred[cur]
+                for nb, e in adj.get(cur, []):
+                    if nb in visited:
+                        continue
+                    predicted = (
+                        _predict_forward(cur_state, e, self._sign)
+                        if e.from_id == cur
+                        else _predict_inverse(cur_state, e, self._sign)
+                    )
+                    if nb == target:
+                        return predicted
+                    pred[nb] = predicted
+                    visited.add(nb)
+                    queue.append(nb)
+            return None
+
+        ids = sorted(anchors)
+        results: dict[int, dict] = {}
+        for target in anchors:
+            prevs = [a for a in ids if a < target]
+            nexts = [a for a in ids if a > target]
+            sides = ([max(prevs)] if prevs else []) + ([min(nexts)] if nexts else [])
+            diffs = []
+            for seed in sides:
+                p = predict_from(seed, target)
+                if p is not None:
+                    diffs.append(float(np.linalg.norm(p[:2] - anchors[target][:2])))
+            if not diffs:
+                results[target] = {"reachable": False}
+                continue
+            d = min(diffs)
+            results[target] = {
+                "reachable": True,
+                "disagreement_m": d,
+                "flag": "warning" if d > threshold_m else "normal",
+            }
+        return results
+
+    def diagnostics_report(self, top_n: int = 5, loo_threshold_m: float = 5.0) -> dict:
         """Повний звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших,
-        anchor stress. Read-only — нуль впливу на розв'язок."""
+        anchor stress, LOO-валідація якорів (1.2). Read-only — нуль впливу на розв'язок."""
         res = self.compute_edge_residuals()
         stats = self.edge_residual_stats()
         stress = self.compute_anchor_stress()
+        loo = self.leave_one_out_anchor_check(loo_threshold_m)
 
         order = [k for k in np.argsort(res)[::-1] if not np.isnan(res[k])]
         worst = []
@@ -116,11 +194,12 @@ class DiagnosticsMixin:
             "residual_stats": stats,
             "worst_edges": worst,
             "anchor_stress": {int(k): float(v) for k, v in stress.items()},
+            "anchor_loo": {int(k): v for k, v in loo.items()},
         }
 
-    def format_diagnostics(self, top_n: int = 5) -> str:
+    def format_diagnostics(self, top_n: int = 5, loo_threshold_m: float = 5.0) -> str:
         """Текстовий звіт для лога/діалогу-підсумку."""
-        r = self.diagnostics_report(top_n=top_n)
+        r = self.diagnostics_report(top_n=top_n, loo_threshold_m=loo_threshold_m)
         lines = [
             f"Ребер: {r['num_edges']} ({r['num_temporal']} temporal + "
             f"{r['num_spatial']} spatial), якорів: {r['num_anchors']}",
@@ -142,6 +221,16 @@ class DiagnosticsMixin:
         if hot:
             for fid, v in sorted(hot.items(), key=lambda kv: -kv[1]):
                 lines.append(f"  ⚠ Якір #{fid}: stress {v:.1f}× медіани — перевірте точки")
+        loo_warn = {
+            k: v for k, v in r["anchor_loo"].items()
+            if v.get("flag") == "warning"
+        }
+        if loo_warn:
+            for fid, v in sorted(loo_warn.items(), key=lambda kv: -kv[1]["disagreement_m"]):
+                lines.append(
+                    f"  ⚠ Якір #{fid}: конфліктує з ланцюгом сусідніх якорів на "
+                    f"{v['disagreement_m']:.1f} м (LOO) — перевірте точки"
+                )
         return "\n".join(lines)
 
     def export_graph_geojson(self, converter, frame_w: int, frame_h: int) -> dict:

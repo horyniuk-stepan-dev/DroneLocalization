@@ -128,3 +128,4 @@ models.zip
 scratch/
 .complexipy_cache/
 .pytest_cache/
+scripts/allFiles/all_merged_new.py
