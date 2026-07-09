@@ -2,6 +2,8 @@
 
 > Постановка: БД збудована з обльоту на ~100 м; локалізація має працювати на 50–200+ м. Телеметрії (висота/курс) НЕМАЄ. Дата: 2026-07-07.
 
+> **Статус (2026-07-08):** Етап 1 (ScaleManager: prior + піраміда) — ✅ реалізовано (`src/localization/scale_manager.py`, інтеграція в `rotation_selector.py`/`localizer.py`, конфіг-ключі в `config/localization.py`). Етап 2 (depth-hint) — 🔨 у робочому дереві (uncommitted). Етапи 3–5 — відкриті. Живий статус: [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+
 ## 1. Діагноз: де саме ламається пайплайн
 
 Позначимо **r = висота_запиту / висота_БД** (r=2 → GSD запиту вдвічі грубший, кадр покриває вчетверо більшу площу).
@@ -40,7 +42,7 @@
 
 ## 4. План впровадження (ранжовано за ефект/зусилля)
 
-### Етап 1 — ScaleManager: prior + піраміда (ядро рішення, ~тиждень)
+### Етап 1 — ScaleManager: prior + піраміда (ядро рішення, ~тиждень) — ✅ РЕАЛІЗОВАНО
 
 Новий `src/localization/scale_manager.py`, дзеркало логіки A2/A3 для масштабу:
 
@@ -73,7 +75,7 @@ class ScaleManager:
 
 Конфіг: `localization.scale_pyramid`, `scale_rescan_min_score` (аналог rotation_rescan_min_score), `scale_prior_ema`.
 
-### Етап 2 — задіяти наявні depth_scales (~2-3 дні)
+### Етап 2 — задіяти наявні depth_scales (~2-3 дні) — 🔨 У РОБОТІ (uncommitted)
 
 `Localizer` читає `depth_scales` з HDF5 (уже пишуться), рахує depth_scale запиту раз на keyframe (інференс уже є в кодовій базі): (а) стартовий рівень піраміди = найближчий до depth-оцінки (скорочення скану 5→2 рівні); (б) гейт узгодженості: H-масштаб і depth-ratio розходяться >1.5× → знизити confidence.
 

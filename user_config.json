@@ -307,15 +307,25 @@
     },
     "graph_optimization": {
         "loop_closure_top_k": 5,
-        "loop_closure_min_similarity": 0.75,
-        "loop_closure_min_frame_gap": 3,
-        "loop_closure_min_inliers": 15,
+        "loop_closure_min_similarity": 0.8,
+        "loop_closure_min_frame_gap": 30,
+        "loop_closure_min_inliers": 30,
         "temporal_edge_base_weight": 1.0,
-        "spatial_edge_base_weight": 2.0,
+        "spatial_edge_base_weight": 1.0,
         "anchor_weight": 999999.0,
         "max_iterations": 50,
         "convergence_tolerance": 1e-06,
         "use_bfs_initialization": true,
-        "export_geojson": true
+        "export_geojson": true,
+        "edge_gate_enabled": true,
+        "edge_gate_max_rotation_deg": 15.0,
+        "edge_gate_max_scale_ratio": 1.3,
+        "edge_gate_min_inlier_ratio": 0.3,
+        "edge_gate_mutual_check": true,
+        "edge_gate_cluster_consistency": true,
+        "two_stage_prune": true,
+        "prune_mad_k": 5.0,
+        "prune_max_spatial_frac": 0.3,
+        "spatial_weight_use_similarity": true
     }
 }

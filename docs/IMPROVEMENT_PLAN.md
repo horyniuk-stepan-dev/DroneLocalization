@@ -2,6 +2,8 @@
 
 > Аналіз кодової бази станом на 2026-07-07. Порядок пунктів — за співвідношенням цінність/ризик (перший — найбільше цінності при найменшому ризику).
 
+> **Статус виконання (звірено з кодом 2026-07-08):** ✅ виконано — розбиття `localizer.py` (1.1), пакет `pose_graph/` (1.2), пакет `config/` (2.2), Protocol-інтерфейси `src/interfaces.py` (3.1), `src/exceptions.py` (3.3), характеризаційні тести + fakes (4), `architecture.md`/`POSE_GRAPH_MATH.md` (6). 🔲 відкрито — `database_builder.py` (1.3, досі 886 рядків), `PropagationPipeline` (1.4), `ModelManager`→registry/vram (1.6), mixins→контролери (2.1/1.5), performance (5), повна get_cfg-міграція (2.3). Живий, звірений план — у [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+
 ## Резюме та розбіжності з ТЗ
 
 Перед планом — факти, які відрізняються від припущень у ТЗ:
@@ -18,7 +20,7 @@
 
 ## 1. Рефакторинг монолітних файлів
 
-### 1.1 localizer.py (935 рядків)
+### 1.1 localizer.py (935 рядків) — ✅ ВИКОНАНО
 
 **Аналіз.** Клас `Localizer` — оркестратор, що робить усе сам: вибір кута (prior + batch scan), retrieval (single/multi-db/patchify + merge), цикл матчинг→RANSAC з early stop, 3 варіанти fallback, координатні перетворення, Kalman + outlier, обчислення FOV з захистом від "вибуху" гомографії, confidence, CSV-лог невдач. `localize_frame()` — ~450 рядків. Побічний ефект: неможливо юніт-тестити вибір кута окремо від RANSAC, а FOV — окремо від Kalman.
 
@@ -84,7 +86,7 @@ def localize_frame(self, frame, static_mask=None, dt=1.0) -> dict:
 
 **Ризики.** (а) `_last_state` використовується `localize_optical_flow` і TrackingWorker через property `last_state` — контракт зберегти дослівно. (б) Порядок side-effect'ів (`_consecutive_failures`, `_last_best_angle`, перемикання `self.database` у мульти-режимі) впливає на поведінку — переносити разом із станом, не "чистити" попутно. (в) Перемикання database/calibration у мульти-режимі мутує self — у новій схемі передавати active-контекст явно. Мітигація: спершу characterization-тести (п.4), рефакторинг без зміни жодної формули.
 
-### 1.2 pose_graph_optimizer.py (915 рядків)
+### 1.2 pose_graph_optimizer.py (915 рядків) — ✅ ВИКОНАНО
 
 **Аналіз.** Стан кращий, ніж підказує розмір: residuals/jacobian уже векторизовані і локалізовані в `_residuals_vec`/`_jacobian_vec`, prune і діагностика — окремі групи методів. Головні проблеми: (а) дублювання формули резидуала у 3 місцях (`_residuals_vec`, `_single_edge_residual`, `_predict_forward`) — зміна моделі вимагає синхронного редагування; (б) GeoJSON-експорт і текстова діагностика — не справа оптимізатора; (в) `optimize()` рекурсивно викликає себе для two-stage prune.
 
@@ -222,7 +224,7 @@ class MainWindow(QMainWindow):
 
 **Ризики:** середні. Найтонше — прихована взаємодія міксинів між собою через self (наприклад, tracking читає стан calibration). Перед міграцією — grep усіх `self.<attr>` кожного міксина і явний перелік спільного стану: він і переїде в `AppContext`.
 
-### 2.2 Розбити config.py по доменах
+### 2.2 Розбити config.py по доменах — ✅ ВИКОНАНО
 
 **Аналіз.** 450 рядків, ~24 моделі — ще не критично, але файл росте, і кожна правка конфлікт-магніт.
 
@@ -277,7 +279,7 @@ class Localizer:
 
 ## 3. Типізація та якість коду
 
-### 3.1 Protocol-інтерфейси
+### 3.1 Protocol-інтерфейси — ✅ ВИКОНАНО (src/interfaces.py)
 
 **Аналіз.** `Localizer` приймає `database`, `feature_extractor`, `matcher`, `calibration` без типів; сумісність тримається на duck typing і `hasattr`-перевірках (`hasattr(self.database, "lance_table")`, `hasattr(fe, "extract_global_descriptors_multi")`). Реальні "інтерфейси" вже існують неявно: два ретрівери (FastRetrieval, LanceDBRetrieval), стратегії маскування (masking_strategy.py з фабрикою), два екстрактори (ALIKED/RDD через wrappers).
 
@@ -413,17 +415,17 @@ class MockModelManager:
 
 | # | Задача | Цінність | Ризик | Залежить від |
 |---|---|---|---|---|
-| 1 | MockModelManager + Localizer/Builder тести (п.4) | висока | ~0 | — |
-| 2 | Integration flow test (п.4.5) | висока | ~0 | 1, частково 1.4 |
-| 3 | PropagationPipeline із worker (п.1.4) | висока | низький | 1 |
-| 4 | ModelManager → registry/vram (п.1.6) | середня | низький | 1 |
-| 5 | database_builder розбиття (п.1.3) + DI (п.2.4) | висока | середній | 1, 2 |
-| 6 | localizer розбиття (п.1.1) | висока | середній | 1, 2 |
-| 7 | config/ пакет (п.2.2) + get_cfg-міграція (п.2.3) | середня | низький | поступово, разом з 5-6 |
-| 8 | pose_graph пакет (п.1.2) | середня | середній* | існуючі тести |
-| 9 | Mixins → контролери (п.2.1, включно з 1.5) | середня | середній | 3 |
-| 10 | Performance: patchify batch, candidate batch, DINOv2 frame batch (п.5) | середня | середній | 5, 6, бенчмарки |
-| 11 | Error handling + Protocols + mypy (п.3) | середня | низький | розмазано по 5-9 |
-| 12 | ARCHITECTURE.md + docstrings (п.6) | середня | 0 | після 5-9 |
+| 1 | ✅ MockModelManager + Localizer/Builder тести (п.4) | висока | ~0 | — |
+| 2 | ◑ Integration flow test (п.4.5) | висока | ~0 | 1, частково 1.4 |
+| 3 | 🔲 PropagationPipeline із worker (п.1.4) | висока | низький | 1 |
+| 4 | 🔲 ModelManager → registry/vram (п.1.6) | середня | низький | 1 |
+| 5 | 🔲 database_builder розбиття (п.1.3) + DI (п.2.4) | висока | середній | 1, 2 |
+| 6 | ✅ localizer розбиття (п.1.1) | висока | середній | 1, 2 |
+| 7 | ✅ config/ пакет (п.2.2) + get_cfg-міграція (п.2.3) | середня | низький | поступово, разом з 5-6 |
+| 8 | ✅ pose_graph пакет (п.1.2) | середня | середній* | існуючі тести |
+| 9 | 🔲 Mixins → контролери (п.2.1, включно з 1.5) | середня | середній | 3 |
+| 10 | 🔲 Performance: patchify batch, candidate batch, DINOv2 frame batch (п.5) | середня | середній | 5, 6, бенчмарки |
+| 11 | ◑ Error handling + Protocols + mypy (п.3) | середня | низький | розмазано по 5-9 |
+| 12 | ✅ ARCHITECTURE.md + docstrings (п.6) | середня | 0 | після 5-9 |
 
 \* ризик чисельного ядра, але покритий найкращими тестами в проєкті.

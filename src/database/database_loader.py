@@ -44,6 +44,7 @@ class DatabaseLoader:
         self.frame_rmse: np.ndarray | None = None  # (N,)      — RMSE кожного кадру
         self.frame_disagreement: np.ndarray | None = None  # (N,)   — Розбіжність між гілками
         self.frame_matches: np.ndarray | None = None  # (N,)      — Кількість точок (inliers)
+        self.depth_scales: np.ndarray | None = None  # (N,) — 1/median_depth per frame (GSD hint)
 
         # GPS-координати кадрів та просторовий індекс (мультиджерельна геолокалізація)
         self.frame_gps: np.ndarray | None = None  # (N, 2) — [lat, lon] per frame
@@ -136,6 +137,12 @@ class DatabaseLoader:
                 logger.info(f"Loaded patch descriptors: shape={self.patch_descriptors.shape}")
             else:
                 self.patch_descriptors = None
+
+            # Depth scales (1/median_depth per frame) — GSD hint for ScaleManager pyramid
+            if "depth_scales" in self.db_file["metadata"]:
+                self.depth_scales = self.db_file["metadata"]["depth_scales"][:]
+            else:
+                self.depth_scales = None
 
             # Завантажуємо frame_gps якщо є (мультиджерельна геолокалізація)
             if "frame_gps" in self.db_file:
@@ -249,6 +256,14 @@ class DatabaseLoader:
     @property
     def is_propagated(self) -> bool:
         return self.frame_affine is not None
+
+    @property
+    def median_depth_scale(self) -> float | None:
+        """Median 1/median_depth across DB frames (GSD hint for ScaleManager), or None."""
+        if self.depth_scales is None:
+            return None
+        vals = self.depth_scales[np.isfinite(self.depth_scales) & (self.depth_scales > 0)]
+        return float(np.median(vals)) if vals.size else None
 
     @_synchronized
     def get_frame_affine(self, frame_id: int) -> np.ndarray | None:

@@ -1,5 +1,7 @@
 # Патч-план: розбиття `localizer.py` (IMPROVEMENT_PLAN п.1.1)
 
+> ✅ **ВИКОНАНО (2026-07-08).** Рефакторинг завершено: `localizer.py` (оркестратор) + модулі `failure_log.py`, `rotation_geometry.py`, `rotation_selector.py`, `candidate_retriever.py`, `geometric_verifier.py`, `result_builder.py`. Характеризаційний тест `tests/test_localization_characterization.py` на місці (коміти 8be2d8c, 6aed82e). Документ лишено як історичний запис.
+
 Мета — розбити `Localizer` (935 рядків) на пакет фокусованих компонентів **без зміни
 поведінки** (bit-identical результати `localize_frame` / `localize_optical_flow`).
 `localize_frame` (~450 рядків) стає ~80 рядків послідовних викликів.

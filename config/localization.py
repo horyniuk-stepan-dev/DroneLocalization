@@ -46,6 +46,8 @@ class LocalizationConfig(BaseModel):
     scale_prior_ema: float = 0.7
     # Use DepthAnythingV2 depth_scales (if available in DB) to reorder the pyramid.
     scale_use_depth_hint: bool = True
+    # How often (in keyframes) to recompute the depth-based scale hint.
+    depth_hint_every_n: int = 30
 
 
 class TrackingConfig(BaseModel):

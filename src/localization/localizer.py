@@ -93,6 +93,13 @@ class Localizer:
         # ── ScaleManager: GSD-ratio estimation for altitude-invariant localization ─
         self._scale_manager = ScaleManager(self.config)
 
+        # Depth-based scale hint (soft pyramid reorder; hint only, never a hard scale).
+        self._db_depth_scale = getattr(self.database, "median_depth_scale", None)
+        self._use_depth_hint = get_cfg(self.config, "localization.scale_use_depth_hint", True)
+        self._depth_hint_every_n = get_cfg(self.config, "localization.depth_hint_every_n", 30)
+        self._depth_estimator = None
+        self._depth_hint_counter = 0
+
         # ── Patchify: мультипатч-retrieval ────────────────────────────────────
         # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
         #   1. Увімкнено через конфіг
@@ -188,6 +195,24 @@ class Localizer:
         self._last_state = None
         self._scale_manager.reset()
 
+    def _maybe_set_depth_hint(self, frame: np.ndarray) -> None:
+        """Soft depth-based reorder of the scale pyramid (every N keyframes; hint only)."""
+        if not self._use_depth_hint or self._db_depth_scale is None:
+            return
+        self._depth_hint_counter += 1
+        if (self._depth_hint_counter - 1) % max(1, self._depth_hint_every_n) != 0:
+            return
+        try:
+            if self._depth_estimator is None:
+                from src.depth.depth_estimator import DepthEstimator
+
+                device = getattr(self.model_manager, "device", "cuda")
+                self._depth_estimator = DepthEstimator.build(device=device)
+            q_scale = self._depth_estimator.get_relative_scale(frame)
+            self._scale_manager.set_depth_hint(q_scale, self._db_depth_scale)
+        except Exception as e:
+            logger.debug(f"Depth hint skipped: {e}")
+
     def localize_frame(
         self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
     ) -> dict:
@@ -217,6 +242,9 @@ class Localizer:
         if static_mask is not None:
             static_mask = self.normalizer.normalize_mask(static_mask)
         height, width = query_frame.shape[:2]
+
+        # Depth hint: soft reorder of the scale pyramid toward the DB GSD (every N keyframes).
+        self._maybe_set_depth_hint(query_frame)
 
         angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
 

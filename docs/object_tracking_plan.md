@@ -2,10 +2,10 @@
 
 > **Версія:** 1.0  
 > **Дата:** 2026-04-23  
-> **Статус:** ⚠️ Частково реалізовано (2026-06)
+> **Статус:** ✅ Реалізовано (2026-07)
 
 > [!NOTE]
-> **Фази 1–2 виконано:** `src/tracking/object_tracker.py` та `src/tracking/object_projector.py` вже існують. Залежність `supervision` додана в `pyproject.toml`. Фази 3–4 (візуалізація bbox та маркери на карті) в процесі реалізації.
+> **Фази 1–2 виконано:** `src/tracking/object_tracker.py` та `src/tracking/object_projector.py` вже існують. Залежність `supervision` додана в `pyproject.toml`. Фази 3–4 (візуалізація bbox та маркери на карті) також реалізовано — готово.
 
 ---
 
@@ -211,7 +211,7 @@ class ObjectProjector:
 | 1.2 | Створити `ObjectTracker` з ByteTrack | `src/tracking/object_tracker.py` | ✅ |
 | 1.3 | Створити `ObjectProjector` | `src/tracking/object_projector.py` | ✅ |
 | 1.4 | Додати `ObjectTrackingConfig` | `config/config.py` | ✅ |
-| 1.5 | Unit-тести для `ObjectTracker` | `tests/test_object_tracker.py` | ⏳ Очікується |
+| 1.5 | Unit-тести для `ObjectTracker` | `tests/test_object_tracker.py` | ✅ |
 
 ### Фаза 2: Інтеграція у TrackingWorker — ✅ Виконано
 
@@ -223,22 +223,22 @@ class ObjectProjector:
 | 2.4 | GPS-проєкція через `_last_state["H"]` та `_last_state["affine"]` | `tracking_worker.py` | ✅ |
 | 2.5 | Інтерполяція на OF-кадрах (Kalman predict) | `tracking_worker.py` | ✅ |
 
-### Фаза 3: Візуалізація — ⏳ В планах
+### Фаза 3: Візуалізація — ✅ Виконано
 
 | # | Задача | Файл | Статус |
 |---|---|---|---|
-| 3.1 | `draw_tracked_objects()` у VideoWidget | `video_widget.py` | ⏳ |
-| 3.2 | Сигнали в MapBridge для маркерів об’єктів | `map_widget.py` | ⏳ |
-| 3.3 | JavaScript шар для об’єктів у map_template | `map_template.html` | ⏳ |
-| 3.4 | Підключити сигнали у TrackingMixin | `tracking_mixin.py` | ⏳ Очікується |
+| 3.1 | `draw_tracked_objects()` у VideoWidget | `video_widget.py` | ✅ |
+| 3.2 | Сигнали в MapBridge для маркерів об’єктів | `map_widget.py` | ✅ |
+| 3.3 | JavaScript шар для об’єктів у map_template | `map_template.html` | ✅ |
+| 3.4 | Підключити сигнали у TrackingMixin | `tracking_mixin.py` | ✅ |
 
-### Фаза 4: Експорт та UI — ⏳ В планах
+### Фаза 4: Експорт та UI — ✅ Виконано
 
 | # | Задача | Файл | Статус |
 |---|---|---|---|
-| 4.1 | Збереження історії об’єктів у `_tracking_results` | `tracking_mixin.py` | ⏳ |
-| 4.2 | Експорт траєкторій об'єктів у CSV/GeoJSON | `export_results.py` | ⏳ |
-| 4.3 | Toggle кнопка "Показати/Сховати об’єкти" у ControlPanel | `control_panel.py` | ⏳ Очікується |
+| 4.1 | Збереження історії об’єктів у `_tracking_results` | `tracking_mixin.py` | ✅ |
+| 4.2 | Експорт траєкторій об'єктів у CSV/GeoJSON | `export_results.py` | ✅ |
+| 4.3 | Toggle кнопка "Показати/Сховати об’єкти" у ControlPanel | `control_panel.py` | ✅ |
 
 ---
 
