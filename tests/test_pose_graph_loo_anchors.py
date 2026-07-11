@@ -5,6 +5,7 @@
 (2) навмисно зсунутий якір → warning із розбіжністю ≈ зсуву;
 (3) метод не мутує стан оптимізатора; працює і для fix_node, і для add_anchor.
 """
+
 import numpy as np
 
 from src.geometry.pose_graph.model_5dof import _state_to_affine
@@ -85,4 +86,5 @@ def test_loo_works_for_soft_anchors():
 
 if __name__ == "__main__":
     import pytest
+
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -3,7 +3,7 @@
 from pydantic import BaseModel
 
 from config.database import DatabaseConfig
-from config.graph import GraphOptimizationConfig, ProjectionConfig
+from config.graph import GraphOptimizationConfig, ProjectionConfig, PropagationConfig
 from config.localization import HomographyConfig, LocalizationConfig, TrackingConfig
 from config.models import GlobalDescriptorConfig, ModelsConfig
 
@@ -82,3 +82,4 @@ class AppConfig(BaseModel):
     projection: ProjectionConfig = ProjectionConfig()
     homography: HomographyConfig = HomographyConfig()
     graph_optimization: GraphOptimizationConfig = GraphOptimizationConfig()
+    propagation: PropagationConfig = PropagationConfig()

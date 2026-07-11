@@ -10,7 +10,6 @@ from datetime import datetime
 from typing import Any
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
@@ -19,16 +18,9 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-# Єдине джерело — src.geometry.affine_utils (усунення дублювання)
-from src.geometry.affine_utils import (
-    compose_affine_5dof as _compose_affine_5dof,
-)
-from src.geometry.affine_utils import (
-    decompose_affine_5dof as _decompose_affine_5dof,
-)
-from src.geometry.affine_utils import (
-    unwrap_angles as _unwrap_angles,
-)
+# Єдине джерело центр-базової 5-DoF PCHIP-форми — src.geometry.affine_utils
+from src.geometry.affine_utils import build_5dof_pchip as _build_5dof_pchip
+from src.geometry.affine_utils import sample_5dof_pchip as _sample_5dof_pchip
 
 
 class AnchorCalibration:
@@ -119,10 +111,26 @@ class MultiAnchorCalibration:
 
     VERSION: str = "2.3"
 
-    def __init__(self, converter: CoordinateConverter | None = None) -> None:
+    def __init__(
+        self,
+        converter: CoordinateConverter | None = None,
+        log_scale_interp: bool | None = None,
+    ) -> None:
         self.anchors: list[AnchorCalibration] = []
         self.converter = converter or CoordinateConverter("WEB_MERCATOR")
-        self._interp: PchipInterpolator | None = None  # кешований інтерполятор
+        # Log-scale інтерполяція масштабу між якорями (RESEARCH 1.3). None →
+        # читаємо graph_optimization.log_scale_interp з APP_CONFIG (дефолт off).
+        if log_scale_interp is None:
+            try:
+                from config import APP_CONFIG, get_cfg
+
+                log_scale_interp = bool(
+                    get_cfg(APP_CONFIG, "graph_optimization.log_scale_interp", False)
+                )
+            except Exception:
+                log_scale_interp = False
+        self._log_scale_interp = bool(log_scale_interp)
+        self._interp: Any = None  # кешований PCHIP-інтерполятор (build_5dof_pchip)
         self._interp_sign: float = -1.0  # знак det якірних матриць (Y-flip)
         self._interp_range: tuple[float, float] | None = None  # [перший, останній] якір
         self._ref_px: tuple[float, float] = (0.0, 0.0)  # опорний піксель декомпозиції
@@ -179,48 +187,28 @@ class MultiAnchorCalibration:
                 f"One of the anchors is likely mirrored (swapped lat/lon?). "
                 f"Interpolation may be unreliable — recheck anchor points."
             )
-        self._interp_sign = -1.0 if n_neg * 2 >= len(dets) else 1.0
 
         cx, cy = self._reference_pixel()
         self._ref_px = (cx, cy)
 
-        ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
-        comps = np.zeros((len(self.anchors), 5), dtype=np.float64)
-        for i, a in enumerate(self.anchors):
-            M = a.affine_matrix
-            _, _, sx, sy, angle = _decompose_affine_5dof(M)
-            # Метрична позиція опорного пікселя — інтерполюємо саме її
-            rx = M[0, 0] * cx + M[0, 1] * cy + M[0, 2]
-            ry = M[1, 0] * cx + M[1, 1] * cy + M[1, 2]
-            comps[i] = (rx, ry, sx, sy, angle)
-
-        # Розгортаємо кути для коректної інтерполяції через межу ±π
-        comps[:, 4] = _unwrap_angles(comps[:, 4])
-
-        # extrapolate=False + clamp у _get_interpolated_matrix:
-        # кубічна екстраполяція за межами діапазону якорів розліталась.
-        self._interp = PchipInterpolator(ids, comps, extrapolate=False)
-        self._interp_range = (float(ids[0]), float(ids[-1]))
+        # Спільний білдер (Етап 4): та сама центр-базова 5-DoF PCHIP-форма, що й у
+        # заповненні пропущених кадрів пропагації (src.geometry.affine_utils).
+        ids = [a.frame_id for a in self.anchors]
+        affines = [a.affine_matrix for a in self.anchors]
+        self._interp, self._interp_sign, self._interp_range = _build_5dof_pchip(
+            ids, affines, (cx, cy), log_scale=self._log_scale_interp
+        )
 
     def _get_interpolated_matrix(self, frame_id: float) -> np.ndarray | None:
         """Повертає інтерпольовану афінну матрицю 2x3 для заданого frame_id."""
-        if self._interp is None or self._interp_range is None:
-            return None
-        # Clamp: за межами діапазону якорів використовуємо крайній якір
-        fid = float(np.clip(frame_id, self._interp_range[0], self._interp_range[1]))
-        components = self._interp(fid)  # (5,): rx, ry, sx, sy, angle
-        if components is None or np.any(np.isnan(components)):
-            return None
-        rx, ry, sx, sy, angle = components
-        # Захист від вироджених значень масштабу
-        sx = float(np.clip(sx, 1e-6, 1e6))
-        sy = float(np.clip(sy, 1e-6, 1e6))
-        M = _compose_affine_5dof(0.0, 0.0, sx, sy, float(angle), sign=self._interp_sign)
-        # Трансляція: опорний піксель має відобразитись точно у (rx, ry)
-        cx, cy = self._ref_px
-        M[0, 2] = float(rx) - (M[0, 0] * cx + M[0, 1] * cy)
-        M[1, 2] = float(ry) - (M[1, 0] * cx + M[1, 1] * cy)
-        return M
+        return _sample_5dof_pchip(
+            self._interp,
+            self._interp_sign,
+            self._interp_range,
+            self._ref_px,
+            frame_id,
+            log_scale=self._log_scale_interp,
+        )
 
     @property
     def is_calibrated(self) -> bool:
@@ -262,6 +250,7 @@ class MultiAnchorCalibration:
         self._interp = None
         self._interp_range = None
         from src.geometry.coordinates import CoordinateConverter
+
         self.converter = CoordinateConverter("WEB_MERCATOR")
         logger.info("Cleared all anchors and reset calibration state.")
 
@@ -277,7 +266,9 @@ class MultiAnchorCalibration:
         exact_anchor = self.get_anchor(frame_id)
         if exact_anchor is not None:
             # Точне потрапляння на якір = скидаємо накопичений drift
-            logger.debug(f"Exact anchor hit at frame {frame_id} — using direct affine (drift reset)")
+            logger.debug(
+                f"Exact anchor hit at frame {frame_id} — using direct affine (drift reset)"
+            )
             return exact_anchor.pixel_to_metric(x, y)
 
         # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
@@ -323,7 +314,7 @@ class MultiAnchorCalibration:
         mx, my = result
 
         # Нормалізуємо depth_scale відносно reference (медіана всіх якорів).
-        ref_depth = getattr(self, '_reference_depth_scale', 1.0)
+        ref_depth = getattr(self, "_reference_depth_scale", 1.0)
         if ref_depth > 1e-6:
             correction = depth_scale / ref_depth
             # Обмежуємо корекцію: максимум 2x в будь-який бік
@@ -348,7 +339,7 @@ class MultiAnchorCalibration:
         """Встановлює калькулятор GSD для прив'язки до фізичного масштабу."""
         self._gsd = gsd_calculator
         if self._gsd:
-            logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px*100:.2f} cm/px")
+            logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px * 100:.2f} cm/px")
 
     def save(self, path: str) -> None:
         """Збереження якорів та метаданих проєкції у JSON."""

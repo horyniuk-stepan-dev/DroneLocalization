@@ -27,6 +27,7 @@ from src.geometry.affine_utils import (
 )
 from src.geometry.pose_graph_optimizer import (
     PoseGraphOptimizer,
+    affine_fit_residual,
     homography_to_similarity,
 )
 from src.geometry.transformations import GeometryTransforms
@@ -117,6 +118,13 @@ class CalibrationPropagationWorker(QThread):
 
         # Скільки кадрів можна "перестрибнути" при побудові temporal ребер
         self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 3)
+        self.rotation_retry = get_cfg(self.config, "propagation.rotation_retry", False)
+        self.temporal_weight_use_fit = get_cfg(
+            self.config, "graph_optimization.temporal_weight_use_fit_quality", False
+        )
+        self.temporal_fit_k = get_cfg(
+            self.config, "graph_optimization.temporal_fit_quality_k", 0.05
+        )
 
         # ── Нові опції (Етапи 2/3/4). Дефолти off = поточна поведінка. ──
         go = "graph_optimization."
@@ -125,6 +133,11 @@ class CalibrationPropagationWorker(QThread):
         self.two_stage_prune = get_cfg(self.config, go + "two_stage_prune", False)
         self.prune_mad_k = get_cfg(self.config, go + "prune_mad_k", 5.0)
         self.prune_max_spatial_frac = get_cfg(self.config, go + "prune_max_spatial_frac", 0.2)
+        self.gnc_spatial = get_cfg(self.config, go + "gnc_spatial", False)
+        self.gnc_rounds = get_cfg(self.config, go + "gnc_rounds", 5)
+        self.gnc_mad_k = get_cfg(self.config, go + "gnc_mad_k", 3.0)
+        self.pchip_gap_fill = get_cfg(self.config, go + "pchip_gap_fill", False)
+        self.log_scale_interp = get_cfg(self.config, go + "log_scale_interp", False)
         self.edge_gate_enabled = get_cfg(self.config, go + "edge_gate_enabled", False)
         self.edge_gate_max_rot = get_cfg(self.config, go + "edge_gate_max_rotation_deg", 40.0)
         self.edge_gate_max_scale = get_cfg(self.config, go + "edge_gate_max_scale_ratio", 1.6)
@@ -208,9 +221,7 @@ class CalibrationPropagationWorker(QThread):
                 self.frame_w, self.frame_h, self.lc_overlap_factor
             )
             if auto_gap is not None:
-                logger.info(
-                    f"Auto min_frame_gap: {auto_gap} слотів (було {self.lc_min_gap})"
-                )
+                logger.info(f"Auto min_frame_gap: {auto_gap} слотів (було {self.lc_min_gap})")
                 self.lc_min_gap = auto_gap
 
         # Дистанційний префільтр (Етап 2.2): прикидка центрів BFS-ланцюгом temporal
@@ -223,9 +234,7 @@ class CalibrationPropagationWorker(QThread):
                 a.frame_id: a.affine_matrix for a in anchors if a.frame_id in all_features
             }
             self._prelim_states = optimizer.preliminary_states(seed_affines)
-            self._prelim_centers = {
-                fid: st[:2] for fid, st in self._prelim_states.items()
-            }
+            self._prelim_centers = {fid: st[:2] for fid, st in self._prelim_states.items()}
             if self.lc_dist_prefilter and self._prelim_centers:
                 scales = [
                     float(np.sqrt(abs(np.linalg.det(np.asarray(a.affine_matrix)[:2, :2]))))
@@ -233,9 +242,7 @@ class CalibrationPropagationWorker(QThread):
                 ]
                 scale_m_per_px = float(np.median(scales)) if scales else 0.0
                 frame_diag_px = float(np.hypot(self.frame_w, self.frame_h))
-                self._prelim_dist_threshold = (
-                    self.lc_dist_margin * frame_diag_px * scale_m_per_px
-                )
+                self._prelim_dist_threshold = self.lc_dist_margin * frame_diag_px * scale_m_per_px
                 logger.info(
                     f"Dist prefilter: поріг {self._prelim_dist_threshold:.1f} м, "
                     f"{len(self._prelim_centers)} прикидок центрів"
@@ -296,7 +303,8 @@ class CalibrationPropagationWorker(QThread):
             if self.soft_anchors:
                 # σ = rmse_m якоря: GT (≈0)→floor→жорсткий; реальний (5–10 м)→м'який
                 optimizer.add_anchor(
-                    fid, local_affine,
+                    fid,
+                    local_affine,
                     sigma_m=float(getattr(anchor, "rmse_m", 0.0)),
                     base_w=self.anchor_base_w,
                     sigma_floor=self.anchor_sigma_floor_m,
@@ -334,6 +342,9 @@ class CalibrationPropagationWorker(QThread):
             two_stage_prune=self.two_stage_prune,
             prune_mad_k=self.prune_mad_k,
             prune_max_spatial_frac=self.prune_max_spatial_frac,
+            gnc_spatial=self.gnc_spatial,
+            gnc_rounds=self.gnc_rounds,
+            gnc_mad_k=self.gnc_mad_k,
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
 
@@ -403,6 +414,7 @@ class CalibrationPropagationWorker(QThread):
     ) -> int:
         """Побудова часових ребер між послідовними кадрами."""
         count = 0
+        n_rotation_retry = 0
         last_success_id = -1
         last_success_feat = None
 
@@ -423,26 +435,45 @@ class CalibrationPropagationWorker(QThread):
                 gap = i - last_success_id
                 if gap > self.max_skip_frames:
                     logger.debug(
-                        f"Temporal edge across keyframe gap: {last_success_id} → {i} "
-                        f"({gap} slots)"
+                        f"Temporal edge across keyframe gap: {last_success_id} → {i} ({gap} slots)"
                     )
                 # H maps feat_i → last_success_feat (to→from direction)
+                similarity = None
+                inliers = 0
+                rmse_val = 0.0
                 result = self._match_and_build_edge(feat_i, last_success_feat)
                 if result is not None:
                     H, inliers, rmse_val, _n_matches = result
                     similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
-                    if similarity is not None:
-                        weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
-                        optimizer.add_edge(
-                            from_id=last_success_id,
-                            to_id=i,
-                            relative_affine_2x3=similarity,
-                            weight=weight,
-                            edge_type="temporal",
-                            inliers=inliers,
-                            rmse=rmse_val,
-                        )
-                        count += 1
+
+                # Ротаційна робастність (Етап 5): матч упав → пробуємо з поворотом
+                # query на кут ланцюга frame_poses, далі перебір k·90°.
+                if similarity is None and self.rotation_retry:
+                    retry = self._temporal_rotation_retry(
+                        feat_i, last_success_feat, last_success_id, i
+                    )
+                    if retry is not None:
+                        similarity, inliers, rmse_val = retry
+                        n_rotation_retry += 1
+
+                if similarity is not None:
+                    weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
+                    # 6.2: менша довіра кадрам із нахилом/рельєфом (великий залишок
+                    # афінного фіту H). Лише первинний матч (result), не rotation-retry.
+                    if self.temporal_weight_use_fit and result is not None:
+                        fit_res = affine_fit_residual(result[0], self.frame_w, self.frame_h)
+                        if fit_res is not None:
+                            weight *= 1.0 / (1.0 + self.temporal_fit_k * fit_res)
+                    optimizer.add_edge(
+                        from_id=last_success_id,
+                        to_id=i,
+                        relative_affine_2x3=similarity,
+                        weight=weight,
+                        edge_type="temporal",
+                        inliers=inliers,
+                        rmse=rmse_val,
+                    )
+                    count += 1
 
             last_success_id = i
             last_success_feat = feat_i
@@ -453,7 +484,45 @@ class CalibrationPropagationWorker(QThread):
                     f"Часові ребра: {count} (кадр {i}/{num_frames})",
                 )
 
+        if self.rotation_retry and n_rotation_retry:
+            logger.info(f"Rotation-retry врятував {n_rotation_retry} temporal-ребер")
         return count
+
+    def _temporal_rotation_retry(self, feat_i, last_feat, from_id, to_id):
+        """Повторний temporal-матч із поворотом query (Етап 5). Повертає
+        (similarity, inliers, rmse) або None. Кут — із ланцюга frame_poses БД
+        (одометричний пріор), fallback — перебір k·90°. Отриману H_r
+        (rotated_query→ref) компонуємо назад: H_true = H_r · R(θ)."""
+        from src.localization.rotation_geometry import (
+            chain_relative_angle_deg,
+            rotate_keypoints,
+            rotation_homography,
+            temporal_retry_angles,
+        )
+
+        cx, cy = self.frame_w / 2.0, self.frame_h / 2.0
+        chain_angle = None
+        fp = getattr(self.database, "frame_poses", None)
+        if fp is not None and 0 <= to_id < len(fp) and 0 <= from_id < len(fp):
+            # to→from: кут, яким повертаємо query(to), щоб вирівняти з ref(from)
+            chain_angle = chain_relative_angle_deg(fp[to_id], fp[from_id])
+
+        for ang_deg in temporal_retry_angles(chain_angle, use_chain=chain_angle is not None):
+            ang = np.radians(ang_deg)
+            feat_rot = dict(feat_i)
+            feat_rot["keypoints"] = rotate_keypoints(feat_i["keypoints"], ang, cx, cy)
+            result = self._match_and_build_edge(feat_rot, last_feat)
+            if result is None:
+                continue
+            H_r, inliers, rmse_val, _n = result
+            H_true = np.asarray(H_r, dtype=np.float64) @ rotation_homography(ang, cx, cy)
+            similarity = homography_to_similarity(H_true, self.frame_w, self.frame_h)
+            if similarity is not None:
+                logger.debug(
+                    f"Rotation-retry {from_id}→{to_id} OK @ {ang_deg:.1f}° (chain={chain_angle})"
+                )
+                return similarity, inliers, rmse_val
+        return None
 
     # ─── Phase 2: Loop closure detection ─────────────────────────────────────
 
@@ -465,7 +534,9 @@ class CalibrationPropagationWorker(QThread):
     ) -> int:
         """Знаходить просторові замикання через DINOv2 (LanceDB/FAISS) + LightGlue matching."""
 
-        has_lancedb = hasattr(self.database, "lance_table") and self.database.lance_table is not None
+        has_lancedb = (
+            hasattr(self.database, "lance_table") and self.database.lance_table is not None
+        )
         lance_table = self.database.lance_table if has_lancedb else None
 
         # Завантажуємо вектори для швидкого пошуку
@@ -561,9 +632,13 @@ class CalibrationPropagationWorker(QThread):
                 if self.lc_dist_prefilter and self._prelim_dist_threshold > 0:
                     ci = self._prelim_centers.get(i)
                     cj = self._prelim_centers.get(j)
-                    if ci is not None and cj is not None and (
-                        float(np.linalg.norm(np.asarray(ci) - np.asarray(cj)))
-                        > self._prelim_dist_threshold
+                    if (
+                        ci is not None
+                        and cj is not None
+                        and (
+                            float(np.linalg.norm(np.asarray(ci) - np.asarray(cj)))
+                            > self._prelim_dist_threshold
+                        )
                     ):
                         n_gated_dist += 1
                         continue
@@ -592,10 +667,16 @@ class CalibrationPropagationWorker(QThread):
                     n_gated_phys += 1
                     continue
 
-                specs.append({
-                    "i": i, "j": j, "similarity": similarity,
-                    "inliers": inliers, "rmse": rmse_val, "sim": float(sim_score),
-                })
+                specs.append(
+                    {
+                        "i": i,
+                        "j": j,
+                        "similarity": similarity,
+                        "inliers": inliers,
+                        "rmse": rmse_val,
+                        "sim": float(sim_score),
+                    }
+                )
 
             if i % 200 == 0:
                 self.progress.emit(
@@ -612,16 +693,18 @@ class CalibrationPropagationWorker(QThread):
         # 2.3 odometry-consistency: несумісні з temporal-ланцюгом spatial-ребра → ×factor
         odometry_factor = (
             optimizer.odometry_consistency_factors(
-                specs, self._prelim_states, self.frame_w, self.frame_h,
-                margin=self.odometry_margin, drift_frac=self.odometry_drift_frac,
+                specs,
+                self._prelim_states,
+                self.frame_w,
+                self.frame_h,
+                margin=self.odometry_margin,
+                drift_frac=self.odometry_drift_frac,
                 factor=self.odometry_inconsistency_factor,
             )
             if (self.lc_odometry_check and self._prelim_states)
             else None
         )
-        n_odo_down = (
-            sum(1 for f in odometry_factor if f < 1.0) if odometry_factor else 0
-        )
+        n_odo_down = sum(1 for f in odometry_factor if f < 1.0) if odometry_factor else 0
         for idx, spec in enumerate(specs):
             weight = self._compute_weight(spec["inliers"], spec["rmse"], self.spatial_base_w)
             if self.spatial_weight_use_sim:  # 4.3: w *= 0.5 + 0.5·sim
@@ -895,7 +978,8 @@ class CalibrationPropagationWorker(QThread):
                 return None
 
             H, mask = GeometryTransforms.estimate_homography(
-                mkpts_a, mkpts_b,
+                mkpts_a,
+                mkpts_b,
                 ransac_threshold=self.ransac_thresh,
                 backend=self.homography_backend,
                 use_mad_ransac=self.use_mad_ransac,
@@ -924,11 +1008,48 @@ class CalibrationPropagationWorker(QThread):
         """Обчислює вагу ребра: w = base * √inliers / (1 + RMSE)."""
         return base_weight * np.sqrt(max(inliers, 1)) / (1.0 + rmse)
 
+    def _fill_gaps_pchip(self, frame_affine, frame_valid, valid_ids):
+        """PCHIP-заповнення (Етап 4): центр-базова shape-preserving 5-DoF інтерполяція
+        над УСІМА валідними кадрами (спільний білдер із MultiAnchorCalibration).
+        Кадри поза діапазоном валідних — clamp до крайнього (як лінійна екстраполяція).
+        None → білдер не зібрав інтерполятор → fallback на лінійну."""
+        from src.geometry.affine_utils import build_5dof_pchip, sample_5dof_pchip
+
+        ref_px = (self.frame_w / 2.0, self.frame_h / 2.0)
+        affines = [frame_affine[int(i)] for i in valid_ids]
+        interp, sign, rng = build_5dof_pchip(
+            valid_ids, affines, ref_px, log_scale=self.log_scale_interp
+        )
+        if interp is None:
+            return None
+        filled = 0
+        for fid in range(len(frame_valid)):
+            if frame_valid[fid]:
+                continue
+            M = sample_5dof_pchip(
+                interp, sign, rng, ref_px, fid, log_scale=self.log_scale_interp
+            )
+            if M is None:
+                continue
+            frame_affine[fid] = M
+            frame_valid[fid] = True
+            filled += 1
+        return filled
+
     def _fill_gaps_by_interpolation(self, frame_affine: np.ndarray, frame_valid: np.ndarray) -> int:
-        """Лінійна 5-DoF інтерполяція для кадрів, пропущених через Keyframe Selection."""
+        """5-DoF інтерполяція кадрів, пропущених через Keyframe Selection.
+
+        Дефолт — посегментна лінійна. За прапорцем pchip_gap_fill — shape-preserving
+        PCHIP над усіма валідними кадрами (Етап 4), що прибирає «сходинки» на дугах.
+        """
         valid_ids = np.where(frame_valid)[0]
         if len(valid_ids) < 1:
             return 0
+
+        if self.pchip_gap_fill and len(valid_ids) >= 2:
+            pchip_filled = self._fill_gaps_pchip(frame_affine, frame_valid, valid_ids)
+            if pchip_filled is not None:
+                return pchip_filled  # інакше — fallback на лінійну нижче
 
         filled = 0
 
@@ -959,12 +1080,20 @@ class CalibrationPropagationWorker(QThread):
                 comp_left[4] = angles[0]
                 comp_right[4] = angles[1]
 
+                # Log-scale (RESEARCH 1.3): лінійна інтерполяція в log-просторі
+                # масштабу = геометрична інтерполяція самого масштабу.
+                if self.log_scale_interp:
+                    comp_left[2:4] = np.log(np.maximum(comp_left[2:4], 1e-12))
+                    comp_right[2:4] = np.log(np.maximum(comp_right[2:4], 1e-12))
+
                 for mid in range(left + 1, right):
                     t = (mid - left) / gap
                     comp_mid = comp_left * (1.0 - t) + comp_right * t
 
                     # Розпаковуємо 5 змінних
                     tx, ty, sx, sy, angle = comp_mid
+                    if self.log_scale_interp:
+                        sx, sy = float(np.exp(sx)), float(np.exp(sy))
                     sx = float(np.clip(sx, 1e-6, 1e6))
                     sy = float(np.clip(sy, 1e-6, 1e6))
 

@@ -8,6 +8,7 @@
 3. КЛЮЧОВЕ: хибний якір (RMSE великий) із soft_anchors «переголосовується»
    узгодженим ланцюгом → median-похибка МЕНША, ніж із жорстким fix_node.
 """
+
 import numpy as np
 
 from src.geometry.pose_graph.model_5dof import _state_to_affine
@@ -17,9 +18,7 @@ CX, CY = 960.0, 540.0
 
 
 def _anchor_affine(cx_m, cy_m, log_sx=0.0, log_sy=0.0, theta=0.0):
-    return _state_to_affine(
-        np.array([cx_m, cy_m, log_sx, log_sy, theta]), CX, CY, sign=1.0
-    )
+    return _state_to_affine(np.array([cx_m, cy_m, log_sx, log_sy, theta]), CX, CY, sign=1.0)
 
 
 def _step(dx, dy=0.0):
@@ -38,8 +37,10 @@ def _num_jac(opt, x, d, eps=1e-6):
     m = opt._residuals_vec(x.copy(), d).size
     J = np.zeros((m, x.size))
     for k in range(x.size):
-        xp = x.copy(); xp[k] += eps
-        xm = x.copy(); xm[k] -= eps
+        xp = x.copy()
+        xp[k] += eps
+        xm = x.copy()
+        xm[k] -= eps
         J[:, k] = (opt._residuals_vec(xp, d) - opt._residuals_vec(xm, d)) / (2 * eps)
     return J
 
@@ -53,15 +54,20 @@ def test_analytic_jacobian_with_anchors_matches_fd():
         "free_indices": [0, 1],
         "edges_from": np.array([0], dtype=np.int32),
         "edges_to": np.array([1], dtype=np.int32),
-        "dtx": np.array([12.0]), "dty": np.array([-5.0]),
-        "log_dsx": np.array([0.05]), "log_dsy": np.array([-0.03]),
-        "dtheta": np.array([0.2]), "weights": np.array([1.4]),
-        "cx": 960.0, "sign": 1.0, "n_edges": 1, "n_free": 2,
+        "dtx": np.array([12.0]),
+        "dty": np.array([-5.0]),
+        "log_dsx": np.array([0.05]),
+        "log_dsy": np.array([-0.03]),
+        "dtheta": np.array([0.2]),
+        "weights": np.array([1.4]),
+        "cx": 960.0,
+        "sign": 1.0,
+        "n_edges": 1,
+        "n_free": 2,
         "edge_from_free": np.array([0], dtype=np.int64),
         "edge_to_free": np.array([1], dtype=np.int64),
         "anchor_var_idx": np.array([0, 1], dtype=np.int64),
-        "anchor_states": np.array([[1.0, -2.0, 0.1, -0.1, 0.3],
-                                   [3.0, 1.0, -0.05, 0.2, -0.2]]),
+        "anchor_states": np.array([[1.0, -2.0, 0.1, -0.1, 0.3], [3.0, 1.0, -0.05, 0.2, -0.2]]),
         "anchor_w": np.array([30.0, 5.0]),
         "n_anch": 2,
     }
@@ -103,10 +109,10 @@ def test_soft_anchor_near_hard_matches_fix_node():
         opt.fix_node(n - 1, _anchor_affine(step * (n - 1), 0.0))
 
     def soft(opt):
-        opt.add_anchor(0, _anchor_affine(0.0, 0.0), sigma_m=0.0,
-                       base_w=200.0, sigma_floor=0.05)
-        opt.add_anchor(n - 1, _anchor_affine(step * (n - 1), 0.0), sigma_m=0.0,
-                       base_w=200.0, sigma_floor=0.05)
+        opt.add_anchor(0, _anchor_affine(0.0, 0.0), sigma_m=0.0, base_w=200.0, sigma_floor=0.05)
+        opt.add_anchor(
+            n - 1, _anchor_affine(step * (n - 1), 0.0), sigma_m=0.0, base_w=200.0, sigma_floor=0.05
+        )
 
     r_hard = _build_chain(hard, n, step).optimize(max_iterations=100, tolerance=1e-12)
     r_soft = _build_chain(soft, n, step).optimize(max_iterations=100, tolerance=1e-12)
@@ -147,14 +153,19 @@ def test_soft_anchors_outvote_bad_anchor():
     # хибний вузол: жорсткий пришпилений на 40 м; м'який підтягнутий ланцюгом
     assert e_hard[bad_id] > 35.0, f"hard bad-node err {e_hard[bad_id]:.1f} (очікували ~40)"
     assert e_soft[bad_id] < e_hard[bad_id] * 0.5, (
-        f"soft не переголосував: {e_soft[bad_id]:.1f} vs hard {e_hard[bad_id]:.1f}")
+        f"soft не переголосував: {e_soft[bad_id]:.1f} vs hard {e_hard[bad_id]:.1f}"
+    )
     # загальна якість краща
     assert np.median(e_soft) < np.median(e_hard), (
-        f"median soft {np.median(e_soft):.2f} !< hard {np.median(e_hard):.2f}")
-    print(f"median err: hard={np.median(e_hard):.2f} м, soft={np.median(e_soft):.2f} м; "
-          f"bad-node: hard={e_hard[bad_id]:.1f} м, soft={e_soft[bad_id]:.1f} м")
+        f"median soft {np.median(e_soft):.2f} !< hard {np.median(e_hard):.2f}"
+    )
+    print(
+        f"median err: hard={np.median(e_hard):.2f} м, soft={np.median(e_soft):.2f} м; "
+        f"bad-node: hard={e_hard[bad_id]:.1f} м, soft={e_soft[bad_id]:.1f} м"
+    )
 
 
 if __name__ == "__main__":
     import pytest
+
     raise SystemExit(pytest.main([__file__, "-q", "-s"]))

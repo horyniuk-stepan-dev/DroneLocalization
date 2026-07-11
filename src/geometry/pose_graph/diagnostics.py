@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 import cv2
 import numpy as np
-
-from collections import deque
 
 from src.geometry.pose_graph.model_5dof import (
     GraphEdge,
@@ -26,13 +26,19 @@ class DiagnosticsMixin:
                 states[fid] = st
         return states
 
-    def _single_edge_residual(
-        self, si: np.ndarray, sj: np.ndarray, e: GraphEdge
-    ) -> np.ndarray:
+    def _single_edge_residual(self, si: np.ndarray, sj: np.ndarray, e: GraphEdge) -> np.ndarray:
         """Зважений 5-вектор резидуала ребра — ТА САМА формула, що в _residuals_vec."""
         return edge_residual(
-            si, sj, e.dtx, e.dty, e.log_dsx, e.log_dsy, e.dtheta,
-            e.weight, self.cx, self._sign,
+            si,
+            sj,
+            e.dtx,
+            e.dty,
+            e.log_dsx,
+            e.log_dsy,
+            e.dtheta,
+            e.weight,
+            self.cx,
+            self._sign,
         )
 
     def compute_edge_residuals(self) -> np.ndarray:
@@ -56,10 +62,13 @@ class DiagnosticsMixin:
         res = self.compute_edge_residuals()
         out: dict[str, dict] = {}
         for cls in ("temporal", "spatial"):
-            vals = np.array([
-                res[k] for k, e in enumerate(self._edges)
-                if e.edge_type == cls and not np.isnan(res[k])
-            ])
+            vals = np.array(
+                [
+                    res[k]
+                    for k, e in enumerate(self._edges)
+                    if e.edge_type == cls and not np.isnan(res[k])
+                ]
+            )
             if vals.size:
                 out[cls] = {
                     "count": int(vals.size),
@@ -180,11 +189,16 @@ class DiagnosticsMixin:
         worst = []
         for k in order[:top_n]:
             e = self._edges[k]
-            worst.append({
-                "from_id": e.from_id, "to_id": e.to_id,
-                "type": e.edge_type, "residual": float(res[k]),
-                "inliers": e.inliers, "rmse": e.rmse,
-            })
+            worst.append(
+                {
+                    "from_id": e.from_id,
+                    "to_id": e.to_id,
+                    "type": e.edge_type,
+                    "residual": float(res[k]),
+                    "inliers": e.inliers,
+                    "rmse": e.rmse,
+                }
+            )
 
         return {
             "num_edges": len(self._edges),
@@ -214,17 +228,13 @@ class DiagnosticsMixin:
             lines.append("  Топ-гірших ребер:")
             for w in r["worst_edges"]:
                 lines.append(
-                    f"    #{w['from_id']}→#{w['to_id']} [{w['type']}] "
-                    f"резидуал={w['residual']:.1f}"
+                    f"    #{w['from_id']}→#{w['to_id']} [{w['type']}] резидуал={w['residual']:.1f}"
                 )
         hot = {k: v for k, v in r["anchor_stress"].items() if v >= 2.0}
         if hot:
             for fid, v in sorted(hot.items(), key=lambda kv: -kv[1]):
                 lines.append(f"  ⚠ Якір #{fid}: stress {v:.1f}× медіани — перевірте точки")
-        loo_warn = {
-            k: v for k, v in r["anchor_loo"].items()
-            if v.get("flag") == "warning"
-        }
+        loo_warn = {k: v for k, v in r["anchor_loo"].items() if v.get("flag") == "warning"}
         if loo_warn:
             for fid, v in sorted(loo_warn.items(), key=lambda kv: -kv[1]["disagreement_m"]):
                 lines.append(
@@ -279,14 +289,10 @@ class DiagnosticsMixin:
                         "from_id": edge.from_id,
                         "to_id": edge.to_id,
                         "edge_type": edge.edge_type,
-                        "residual": (
-                            None if np.isnan(edge_res[e_idx])
-                            else float(edge_res[e_idx])
-                        ),
+                        "residual": (None if np.isnan(edge_res[e_idx]) else float(edge_res[e_idx])),
                         "weight": float(edge.weight),
                     },
                 }
             )
 
         return {"type": "FeatureCollection", "features": features}
-

@@ -203,9 +203,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 queue.append(neighbor_id)
                 count += 1
 
-        logger.info(
-            f"BFS initialization: {count} nodes initialized from {len(seeds)} seeds"
-        )
+        logger.info(f"BFS initialization: {count} nodes initialized from {len(seeds)} seeds")
         return count
 
     def warm_start_from_affines(self, affines: dict[int, np.ndarray]) -> int:
@@ -227,9 +225,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         logger.info(f"Warm start: {count} nodes seeded from previous solution")
         return count
 
-    def preliminary_states(
-        self, seed_affines: dict[int, np.ndarray]
-    ) -> dict[int, np.ndarray]:
+    def preliminary_states(self, seed_affines: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
         """Прикидка ПОВНИХ станів вузлів BFS-ланцюгом ЛИШЕ по temporal-ребрах від
         заданих якірних матриць (Етапи 2.2/2.3 — ДО матчингу/оптимізації).
 
@@ -239,8 +235,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         seeds = {}
         for fid, aff in seed_affines.items():
             if fid in self._node_ids:
-                seeds[fid] = _affine_to_state(np.asarray(aff, dtype=np.float64),
-                                              self.cx, self.cy)
+                seeds[fid] = _affine_to_state(np.asarray(aff, dtype=np.float64), self.cx, self.cy)
         if not seeds:
             return {}
 
@@ -267,9 +262,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 queue.append(nb)
         return states
 
-    def preliminary_centers(
-        self, seed_affines: dict[int, np.ndarray]
-    ) -> dict[int, np.ndarray]:
+    def preliminary_centers(self, seed_affines: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
         """Прикидка метричних центрів (Етап 2.2, дистанційний префільтр) —
         тонка обгортка над preliminary_states."""
         return {fid: st[:2].copy() for fid, st in self.preliminary_states(seed_affines).items()}
@@ -303,8 +296,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         # Медіанний метричний рух за слот (для компенсації дрейфу довгих ланцюгів).
         ids = sorted(prelim_states)
         consec = [
-            float(np.linalg.norm(prelim_states[b][:2] - prelim_states[a][:2]))
-            / max(b - a, 1)
+            float(np.linalg.norm(prelim_states[b][:2] - prelim_states[a][:2])) / max(b - a, 1)
             for a, b in zip(ids, ids[1:])
             if b - a <= 3
         ]
@@ -361,6 +353,9 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         two_stage_prune: bool = False,
         prune_mad_k: float = 5.0,
         prune_max_spatial_frac: float = 0.2,
+        gnc_spatial: bool = False,
+        gnc_rounds: int = 5,
+        gnc_mad_k: float = 3.0,
     ) -> dict[int, np.ndarray]:
 
         if not self._edges:
@@ -417,6 +412,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
 
         # jac_sparsity is ignored by 'lm'. method='trf' with sparse jacobian runs 100x faster.
         import time
+
         self._nfev = 0
         self._start_time = time.time()
         self._last_cb_time = self._start_time
@@ -437,42 +433,40 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         edge_from_free = np.array(
             [id_to_var.get(e.from_id, -1) for e in valid_edges], dtype=np.int64
         )
-        edge_to_free = np.array(
-            [id_to_var.get(e.to_id, -1) for e in valid_edges], dtype=np.int64
-        )
-
+        edge_to_free = np.array([id_to_var.get(e.to_id, -1) for e in valid_edges], dtype=np.int64)
 
         d = {
-            'X_full': X_fixed,
-            'free_indices': free_indices_in_full,
-            'edges_from': edges_from,
-            'edges_to': edges_to,
-            'dtx': np.array([e.dtx for e in valid_edges], dtype=np.float64),
-            'dty': np.array([e.dty for e in valid_edges], dtype=np.float64),
-            'log_dsx': np.array([e.log_dsx for e in valid_edges], dtype=np.float64),
-            'log_dsy': np.array([e.log_dsy for e in valid_edges], dtype=np.float64),
-            'dtheta': np.array([e.dtheta for e in valid_edges], dtype=np.float64),
-            'weights': np.array([e.weight for e in valid_edges], dtype=np.float64),
-            'cx': self.cx,
-            'sign': self._sign,
-            'n_edges': n_edges,
-            'n_free': len(free_ids),
-            'edge_from_free': edge_from_free,
-            'edge_to_free': edge_to_free,
-            'anchor_var_idx': np.array(anchor_var_idx, dtype=np.int64),
-            'anchor_states': (
+            "X_full": X_fixed,
+            "free_indices": free_indices_in_full,
+            "edges_from": edges_from,
+            "edges_to": edges_to,
+            "dtx": np.array([e.dtx for e in valid_edges], dtype=np.float64),
+            "dty": np.array([e.dty for e in valid_edges], dtype=np.float64),
+            "log_dsx": np.array([e.log_dsx for e in valid_edges], dtype=np.float64),
+            "log_dsy": np.array([e.log_dsy for e in valid_edges], dtype=np.float64),
+            "dtheta": np.array([e.dtheta for e in valid_edges], dtype=np.float64),
+            "weights": np.array([e.weight for e in valid_edges], dtype=np.float64),
+            "cx": self.cx,
+            "sign": self._sign,
+            "n_edges": n_edges,
+            "n_free": len(free_ids),
+            "edge_from_free": edge_from_free,
+            "edge_to_free": edge_to_free,
+            "anchor_var_idx": np.array(anchor_var_idx, dtype=np.int64),
+            "anchor_states": (
                 np.array(anchor_states_list, dtype=np.float64)
-                if anchor_states_list else np.zeros((0, 5), dtype=np.float64)
+                if anchor_states_list
+                else np.zeros((0, 5), dtype=np.float64)
             ),
-            'anchor_w': np.array(anchor_w_list, dtype=np.float64),
-            'n_anch': n_anch,
-            'callback': progress_callback
+            "anchor_w": np.array(anchor_w_list, dtype=np.float64),
+            "n_anch": n_anch,
+            "callback": progress_callback,
         }
 
         def residual_wrapper(x, d_dict):
             self._nfev += 1
             now = time.time()
-            if d_dict['callback'] and (now - self._last_cb_time > 1.0):
+            if d_dict["callback"] and (now - self._last_cb_time > 1.0):
                 elapsed = now - self._start_time
                 rate = self._nfev / elapsed if elapsed > 0 else 0
                 max_evals = max_iterations * n_vars
@@ -486,7 +480,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                     eta_str = f"{m}хв {s:02d}с" if m > 0 else f"{s}с"
                     msg = f"Глобальна оптимізація: обчислення {self._nfev}/{max_evals}, швидкість {rate:.0f} it/s, ETA: {eta_str}"
 
-                d_dict['callback'](msg)
+                d_dict["callback"](msg)
                 self._last_cb_time = now
             return self._residuals_vec(x, d_dict)
 
@@ -515,6 +509,18 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         for fid, idx in id_to_var.items():
             self._free_nodes[fid] = result.x[5 * idx : 5 * idx + 5].copy()
 
+        # ── Етап 3 (GNC): плавна еволюція prune. За прапорцем, дефолт off. ──
+        # Взаємно виключно з two_stage_prune; на чистій сцені — no-op (без деградації).
+        if gnc_spatial:
+            return self._run_gnc_spatial(
+                gnc_rounds,
+                gnc_mad_k,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                progress_callback=progress_callback,
+                use_analytic_jac=use_analytic_jac,
+            )
+
         # ── Етап 3: two-stage L2 → prune → L2 (за прапорцем, дефолт off) ──
         # Поріг рахується ВІДНОСНО інших spatial-резидуалів (та сама природа),
         # а не абсолютною константою — валідні loop closures лишаються з
@@ -537,25 +543,32 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         return self._export_results()
 
     def _residuals_vec(self, x: np.ndarray, d: dict) -> np.ndarray:
-        X_full = d['X_full']
-        X_full[d['free_indices']] = x.reshape(-1, 5)
+        X_full = d["X_full"]
+        X_full[d["free_indices"]] = x.reshape(-1, 5)
 
         res_edges = edge_residual(
-            X_full[d['edges_from']], X_full[d['edges_to']],
-            d['dtx'], d['dty'], d['log_dsx'], d['log_dsy'], d['dtheta'],
-            d['weights'], d['cx'], d['sign'],
+            X_full[d["edges_from"]],
+            X_full[d["edges_to"]],
+            d["dtx"],
+            d["dty"],
+            d["log_dsx"],
+            d["log_dsy"],
+            d["dtheta"],
+            d["weights"],
+            d["cx"],
+            d["sign"],
         )
 
-        w_reg = 200.0 * d['cx']
+        w_reg = 200.0 * d["cx"]
         x_reshaped = x.reshape(-1, 5)
         res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
 
-        if d.get('n_anch', 0) > 0:
+        if d.get("n_anch", 0) > 0:
             # Унарний пріор якоря: w_a·(state − state_anchor), кут SO(2)-safe.
-            ap = x_reshaped[d['anchor_var_idx']]          # (n_anch, 5)
-            diff = ap - d['anchor_states']
+            ap = x_reshaped[d["anchor_var_idx"]]  # (n_anch, 5)
+            diff = ap - d["anchor_states"]
             ang = np.arctan2(np.sin(diff[:, 4]), np.cos(diff[:, 4]))
-            aw = d['anchor_w'][:, None]
+            aw = d["anchor_w"][:, None]
             res_anchor = (
                 aw * np.column_stack([diff[:, 0], diff[:, 1], diff[:, 2], diff[:, 3], ang])
             ).ravel()
@@ -570,19 +583,19 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         що й FD-варіант — лише точніші градієнти та 3-10× швидша оптимізація.
         Верифікується проти 2-point FD (див. tests/test_pose_graph_jacobian.py).
         """
-        X_full = d['X_full']
-        X_full[d['free_indices']] = x.reshape(-1, 5)
+        X_full = d["X_full"]
+        X_full[d["free_indices"]] = x.reshape(-1, 5)
 
-        si = X_full[d['edges_from']]
-        sj = X_full[d['edges_to']]
+        si = X_full[d["edges_from"]]
+        sj = X_full[d["edges_to"]]
         txi, tyi, lxi, lyi, thi = si.T
         txj, tyj, lxj, lyj, thj = sj.T
 
-        w = d['weights']
-        cx = d['cx']
-        sign = d['sign']
-        dtx = d['dtx']
-        dty = d['dty']
+        w = d["weights"]
+        cx = d["cx"]
+        sign = d["sign"]
+        dtx = d["dtx"]
+        dty = d["dty"]
 
         sxi = np.exp(lxi)
         syi = np.exp(lyi)
@@ -613,11 +626,11 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         j0_txj = w * inv_sxi
         j1_tyj = w * inv_syi
 
-        n_edges = d['n_edges']
-        n_free = d['n_free']
-        n_anch = int(d.get('n_anch', 0))
-        ff = d['edge_from_free']
-        ft = d['edge_to_free']
+        n_edges = d["n_edges"]
+        n_free = d["n_free"]
+        n_anch = int(d.get("n_anch", 0))
+        ff = d["edge_from_free"]
+        ft = d["edge_to_free"]
         base_r = 5 * np.arange(n_edges)
 
         rows: list = []
@@ -665,8 +678,8 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         # М'які якорі (Етап 1.1): d(w_a·Δstate)/d(state) = w_a·I по 5 компонентах
         # (похідна atan2(sin dθ, cos dθ) по θ = 1). Блок діагональний.
         if n_anch > 0:
-            av = d['anchor_var_idx']
-            aw = d['anchor_w']
+            av = d["anchor_var_idx"]
+            aw = d["anchor_w"]
             base_a = 5 * n_edges + n_free
             a_rows = base_a + 5 * np.arange(n_anch)
             for comp in range(5):
@@ -675,12 +688,16 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         rows = np.concatenate(rows)
         cols = np.concatenate(cols)
         data = np.concatenate(data)
-        J = coo_matrix((data, (rows, cols)),
-                       shape=(5 * n_edges + n_free + 5 * n_anch, 5 * n_free), dtype=np.float64)
+        J = coo_matrix(
+            (data, (rows, cols)),
+            shape=(5 * n_edges + n_free + 5 * n_anch, 5 * n_free),
+            dtype=np.float64,
+        )
         return J.tocsr()
 
-    def _build_jac_sparsity(self, valid_edges, id_to_var, n_residuals, n_vars, n_edges,
-                            anchor_var_idx=None):
+    def _build_jac_sparsity(
+        self, valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx=None
+    ):
         # COO-конструктор (rows/cols списками) швидший за поелементний lil на
         # великих графах. Патерн розрідженості ІДЕНТИЧНИЙ попередньому.
         rows: list[int] = []
@@ -745,7 +762,6 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         return results
 
 
-
 def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
     """Проєктує гомографію на афінну модель через 5 опорних точок навколо центру."""
     cx, cy = frame_w / 2.0, frame_h / 2.0
@@ -761,6 +777,30 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
 
     T, _ = cv2.estimateAffine2D(pts, transformed, method=cv2.LMEDS)
     return T
+
+
+def affine_fit_residual(H: np.ndarray, frame_w: int, frame_h: int) -> float | None:
+    """RMS-залишок афінного наближення гомографії H на 5 точках (Етап 6.2).
+
+    homography_to_affine відкидає цей залишок. Він великий, коли H неафінна
+    (нахил камери / рельєф) — такі temporal-кадри заслуговують меншої довіри.
+    Повертає залишок у пікселях або None. ~0 для чисто афінної H.
+    """
+    cx, cy = frame_w / 2.0, frame_h / 2.0
+    d = min(frame_w, frame_h) * 0.25
+    pts = np.array(
+        [[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]],
+        dtype=np.float64,
+    )
+    transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
+    if transformed is None:
+        return None
+    transformed = transformed.reshape(-1, 2).astype(np.float64)
+    T, _ = cv2.estimateAffine2D(pts, transformed, method=cv2.LMEDS)
+    if T is None:
+        return None
+    proj = (T[:, :2] @ pts.T).T + T[:, 2]
+    return float(np.sqrt(np.mean(np.sum((proj - transformed) ** 2, axis=1))))
 
 
 # Аліас для сумісності з worker-ом (використовує назву homography_to_similarity)

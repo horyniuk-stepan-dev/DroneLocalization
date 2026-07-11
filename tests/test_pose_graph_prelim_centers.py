@@ -1,6 +1,7 @@
 """Дистанційний префільтр (Етап 2.2): preliminary_centers — прикидка центрів
 BFS-ланцюгом ЛИШЕ по temporal-ребрах від якорів, ДО матчингу/оптимізації.
 """
+
 import numpy as np
 
 from src.geometry.pose_graph.model_5dof import _state_to_affine
@@ -66,4 +67,5 @@ def test_prelim_non_mutating_and_empty():
 
 if __name__ == "__main__":
     import pytest
+
     raise SystemExit(pytest.main([__file__, "-q"]))

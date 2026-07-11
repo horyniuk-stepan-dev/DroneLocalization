@@ -18,6 +18,18 @@ class ProjectionConfig(BaseModel):
     localizer_expected_spread_m: float = 150.0
 
 
+class PropagationConfig(BaseModel):
+    """Параметри графової пропагації калібрування (воркер)."""
+
+    # Скільки слотів можна "перестрибнути" при temporal-ребрах (лог-повідомлення).
+    max_skip_frames: int = 3
+
+    # Ротаційна робастність temporal-ребер (Етап 5). off = ребро просто падає.
+    # При провалі матчу — повтор із поворотом query на кут ланцюга frame_poses,
+    # далі перебір k·90°. Для місій БЕЗ heading-hold (дуги/протилежні ноги).
+    rotation_retry: bool = False
+
+
 class GraphOptimizationConfig(BaseModel):
     """Конфігурація графової оптимізації пропагації координат."""
 
@@ -50,7 +62,8 @@ class GraphOptimizationConfig(BaseModel):
     # Вагові коефіцієнти ребер
     temporal_edge_base_weight: float = 1.0
     spatial_edge_base_weight: float = 2.0
-    anchor_weight: float = 1e6
+    # (мертвий ключ anchor_weight видалено у Етапі 6 — жорсткі fix_node не мають
+    #  ваги, а м'які якорі Етапу 1.1 несуть власні anchor_base_w/anchor_sigma_floor_m)
 
     # ── М'які якорі (Етап 1.1). Дефолт off = fix_node (жорсткий, поточна поведінка). ──
     # Якір стає унарним фактором w_a·(state−anchor), w_a = anchor_base_w/max(σ, floor).
@@ -88,16 +101,41 @@ class GraphOptimizationConfig(BaseModel):
     # ── Гейтинг ребер ДО оптимізації (Етап 2). Майстер-прапорець off = ПОТОЧНА ──
     # поведінка (жодне ребро не відсіюється). Дефолти гейтів м'які.
     edge_gate_enabled: bool = False
-    edge_gate_max_rotation_deg: float = 40.0     # |dtheta| spatial-ребра
-    edge_gate_max_scale_ratio: float = 1.6       # висота не стрибає вдвічі: |log_ds|≤log(1.6)
+    edge_gate_max_rotation_deg: float = 40.0  # |dtheta| spatial-ребра
+    edge_gate_max_scale_ratio: float = 1.6  # висота не стрибає вдвічі: |log_ds|≤log(1.6)
     edge_gate_min_inlier_ratio: float = 0.25
-    edge_gate_mutual_check: bool = True          # взаємність retrieval (j теж бачить i у top-k)
-    edge_gate_cluster_consistency: bool = True   # самотнє loop closure без підтримки → вага ×0.5
+    edge_gate_mutual_check: bool = True  # взаємність retrieval (j теж бачить i у top-k)
+    edge_gate_cluster_consistency: bool = True  # самотнє loop closure без підтримки → вага ×0.5
 
     # ── Two-stage prune L2→prune→L2 (Етап 3). Дефолт off. ──
     two_stage_prune: bool = False
-    prune_mad_k: float = 5.0                     # поріг = median + k·1.4826·MAD (у класі spatial)
-    prune_max_spatial_frac: float = 0.2          # не більше 20% spatial за прохід
+    prune_mad_k: float = 5.0  # поріг = median + k·1.4826·MAD (у класі spatial)
+    prune_max_spatial_frac: float = 0.2  # не більше 20% spatial за прохід
+
+    # ── GNC-переваження spatial (Етап 3): плавна еволюція prune. Дефолт off. ──
+    # Раунди L2 із Geman-McClure-вагами w'=w·σ²/(σ²+r²), σ=µ·(median+k·MAD) свого
+    # класу, µ від опуклого до 1. Чиста сцена (без викидів > поріг) → no-op.
+    # Взаємно виключно з two_stage_prune (gnc має пріоритет, якщо ввімкнено).
+    gnc_spatial: bool = False
+    gnc_rounds: int = 5
+    gnc_mad_k: float = 3.0
+
+    # PCHIP-заповнення пропущених кадрів (Етап 4). off = посегментна лінійна.
+    # Shape-preserving 5-DoF інтерполяція над УСІМА валідними кадрами (центр-базова)
+    # прибирає «сходинки» на дугах розворотів для реальних даних.
+    pchip_gap_fill: bool = False
+
+    # Log-scale інтерполяція масштабу (RESEARCH_INTEGRATION_PLAN 1.3). off = ПОТОЧНА
+    # поведінка (лінійна по sx, sy). on = інтерполяція log(sx), log(sy) — геодезично
+    # коректна для масштабу; діє і на PCHIP, і на лінійне заповнення, і на
+    # інтерполяцію між якорями MultiAnchorCalibration.
+    log_scale_interp: bool = False
+
+    # Вага temporal-ребра × якість афінного фіту H (Етап 6.2). off = без корекції.
+    # Кадри з нахилом/рельєфом (великий залишок 5-точкового фіту) → менша довіра:
+    # w *= 1/(1 + k·residual_px).
+    temporal_weight_use_fit_quality: bool = False
+    temporal_fit_quality_k: float = 0.05
 
     # ── Вага spatial × DINOv2-подібність (Етап 4.3). Дефолт off. w *= 0.5+0.5·sim ──
     spatial_weight_use_similarity: bool = False

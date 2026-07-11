@@ -51,6 +51,7 @@ BASELINE_PATH = Path("benchmarks/propagation_baseline.json")
 
 # ── Чисті функції (тестовані без GPU) ────────────────────────────────────────
 
+
 def _center(affine: np.ndarray, cx: float, cy: float) -> np.ndarray:
     p = np.array([cx, cy], dtype=np.float64)
     return affine[:2, :2] @ p + affine[:2, 2]
@@ -133,8 +134,7 @@ def check_gate(
 def load_ground_truth(path: Path) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     gt_affines = {
-        int(fr["frame_id"]): np.array(fr["affine"], dtype=np.float64)
-        for fr in data["frames"]
+        int(fr["frame_id"]): np.array(fr["affine"], dtype=np.float64) for fr in data["frames"]
     }
     return {
         "scene": data.get("scene", Path(path).parent.name),
@@ -162,6 +162,7 @@ def save_baseline(scene: str, metrics: dict, path: Path = BASELINE_PATH) -> None
 
 
 # ── Оркестрація повного пайплайну (потребує GPU/моделей/відео) ────────────────
+
 
 def read_pred_affines_from_hdf5(db_path: str) -> dict[int, np.ndarray]:
     """Читає результати пропагації (frame_affine, frame_valid) з HDF5."""
@@ -222,12 +223,23 @@ def run_pipeline(dataset_dir: Path, gt: dict) -> dict[int, np.ndarray]:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Бенчмарк графової пропагації проти GT")
-    ap.add_argument("--dataset", required=True, type=Path,
-                    help="тека з відео + ground_truth.json")
-    ap.add_argument("--update-baseline", action="store_true",
-                    help="перезаписати базлайн цією сценою")
-    ap.add_argument("--pred-hdf5", type=Path, default=None,
-                    help="(опційно) готовий HDF5 з пропагацією — оцінка без збудови/прогону")
+    ap.add_argument("--dataset", required=True, type=Path, help="тека з відео + ground_truth.json")
+    ap.add_argument(
+        "--update-baseline", action="store_true", help="перезаписати базлайн цією сценою"
+    )
+    ap.add_argument(
+        "--pred-hdf5",
+        type=Path,
+        default=None,
+        help="(опційно) готовий HDF5 з пропагацією — оцінка без збудови/прогону",
+    )
+    ap.add_argument(
+        "--validate-slots",
+        type=Path,
+        default=None,
+        help="(опційно) ground_truth.json Етапу 0.2 (по слотах) — додатковий "
+        "розрізний звіт через validate_vs_telemetry (straights/дуги/±k/mid-leg)",
+    )
     args = ap.parse_args(argv)
 
     gt_path = args.dataset / "ground_truth.json"
@@ -244,6 +256,39 @@ def main(argv=None) -> int:
     print("\nМетрики:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+
+    # Етап 0.1 — validate_vs_telemetry як ДОДАТКОВЕ джерело істини: розрізний звіт
+    # (straights / дуги розворотів / ±k від якоря / середини ніг) поверх агрегатів.
+    slots_path = args.validate_slots
+    if slots_path is None:
+        cand = args.dataset / "ground_truth.json"
+        # Формат Етапу 0.2 має ключ "slots"; власний GT бенчмарку — "frames".
+        if cand.exists() and '"slots"' in cand.read_text(encoding="utf-8")[:2000]:
+            slots_path = cand
+    if slots_path is not None:
+        try:
+            from scripts.validate_vs_telemetry import (
+                compute_report as _vt_report,
+            )
+            from scripts.validate_vs_telemetry import (
+                format_report as _vt_format,
+            )
+            from scripts.validate_vs_telemetry import (
+                load_ground_truth as _vt_load,
+            )
+
+            g = _vt_load(str(slots_path))
+            rep = _vt_report(
+                pred,
+                g["gt_affine"],
+                g["frame_size"][0],
+                g["frame_size"][1],
+                headings_deg=g["headings"] or None,
+                anchor_slots=g["anchor_slots"],
+            )
+            print("\n" + _vt_format(rep, scene=scene))
+        except Exception as e:  # noqa: BLE001
+            print(f"\n(розрізний звіт validate_vs_telemetry пропущено: {e})")
 
     baseline = load_baseline(scene)
     passed, details = check_gate(metrics, baseline)

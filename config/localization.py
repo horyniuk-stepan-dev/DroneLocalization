@@ -27,6 +27,12 @@ class LocalizationConfig(BaseModel):
     # поріг — повний батчований скан 4 кутів.
     rotation_rescan_min_score: float = 0.70
     enable_lightglue_fallback: bool = True
+    # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ──
+    # Одноразовий перезапуск матчингу через SIFT, коли ALIKED дав
+    # < min_matches inliers (in-plane rotation / екстремальна похилість).
+    # Вимагає БД, збудованої з database.store_sift_features=True.
+    sift_fallback: bool = False
+    sift_fallback_max_candidates: int = 3
     fallback_extractor: str = "aliked"
     confidence: ConfidenceConfig = ConfidenceConfig()
     use_patchify: bool = False  # Мультимасштабний retrieval через патч-дескриптори DINOv2 (14× DINOv2 forward passes — повільно на слабких GPU)

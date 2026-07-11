@@ -1,4 +1,5 @@
 import gc
+import math
 import shutil
 import traceback
 from datetime import datetime
@@ -15,7 +16,7 @@ import torch
 
 from config import get_active_descriptor_cfg, get_cfg
 from src.geometry.transformations import GeometryTransforms
-from src.localization.matcher import FeatureMatcher
+from src.localization.matcher import FeatureMatcher, extract_sift_features
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.utils.logging_utils import get_logger, silent_output
@@ -33,6 +34,24 @@ class DatabaseBuilder:
         self.matcher = matcher
         db_cfg = self.config.get("database", {})
         self.descriptor_dim = get_active_descriptor_cfg(self.config).descriptor_dim
+        # RESEARCH 2.1: VLAD змінює розмірність глобального дескриптора —
+        # читаємо out_dim зі словника, щоб HDF5/LanceDB схема збігалася з
+        # тим, що реально видаватиме FeatureExtractor.
+        if get_cfg(self.config, "models.vlad.enabled", False):
+            _vocab = get_cfg(self.config, "models.vlad.vocab_path", None)
+            if _vocab and Path(_vocab).exists():
+                from src.models.wrappers.vlad_aggregator import VladAggregator
+
+                self.descriptor_dim = VladAggregator.load(_vocab).out_dim
+                logger.info(f"VLAD enabled: global descriptor dim = {self.descriptor_dim}")
+            else:
+                logger.warning(
+                    f"models.vlad.enabled=True but vocab not found ({_vocab!r}) — "
+                    f"building with CLS descriptors (dim={self.descriptor_dim})"
+                )
+        # RESEARCH 2.2: SIFT-ознаки для аварійного фолбека
+        self.store_sift = get_cfg(self.config, "database.store_sift_features", False)
+        self.sift_max_kps = get_cfg(self.config, "database.sift_max_keypoints", 2048)
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
@@ -273,7 +292,9 @@ class DatabaseBuilder:
                     if cesp is not None:
                         features = nv_model.forward_features(dummy_input)
                         patch_tokens = features["x_norm_patchtokens"]
-                        h_patches, w_patches = dino_size // 14, dino_size // 14
+                        # Сітка з фактичної кількості токенів (DINOv3 patch=16, не 14)
+                        side = int(math.isqrt(int(patch_tokens.shape[1])))
+                        h_patches, w_patches = side, side
                         dummy_out = cesp(patch_tokens, h_patches, w_patches)[0]
                         self.descriptor_dim = int(dummy_out.shape[0])
                     else:
@@ -468,6 +489,17 @@ class DatabaseBuilder:
                     self.db_file["global_descriptors"]["frame_poses"][p_idx] = current_pose
 
                 if save_this_frame:
+                    # RESEARCH 2.2: SIFT рахуємо лише для кадрів, що реально
+                    # зберігаються (keyframe-ів) — на пропущених це марна робота
+                    if self.store_sift:
+                        try:
+                            sift_feats = extract_sift_features(
+                                p_frame_rgb, p_static_mask, self.sift_max_kps
+                            )
+                            features["sift_keypoints"] = sift_feats["keypoints"]
+                            features["sift_descriptors"] = sift_feats["descriptors"]
+                        except Exception as e:
+                            logger.warning(f"SIFT extraction failed for frame {p_idx}: {e}")
                     frame_index_map.append(p_idx)
                     # Зберігаємо за ОРИГІНАЛЬНИМ індексом p_idx, а не послідовним
                     # Це зберігає frame_id ↔ slot identity для калібрування/пропагації
@@ -801,6 +833,38 @@ class DatabaseBuilder:
             lf.attrs["frame_width"] = width
             lf.attrs["frame_height"] = height
 
+            # --- RESEARCH 2.2: SIFT-ознаки для аварійного фолбека ---
+            if self.store_sift:
+                sf = f.create_group("sift_features")
+                sf.create_dataset(
+                    "keypoints",
+                    shape=(num_frames, self.sift_max_kps, 2),
+                    maxshape=(None, self.sift_max_kps, 2),
+                    dtype="float32",
+                    compression=compression,
+                    chunks=(min(chunk_f, num_frames), self.sift_max_kps, 2),
+                    fillvalue=0.0,
+                )
+                sf.create_dataset(
+                    "descriptors",
+                    shape=(num_frames, self.sift_max_kps, 128),
+                    maxshape=(None, self.sift_max_kps, 128),
+                    dtype="float16",  # rootSIFT ∈ [0,1] — f16 безпечний
+                    compression=compression,
+                    chunks=(min(chunk_f, num_frames), self.sift_max_kps, 128),
+                    fillvalue=0.0,
+                )
+                sf.create_dataset(
+                    "kp_counts",
+                    shape=(num_frames,),
+                    maxshape=(None,),
+                    dtype="int16",
+                    compression=compression,
+                    chunks=(min(num_frames, 4096),),
+                    fillvalue=0,
+                )
+                logger.info(f"SIFT fallback group created (max {self.sift_max_kps} kps/frame)")
+
             g3 = f.create_group("metadata")
             g3.attrs["num_frames"] = num_frames
             g3.attrs["creation_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -880,6 +944,17 @@ class DatabaseBuilder:
                 self.db_file["patch_descriptors"]["descriptors"][frame_id] = features[
                     "patch_descriptors"
                 ]
+
+            # RESEARCH 2.2: SIFT-ознаки
+            if "sift_keypoints" in features and "sift_features" in self.db_file:
+                sf = self.db_file["sift_features"]
+                s_kps = features["sift_keypoints"]
+                s_descs = features["sift_descriptors"]
+                sn = min(len(s_kps), sf["keypoints"].shape[1])
+                if sn > 0:
+                    sf["keypoints"][frame_id, :sn] = s_kps[:sn]
+                    sf["descriptors"][frame_id, :sn] = s_descs[:sn].astype("float16")
+                sf["kp_counts"][frame_id] = sn
 
             # Save depth scale
             if "depth_scale" in features:

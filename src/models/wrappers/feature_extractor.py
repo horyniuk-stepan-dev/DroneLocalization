@@ -1,4 +1,6 @@
 import contextlib
+import math
+import os
 
 import numpy as np
 import torch
@@ -22,6 +24,30 @@ class FeatureExtractor:
         self.config = config or {}
         self.preprocessor = ImagePreprocessor(config)
         self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
+
+        # ── RESEARCH 2.1 (AnyLoc): VLAD-агрегація патч-токенів ──────────────
+        # Вантажиться з конфігу тут (а не в місцях конструювання), щоб усі
+        # 4 точки створення FeatureExtractor отримали її автоматично.
+        self.vlad_aggregator = None
+        self._vlad_layer = None
+        if get_cfg(config, "models.vlad.enabled", False):
+            vocab_path = get_cfg(config, "models.vlad.vocab_path", None)
+            if vocab_path and os.path.exists(vocab_path):
+                from src.models.wrappers.vlad_aggregator import VladAggregator
+
+                self.vlad_aggregator = VladAggregator.load(
+                    vocab_path,
+                    low_norm_fraction=get_cfg(config, "models.vlad.low_norm_fraction", 0.0),
+                )
+                self._vlad_layer = get_cfg(config, "models.vlad.layer", None)
+                if cesp_module is not None:
+                    logger.warning("Both VLAD and CESP enabled — VLAD takes precedence")
+            else:
+                logger.warning(
+                    f"models.vlad.enabled=True but vocab_path is missing or not found "
+                    f"({vocab_path!r}) — falling back to CLS. "
+                    f"Build the vocabulary with scripts/build_vlad_vocab.py"
+                )
 
         # Параметри нормалізації та розміру входу — беремо з активного backend (dinov2 або dinov3)
         _desc_cfg = get_active_descriptor_cfg(self.config)
@@ -62,6 +88,44 @@ class FeatureExtractor:
             self.stream_global = None
             self.stream_local = None
 
+    @staticmethod
+    def _patch_grid_side(n_tokens: int) -> int:
+        """Сторона квадратної сітки патчів із кількості патч-токенів.
+
+        Вхід DINO — квадрат (S, S), тож токенів має бути side². Якщо ні —
+        у токени протекли register-токени або вхід не квадратний; беремо
+        floor(sqrt) і попереджаємо, щоб CESP не отримав неузгоджену сітку.
+        """
+        side = int(math.isqrt(int(n_tokens)))
+        if side * side != int(n_tokens):
+            logger.warning(
+                f"Patch tokens count {n_tokens} is not a perfect square — "
+                f"possible register-token leak or non-square input; using side={side}"
+            )
+        return side
+
+    @property
+    def global_descriptor_dim(self) -> int:
+        """Фактична розмірність глобального дескриптора (VLAD змінює її)."""
+        if self.vlad_aggregator is not None:
+            return self.vlad_aggregator.out_dim
+        return get_active_descriptor_cfg(self.config).descriptor_dim
+
+    @torch.no_grad()
+    def _vlad_descriptors(self, dino_input: torch.Tensor) -> np.ndarray:
+        """(B, 3, S, S) → (B, out_dim) через VLAD-агрегацію патч-токенів."""
+        kwargs = {}
+        if self._vlad_layer is not None:
+            kwargs["layer"] = self._vlad_layer
+        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+            try:
+                features = self.global_model.forward_features(dino_input, **kwargs)
+            except TypeError:
+                # DINOv2 (torch.hub) не приймає layer — беремо останній шар
+                features = self.global_model.forward_features(dino_input)
+        tokens = features["x_norm_patchtokens"].float().cpu().numpy()
+        return self.vlad_aggregator.aggregate_batch(tokens)
+
     @torch.no_grad()
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
         with Telemetry.profile("dinov2"):
@@ -72,14 +136,19 @@ class FeatureExtractor:
             )
             dino_input = self.dinov2_transform(dino_tensor)
 
+        if self.vlad_aggregator is not None:
+            return self._vlad_descriptors(dino_input)[0]
+
         if self.cesp_module is not None:
             # CESP mode: отримуємо patch tokens замість CLS
             with torch.cuda.amp.autocast(dtype=self.amp_dtype, enabled=self.use_half):
                 features = self.global_model.forward_features(dino_input)
                 patch_tokens = features["x_norm_patchtokens"].float()
 
-            h_patches = self.dino_size // 14
-            w_patches = self.dino_size // 14
+            # Сітка патчів — з фактичної кількості токенів, а не з хардкоду //14:
+            # DINOv3 має patch_size=16 (DINOv2 — 14), і після виправлення витоку
+            # register-токенів кількість токенів = (S/patch)^2 (RESEARCH 1.1).
+            h_patches = w_patches = self._patch_grid_side(patch_tokens.shape[1])
             global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
             # Стандартний mode: CLS token
@@ -108,11 +177,14 @@ class FeatureExtractor:
                 prepped.append(self.dinov2_transform(t)[0])
             batch = torch.stack(prepped)  # (B, 3, S, S)
 
+            if self.vlad_aggregator is not None:
+                return self._vlad_descriptors(batch)
+
             if self.cesp_module is not None:
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
                     features = self.global_model.forward_features(batch)
                 patch_tokens = features["x_norm_patchtokens"].float()
-                h_p = w_p = self.dino_size // 14
+                h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
                 out = self.cesp_module(patch_tokens, h_p, w_p)
             else:
                 with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
@@ -254,11 +326,14 @@ class FeatureExtractor:
         )
         with context_global:
             with Telemetry.profile("dinov2"):
-                if self.cesp_module is not None:
+                if self.vlad_aggregator is not None:
+                    out_global = torch.from_numpy(self._vlad_descriptors(dino_input))
+                elif self.cesp_module is not None:
                     with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
                         features = self.global_model.forward_features(dino_input)
                     patch_tokens = features["x_norm_patchtokens"].float()
-                    h_p, w_p = self.dino_size // 14, self.dino_size // 14
+                    # RESEARCH 1.1: сітка з фактичної кількості токенів, не //14
+                    h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
                     out_global = self.cesp_module(patch_tokens, h_p, w_p)
                 else:
                     with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):

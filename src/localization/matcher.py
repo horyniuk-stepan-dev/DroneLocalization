@@ -19,6 +19,45 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def extract_sift_features(
+    image: np.ndarray, static_mask: np.ndarray | None = None, max_keypoints: int = 2048
+) -> dict:
+    """RESEARCH 2.2: SIFT-ознаки у форматі, сумісному з LightGlue(features="sift").
+
+    Використовується і DatabaseBuilder-ом (offline, збереження у БД), і
+    Localizer-ом (online, аварійний фолбек) — ідентичний пайплайн гарантує
+    сумісність дескрипторів. Дескриптори — rootSIFT (L1-норм + sqrt), як в
+    екстракторі бібліотеки lightglue, на якому натреновані ваги sift-матчера.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    mask8 = None
+    if static_mask is not None:
+        mask8 = (static_mask > 128).astype(np.uint8) * 255
+
+    sift = cv2.SIFT_create(nfeatures=int(max_keypoints))
+    kps, descs = sift.detectAndCompute(gray, mask8)
+    if descs is None or len(kps) == 0:
+        return {
+            "keypoints": np.empty((0, 2), dtype=np.float32),
+            "descriptors": np.empty((0, 128), dtype=np.float32),
+            "image_size": np.array(gray.shape[:2], dtype=np.int32),
+        }
+
+    # rootSIFT: L1-нормалізація + поелементний sqrt → L2-норм ~1
+    descs = descs.astype(np.float32)
+    descs /= np.maximum(descs.sum(axis=1, keepdims=True), 1e-12)
+    descs = np.sqrt(descs)
+
+    pts = np.array([kp.pt for kp in kps], dtype=np.float32)
+    return {
+        "keypoints": pts,
+        "descriptors": descs,
+        "image_size": np.array(gray.shape[:2], dtype=np.int32),
+    }
+
+
 class FastRetrieval:
     """Fast candidate search using DINOv2 global descriptors (optimized with FAISS)"""
 
@@ -131,6 +170,11 @@ class FeatureMatcher:
         # Для warn-once логування несумісних розмірностей дескрипторів
         self._dim_mismatch_warned: set = set()
 
+        # RESEARCH 2.2: LightGlue(sift) вантажиться ліниво — лише коли
+        # аварійний фолбек реально спрацював уперше (VRAM не витрачається дарма)
+        self._lightglue_sift = None
+        self._lightglue_sift_failed = False
+
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         """
         Dynamically routes to LightGlue (for 256-dim SuperPoint)
@@ -225,9 +269,34 @@ class FeatureMatcher:
 
         return mkpts_q, mkpts_r
 
-    def _lightglue_match(self, query_features: dict, ref_features: dict) -> tuple:
+    def match_sift(self, query_features: dict, ref_features: dict) -> tuple:
+        """RESEARCH 2.2: матчинг SIFT-ознак через LightGlue(features="sift").
+
+        Окремий метод (не через match()): SIFT-дескриптори 128-вимірні, як
+        ALIKED, тож маршрутизація за розмірністю відправила б їх у
+        ALIKED-матчер з ловом сміттєвих збігів.
+        """
+        if self._lightglue_sift is None and not self._lightglue_sift_failed:
+            if self.model_manager is None:
+                self._lightglue_sift_failed = True
+            else:
+                try:
+                    self._lightglue_sift = self.model_manager.load_lightglue(features="sift")
+                    logger.info("LightGlue (sift) loaded for emergency fallback")
+                except Exception as e:
+                    self._lightglue_sift_failed = True
+                    logger.warning(f"Failed to load LightGlue (sift): {e} — fallback disabled")
+        if self._lightglue_sift is None:
+            return np.empty((0, 2)), np.empty((0, 2))
+        return self._lightglue_match(query_features, ref_features, model=self._lightglue_sift)
+
+    def _lightglue_match(
+        self, query_features: dict, ref_features: dict, model=None
+    ) -> tuple:
         """Matches features using Neural LightGlue Matcher"""
         try:
+            if model is None:
+                model = self.lightglue
             if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
                 logger.warning(
                     f"Empty keypoints provided to LightGlue | "
@@ -237,7 +306,7 @@ class FeatureMatcher:
                 )
                 return np.empty((0, 2)), np.empty((0, 2))
 
-            device = next(self.lightglue.parameters()).device
+            device = next(model.parameters()).device
 
             # image_size для коректної нормалізації координат [-1, 1] у LightGlue.
             # Без цього крос-роздільні пари (4K query vs 1080p ref) дають ~0 matches.
@@ -273,7 +342,7 @@ class FeatureMatcher:
             data = {"image0": image0_data, "image1": image1_data}
 
             with torch.no_grad():
-                res = self.lightglue(data)
+                res = model(data)
 
             matches = res["matches"][0].cpu().numpy()
 

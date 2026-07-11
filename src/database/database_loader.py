@@ -356,6 +356,38 @@ class DatabaseLoader:
         self._feature_cache[frame_id] = res
         return res
 
+    @property
+    def has_sift_features(self) -> bool:
+        """RESEARCH 2.2: чи містить БД SIFT-ознаки для аварійного фолбека."""
+        try:
+            return self.db_file is not None and "sift_features" in self.db_file
+        except Exception:
+            return False
+
+    @_synchronized
+    def get_sift_features(self, frame_id: int) -> dict[str, np.ndarray]:
+        """RESEARCH 2.2: SIFT-ознаки кадру (rootSIFT, сумісні з LightGlue-sift).
+
+        Без LRU-кешу: фолбек викликається рідко (лише при провалі ALIKED),
+        кешування лише витісняло б гарячі ALIKED-ознаки з пам'яті.
+        """
+        if self.db_file is None:
+            raise RuntimeError("Database not opened")
+        if "sift_features" not in self.db_file:
+            raise ValueError(
+                "База не містить SIFT-ознак — перебудуйте з database.store_sift_features=True"
+            )
+        sf = self.db_file["sift_features"]
+        n = int(sf["kp_counts"][frame_id])
+        if n == 0:
+            raise ValueError(f"Кадр {frame_id} не має SIFT keypoints (kp_count=0)")
+        res = {
+            "keypoints": sf["keypoints"][frame_id, :n],
+            "descriptors": sf["descriptors"][frame_id, :n].astype("float32"),
+            "image_size": np.array(self.get_frame_size(frame_id), dtype=np.int32),
+        }
+        return res
+
     def get_num_frames(self) -> int:
         """Повертає кількість кадрів у БД (pre-allocated slots для v2)."""
         return int(self.metadata.get("num_frames", 0))

@@ -67,6 +67,27 @@ class CespConfig(BaseModel):
     scales: list[int] = [1, 2, 4]
 
 
+class VladConfig(BaseModel):
+    """RESEARCH 2.1 (AnyLoc): ненавчена VLAD-агрегація патч-токенів DINOv3.
+
+    enabled=True вимагає vocab_path — словник, збудований
+    scripts/build_vlad_vocab.py на референсних кадрах ТОГО САМОГО домену.
+    База даних має бути перебудована з тим самим словником (розмірність
+    глобального дескриптора змінюється: 1024 → pca_dim).
+    """
+    enabled: bool = False
+    vocab_path: str | None = None
+    n_clusters: int = 32
+    pca_dim: int = 512
+    # Проміжний шар ViT для патч-токенів (None = останній, з фінальним
+    # LayerNorm). AnyLoc показує кращі результати з проміжних шарів —
+    # підбирати валідацією, значення залежить від бекбона.
+    layer: int | None = None
+    # Dustbin-сурогат (SALAD): відкинути цю частку патчів з найнижчою
+    # L2-нормою токена перед агрегацією (0.0 = вимкнено, 0.1 = 10%).
+    low_norm_fraction: float = 0.0
+
+
 class VramManagementConfig(BaseModel):
     max_vram_ratio: float = 0.8
     default_required_mb: float = 2000.0
@@ -136,7 +157,13 @@ class ModelsConfig(BaseModel):
         model_path="models/RDD_lg-v2.pth",
         auto_convert=False,
     )
+    lightglue_sift: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        auto_convert=False,
+    )
     cesp: CespConfig = CespConfig()
+    vlad: VladConfig = VladConfig()
     vram_management: VramManagementConfig = VramManagementConfig()
     performance: PerformanceConfig = PerformanceConfig()
     engines_cache: ModelsCacheConfig = ModelsCacheConfig()

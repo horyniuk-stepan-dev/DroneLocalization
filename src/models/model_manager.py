@@ -350,6 +350,7 @@ class ModelManager:
                     "aliked": "models.lightglue",
                     "superpoint": "models.lightglue_superpoint",
                     "rdd": "models.lightglue_rdd",
+                    "sift": "models.lightglue_sift",  # RESEARCH 2.2
                 }
                 config_key = config_key_map.get(features, "models.lightglue")
                 config = get_cfg(self.config, config_key)
@@ -463,7 +464,9 @@ class ModelManager:
             if target_backend in ["torchscript", "tensorrt"] and not path.exists():
                 logger.info(f"Exporting LightGlue ({features}) to TorchScript: {model_path}")
                 model.eval()
-                dim = {"aliked": 128, "superpoint": 256, "rdd": 256}.get(features, 128)
+                dim = {"aliked": 128, "superpoint": 256, "rdd": 256, "sift": 128}.get(
+                    features, 128
+                )
                 dummy_data = {
                     "image0": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),

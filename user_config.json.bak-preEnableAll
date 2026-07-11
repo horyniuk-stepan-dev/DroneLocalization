@@ -312,6 +312,7 @@
         "loop_closure_min_inliers": 30,
         "temporal_edge_base_weight": 1.0,
         "spatial_edge_base_weight": 1.0,
+        "anchor_weight": 999999.0,
         "max_iterations": 50,
         "convergence_tolerance": 1e-06,
         "use_bfs_initialization": true,
@@ -325,28 +326,6 @@
         "two_stage_prune": true,
         "prune_mad_k": 5.0,
         "prune_max_spatial_frac": 0.3,
-        "spatial_weight_use_similarity": true,
-        "soft_anchors": true,
-        "anchor_base_w": 200.0,
-        "anchor_sigma_floor_m": 0.05,
-        "anchor_loo_threshold_m": 5.0,
-        "loop_closure_auto_min_gap": false,
-        "loop_closure_overlap_factor": 1.0,
-        "loop_closure_dist_prefilter": true,
-        "loop_closure_dist_margin": 2.0,
-        "loop_closure_odometry_check": true,
-        "odometry_consistency_margin": 1.5,
-        "odometry_drift_frac": 0.25,
-        "odometry_inconsistency_factor": 0.3,
-        "gnc_spatial": false,
-        "gnc_rounds": 5,
-        "gnc_mad_k": 3.0,
-        "pchip_gap_fill": true,
-        "temporal_weight_use_fit_quality": true,
-        "temporal_fit_quality_k": 0.05
-    },
-    "propagation": {
-        "max_skip_frames": 3,
-        "rotation_retry": true
+        "spatial_weight_use_similarity": true
     }
 }

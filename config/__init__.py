@@ -23,7 +23,7 @@ from config.app import (
     PreprocessingConfig,
 )
 from config.database import DatabaseConfig
-from config.graph import GraphOptimizationConfig, ProjectionConfig
+from config.graph import GraphOptimizationConfig, ProjectionConfig, PropagationConfig
 from config.localization import (
     ConfidenceConfig,
     HomographyConfig,
@@ -46,19 +46,41 @@ from config.models import (
 
 __all__ = [
     # models
-    "Dinov2ModelConfig", "Dinov3ModelConfig", "GlobalDescriptorConfig", "YoloConfig",
-    "ModelSettings", "CespConfig", "VramManagementConfig", "ModelsCacheConfig",
-    "PerformanceConfig", "ModelsConfig", "get_default_local_extractor",
+    "Dinov2ModelConfig",
+    "Dinov3ModelConfig",
+    "GlobalDescriptorConfig",
+    "YoloConfig",
+    "ModelSettings",
+    "CespConfig",
+    "VramManagementConfig",
+    "ModelsCacheConfig",
+    "PerformanceConfig",
+    "ModelsConfig",
+    "get_default_local_extractor",
     # database
     "DatabaseConfig",
     # localization
-    "ConfidenceConfig", "LocalizationConfig", "TrackingConfig", "HomographyConfig",
+    "ConfidenceConfig",
+    "LocalizationConfig",
+    "TrackingConfig",
+    "HomographyConfig",
     # graph
-    "ProjectionConfig", "GraphOptimizationConfig",
+    "ProjectionConfig",
+    "GraphOptimizationConfig",
+    "PropagationConfig",
     # app
-    "PreprocessingConfig", "GuiConfig", "ObjectTrackingConfig", "LiveStreamConfig",
-    "NetworkApiConfig", "AppConfig",
+    "PreprocessingConfig",
+    "GuiConfig",
+    "ObjectTrackingConfig",
+    "LiveStreamConfig",
+    "NetworkApiConfig",
+    "AppConfig",
     # access
-    "get_cfg", "get_active_descriptor_cfg", "load_user_config", "save_user_config",
-    "CONFIG_FILE_PATH", "APP_SETTINGS", "APP_CONFIG",
+    "get_cfg",
+    "get_active_descriptor_cfg",
+    "load_user_config",
+    "save_user_config",
+    "CONFIG_FILE_PATH",
+    "APP_SETTINGS",
+    "APP_CONFIG",
 ]

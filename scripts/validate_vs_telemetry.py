@@ -59,6 +59,11 @@ def _wrap_deg(d: np.ndarray) -> np.ndarray:
     return (np.asarray(d, dtype=np.float64) + 180.0) % 360.0 - 180.0
 
 
+def mercator_y_to_lat(y_m: float, radius: float = 6378137.0) -> float:
+    """Широта (град) з Web-Mercator Y (для корекції cos(lat), Етап 6)."""
+    return float(np.degrees(2.0 * np.arctan(np.exp(y_m / radius)) - np.pi / 2.0))
+
+
 def summarize(errs: np.ndarray) -> dict:
     """{n, median, p95, max, mean} для масиву похибок (порожній → нулі)."""
     e = np.asarray(errs, dtype=np.float64)
@@ -144,6 +149,7 @@ def compute_report(
     turn_rate_deg_per_slot: float = 3.0,
     near_anchor_k: int = 3,
     telemetry_centers: dict[int, np.ndarray] | None = None,
+    ground_scale: float = 1.0,
 ) -> dict:
     """Повний звіт: похибка центру/кута/масштабу загалом і в розрізах.
 
@@ -175,9 +181,7 @@ def compute_report(
     )
     if head_arr is not None and np.all(np.isnan(head_arr)):
         head_arr = None
-    masks = classify_slots(
-        slots, head_arr, anchor_slots, turn_rate_deg_per_slot, near_anchor_k
-    )
+    masks = classify_slots(slots, head_arr, anchor_slots, turn_rate_deg_per_slot, near_anchor_k)
 
     def cut(mask: np.ndarray) -> dict:
         d = summarize(err[mask])
@@ -197,6 +201,16 @@ def compute_report(
         },
         "cuts": {name: cut(m) for name, m in masks.items()},
     }
+
+    # Корекція одиниць (Етап 6): Web-Mercator-метри → справжні наземні × cos(lat).
+    if abs(ground_scale - 1.0) > 1e-9:
+        o = report["overall"]
+        report["ground_scale_factor"] = float(ground_scale)
+        report["overall_ground_m"] = {
+            "median": o["median"] * ground_scale,
+            "p95": o["p95"] * ground_scale,
+            "max": o["max"] * ground_scale,
+        }
 
     # Незалежна телеметрична звірка позиції (за наявності).
     if telemetry_centers:
@@ -235,6 +249,12 @@ def format_report(rep: dict, scene: str = "") -> str:
         lines.append(
             f"    {name:<12}: {c['median']:6.2f} / {c['p95']:6.2f} / {c['max']:6.2f}"
             f"  (n={c['n']}, кут {c['angle_deg']:.2f}°, масшт {c['scale_rel']:.3%})"
+        )
+    if "overall_ground_m" in rep:
+        g = rep["overall_ground_m"]
+        lines.append(
+            f"  СПРАВЖНІ метри (×cos lat = {rep['ground_scale_factor']:.4f}): "
+            f"median={g['median']:.2f} м, p95={g['p95']:.2f} м, max={g['max']:.2f} м"
         )
     if "telemetry_cross_check" in rep:
         t = rep["telemetry_cross_check"]
@@ -329,8 +349,11 @@ def main(argv=None) -> int:
     ap.add_argument("--db", required=True, help="database.h5 після пропагації")
     ap.add_argument("--ground-truth", default=None, help="ground_truth.json (Етап 0.2, точний)")
     ap.add_argument("--telemetry", default=None, help="telemetry.csv (щільна позиція)")
-    ap.add_argument("--map-center", default=None,
-                    help="cx,cy Mercator-центру мапи для телеметрії (якщо нема GT-json)")
+    ap.add_argument(
+        "--map-center",
+        default=None,
+        help="cx,cy Mercator-центру мапи для телеметрії (якщо нема GT-json)",
+    )
     ap.add_argument("--frame-step", type=int, default=None, help="DB frame_step (для телеметрії)")
     ap.add_argument("--fps", type=float, default=None, help="target_fps відео (для телеметрії)")
     ap.add_argument("--turn-rate-deg", type=float, default=3.0, help="поріг дуги (°/слот)")
@@ -344,8 +367,7 @@ def main(argv=None) -> int:
         return 2
 
     if not args.ground_truth and not args.telemetry:
-        print("Потрібне хоча б одне джерело GT: --ground-truth або --telemetry.",
-              file=sys.stderr)
+        print("Потрібне хоча б одне джерело GT: --ground-truth або --telemetry.", file=sys.stderr)
         return 2
 
     gt_affine: dict[int, np.ndarray] = {}
@@ -376,8 +398,10 @@ def main(argv=None) -> int:
             args.telemetry, target_slots, map_center, frame_step, fps
         )
     elif args.telemetry and map_center is None:
-        print("  (телеметрію задано без --map-center/ground_truth → пропущено звірку позиції)",
-              file=sys.stderr)
+        print(
+            "  (телеметрію задано без --map-center/ground_truth → пропущено звірку позиції)",
+            file=sys.stderr,
+        )
 
     # Якщо GT-json немає — будуємо «GT-афінну» з телеметрії неможливо (нема кута/масштабу).
     # Тоді звіряємося лише позиційно: використовуємо предикт як gt-плейсхолдер для розрізів
@@ -397,11 +421,22 @@ def main(argv=None) -> int:
         rep = {"telemetry_only": summarize(np.array(errs))}
         print(json.dumps(rep, ensure_ascii=False, indent=2))
     else:
+        ground_scale = 1.0
+        if map_center is not None:
+            from src.geometry.coordinates import mercator_scale_factor
+
+            ground_scale = mercator_scale_factor(mercator_y_to_lat(float(map_center[1])))
         rep = compute_report(
-            pred, gt_affine, frame_w, frame_h,
-            headings_deg=headings, anchor_slots=anchor_slots,
-            turn_rate_deg_per_slot=args.turn_rate_deg, near_anchor_k=args.near_anchor_k,
+            pred,
+            gt_affine,
+            frame_w,
+            frame_h,
+            headings_deg=headings,
+            anchor_slots=anchor_slots,
+            turn_rate_deg_per_slot=args.turn_rate_deg,
+            near_anchor_k=args.near_anchor_k,
             telemetry_centers=telemetry_centers,
+            ground_scale=ground_scale,
         )
         print(format_report(rep, scene=Path(args.db).stem))
 

@@ -14,6 +14,7 @@ from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
 from src.utils.resolution_normalizer import ResolutionNormalizer
+from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
 
@@ -76,6 +77,11 @@ class Localizer:
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
         self.min_inliers_for_accept = get_cfg(self.config, "localization.min_inliers_accept", 10)
         self.retrieval_top_k = get_cfg(self.config, "localization.retrieval_top_k", 8)
+        # RESEARCH 2.2: аварійний SIFT+LightGlue фолбек
+        self._sift_fallback = get_cfg(self.config, "localization.sift_fallback", False)
+        self._sift_fallback_max_cand = get_cfg(
+            self.config, "localization.sift_fallback_max_candidates", 3
+        )
         self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
 
         # Fix #1: Захист від нескінченного циклу при виході за межі покриття
@@ -214,7 +220,11 @@ class Localizer:
             logger.debug(f"Depth hint skipped: {e}")
 
     def localize_frame(
-        self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
+        self,
+        query_frame: np.ndarray,
+        static_mask: np.ndarray = None,
+        dt: float = 1.0,
+        yaw_hint_deg: float | None = None,
     ) -> dict:
         # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
         if self._consecutive_failures >= self._max_failures:
@@ -250,10 +260,24 @@ class Localizer:
 
         top_k = self.retrieval_top_k
 
+        # ── RESEARCH 2.3: зовнішній yaw-hint (симулятор / телеметрія) ────────
+        # yaw_hint_deg — кут CW у градусах, на який слід повернути кадр, щоб
+        # він збігся з орієнтацією БД (north-up); конвертацію з курсу дрона
+        # робить викликач. Квантуємо до 90° — весь rotation-тракт працює з
+        # k·90. Хибний hint самовиліковується: якщо retrieval-score prior-кута
+        # нижчий за rotation_rescan_min_score, RotationSelector сам виконає
+        # повний батчований скан 4 кутів.
+        prior_angle = self._last_best_angle
+        use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
+        if yaw_hint_deg is not None and self.enable_auto_rotation:
+            prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
+            use_prior = True
+            logger.debug(f"Yaw hint {yaw_hint_deg:.1f}° → prior rotation {prior_angle}°")
+
         rot = self._rotation_selector.select(
             query_frame,
-            self._last_best_angle,
-            self.enable_auto_rotation and self._consecutive_failures == 0,
+            prior_angle,
+            use_prior,
             angles_to_try,
             top_k,
             scale_manager=self._scale_manager,
@@ -344,6 +368,30 @@ class Localizer:
             best_mkpts_r_inliers = None
             best_total_matches = 0
             best_rmse = 999.0
+
+        # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ────────────────────
+        # ALIKED (як і SuperPoint) втрачає матчі при великому in-plane rotation
+        # та екстремальній похилості [ISPRS 2025; MDPI RS 17(22)]. Одноразовий
+        # перезапуск через ротаційно-інваріантний SIFT + LightGlue(sift) рятує
+        # кадр до того, як він піде у retrieval-only фолбек.
+        if (
+            (best_inliers < self.min_matches or best_H_query_to_ref is None)
+            and self._sift_fallback
+            and getattr(self.database, "has_sift_features", False)
+        ):
+            rescue = self._try_sift_rescue(
+                best_rotated_frame, best_rotated_mask, best_global_candidates
+            )
+            if rescue is not None:
+                (
+                    best_candidate_id,
+                    best_H_query_to_ref,
+                    best_inliers,
+                    best_mkpts_q_inliers,
+                    best_mkpts_r_inliers,
+                    best_total_matches,
+                    best_rmse,
+                ) = rescue
 
         if (
             best_inliers < self.min_matches
@@ -647,6 +695,71 @@ class Localizer:
         return self._result_builder.compute_confidence(
             best_candidate_id, best_inliers, total_matches, rmse_val, self.database
         )
+
+    def _try_sift_rescue(
+        self,
+        rotated_frame: np.ndarray,
+        rotated_mask: np.ndarray | None,
+        candidates: list,
+    ) -> tuple | None:
+        """RESEARCH 2.2: одноразовий SIFT+LightGlue перезапуск матчингу.
+
+        Повертає (candidate_id, H, inliers, mkpts_q_in, mkpts_r_in,
+        total_matches, rmse) або None. Координати SIFT-точок — у тій самій
+        системі rotated_frame, що й ALIKED, тож даунстрім-композиція гомографій
+        не змінюється.
+        """
+        from src.localization.matcher import extract_sift_features
+
+        try:
+            q_sift = extract_sift_features(
+                rotated_frame,
+                rotated_mask,
+                get_cfg(self.config, "database.sift_max_keypoints", 2048),
+            )
+        except Exception as e:
+            logger.warning(f"SIFT rescue: query extraction failed: {e}")
+            return None
+        if len(q_sift["keypoints"]) < self.min_matches:
+            return None
+
+        best: tuple | None = None
+        with Telemetry.profile("sift_rescue"):
+            for cand_id, _score in candidates[: self._sift_fallback_max_cand]:
+                try:
+                    ref_sift = self.database.get_sift_features(cand_id)
+                except (ValueError, KeyError):
+                    continue
+                mkq, mkr = self.matcher.match_sift(q_sift, ref_sift)
+                if len(mkq) < self.min_matches:
+                    continue
+                H, mask = GeometryTransforms.estimate_homography(
+                    mkq,
+                    mkr,
+                    ransac_threshold=self.ransac_thresh,
+                    backend=self.homography_backend,
+                    use_mad_ransac=self.use_mad_ransac,
+                    mad_k_factor=self.mad_k_factor,
+                )
+                if H is None:
+                    continue
+                inl_mask = mask.ravel().astype(bool)
+                inliers = int(np.sum(inl_mask))
+                if inliers < self.min_matches:
+                    continue
+                pts_q_in, pts_r_in = mkq[inl_mask], mkr[inl_mask]
+                proj = GeometryTransforms.apply_homography(pts_q_in, H)
+                rmse = float(np.sqrt(np.mean(np.sum((proj - pts_r_in) ** 2, axis=1))))
+                if best is None or inliers > best[2]:
+                    best = (cand_id, H, inliers, pts_q_in, pts_r_in, len(mkq), rmse)
+
+        if best is not None:
+            logger.info(
+                f"SIFT rescue SUCCEEDED: frame={best[0]}, inliers={best[2]}, "
+                f"rmse={best[6]:.2f} (ALIKED had failed — likely in-plane rotation "
+                f"or extreme oblique view)"
+            )
+        return best
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
         return self._result_builder.fallback(frame_id, score, self.database, self.calibration)

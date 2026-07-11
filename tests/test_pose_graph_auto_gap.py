@@ -3,6 +3,7 @@
 gap_min = ceil(overlap · frame_diag_px / median_disp_px), median_disp з
 temporal-ребер (нормований на span ребра). Дуги/викиди не мусять ламати медіану.
 """
+
 import math
 
 import numpy as np
@@ -68,4 +69,5 @@ def test_auto_gap_robust_to_outlier():
 
 if __name__ == "__main__":
     import pytest
+
     raise SystemExit(pytest.main([__file__, "-q"]))

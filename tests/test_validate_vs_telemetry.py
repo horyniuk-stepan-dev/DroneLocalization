@@ -4,6 +4,7 @@
 тож бігають у пісочниці. Орієнтир: pred==gt → нульова похибка; відомий зсув →
 median≈зсув; дуги/прямі/near-anchor коректно класифікуються.
 """
+
 from __future__ import annotations
 
 import sys
@@ -66,9 +67,10 @@ def test_classify_slots_turns_and_anchors():
     slots = np.arange(10)
     # прямо 0..4, розворот 5..7, прямо 8..9
     headings = np.array([0, 0, 0, 0, 0, 20, 60, 90, 90, 90], dtype=float)
-    m = classify_slots(slots, headings, anchor_slots={0, 9},
-                       turn_rate_deg_per_slot=3.0, near_anchor_k=1)
-    assert m["turn_arcs"].sum() >= 3           # дуга спіймана
+    m = classify_slots(
+        slots, headings, anchor_slots={0, 9}, turn_rate_deg_per_slot=3.0, near_anchor_k=1
+    )
+    assert m["turn_arcs"].sum() >= 3  # дуга спіймана
     assert m["straights"][0] and m["straights"][2]
     assert m["near_anchor"][0] and m["near_anchor"][1] and m["near_anchor"][9]
     assert not m["near_anchor"][5]
@@ -85,15 +87,17 @@ def test_compute_report_perfect_and_offset():
     gt = {s: _affine(tx=1000.0 + 50.0 * s, ty=2000.0, s=0.5) for s in range(6)}
     headings = {s: 0.0 for s in range(6)}
 
-    perfect = compute_report(gt, gt, 100, 100, headings_deg=headings,
-                             anchor_slots={0, 5}, near_anchor_k=1)
+    perfect = compute_report(
+        gt, gt, 100, 100, headings_deg=headings, anchor_slots={0, 5}, near_anchor_k=1
+    )
     assert perfect["overall"]["median"] == pytest.approx(0.0, abs=1e-9)
     assert perfect["overall"]["angle_deg_median"] == pytest.approx(0.0, abs=1e-9)
 
     # зсув усіх передбачень на 4 м по x
     pred = {s: _affine(tx=1000.0 + 50.0 * s + 4.0, ty=2000.0, s=0.5) for s in range(6)}
-    rep = compute_report(pred, gt, 100, 100, headings_deg=headings,
-                         anchor_slots={0, 5}, near_anchor_k=1)
+    rep = compute_report(
+        pred, gt, 100, 100, headings_deg=headings, anchor_slots={0, 5}, near_anchor_k=1
+    )
     assert rep["overall"]["median"] == pytest.approx(4.0, abs=1e-9)
     assert rep["cuts"]["straights"]["n"] == 6
     assert rep["coverage"] == pytest.approx(1.0)

@@ -8,6 +8,17 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def mercator_scale_factor(lat: float) -> float:
+    """Множник Web-Mercator-метри → справжні наземні метри (Етап 6): cos(lat).
+
+    WebMercator (EPSG:3857) розтягує відстані у 1/cos(lat) (×~1.5 на 48°), тож
+    «метрові» цифри звітів/GSD на реальних даних систематично завищені. Множення
+    Mercator-відстані на cos(lat) дає справжні метри. Для UTM корекція = 1.0.
+    На сим-даних (усе в Mercator, порівняння відносне) не впливає на висновки.
+    """
+    return math.cos(math.radians(lat))
+
+
 class CoordinateConverter:
     """Детермінована конвертація координат (WebMercator або UTM) на основі екземпляра."""
 
@@ -39,6 +50,20 @@ class CoordinateConverter:
     def mode(self) -> str:
         """Режим проєкції: "UTM" або "WEB_MERCATOR" (публічний доступ замість _mode)."""
         return self._mode
+
+    def ground_scale_factor(self, lat: float | None = None) -> float:
+        """Множник «проєкційні метри → справжні наземні» (Етап 6).
+
+        UTM → 1.0 (уже справжні метри). WEB_MERCATOR → cos(lat): lat береться з
+        аргументу або з reference_gps. Якщо широта невідома — 1.0 (без корекції).
+        """
+        if self._mode != "WEB_MERCATOR":
+            return 1.0
+        if lat is None and self._reference_gps is not None:
+            lat = self._reference_gps[0]
+        if lat is None:
+            return 1.0
+        return mercator_scale_factor(lat)
 
     def _initialize_projection(self, lat: float, lon: float) -> None:
         wgs84_crs = CRS("EPSG:4326")

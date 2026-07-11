@@ -61,10 +61,15 @@ class DINOv3Wrapper(nn.Module):
         self._device = device
 
         hidden_size = self._model.config.hidden_size
+        # DINOv3 має register-токени між CLS та патч-токенами в last_hidden_state:
+        # [CLS, reg_1..reg_n, patch_1..patch_N]. Кількість читаємо з конфігу моделі,
+        # щоб не хардкодити (RESEARCH_INTEGRATION_PLAN 1.1).
+        self._num_register_tokens = int(getattr(self._model.config, "num_register_tokens", 0) or 0)
         logger.info(
             f"DINOv3 loaded: hidden_size={hidden_size}, "
             f"image_size={self._model.config.image_size}, "
-            f"patch_size={self._model.config.patch_size}"
+            f"patch_size={self._model.config.patch_size}, "
+            f"num_register_tokens={self._num_register_tokens}"
         )
 
     @torch.no_grad()
@@ -85,19 +90,32 @@ class DINOv3Wrapper(nn.Module):
         return cls_token
 
     @torch.no_grad()
-    def forward_features(self, pixel_values: torch.Tensor) -> dict:
+    def forward_features(self, pixel_values: torch.Tensor, layer: int | None = None) -> dict:
         """
         Returns patch tokens and CLS token — compatible with CESP module.
 
         Returns dict with:
             'x_norm_clstoken':    (B, 1024)
-            'x_norm_patchtokens': (B, num_patches, 1024)
+            'x_norm_patchtokens': (B, num_patches, 1024) — без CLS та register-токенів
         """
-        outputs = self._model(pixel_values=pixel_values)
-        hidden = outputs.last_hidden_state  # (B, 1 + N_patches, 1024)
+        if layer is None:
+            outputs = self._model(pixel_values=pixel_values)
+            hidden_src = outputs.last_hidden_state
+        else:
+            # RESEARCH 2.1 (AnyLoc): патч-токени з проміжного шару. Увага:
+            # hidden_states[layer] БЕЗ фінального LayerNorm — узгоджено з
+            # AnyLoc, який агрегує сирі проміжні токени; словник VLAD треба
+            # будувати з ТОГО САМОГО шару.
+            outputs = self._model(pixel_values=pixel_values, output_hidden_states=True)
+            hidden_src = outputs.hidden_states[layer]
+        # (B, 1 + n_reg + N_patches, 1024): пропускаємо CLS і register-токени —
+        # register-токени не несуть просторової семантики і забруднювали б
+        # патч-агрегацію (CESP/VLAD). Раніше тут був зріз [:, 1:, :] — витік.
+        hidden = hidden_src
+        n_skip = 1 + self._num_register_tokens
         return {
             "x_norm_clstoken": hidden[:, 0, :],
-            "x_norm_patchtokens": hidden[:, 1:, :],
+            "x_norm_patchtokens": hidden[:, n_skip:, :],
         }
 
     def to(self, *args, **kwargs):

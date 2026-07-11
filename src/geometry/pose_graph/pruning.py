@@ -41,7 +41,8 @@ class PruningMixin:
         """
         res = self.compute_edge_residuals()
         spatial_idx = [
-            k for k, e in enumerate(self._edges)
+            k
+            for k, e in enumerate(self._edges)
             if e.edge_type == "spatial" and not np.isnan(res[k])
         ]
         if len(spatial_idx) < 3:
@@ -64,10 +65,7 @@ class PruningMixin:
         base_reach = self._anchor_reachable(self._edges)
         removed_idx: list[int] = []
         for k in candidates:
-            trial = [
-                e for j, e in enumerate(self._edges)
-                if j != k and j not in removed_idx
-            ]
+            trial = [e for j, e in enumerate(self._edges) if j != k and j not in removed_idx]
             if self._anchor_reachable(trial) == base_reach:
                 removed_idx.append(k)  # безпечно: нічого не роз'єднали
 
@@ -81,3 +79,78 @@ class PruningMixin:
         self._last_edge_residuals = None
         return pruned
 
+    def _run_gnc_spatial(
+        self,
+        rounds: int,
+        mad_k: float,
+        *,
+        max_iterations: int,
+        tolerance: float,
+        progress_callback,
+        use_analytic_jac: bool,
+    ) -> dict[int, np.ndarray]:
+        """GNC-переваження spatial-ребер (Етап 3) — плавна еволюція two-stage prune.
+
+        Замість бінарного викидання: раунди L2 із Geman-McClure-вагами
+        w' = w · σ²/(σ²+r²), де σ = µ·thr, thr = median + mad_k·1.4826·MAD резидуалів
+        ВЛАСНОГО (spatial) класу — той самий поріг, що й у prune (урок soft_l1:
+        temporal-ланцюг недоторканий, пороги класо-відносні). µ спадає від
+        опуклого (усі ваги≈1) до 1 (справжній GM), warm start між раундами.
+
+        ЧИСТА СЦЕНА (жоден spatial-резидуал не перевищує thr) → миттєвий вихід із
+        БАЗОВИМИ вагами → розв'язок ІДЕНТИЧНИЙ чистому L2 (нуль деградації).
+        Геометричний (незалежний від ваги) резидуал = ‖residual‖ / weight.
+        """
+        spatial_idx = [k for k, e in enumerate(self._edges) if e.edge_type == "spatial"]
+        base_w = {k: float(self._edges[k].weight) for k in spatial_idx}
+        if len(base_w) < 3:
+            return self._export_results()
+
+        def _geom_residuals():
+            res = self.compute_edge_residuals()
+            geo = {}
+            for k in base_w:
+                w_cur = float(self._edges[k].weight)
+                if not np.isnan(res[k]) and w_cur > 1e-12:
+                    geo[k] = float(res[k]) / w_cur
+            return geo
+
+        # Раунд-0 діагностика на БАЗОВИХ вагах (розв'язок уже є з головного L2).
+        geo0 = _geom_residuals()
+        if len(geo0) < 3:
+            return self._export_results()
+        vals0 = np.array(list(geo0.values()))
+        med = float(np.median(vals0))
+        mad = float(np.median(np.abs(vals0 - med)))
+        thr = med + mad_k * 1.4826 * mad
+        if float(np.max(vals0)) <= thr * (1.0 + 1e-9):
+            return self._export_results()  # немає викидів → чиста сцена → no-op
+
+        opt_kw = dict(
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+            progress_callback=progress_callback,
+            use_analytic_jac=use_analytic_jac,
+            gnc_spatial=False,
+            two_stage_prune=False,
+        )
+        mu = max(1.0, float(np.max(vals0)) / max(thr, 1e-9))
+        for _ in range(max(1, rounds)):
+            geo = _geom_residuals()
+            sigma2 = (mu * thr) ** 2
+            for k, w0 in base_w.items():
+                r = geo.get(k)
+                if r is None:
+                    continue
+                self._edges[k].weight = w0 * (sigma2 / (sigma2 + r * r))
+            self.optimize(**opt_kw)  # повторний L2, warm start із self._free_nodes
+            if mu <= 1.0:
+                break
+            mu = max(1.0, mu / 1.4)
+
+        # Відновлюємо базові ваги (розв'язок уже в self._free_nodes; ваги — лише
+        # для GNC-ітерацій, звіти мають бачити оригінальні ваги ребер).
+        for k, w0 in base_w.items():
+            self._edges[k].weight = w0
+        self._last_edge_residuals = None
+        return self._export_results()
