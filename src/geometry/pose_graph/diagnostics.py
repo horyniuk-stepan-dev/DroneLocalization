@@ -243,10 +243,15 @@ class DiagnosticsMixin:
                 )
         return "\n".join(lines)
 
-    def export_graph_geojson(self, converter, frame_w: int, frame_h: int) -> dict:
+    def export_graph_geojson(
+        self, converter, frame_w: int, frame_h: int, origin_xy: tuple = (0.0, 0.0)
+    ) -> dict:
+        """origin_xy — Local Origin пропагації: внутрішні стани графа локальні,
+        без цього зсуву GeoJSON опинявся біля (0°, 0°) (баг, сесія 2026-07-12)."""
         features = []
         results = self._export_results()
         cx, cy = frame_w / 2.0, frame_h / 2.0
+        ox, oy = float(origin_xy[0]), float(origin_xy[1])
 
         # Пер-ребровий резидуал у properties → на карті розфарбувати ребра
         # за резидуалом (погані loop closures стає ВИДНО очима).
@@ -256,7 +261,7 @@ class DiagnosticsMixin:
             pt = np.array([[cx, cy]], dtype=np.float64)
             metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
             try:
-                lat, lon = converter.metric_to_gps(float(metric[0]), float(metric[1]))
+                lat, lon = converter.metric_to_gps(float(metric[0]) + ox, float(metric[1]) + oy)
             except Exception:
                 continue
             is_fixed = fid in self._fixed_nodes
@@ -277,8 +282,8 @@ class DiagnosticsMixin:
                 pt = np.array([[cx, cy]], dtype=np.float64).reshape(-1, 1, 2)
                 m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
                 m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
-                lat1, lon1 = converter.metric_to_gps(float(m_from[0]), float(m_from[1]))
-                lat2, lon2 = converter.metric_to_gps(float(m_to[0]), float(m_to[1]))
+                lat1, lon1 = converter.metric_to_gps(float(m_from[0]) + ox, float(m_from[1]) + oy)
+                lat2, lon2 = converter.metric_to_gps(float(m_to[0]) + ox, float(m_to[1]) + oy)
             except Exception:
                 continue
             features.append(

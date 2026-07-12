@@ -1,7 +1,8 @@
-from PyQt6.QtCore import Qt
+import numpy as np
+from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QDockWidget, QMainWindow, QStatusBar
 
-from config import APP_CONFIG, APP_SETTINGS
+from config import APP_CONFIG, APP_SETTINGS, get_cfg
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader
@@ -55,6 +56,28 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         self.map_dock.setWidget(self.map_widget)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.map_dock)
 
+        # ── Debug-вікна «очима моделей» (приховані за замовчуванням) ─────────
+        from src.gui.widgets.debug_view import DebugViewDock
+
+        self.debug_docks: dict = {}
+        debug_specs = [
+            ("yolo", "YOLO — детекції / маска"),
+            ("depth", "Depth Anything"),
+            ("dino", "DINO — PCA / retrieval"),
+            ("matches", "Точки / матчі (ALIKED)"),
+        ]
+        prev_dock = None
+        for channel, title in debug_specs:
+            dock = DebugViewDock(channel, title, self)
+            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+            if prev_dock is not None:
+                self.tabifyDockWidget(prev_dock, dock)
+            dock.hide()
+            dock.visibilityChanged.connect(self._update_debug_channels)
+            self.debug_docks[channel] = dock
+            prev_dock = dock
+        self._restore_debug_visibility()
+
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
@@ -81,6 +104,10 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         view_menu.addAction(self.control_dock.toggleViewAction())
         view_menu.addAction(self.map_dock.toggleViewAction())
         view_menu.addSeparator()
+
+        debug_menu = view_menu.addMenu("Вікна моделей")
+        for _channel in ("yolo", "depth", "dino", "matches"):
+            debug_menu.addAction(self.debug_docks[_channel].toggleViewAction())
 
         sections_menu = view_menu.addMenu("Секції панелі управління")
         cp = self.control_panel
@@ -146,3 +173,60 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         from src.gui.dialogs.config_dialog import ConfigDialog
         dialog = ConfigDialog(self)
         dialog.exec()
+
+    # ── Debug-вікна «очима моделей» ─────────────────────────────────────────
+    def _restore_debug_visibility(self):
+        """Відновлює видимість debug-вікон із user_config.json (секція debug_views)."""
+        mapping = {
+            "yolo": "debug_views.show_yolo",
+            "depth": "debug_views.show_depth",
+            "dino": "debug_views.show_dino",
+            "matches": "debug_views.show_matches",
+        }
+        for channel, path in mapping.items():
+            if get_cfg(self.config, path, False):
+                self.debug_docks[channel].show()
+
+    def _active_debug_channels(self) -> set:
+        """Набір каналів, чиї вікна зараз реально видимі користувачу."""
+        # «Активний» = вікно відкрите (навіть якщо зараз за іншою вкладкою в tab-групі),
+        # а не лише фронтальна вкладка. isVisible() дає False для tabbed-behind дока —
+        # через це depth-вікно «замерзало», коли фронтальною ставала інша вкладка.
+        return {ch for ch, dock in self.debug_docks.items() if not dock.isHidden()}
+
+    def _update_debug_channels(self, *args):
+        """visibilityChanged будь-якого дока → оновити активний набір у worker-і."""
+        worker = getattr(self, "tracking_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.set_debug_channels(self._active_debug_channels())
+
+    @pyqtSlot(str, np.ndarray)
+    def _on_debug_view_ready(self, channel: str, frame_bgr: np.ndarray):
+        """Маршрутизація готового BGR-кадру у відповідне debug-вікно.
+
+        Після показу підтверджуємо worker-у, що кадр спожито (backpressure
+        drop-замість-черги): знімає in-flight, дозволяючи наступний кадр.
+        """
+        try:
+            dock = self.debug_docks.get(channel)
+            if dock is not None:
+                dock.update_frame(frame_bgr)
+        finally:
+            worker = getattr(self, "tracking_worker", None)
+            if worker is not None:
+                worker.mark_debug_channel_free(channel)
+
+    def closeEvent(self, event):
+        """Зберігає стан видимості debug-вікон, не чіпаючи інші налаштування."""
+        try:
+            from config import load_user_config, save_user_config
+
+            cfg = load_user_config()
+            cfg.debug_views.show_yolo = not self.debug_docks["yolo"].isHidden()
+            cfg.debug_views.show_depth = not self.debug_docks["depth"].isHidden()
+            cfg.debug_views.show_dino = not self.debug_docks["dino"].isHidden()
+            cfg.debug_views.show_matches = not self.debug_docks["matches"].isHidden()
+            save_user_config(cfg)
+        except Exception as e:
+            logger.debug(f"Failed to persist debug view visibility: {e}")
+        super().closeEvent(event)

@@ -123,6 +123,19 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         self._initialized_nodes.add(frame_id)
         self._fixed_nodes.pop(frame_id, None)
 
+    @property
+    def sign(self) -> float:
+        """Знак det (−1 = дзеркальні калібрувальні матриці). Для vo_guards."""
+        return self._sign
+
+    def anchor_states(self) -> dict[int, np.ndarray]:
+        """Стани всіх якорів (жорстких fix_node і м'яких add_anchor) —
+        опора для check_anchor_gaps (vo_guards, сесія 2026-07-12)."""
+        states: dict[int, np.ndarray] = dict(self._fixed_nodes)
+        for fid, (st, _w) in self._anchor_priors.items():
+            states.setdefault(fid, st)
+        return states
+
     def _build_graph_edge(
         self,
         from_id: int,

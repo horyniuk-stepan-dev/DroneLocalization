@@ -161,6 +161,7 @@ class TrackingMixin:
         self.tracking_worker.objects_detected.connect(self.on_objects_detected)
         self.tracking_worker.objects_gps_updated.connect(self.on_objects_gps_updated)
         self.tracking_worker.finished.connect(self._on_tracking_finished)
+        self.tracking_worker.debug_view_ready.connect(self._on_debug_view_ready)
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
@@ -180,6 +181,10 @@ class TrackingMixin:
         src_name = _Path(str(video_source)).name if not str(video_source).startswith("rtsp") else "RTSP"
         project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
         self.setWindowTitle(f"Drone Topometric Localizer - {project_name}  🔴 {src_name}")
+
+        # Debug views: передаємо worker-у поточний стан видимості вікон
+        if hasattr(self, "_active_debug_channels"):
+            self.tracking_worker.set_debug_channels(self._active_debug_channels())
 
         self.tracking_worker.start()
         self.status_bar.showMessage(f"Відстеження: {src_name}")

@@ -106,6 +106,13 @@ class Localizer:
         self._depth_estimator = None
         self._depth_hint_counter = 0
 
+        # ── Debug views: незалежний depth-інференс для вікна (окрема каденція) ─
+        self._debug_depth_every_n = get_cfg(
+            self.config, "debug_views.depth_every_n_keyframes", 1
+        )
+        self._debug_depth_estimator = None
+        self._debug_depth_counter = 0
+
         # ── Patchify: мультипатч-retrieval ────────────────────────────────────
         # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
         #   1. Увімкнено через конфіг
@@ -200,6 +207,7 @@ class Localizer:
         self._last_best_angle = None
         self._last_state = None
         self._scale_manager.reset()
+        self._debug_depth_counter = 0
 
     def _maybe_set_depth_hint(self, frame: np.ndarray) -> None:
         """Soft depth-based reorder of the scale pyramid (every N keyframes; hint only)."""
@@ -219,12 +227,45 @@ class Localizer:
         except Exception as e:
             logger.debug(f"Depth hint skipped: {e}")
 
+    def _maybe_collect_depth(self, frame_rgb: np.ndarray, collector) -> None:
+        """Debug: незалежний depth-інференс для вікна (окрема каденція).
+
+        Не впливає на локалізацію — суто візуалізація «очима Depth Anything».
+        Рахується лише коли вікно depth відкрите (collector.want_depth) і не
+        частіше ніж кожен debug_views.depth_every_n_keyframes keyframe.
+        """
+        if collector is None or not collector.want_depth:
+            return
+        self._debug_depth_counter += 1
+        if (self._debug_depth_counter - 1) % max(1, self._debug_depth_every_n) != 0:
+            return
+        try:
+            if self._debug_depth_estimator is None:
+                from src.depth.depth_estimator import DepthEstimator
+
+                device = getattr(self.model_manager, "device", "cuda")
+                self._debug_depth_estimator = DepthEstimator.build(device=device)
+            depth = self._debug_depth_estimator.estimate(frame_rgb)
+            collector.depth_map = depth
+            # відносний масштаб з центру (як get_relative_scale, без 2-го інференсу)
+            h, w = depth.shape
+            cd = depth[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
+            vm = cd > 0
+            if bool(vm.any()):
+                med = float(np.median(cd[vm]))
+                collector.depth_scale = (1.0 / med) if med > 1e-6 else 1.0
+            else:
+                collector.depth_scale = 1.0
+        except Exception as e:
+            logger.debug(f"Debug depth skipped: {e}")
+
     def localize_frame(
         self,
         query_frame: np.ndarray,
         static_mask: np.ndarray = None,
         dt: float = 1.0,
         yaw_hint_deg: float | None = None,
+        collector=None,
     ) -> dict:
         # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
         if self._consecutive_failures >= self._max_failures:
@@ -255,6 +296,8 @@ class Localizer:
 
         # Depth hint: soft reorder of the scale pyramid toward the DB GSD (every N keyframes).
         self._maybe_set_depth_hint(query_frame)
+        # Debug: depth-мапа для вікна (незалежно від успіху локалізації).
+        self._maybe_collect_depth(query_frame, collector)
 
         angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
 
@@ -298,6 +341,14 @@ class Localizer:
         best_global_candidates = rot.candidates
         best_source_id_per_angle = rot.source_id
         best_scale = rot.best_scale
+
+        if collector is not None:
+            collector.global_score = float(best_global_score)
+            collector.global_angle = int(best_global_angle)
+            collector.scale = float(best_scale)
+            collector.retrieval_candidates = [
+                (int(cid), float(sc)) for cid, sc in best_global_candidates
+            ][: self.retrieval_top_k]
 
         logger.debug(
             f"Selected rotation {best_global_angle}° scale {best_scale:.2f} "
@@ -349,6 +400,19 @@ class Localizer:
             best_rotated_frame, static_mask=best_rotated_mask
         )
 
+        if collector is not None:
+            collector.rotated_frame = best_rotated_frame
+            collector.query_features = best_query_features
+            if collector.want_dino_pca:
+                try:
+                    tokens, h_p, w_p = self.feature_extractor.extract_patch_tokens(
+                        best_rotated_frame
+                    )
+                    collector.patch_tokens = tokens
+                    collector.patch_grid = (h_p, w_p)
+                except Exception as e:
+                    logger.debug(f"Debug DINO tokens skipped: {e}")
+
         ver = self._geometric_verifier.verify(
             best_query_features, best_global_candidates, self.database
         )
@@ -368,6 +432,14 @@ class Localizer:
             best_mkpts_r_inliers = None
             best_total_matches = 0
             best_rmse = 999.0
+
+        if collector is not None:
+            collector.candidate_id = int(best_candidate_id)
+            collector.inliers = int(best_inliers)
+            collector.total_matches = int(best_total_matches)
+            collector.rmse = float(best_rmse)
+            collector.mkpts_q_inliers = best_mkpts_q_inliers
+            collector.mkpts_r_inliers = best_mkpts_r_inliers
 
         # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ────────────────────
         # ALIKED (як і SuperPoint) втрачає матчі при великому in-plane rotation

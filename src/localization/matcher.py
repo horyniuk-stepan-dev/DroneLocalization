@@ -269,6 +269,15 @@ class FeatureMatcher:
 
         return mkpts_q, mkpts_r
 
+    def match_mnn(self, query_features: dict, ref_features: dict) -> tuple:
+        """Детермінований mutual-NN (L2) матчинг ПОВЗ LightGlue (Етап 8, 2026-07-12).
+
+        Фолбек для temporal-ребер пропагації: на повторюваній ріллі LightGlue
+        місцями віддає 12–28 матчів там, де MNN по тих самих дескрипторах
+        знаходить 100–800 пар (перевірено на lasttest). Викликається воркером,
+        коли LightGlue дав < min_matches."""
+        return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
+
     def match_sift(self, query_features: dict, ref_features: dict) -> tuple:
         """RESEARCH 2.2: матчинг SIFT-ознак через LightGlue(features="sift").
 

@@ -16,6 +16,7 @@ from config.access import (
 )
 from config.app import (
     AppConfig,
+    DebugViewsConfig,
     GuiConfig,
     LiveStreamConfig,
     NetworkApiConfig,
@@ -71,6 +72,7 @@ __all__ = [
     # app
     "PreprocessingConfig",
     "GuiConfig",
+    "DebugViewsConfig",
     "ObjectTrackingConfig",
     "LiveStreamConfig",
     "NetworkApiConfig",

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QCoreApplication
 
-from config import APP_CONFIG, APP_SETTINGS
+from config import APP_CONFIG, APP_SETTINGS, get_cfg
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.project import ProjectManager
@@ -57,7 +57,7 @@ class HeadlessRunner:
             if is_multi and len(sources) > 0:
                 # Мультиджерельний режим
                 self.db_manager = MultiDatabaseManager(
-                    sources, self.project_dir, config=APP_CONFIG.model_dump()
+                    sources, self.project_dir, config=APP_CONFIG
                 )
                 self.calib_manager = MultiCalibrationManager()
                 self.calib_manager.load_all(sources, self.project_dir)
@@ -110,7 +110,7 @@ class HeadlessRunner:
         nv = self.model_manager.load_dinov2()
 
         cesp = None
-        if APP_CONFIG.models.cesp.enabled:
+        if get_cfg(APP_CONFIG, "models.cesp.enabled", False):
             try:
                 cesp = self.model_manager.load_cesp()
             except Exception as e:
@@ -121,7 +121,7 @@ class HeadlessRunner:
         )
 
         matcher = FeatureMatcher(model_manager=self.model_manager, config=APP_CONFIG)
-        localizer_config = {**APP_CONFIG.model_dump(), "_model_manager": self.model_manager}
+        localizer_config = {**APP_CONFIG, "_model_manager": self.model_manager}
 
         return Localizer(
             self.database, fe, matcher, self.calibration, config=localizer_config,

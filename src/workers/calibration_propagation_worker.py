@@ -25,6 +25,12 @@ from src.geometry.affine_utils import (
     decompose_affine_5dof,
     unwrap_angles,
 )
+from src.geometry.pose_graph.vo_guards import (
+    check_anchor_gaps,
+    downweight_gap_edges,
+    select_gap_fallback_frames,
+    temporal_edge_sane,
+)
 from src.geometry.pose_graph_optimizer import (
     PoseGraphOptimizer,
     affine_fit_residual,
@@ -155,6 +161,25 @@ class CalibrationPropagationWorker(QThread):
         self.anchor_base_w = get_cfg(self.config, go + "anchor_base_w", 200.0)
         self.anchor_sigma_floor_m = get_cfg(self.config, go + "anchor_sigma_floor_m", 0.05)
         self.anchor_loo_threshold_m = get_cfg(self.config, go + "anchor_loo_threshold_m", 5.0)
+
+        # ── Етап 8 (сесія 2026-07-12): запобіжники temporal-VO. Дефолти off. ──
+        self.temporal_edge_gate = get_cfg(self.config, go + "temporal_edge_gate", False)
+        self.temporal_gate_max_rot = get_cfg(
+            self.config, go + "temporal_gate_max_rotation_deg", 30.0
+        )
+        self.temporal_gate_max_scale = get_cfg(
+            self.config, go + "temporal_gate_max_scale_ratio", 1.4
+        )
+        self.temporal_gate_max_shift_frac = get_cfg(
+            self.config, go + "temporal_gate_max_shift_frac", 1.2
+        )
+        self.anchor_gap_check = get_cfg(self.config, go + "anchor_gap_check", False)
+        self.anchor_gap_max_dev_m = get_cfg(self.config, go + "anchor_gap_max_dev_m", 150.0)
+        self.anchor_gap_downweight = get_cfg(self.config, go + "anchor_gap_downweight", 0.05)
+        self.skip_bridges = get_cfg(self.config, "propagation.skip_bridges", False)
+        self.mnn_fallback = get_cfg(self.config, "propagation.mnn_fallback", False)
+        self._n_rotation_retry = 0
+        self._origin_xy = (0.0, 0.0)
 
     def stop(self):
         self._is_running = False
@@ -294,6 +319,7 @@ class CalibrationPropagationWorker(QThread):
         origin_tx = float(ref_anchor.affine_matrix[0, 2])
         origin_ty = float(ref_anchor.affine_matrix[1, 2])
         logger.info(f"Local Origin established at: ({origin_tx:.2f}, {origin_ty:.2f})")
+        self._origin_xy = (origin_tx, origin_ty)
 
         for fid, anchor in anchor_nodes.items():
             # Створюємо копію матриці з відносною трансляцією
@@ -311,6 +337,41 @@ class CalibrationPropagationWorker(QThread):
                 )
             else:
                 optimizer.fix_node(fid, local_affine)
+
+        # ── Етап 8.2: звірка проміжків між якорями ДО оптимізації ────────────
+        # Консистентний аліасинг (усі ребра проміжку брешуть однаково) невидимий
+        # для резидуалів; неузгоджені проміжки глушаться, їх кадри після
+        # оптимізації перезаповнюються інтерполяцією по якорях.
+        flagged_gaps: list[tuple[int, int]] = []
+        gap_report: dict = {}
+        if self.anchor_gap_check:
+            gap_report = check_anchor_gaps(
+                optimizer.edges,
+                optimizer.anchor_states(),
+                optimizer.sign,
+                self.anchor_gap_max_dev_m,
+            )
+            flagged_gaps = [k for k, v in gap_report.items() if v["status"] != "ok"]
+            for a, b in flagged_gaps:
+                v = gap_report[(a, b)]
+                dev = (
+                    f"розбіжність {v['dev_m']:.0f} м"
+                    if v["dev_m"] is not None
+                    else "ланцюг розірваний"
+                )
+                logger.warning(
+                    f"Проміжок якорів #{a}→#{b} не узгоджений із VO-ланцюгом ({dev}) — "
+                    f"кадри проміжку підуть на інтерполяцію по якорях"
+                )
+            n_dw = downweight_gap_edges(
+                optimizer.edges,
+                [k for k in flagged_gaps if gap_report[k]["status"] == "inconsistent"],
+                self.anchor_gap_downweight,
+            )
+            if n_dw:
+                logger.info(
+                    f"Етап 8.2: приглушено {n_dw} temporal-ребер (вага ×{self.anchor_gap_downweight})"
+                )
 
         # Warm start (Етап 4.2): x0 з попереднього розв'язку замість BFS з нуля.
         # BFS нижче лишається для першого запуску та як fallback (заповнює лише
@@ -357,6 +418,28 @@ class CalibrationPropagationWorker(QThread):
         except Exception as diag_err:
             logger.warning(f"Diagnostics report failed: {diag_err}")
 
+        # ── Етап 8.2: кадри неузгоджених проміжків → на інтерполяцію по якорях.
+        # Рахуємо в ЛОКАЛЬНИХ координатах (до відновлення origin).
+        force_invalid: set[int] = set()
+        if self.anchor_gap_check and flagged_gaps:
+            cxp, cyp = self.frame_w / 2.0, self.frame_h / 2.0
+            centers = {
+                fid: (
+                    float(aff[0, 0] * cxp + aff[0, 1] * cyp + aff[0, 2]),
+                    float(aff[1, 0] * cxp + aff[1, 1] * cyp + aff[1, 2]),
+                )
+                for fid, aff in results.items()
+            }
+            force_invalid = select_gap_fallback_frames(
+                centers, optimizer.anchor_states(), flagged_gaps, self.anchor_gap_max_dev_m
+            )
+            if force_invalid:
+                logger.info(
+                    f"Етап 8.2: {len(force_invalid)} кадрів перезаповнюються інтерполяцією "
+                    f"(відхилення від лінії якорів > {self.anchor_gap_max_dev_m:.0f} м): "
+                    f"{sorted(force_invalid)}"
+                )
+
         # Відновлюємо абсолютні координати (додаємо Local Origin назад)
         for fid in results:
             results[fid][0, 2] += origin_tx
@@ -364,13 +447,16 @@ class CalibrationPropagationWorker(QThread):
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
         self.progress.emit(85, "Збереження результатів у HDF5...")
-        valid_count = self._save_to_hdf5(results, anchors, optimizer)
+        valid_count = self._save_to_hdf5(results, anchors, optimizer, force_invalid=force_invalid)
 
         # Експорт GeoJSON для візуалізації
         if self.export_geojson and self.calibration.converter:
             try:
                 geojson = optimizer.export_graph_geojson(
-                    self.calibration.converter, self.frame_w, self.frame_h
+                    self.calibration.converter,
+                    self.frame_w,
+                    self.frame_h,
+                    origin_xy=self._origin_xy,
                 )
                 geojson_path = str(self.database.db_path).replace(".h5", "_graph.geojson")
                 with open(geojson_path, "w", encoding="utf-8") as f:
@@ -414,9 +500,16 @@ class CalibrationPropagationWorker(QThread):
     ) -> int:
         """Побудова часових ребер між послідовними кадрами."""
         count = 0
-        n_rotation_retry = 0
-        last_success_id = -1
-        last_success_feat = None
+        self._n_rotation_retry = 0
+        n_gated = 0
+        n_bridged = 0
+        # ВИПРАВЛЕНО (раніше): ребро будується до попереднього кадру-З-ФІЧАМИ,
+        # незалежно від гепа keyframe selection. Етап 8 (2026-07-12): опційно
+        # (а) санітарний гейт трансформації ребра, (б) мости через розриви —
+        # якщо матч із найближчим сусідом упав/відсіяний, пробуємо глибших
+        # (до max_skip_frames), щоб ланцюг не розпадався на «острови» та
+        # «апендикси» без другого якоря (кадри 1–21 lasttest → відліт на км).
+        recent: list[tuple[int, dict]] = []
 
         for i in range(num_frames):
             if not self._is_running:
@@ -426,37 +519,33 @@ class CalibrationPropagationWorker(QThread):
             if feat_i is None:
                 continue
 
-            if last_success_feat is not None:
-                # ВИПРАВЛЕНО: раніше ребро будувалося лише якщо геп ≤ max_skip_frames
-                # СЛОТІВ. Але keyframe selection лишає довгі порожні гепи саме там,
-                # де дрон висить на місці (least motion) — і ланцюг рвався без причини.
-                # Тепер завжди з'єднуємо сусідні кадри-з-фічами: валідність ребра
-                # гарантують min_matches + перевірка гомографії.
-                gap = i - last_success_id
+            if recent:
+                gap = i - recent[-1][0]
                 if gap > self.max_skip_frames:
                     logger.debug(
-                        f"Temporal edge across keyframe gap: {last_success_id} → {i} ({gap} slots)"
+                        f"Temporal edge across keyframe gap: {recent[-1][0]} → {i} ({gap} slots)"
                     )
-                # H maps feat_i → last_success_feat (to→from direction)
-                similarity = None
-                inliers = 0
-                rmse_val = 0.0
-                result = self._match_and_build_edge(feat_i, last_success_feat)
-                if result is not None:
-                    H, inliers, rmse_val, _n_matches = result
-                    similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
-
-                # Ротаційна робастність (Етап 5): матч упав → пробуємо з поворотом
-                # query на кут ланцюга frame_poses, далі перебір k·90°.
-                if similarity is None and self.rotation_retry:
-                    retry = self._temporal_rotation_retry(
-                        feat_i, last_success_feat, last_success_id, i
+                candidates = recent[::-1] if self.skip_bridges else recent[-1:]
+                for depth, (last_id, last_feat) in enumerate(candidates):
+                    similarity, inliers, rmse_val, result = self._try_temporal_pair(
+                        feat_i, last_feat, last_id, i
                     )
-                    if retry is not None:
-                        similarity, inliers, rmse_val = retry
-                        n_rotation_retry += 1
-
-                if similarity is not None:
+                    if similarity is None:
+                        continue
+                    if self.temporal_edge_gate:
+                        ok, reason = temporal_edge_sane(
+                            similarity,
+                            i - last_id,
+                            self.frame_w,
+                            self.frame_h,
+                            self.temporal_gate_max_rot,
+                            self.temporal_gate_max_scale,
+                            self.temporal_gate_max_shift_frac,
+                        )
+                        if not ok:
+                            n_gated += 1
+                            logger.debug(f"Temporal gate відсіяв {last_id}→{i}: {reason}")
+                            continue
                     weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
                     # 6.2: менша довіра кадрам із нахилом/рельєфом (великий залишок
                     # афінного фіту H). Лише первинний матч (result), не rotation-retry.
@@ -465,7 +554,7 @@ class CalibrationPropagationWorker(QThread):
                         if fit_res is not None:
                             weight *= 1.0 / (1.0 + self.temporal_fit_k * fit_res)
                     optimizer.add_edge(
-                        from_id=last_success_id,
+                        from_id=last_id,
                         to_id=i,
                         relative_affine_2x3=similarity,
                         weight=weight,
@@ -474,9 +563,14 @@ class CalibrationPropagationWorker(QThread):
                         rmse=rmse_val,
                     )
                     count += 1
+                    if depth > 0:
+                        n_bridged += 1
+                    break
 
-            last_success_id = i
-            last_success_feat = feat_i
+            recent.append((i, feat_i))
+            depth_limit = max(1, self.max_skip_frames) if self.skip_bridges else 1
+            if len(recent) > depth_limit:
+                recent.pop(0)
 
             if i % 200 == 0:
                 self.progress.emit(
@@ -484,9 +578,38 @@ class CalibrationPropagationWorker(QThread):
                     f"Часові ребра: {count} (кадр {i}/{num_frames})",
                 )
 
-        if self.rotation_retry and n_rotation_retry:
-            logger.info(f"Rotation-retry врятував {n_rotation_retry} temporal-ребер")
+        if self.rotation_retry and self._n_rotation_retry:
+            logger.info(f"Rotation-retry врятував {self._n_rotation_retry} temporal-ребер")
+        if n_gated:
+            logger.info(
+                f"Temporal gate відсіяв {n_gated} ребер (дегенеративні трансформації)"
+            )
+        if n_bridged:
+            logger.info(f"Skip-мости з'єднали {n_bridged} розривів temporal-ланцюга")
         return count
+
+    def _try_temporal_pair(self, feat_i, last_feat, last_id, i):
+        """Одна спроба temporal-матчу пари (last_id → i): основний матч +
+        (за прапорцем) rotation-retry (Етап 5). Повертає
+        (similarity | None, inliers, rmse, result_or_None)."""
+        similarity = None
+        inliers = 0
+        rmse_val = 0.0
+        # H maps feat_i → last_feat (to→from direction)
+        result = self._match_and_build_edge(feat_i, last_feat)
+        if result is not None:
+            H, inliers, rmse_val, _n_matches = result
+            similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
+
+        # Ротаційна робастність (Етап 5): матч упав → пробуємо з поворотом
+        # query на кут ланцюга frame_poses, далі перебір k·90°.
+        if similarity is None and self.rotation_retry:
+            retry = self._temporal_rotation_retry(feat_i, last_feat, last_id, i)
+            if retry is not None:
+                similarity, inliers, rmse_val = retry
+                self._n_rotation_retry += 1
+
+        return similarity, inliers, rmse_val, result
 
     def _temporal_rotation_retry(self, feat_i, last_feat, from_id, to_id):
         """Повторний temporal-матч із поворотом query (Етап 5). Повертає
@@ -798,6 +921,7 @@ class CalibrationPropagationWorker(QThread):
         results: dict[int, np.ndarray],
         anchors,
         optimizer: PoseGraphOptimizer,
+        force_invalid: set[int] | None = None,
     ) -> int:
         """Зберігає оптимізовані афінні матриці у HDF5.
 
@@ -813,8 +937,11 @@ class CalibrationPropagationWorker(QThread):
         # Записуємо результати оптимізації
         # Оскільки optimizer повертає ТІЛЬКИ досяжні вузли,
         # незв'язані кадри залишаться з frame_valid = False
+        # Етап 8.2: кадри неузгоджених проміжків пропускаємо — їх заповнить
+        # штатна інтерполяція (pchip/лінійна) по якорях і валідних сусідах.
+        skip = force_invalid or set()
         for frame_id, affine in results.items():
-            if 0 <= frame_id < num_frames:
+            if 0 <= frame_id < num_frames and frame_id not in skip:
                 frame_affine[frame_id] = affine.astype(np.float64)
                 frame_valid[frame_id] = True
 
@@ -974,6 +1101,14 @@ class CalibrationPropagationWorker(QThread):
         """
         try:
             mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
+            if (
+                len(mkpts_a) < self.min_matches
+                and self.mnn_fallback
+                and hasattr(self.matcher, "match_mnn")
+            ):
+                # Етап 8: LightGlue «сліпне» на повторюваній ріллі (12–28 матчів
+                # там, де MNN по тих самих дескрипторах бачить 100–800 пар).
+                mkpts_a, mkpts_b = self.matcher.match_mnn(features_a, features_b)
             if len(mkpts_a) < self.min_matches:
                 return None
 

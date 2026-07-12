@@ -61,6 +61,7 @@ def get_active_descriptor_cfg(config: Any) -> "Dinov2ModelConfig | Dinov3ModelCo
 
 import json
 import os
+import tempfile
 
 CONFIG_FILE_PATH = "user_config.json"
 
@@ -76,12 +77,33 @@ def load_user_config() -> AppConfig:
     return AppConfig()
 
 def save_user_config(config: AppConfig) -> None:
-    """Зберігає налаштування користувача у файл."""
+    """Зберігає налаштування атомарно: пишемо в тимчасовий файл поруч і
+    робимо os.replace, щоб перерваний запис не пошкодив основний конфіг."""
+    target = os.path.abspath(CONFIG_FILE_PATH)
+    directory = os.path.dirname(target)
+    tmp_path = None
     try:
-        with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".user_config.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
             f.write(config.model_dump_json(indent=4))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
     except Exception as e:
-        print(f"Failed to save user config to {CONFIG_FILE_PATH}: {e}")
+        print(f"Failed to save user config to {target}: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 # Екземпляр конфігу за замовчуванням (зчитаний з файлу або дефолтний).
 APP_SETTINGS = load_user_config()

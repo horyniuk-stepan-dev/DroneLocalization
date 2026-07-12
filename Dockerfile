@@ -16,6 +16,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# ML-ассети (моделі та third_party) — великі й рідко змінюються, тож
+# копіюємо першими заради кешування шарів. УВАГА: models/ і third_party/
+# у .gitignore, отже образ збереться лише там, де ці файли присутні
+# локально (свіжий clone їх не матиме — тоді змонтуйте їх як volume або
+# додайте крок завантаження ваг).
+COPY models/ ./models/
+COPY third_party/ ./third_party/
+
 # Копіюємо файл залежностей та код проекту
 COPY pyproject.toml .
 COPY README.md .

@@ -1,0 +1,27 @@
+# Keep the Docker build context lean. models/ and third_party/ are intentionally
+# NOT excluded — the Dockerfile COPYs them into the image.
+.git/
+.venv/
+venv/
+env/
+ENV/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tests/
+data/
+outputs/
+logs/
+*.log
+scratch/
+KnowledgeBase/
+.obsidian/
+CodeGraph/
+*.mp4
+*.avi
+user_config.json
+.claude/
+.agent
+.agents

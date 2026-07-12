@@ -24,6 +24,24 @@ class GuiConfig(BaseModel):
     verify_label_mode: str = "number"
 
 
+class DebugViewsConfig(BaseModel):
+    """Вікна «очима моделей» у режимі локалізації (YOLO / Depth / DINO / Матчі).
+
+    Усе off за замовчуванням — нульовий overhead, поки жодне вікно не відкрите.
+    Секція round-trip-иться у user_config.json, тож show_* зберігають стан
+    видимості вікон між запусками.
+    """
+
+    max_width: int = 640  # ширина зображень у вікнах (downscale перед emit)
+    depth_every_n_keyframes: int = 1  # частота depth-інференсу (1 = кожен keyframe; окремий GPU-прохід)
+    dino_pca_enabled: bool = True  # PCA патч-токенів (інакше — лише панель retrieval)
+    # Стан видимості вікон (відновлюється при старті, зберігається при виході)
+    show_yolo: bool = False
+    show_depth: bool = False
+    show_dino: bool = False
+    show_matches: bool = False
+
+
 class ObjectTrackingConfig(BaseModel):
     enabled: bool = True
     track_activation_threshold: float = 0.25
@@ -78,6 +96,7 @@ class AppConfig(BaseModel):
     tracking: TrackingConfig = TrackingConfig()
     preprocessing: PreprocessingConfig = PreprocessingConfig()
     gui: GuiConfig = GuiConfig()
+    debug_views: DebugViewsConfig = DebugViewsConfig()
     models: ModelsConfig = ModelsConfig()
     projection: ProjectionConfig = ProjectionConfig()
     homography: HomographyConfig = HomographyConfig()

@@ -23,6 +23,7 @@ class RealtimeTrackingWorker(QThread):
     fov_found = pyqtSignal(list)
     objects_detected = pyqtSignal(object)  # list[TrackedObject]
     objects_gps_updated = pyqtSignal(object)  # list[ObjectGPS]
+    debug_view_ready = pyqtSignal(str, np.ndarray)  # (channel_name, готове BGR-зображення)
 
     def __init__(self, video_source: str, localizer, model_manager=None, config=None):
         super().__init__()
@@ -40,10 +41,23 @@ class RealtimeTrackingWorker(QThread):
         )
         self.tracking_config = get_cfg(self.config, "object_tracking", {})
 
+        # ── Debug views (вікна «очима моделей») ─────────────────────────────
+        # Порожній набір каналів ⇒ нуль overhead: колектор не створюється.
+        self._debug_lock = threading.Lock()
+        self._debug_channels = set()
+        self._debug_max_width = get_cfg(self.config, "debug_views.max_width", 640)
+        self._debug_dino_pca = get_cfg(self.config, "debug_views.dino_pca_enabled", True)
+        self._debug_inflight = {}  # {канал: monotonic-час emit} — backpressure (self-healing)
+        self._debug_inflight_stale_sec = 1.0  # авто-скидання, якщо ack від GUI не прийшов
+
     def run(self):
         # Fix #3: скидаємо стан сесії через публічний API (без приватних полів)
         if hasattr(self.localizer, "reset_session"):
             self.localizer.reset_session()
+
+        # Debug views: свіжий старт backpressure-стану для нової сесії
+        with self._debug_lock:
+            self._debug_inflight.clear()
 
         if self.model_manager:
             self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
@@ -189,9 +203,25 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, detections = yolo_wrapper.detect_and_mask(frame_rgb)
 
+                # Debug views: знімок активних каналів + opt-in колектор.
+                with self._debug_lock:
+                    active_debug = set(self._debug_channels)
+                debug_collector = None
+                if active_debug & {"matches", "dino", "depth"}:
+                    from src.localization.debug_collector import DebugCollector
+
+                    debug_collector = DebugCollector(
+                        want_matches="matches" in active_debug,
+                        want_dino_pca=("dino" in active_debug) and self._debug_dino_pca,
+                        want_depth="depth" in active_debug,
+                    )
+
                 try:
                     loc_result = self.localizer.localize_frame(
-                        frame_rgb, static_mask=static_mask, dt=calculated_dt
+                        frame_rgb,
+                        static_mask=static_mask,
+                        dt=calculated_dt,
+                        collector=debug_collector,
                     )
                 except Exception as e:
                     import torch
@@ -199,6 +229,11 @@ class RealtimeTrackingWorker(QThread):
                     torch.cuda.empty_cache()
                     logger.error(f"Localization exception on keyframe: {e}", exc_info=True)
                     loc_result = {"success": False, "error": str(e)}
+
+                if active_debug:
+                    self._render_debug(
+                        active_debug, frame_rgb, detections, static_mask, debug_collector
+                    )
 
                 # Завжди оновлюємо час останнього keyframe, навіть якщо він rejected
                 last_keyframe_video_time = current_video_time_sec
@@ -394,6 +429,70 @@ class RealtimeTrackingWorker(QThread):
                 f"Models will be loaded on first use (slower first localization).",
                 exc_info=True,
             )
+
+    def set_debug_channels(self, channels) -> None:
+        """GUI → worker: набір активних debug-каналів (thread-safe).
+
+        Порожній набір ⇒ нуль overhead. Викликається з GUI-потоку при зміні
+        видимості вікон і при старті трекінгу.
+        """
+        with self._debug_lock:
+            self._debug_channels = set(channels or [])
+
+    def _render_debug(self, active, frame_rgb, detections, static_mask, collector) -> None:
+        """Рендерить активні debug-канали й emit-ить готові BGR-кадри у GUI.
+
+        Лише на keyframe-ах, у worker-потоці. Емітяться свіжі масиви (не аліаси
+        кадру/колектора), тож безпечно між потоками.
+
+        Backpressure «drop замість черги»: на канал одночасно ≤1 кадр «у льоті».
+        Поки GUI не підтвердив попередній (mark_debug_channel_free), нові кадри
+        цього каналу не рендеряться і не emit-яться — GUI-черга не росте, ми
+        показуємо найсвіжіший кадр, а не відстаємо. Кожен рендер у своєму try:
+        помилка одного вікна не валить локалізацію чи інші вікна.
+        """
+        from src.workers import debug_renderers as dr
+
+        mw = self._debug_max_width
+
+        def emit_if_free(channel, render_fn):
+            now = time.monotonic()
+            with self._debug_lock:
+                ts = self._debug_inflight.get(channel)
+                # Свіжий in-flight → drop. Застарілий (ack втрачено?) → self-heal,
+                # рендеримо знову, щоб канал не «замерзав» назавжди.
+                if ts is not None and (now - ts) < self._debug_inflight_stale_sec:
+                    return
+            try:
+                img = render_fn()
+            except Exception as e:
+                logger.debug(f"{channel} debug render failed: {e}")
+                return
+            with self._debug_lock:
+                self._debug_inflight[channel] = time.monotonic()
+            self.debug_view_ready.emit(channel, img)
+
+        if "yolo" in active:
+            emit_if_free(
+                "yolo", lambda: dr.render_yolo(frame_rgb, detections, static_mask, mw)
+            )
+        if collector is None:
+            return
+        if "matches" in active and collector.rotated_frame is not None:
+            emit_if_free("matches", lambda: dr.render_matches(collector, mw))
+        if "dino" in active and collector.rotated_frame is not None:
+            emit_if_free("dino", lambda: dr.render_dino(collector, mw, self._debug_dino_pca))
+        if "depth" in active and collector.depth_map is not None:
+            emit_if_free("depth", lambda: dr.render_depth(collector, mw))
+
+    def mark_debug_channel_free(self, channel) -> None:
+        """GUI → worker: підтвердження, що кадр каналу спожито (thread-safe).
+
+        Знімає in-flight позначку, дозволяючи emit наступного кадру цього
+        каналу. Викликається зі слота _on_debug_view_ready у GUI-потоці.
+        """
+        with self._debug_lock:
+            self._debug_inflight.pop(channel, None)
 
     def stop(self):
         logger.info("Stopping tracking worker...")

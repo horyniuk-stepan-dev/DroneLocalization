@@ -129,3 +129,6 @@ scratch/
 .complexipy_cache/
 .pytest_cache/
 scripts/allFiles/all_merged_new.py
+
+# Особисті налаштування користувача — у git тримаємо user_config.example.json
+user_config.json

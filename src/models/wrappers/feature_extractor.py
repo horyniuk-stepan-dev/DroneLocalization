@@ -193,6 +193,26 @@ class FeatureExtractor:
             return out.float().cpu().numpy()
 
     @torch.no_grad()
+    def extract_patch_tokens(self, image: np.ndarray):
+        """DINO патч-токени для PCA-візуалізації (debug view «очима DINO»).
+
+        Окремий forward саме для вікна — викликається ЛИШЕ коли вікно DINO
+        відкрите (collector.want_dino_pca). Повертає (tokens, h_p, w_p), де
+        tokens — (N, D) float32 на CPU, N = h_p * w_p. Той самий препроцес
+        (dinov2_transform) і той самий backend (DINOv2/DINOv3), що і retrieval.
+        """
+        dino_tensor = torch.from_numpy(np.ascontiguousarray(image)).float().div_(255.0)
+        dino_tensor = (
+            dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+        )
+        dino_input = self.dinov2_transform(dino_tensor)
+        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+            features = self.global_model.forward_features(dino_input)
+        tokens = features["x_norm_patchtokens"][0].float().cpu().numpy()  # (N, D)
+        side = self._patch_grid_side(tokens.shape[0])
+        return tokens, side, side
+
+    @torch.no_grad()
     def extract_local_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
         logger.debug(f"Extracting local features (ALIKED) from image: {image.shape}")
 
