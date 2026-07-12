@@ -873,35 +873,6 @@ class DatabaseBuilder:
             g3.attrs["frame_step"] = int(frame_step)
             g3.attrs["source_total_frames"] = int(source_total_frames)
 
-            # Schema fingerprint: a stable hash of every structure/content-
-            # defining setting (models, dims, keypoint budget, scale, frame
-            # step, SIFT/VLAD policy). Lets databases built on different
-            # machines be checked for interchangeability instead of silently
-            # mixed. See src/database/schema_fingerprint.py. Never fatal.
-            try:
-                import json as _json
-
-                from src.database.schema_fingerprint import (
-                    build_components,
-                    compute_fingerprint,
-                )
-
-                _fp_components = build_components(
-                    self.config,
-                    descriptor_dim=self.descriptor_dim,
-                    local_descriptor_dim=getattr(self, "local_descriptor_dim", 128),
-                    schema_version="v2",
-                )
-                g3.attrs["schema_fingerprint"] = compute_fingerprint(_fp_components)
-                g3.attrs["schema_components"] = _json.dumps(
-                    _fp_components, sort_keys=True
-                )
-                logger.info(
-                    f"DB schema fingerprint: {g3.attrs['schema_fingerprint']}"
-                )
-            except Exception as _fp_err:  # metadata must never break a build
-                logger.warning(f"Could not write schema fingerprint: {_fp_err}")
-
             # Phase 2.2: Dataset for depth scales
             g3.create_dataset(
                 "depth_scales",
@@ -983,3 +954,4 @@ class DatabaseBuilder:
             # Save depth scale
             if "depth_scale" in features:
                 self.db_file["metadata"]["depth_scales"][frame_id] = features["depth_scale"]
+                                                                                                                                                                                           

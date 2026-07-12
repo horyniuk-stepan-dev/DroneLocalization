@@ -103,17 +103,32 @@ def main() -> None:
 
     logger.info(f"Python: {sys.version}")
     logger.info(f"PyTorch: {torch.__version__}")
-    try:
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            logger.info(f"CUDA: {torch.version.cuda} | GPU: {gpu_name} | VRAM: {vram_total:.1f} GB")
+
+    # ── Hardware auto-detection & compute auto-tuning ────────────────────────
+    from src.utils.hardware_profile import HardwareProfile
+
+    hw_profile = HardwareProfile.detect()
+    hw_profile.log_summary()
+
+    # Apply PyTorch backend optimizations (TF32, cudnn.benchmark, thread counts)
+    hw_profile.apply_torch_backends()
+
+    # Auto-tune config values if enabled
+    if APP_SETTINGS.models.performance.auto_tune:
+        import config as _cfg_module
+
+        overrides = hw_profile.auto_tune(_cfg_module.APP_CONFIG)
+        if overrides:
+            hw_profile.apply_overrides(_cfg_module.APP_CONFIG, overrides)
+            hw_profile.log_overrides(overrides)
+            # Reload APP_SETTINGS from the updated dict so Pydantic models reflect changes
+            _cfg_module.APP_SETTINGS = _cfg_module.AppConfig(**_cfg_module.APP_CONFIG)
+            # Re-bind the module-level name used throughout the app
+            globals()["APP_SETTINGS"] = _cfg_module.APP_SETTINGS
         else:
-            logger.warning(
-                "CUDA not available — running on CPU. Performance will be significantly reduced."
-            )
-    except Exception as e:
-        logger.warning(f"CUDA diagnostics failed: {e}. Continuing without GPU info.")
+            logger.info("Auto-tune: all settings already optimal or user-customized")
+    else:
+        logger.info("Auto-tune disabled (models.performance.auto_tune = false)")
 
     parser = argparse.ArgumentParser(description="Drone Topometric Localization")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")

@@ -117,6 +117,62 @@ class MultiDatabaseManager:
             f"{len(self._active_source_ids)} active"
         )
 
+        self._check_interchangeability()
+
+    def _check_interchangeability(self) -> None:
+        """Warn if loaded databases were built with incompatible schema settings.
+
+        Databases combined in one manager must be mutually queryable, which
+        requires an identical schema fingerprint (same models, dims, keypoint
+        budget, sampling scale, ...). A mismatch means a database was built with
+        different settings (e.g. a different local extractor on another machine)
+        and combined results would be silently wrong. Never raises.
+        """
+        import json as _json
+
+        fps: dict[str, str] = {}
+        comps: dict[str, dict] = {}
+        for sid, loader in self._databases.items():
+            fp = loader.metadata.get("schema_fingerprint")
+            if fp is None:
+                logger.warning(
+                    f"Source '{sid}': no schema_fingerprint (older builder) — "
+                    f"cannot verify interchangeability with the other databases."
+                )
+                continue
+            fps[sid] = str(fp)
+            raw = loader.metadata.get("schema_components")
+            if raw:
+                try:
+                    comps[sid] = _json.loads(raw)
+                except Exception:
+                    pass
+
+        distinct = set(fps.values())
+        if len(distinct) <= 1:
+            if fps:
+                logger.info(
+                    f"Interchangeability OK: {len(fps)} databases share schema "
+                    f"{next(iter(distinct))}."
+                )
+            return
+
+        from src.database.schema_fingerprint import compare
+
+        ref_sid = next(iter(fps))
+        ref = comps.get(ref_sid, {})
+        logger.error(
+            f"DATABASE MISMATCH: {len(distinct)} different schema fingerprints "
+            f"among {len(fps)} databases — they are NOT interchangeable and "
+            f"combined localization may be wrong."
+        )
+        for sid, fp in fps.items():
+            if fp != fps[ref_sid] and comps.get(sid) and ref:
+                logger.error(
+                    f"  '{sid}' ({fp}) differs from '{ref_sid}' ({fps[ref_sid]}): "
+                    f"{'; '.join(compare(ref, comps[sid]))}"
+                )
+
     def unload_source(self, source_id: str) -> None:
         """
         Закриває та вивантажує джерело з пам'яті (без вимкнення).

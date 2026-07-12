@@ -109,24 +109,17 @@ class PerformanceConfig(BaseModel):
     debug_mode: bool = True
 
 
-# Canonical local feature extractor — FIXED and hardware-independent.
-# The extractor defines the CONTENT of the local-feature database: ALIKED and
-# RDD descriptors are NOT cross-matchable, so if this varied with hardware,
-# databases built on different machines would stop being interchangeable.
-# Override in user_config.json (models.local_extractor) ONLY if every database
-# is rebuilt with the same value.
-CANONICAL_LOCAL_EXTRACTOR = "aliked"
-
-
 def get_default_local_extractor() -> str:
-    """Return the fixed default local extractor (hardware-INDEPENDENT).
-
-    Historically this probed VRAM and returned "aliked" on <8 GB GPUs and "rdd"
-    otherwise — which made the database schema/content depend on the machine.
-    Removed on purpose: the choice is now a constant so every machine builds an
-    interchangeable database. See ``CANONICAL_LOCAL_EXTRACTOR``.
-    """
-    return CANONICAL_LOCAL_EXTRACTOR
+    """Визначає дефолтний екстрактор на основі доступної VRAM."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if total_vram_gb < 7.5:  # 8GB cards usually show ~7.9GB
+                return "aliked"
+    except Exception:
+        pass
+    return "rdd"
 
 
 class ModelsConfig(BaseModel):
@@ -172,7 +165,4 @@ class ModelsConfig(BaseModel):
         auto_convert=False,
     )
     cesp: CespConfig = CespConfig()
-    vlad: VladConfig = VladConfig()
-    vram_management: VramManagementConfig = VramManagementConfig()
-    performance: PerformanceConfig = PerformanceConfig()
-    engines_cache: ModelsCacheConfig = ModelsCacheConfig()
+    vlad: VladConfig = 

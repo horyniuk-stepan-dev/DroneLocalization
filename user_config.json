@@ -325,6 +325,8 @@
             "default_required_mb": 2000.0
         },
         "performance": {
+            "auto_tune": true,
+            "auto_tune_vram_headroom": 0.0,
             "propagation_max_workers": 4,
             "fp16_enabled": true,
             "torch_compile": false,
@@ -407,8 +409,8 @@
     },
     "propagation": {
         "max_skip_frames": 3,
-        "rotation_retry": true,
-        "skip_bridges": true,
-        "mnn_fallback": true
+        "rotation_retry": false,
+        "skip_bridges": false,
+        "mnn_fallback": false
     }
 }
