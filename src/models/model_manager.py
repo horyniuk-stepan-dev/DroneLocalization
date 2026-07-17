@@ -196,7 +196,7 @@ class ModelManager:
         name = "yolo"
         with self._model_lock:
             if name not in self.models:
-                model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11n-seg.pt")
+                model_path = get_cfg(self.config, "models.yolo.model_path", "models/yolo11n-seg.pt")
                 vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
                 use_trt = get_cfg(self.config, "models.performance.use_tensorrt_for_yolo", True)
 
@@ -659,7 +659,7 @@ class ModelManager:
         with self._model_lock:
             if name not in self.models:
                 vram_req = get_cfg(self.config, "models.rdd.vram_required_mb", 500.0)
-                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/rdd.pth")
+                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/RDD-v2.pth")
                 max_keypoints = get_cfg(self.config, "models.rdd.max_keypoints", 4096)
 
                 logger.info(f"Loading RDD model (max_keypoints={max_keypoints})...")

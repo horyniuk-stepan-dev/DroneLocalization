@@ -12,12 +12,15 @@ def setup_logging(log_level: str = "INFO", log_file: str = "logs/app.log") -> No
     """Налаштування системи логування для всієї програми."""
     logger.remove()
 
-    # Standart output (pretty console)
-    logger.add(
-        sys.stdout,
-        level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    )
+    # Standart output (pretty console). In a --windowed PyInstaller build there
+    # is no console: sys.stdout is None and loguru raises "Cannot log to
+    # NoneType". Skip the console sink then; the file sinks below still capture all.
+    if sys.stdout is not None:
+        logger.add(
+            sys.stdout,
+            level=log_level,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        )
 
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,21 +89,37 @@ def silent_output(force: bool = False) -> Iterator[None]:
             sys.stderr = save_stderr
         return
 
-    # Aggressive mode: FD-level redirection (os.dup2)
-    # catches C++ output from OpenCV, TensorRT, etc.
-    null_fd = os.open(os.devnull, os.O_RDWR)
-    save_stdout_fd = os.dup(1)
-    save_stderr_fd = os.dup(2)
+    # Aggressive mode: FD-level redirection (os.dup2) catches C++ output from
+    # OpenCV, TensorRT, etc. In a --windowed build FDs 1/2 may be invalid (no
+    # console); output already goes nowhere, so degrade gracefully.
+    null_fd = save_stdout_fd = save_stderr_fd = None
+    try:
+        null_fd = os.open(os.devnull, os.O_RDWR)
+        save_stdout_fd = os.dup(1)
+        save_stderr_fd = os.dup(2)
+    except OSError:
+        for _fd in (null_fd, save_stdout_fd, save_stderr_fd):
+            if _fd is not None:
+                try:
+                    os.close(_fd)
+                except OSError:
+                    pass
+        yield
+        return
 
     try:
-        sys.stdout.flush()
-        sys.stderr.flush()
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        if sys.stderr is not None:
+            sys.stderr.flush()
         os.dup2(null_fd, 1)
         os.dup2(null_fd, 2)
         yield
     finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        if sys.stderr is not None:
+            sys.stderr.flush()
         os.dup2(save_stdout_fd, 1)
         os.dup2(save_stderr_fd, 2)
         os.close(null_fd)

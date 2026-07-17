@@ -220,3 +220,58 @@ Run on every answer before sending. Dormant tasks (Section 3.3) pass automatical
 
 
 Any "no": fix it, then send. Not the other way around.
+
+# Project-Specific Rules — DroneLocalization
+
+Environment facts and repo conventions verified in past sessions. The Operating Manual above governs reasoning; these govern mechanics. "Sandbox" = the Cowork Linux shell; "Windows side" = the user's machine, where the app actually runs.
+
+
+## Search & navigation
+
+- Never inspect, glob, or grep `.venv/` without a direct need — it is a Windows Python 3.11 venv with thousands of irrelevant files, and it cannot execute in the Linux sandbox anyway. Also exclude from searches: `__pycache__/`, `.git/`, `build/`, `dist/` (PyInstaller output), `.benchmarks/`, `.complexipy_cache/`, `.obsidian/`.
+- Code lives in `src/`, `config/`, `scripts/`, `tests/`, `main.py` — scope searches there.
+- `models/` is the SINGLE storage root for all model weights (~640 MB of .pth/.onnx/.engine) plus, after cache centralization, `models/.cache/` (TORCH_HOME/HF_HOME redirected there by `config.paths.ensure_model_cache_env`, ~3.7 GB): `ls` only, never read or search contents.
+- `third_party/` (Depth-Anything-V2, RDD) is vendored reference code — read it, never modify it.
+- `KnowledgeBase/` is Obsidian notes: useful architecture context, but exclude it from code searches and assume it may lag the code — on conflict, the code wins.
+- `scratch/` is disposable one-off scripts, not application source.
+- Plans live in `.agents/` and `docs/`. Before implementing anything from a plan, check what is already done — the staged plans (calibration stages 0–6, VO guards stage 8, debug views) are implemented and flag-gated; re-implementing them wastes a session.
+
+
+## File I/O on this mount (critical)
+
+- The Write/Edit file tools intermittently TRUNCATE files here (even small ones), and bash can read STALE/truncated content for recently-changed files. Symptoms: file cut mid-token, trailing null bytes.
+- Writing: never feed a bash/mount read back into a mount write. Build the full known-good content from the Read tool (Windows side) or a fresh file in the outputs dir, then deploy via python with flush + fsync and a read-back-verify retry loop.
+- Verifying: `py_compile` can pass on a truncated file — verify with a real import (`python -c "import <module>"`) plus a null-byte check (`tr -cd '\000' < f | wc -c` must be 0).
+- Diagnosing: never declare a file corrupt from bash evidence alone — cross-check with the Read tool first. A stale bash view of a valid file has already caused a false "config corrupted" diagnosis once.
+- `unlink`/delete is blocked mount-wide (fuseblk, EPERM): do not create `.bak`/probe files you cannot remove — deletions must be done by the user on Windows.
+
+
+## Git
+
+- Read-only git works from the sandbox: `status`, `diff`, `log`, `show`, `ls-files`. Everything touching the index — `add`, `commit`, `rm`, `checkout`/`restore`, `stash`, deleting tracked files — fails (EPERM on `.git/index.lock`) and must be handed to the user as an exact copy-pasteable Windows command.
+
+
+## Tests & lint in the sandbox
+
+- Sandbox has numpy + cv2 preinstalled. For the pure-Python suite: `pip install --break-system-packages pytest scipy pydantic ruff loguru pyproj` (scipy is ~38 MB — install it separately).
+- Runnable in-sandbox: `config/`, `src/geometry/` (incl. the whole `pose_graph` package), `test_config_*`, `test_affine_utils`, `test_geometry_utils` — a solid green baseline for refactors.
+- NOT runnable (import torch / PyQt6 / lancedb / decord at module load): `Localizer`, `DatabaseBuilder`, `ModelManager`, GUI mixins/controllers, workers. Edit + import-verify here; execution, GUI runs, and benchmarks happen on the Windows side — ask the user to run them and report output. Do not attempt to pip-install torch or PyQt6 in the sandbox.
+- Lint changed files with `ruff check --fix` + `ruff format` (repo pre-commit pins ruff v0.1.9).
+
+
+## Feature flags & config
+
+- New behavior ships flag-gated: pydantic defaults in `config/` = old behavior (OFF); actual enablement lives in `user_config.json` (`graph_optimization.*`, `propagation.*`). Do not change pydantic defaults, and never toggle `user_config.json` silently — propose the change and let the user confirm.
+- `user_config.json.bak-*` files are known-good baselines for regression comparison — never overwrite or "clean up".
+
+
+## Paired project: FlightSimulator
+
+- FlightSimulator (sibling folder) records `flight.mp4` + `calibration.json` (+ `ground_truth.json`) that this project consumes. The calibration format is versioned — CalibrationLogger writes v2.3; v2.2 recordings (e.g. the 2026-06-21 pair) have broken-by-construction anchors and must not be used for benchmarks.
+- Recorder `--frame-step` must equal this project's `database.frame_step` (30). Any format change must update both projects and bump the version field together.
+
+
+## Working with the user
+
+- Chat in Ukrainian unless the user switches language; keep code, docs, and commit messages in English.
+- Anything that only runs on Windows (git index ops, file deletions, benchmarks, GUI tests) → give the user exact commands and ask for the output back.

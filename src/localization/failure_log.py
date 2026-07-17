@@ -26,7 +26,11 @@ FAILURE_TYPES = {
 class FailureLogger:
     """Appends localization failures to a CSV (default logs/localization_failures.csv)."""
 
-    def __init__(self, csv_path: str = "logs/localization_failures.csv") -> None:
+    def __init__(self, csv_path: str | None = None) -> None:
+        if csv_path is None:
+            from config import user_data_dir
+
+            csv_path = str(user_data_dir() / "logs" / "localization_failures.csv")
         self.csv_path = csv_path
 
     def log(self, error_type: str, inliers: int = 0, details: str = "") -> None:

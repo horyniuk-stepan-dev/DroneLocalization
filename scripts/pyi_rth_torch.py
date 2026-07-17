@@ -8,6 +8,15 @@ import os
 import sys
 
 if getattr(sys, "frozen", False):
+    # --windowed builds have no console: sys.stdout/stderr are None, which breaks
+    # loguru, print(), and FD-level output suppression. Point them at os.devnull.
+    for _stream in ("stdout", "stderr"):
+        if getattr(sys, _stream, None) is None:
+            try:
+                setattr(sys, _stream, open(os.devnull, "w"))
+            except OSError:
+                pass
+
     # _MEIPASS points to _internal/ in --onedir mode
     base = sys._MEIPASS
     torch_lib = os.path.join(base, "torch", "lib")
@@ -38,3 +47,8 @@ if getattr(sys, "frozen", False):
         if os.path.isdir(hf_hub):
             os.environ.setdefault("HF_HOME", os.path.join(cache_dir, "huggingface"))
             os.environ.setdefault("HUGGINGFACE_HUB_CACHE", hf_hub)
+            # Fully offline: the bundled cache is complete, so never reach
+            # the network (avoids hangs/errors on machines without internet).
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")

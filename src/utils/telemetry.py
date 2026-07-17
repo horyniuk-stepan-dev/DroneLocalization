@@ -76,10 +76,14 @@ class _TelemetryTracker:
             }
         return summary
 
-    def dump_report(self, path="logs/telemetry_report.json"):
+    def dump_report(self, path: str | None = None):
         if not self.stats:
             return
 
+        if path is None:
+            from config import user_data_dir
+
+            path = str(user_data_dir() / "logs" / "telemetry_report.json")
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         try:
             with open(path, "w", encoding="utf-8") as f:

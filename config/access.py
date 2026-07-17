@@ -4,6 +4,7 @@ from typing import Any, cast
 
 from config.app import AppConfig
 from config.models import Dinov2ModelConfig, Dinov3ModelConfig
+from config.paths import models_root, user_data_dir
 
 
 def get_cfg(config: Any, path: str, default: Any = None) -> Any:
@@ -16,21 +17,26 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
     for key in keys:
         if isinstance(current, dict):
             if key not in current:
-                return default
+                current = default
+                break
             current = current[key]
         elif hasattr(current, key):
             current = getattr(current, key)
         else:
-            return default
-    # PyInstaller runtime path resolution for models/
+            current = default
+            break
+
+    # Resolve "models/..." values against the single models root
+    # (config.paths.models_root) at READ time only — stored config stays
+    # relative, so user_config.json never accumulates absolute paths.
+    # Dev: repo-anchored, cwd-independent. Frozen: only when the file is
+    # really bundled (preserves the old fallback behaviour).
     import os
     import sys
     if isinstance(current, str) and (current.startswith("models/") or current.startswith("models\\")):
-        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            meipass_path = os.path.join(sys._MEIPASS, current)
-            # Якщо модель реально є всередині _internal, використовуємо її
-            if os.path.exists(meipass_path):
-                return meipass_path
+        resolved = os.path.join(str(models_root().parent), current)
+        if not getattr(sys, "frozen", False) or os.path.exists(resolved):
+            return resolved
 
     return current
 
@@ -63,7 +69,7 @@ import json
 import os
 import tempfile
 
-CONFIG_FILE_PATH = "user_config.json"
+CONFIG_FILE_PATH = str(user_data_dir() / "user_config.json")
 
 def load_user_config() -> AppConfig:
     """Завантажує налаштування користувача з файлу, якщо він існує. Інакше повертає дефолтні."""

@@ -106,12 +106,17 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 "depth_anything_v2_vits.pth"
             ]
 
+            from config.paths import models_root
+
+            # Single models root: <repo>/models in dev (cwd-independent),
+            # <_MEIPASS>/models in a frozen build. Bare "models" stays as a
+            # cwd-relative fallback for unusual invocations.
+            model_dirs = [str(models_root()), "models"]
             weight_paths = []
             for name in weight_names:
-                weight_paths.extend([
-                    os.path.join("models", name),
-                    os.path.expanduser(f"~/.cache/depth_anything_v2/{name}")
-                ])
+                for d in model_dirs:
+                    weight_paths.append(os.path.join(d, name))
+                weight_paths.append(os.path.expanduser(f"~/.cache/depth_anything_v2/{name}"))
 
             for wp in weight_paths:
                 if os.path.exists(wp):

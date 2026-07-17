@@ -53,7 +53,7 @@ import traceback
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
-from config import APP_SETTINGS
+from config import APP_SETTINGS, user_data_dir
 from src.core.headless_runner import HeadlessRunner
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
@@ -92,7 +92,7 @@ def main() -> None:
         log_level = APP_SETTINGS.models.performance.log_level
     except Exception:
         log_level = "INFO"  # Safe default
-    setup_logging(log_level=log_level, log_file="logs/app.log")
+    setup_logging(log_level=log_level, log_file=str(user_data_dir() / "logs" / "app.log"))
     logger = get_logger(__name__)
 
     sys.excepthook = _build_exception_hook(logger)

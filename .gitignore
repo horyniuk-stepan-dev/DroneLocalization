@@ -132,3 +132,4 @@ scripts/allFiles/all_merged_new.py
 
 # Особисті налаштування користувача — у git тримаємо user_config.example.json
 user_config.json
+build_log.txt

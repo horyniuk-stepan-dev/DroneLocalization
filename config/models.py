@@ -104,7 +104,7 @@ class PerformanceConfig(BaseModel):
     propagation_max_workers: int = 4
     fp16_enabled: bool = True
     torch_compile: bool = False
-    use_tensorrt_for_yolo: bool = True
+    use_tensorrt_for_yolo: bool = False  # portable across GPUs; TRT engines are hardware-specific
     log_level: str = "INFO"
     debug_mode: bool = True
 
@@ -151,13 +151,15 @@ class ModelsConfig(BaseModel):
     lightglue: ModelSettings = ModelSettings(
         vram_required_mb=800.0,
         backend="git",
-        model_path="models/lightglue_aliked.pth",
+        # git backend: official weights download into TORCH_HOME (models/.cache)
+        model_path="",
         auto_convert=False,
     )
     lightglue_superpoint: ModelSettings = ModelSettings(
         vram_required_mb=800.0,
         backend="git",
-        model_path="models/lightglue_superpoint.pth",
+        # git backend: official weights download into TORCH_HOME (models/.cache)
+        model_path="",
         auto_convert=False,
     )
     lightglue_rdd: ModelSettings = ModelSettings(

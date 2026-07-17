@@ -398,10 +398,19 @@
         "log_scale_interp": false,
         "temporal_weight_use_fit_quality": false,
         "temporal_fit_quality_k": 0.05,
-        "spatial_weight_use_similarity": false
+        "spatial_weight_use_similarity": false,
+        "temporal_edge_gate": false,
+        "temporal_gate_max_rotation_deg": 30.0,
+        "temporal_gate_max_scale_ratio": 1.4,
+        "temporal_gate_max_shift_frac": 1.2,
+        "anchor_gap_check": false,
+        "anchor_gap_max_dev_m": 150.0,
+        "anchor_gap_downweight": 0.05
     },
     "propagation": {
         "max_skip_frames": 3,
-        "rotation_retry": false
+        "rotation_retry": false,
+        "skip_bridges": false,
+        "mnn_fallback": false
     }
 }

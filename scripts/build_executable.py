@@ -31,10 +31,19 @@ CONFIG_DIR = ROOT_DIR / "config"
 MODELS_DIR = ROOT_DIR / "models"
 THIRD_PARTY_DIR = ROOT_DIR / "third_party"
 
-# Cache directories for pre-downloaded models (DINOv2, DINOv3, LightGlue, etc.)
-USER_CACHE = Path.home() / ".cache"
-TORCH_HUB_CACHE = USER_CACHE / "torch" / "hub"
-HF_HUB_CACHE = USER_CACHE / "huggingface" / "hub"
+# Cache directories for pre-downloaded models (DINOv2, DINOv3, LightGlue, etc.).
+# Preferred source: the project-local cache models/.cache (populated by
+# config.paths.ensure_model_cache_env in dev). Fallback: the legacy
+# user-profile cache, so builds keep working before migration.
+
+
+def _cache_root(sub: str) -> Path:
+    project = MODELS_DIR / ".cache" / sub
+    return project if project.is_dir() else Path.home() / ".cache" / sub
+
+
+TORCH_HUB_CACHE = _cache_root("torch") / "hub"
+HF_HUB_CACHE = _cache_root("huggingface") / "hub"
 
 # --------------------------------------------------------------------------- #
 #  Helpers
@@ -142,6 +151,20 @@ def _collect_dino_caches() -> list[tuple[str, str, str, float]]:
                 str(dinov3_hf),
                 ".cache/huggingface/hub/models--facebook--dinov3-vitl16-pretrain-sat493m",
                 f"DINOv3 HuggingFace cache ({size:.0f} MB)",
+                size,
+            )
+        )
+
+    # DINOv3 trust_remote_code: custom model code lives outside hub/, in
+    # ~/.cache/huggingface/modules/transformers_modules/ -- required offline.
+    hf_modules = HF_HUB_CACHE.parent / "modules"
+    if hf_modules.exists():
+        size = _dir_size_mb(hf_modules)
+        entries.append(
+            (
+                str(hf_modules),
+                ".cache/huggingface/modules",
+                f"HF remote-code modules ({size:.0f} MB)",
                 size,
             )
         )
