@@ -56,6 +56,7 @@ class Scenario:
         of_noise=0.0,
         conf=0.8,
         of_quality=0.9,
+        kf_bias=(0.0, 0.0),
     ):
         self.sm = sm
         self.pos = lambda t: np.asarray(pos_fn(t), dtype=np.float64)
@@ -68,6 +69,9 @@ class Scenario:
         self.t_success = 0.0  # video time of the last successful localization
         self.anchor_z = None  # raw fix of the anchoring accepted keyframe
         self.anchor_truth = None
+        # Емуляція front-end KF: kf = truth + kf_offset; повернений servo-крок
+        # застосовується до офсету (дзеркало trajectory_filter.shift).
+        self.kf_offset = np.asarray(kf_bias, dtype=np.float64).copy()
 
     def _noise(self, s):
         if self.rng is None or s <= 0:
@@ -112,7 +116,7 @@ class Scenario:
 
         if accepted:
             kf = (
-                truth.copy()
+                truth + self.kf_offset
                 if isinstance(kf_xy, str)
                 else np.asarray(kf_xy, dtype=np.float64)
             )
@@ -127,6 +131,8 @@ class Scenario:
             self.t_success = t_next
             self.anchor_z = z.copy()  # OF re-anchors at the RAW fix
             self.anchor_truth = truth.copy()
+            if corr is not None:
+                self.kf_offset = self.kf_offset + corr
         else:
             corr = self.sm.add_fix(
                 z, dt=dt, confidence=self.conf, source_id=source_id, accepted=False
@@ -238,11 +244,12 @@ def test_wrong_fix_cluster_outvoted():
         assert dev < 15.0, f"node {k}: deviation {dev:.1f} m"
 
 
-def test_relocation_recovery_direction_and_clamp():
+def test_relocation_recovery_steps_toward_target():
     """Fixes+OF consistently move to a new area while the front-end KF is
-    frozen (Z-score false rejections) — correction must point there, clamped."""
+    frozen (Z-score false rejections) — servo steps must point there and be
+    rate-limited (no teleport back to raw fixes)."""
     rng = np.random.default_rng(17)
-    sm = make_smoother(max_correction_m=50.0)
+    sm = make_smoother(max_correction_m=50.0, correction_lag=4)
     t_move = 8 * KF_DT
 
     def pos(t):
@@ -251,12 +258,15 @@ def test_relocation_recovery_direction_and_clamp():
         return (0.0, min(200.0, 100.0 * (t - t_move)))
 
     corr = Scenario(sm, pos, rng=rng, fix_noise=1.0, of_noise=0.3).run(
-        16, kf_xy=(0.0, 0.0)
+        24, kf_xy=(0.0, 0.0)
     )  # front-end frozen at the origin
-    last = corr[-1]
-    assert last is not None
-    assert last[1] > 0, "correction must point toward the new position"
-    assert np.linalg.norm(last) == pytest.approx(50.0, abs=1e-6), "clamp expected"
+    applied = [c for c in corr if c is not None]
+    assert applied, "servo must engage"
+    for c in applied:
+        assert np.linalg.norm(c) <= 3.0 + 1e-9, "step cap"
+    assert applied[-1][1] > 0, "steps must point toward the new position"
+    total = np.sum(np.stack(applied), axis=0)
+    assert total[1] > 9.0, "cumulative correction must accumulate"
 
 
 def test_rejected_fixes_enter_window_without_correction():
@@ -280,12 +290,15 @@ def test_window_slide_bounds_and_continuity():
     ).run(150)
     assert sm.num_nodes == 60
     assert sm.num_edges <= 59
-    applied = [c for c in corr[10:] if c is not None]
-    assert applied, "corrections expected in steady state"
+    # ГОЛОВНИЙ регрес живого прогону 2026-07-18: KF слідує за truth, дані
+    # шумні але консистентні. Стара політика повертала повну інновацію
+    # ЩОКЕЙФРЕЙМА (метри, 5-6 Гц — розфільтрований Калман). Серво натомість
+    # мовчить або зрідка робить суб-метрові кроки, коли шум оцінки на
+    # лаговому вузлі перетинає deadband.
+    applied = [c for c in corr if c is not None]
+    assert len(applied) <= 7, f"servo fired {len(applied)}x of 150 — too chatty"
     for c in applied:
-        assert np.all(np.isfinite(c))
-        # noisy-but-consistent data: corrections stay at noise scale
-        assert np.linalg.norm(c) < 6.0
+        assert np.linalg.norm(c) < 1.0, "steps must stay sub-meter on noise"
 
 
 def test_entry_prior_set_after_slide():
@@ -319,17 +332,60 @@ def test_source_switch_resets_window():
     assert sm.num_edges == 0
 
 
-def test_min_nodes_gate():
-    sm = make_smoother()
+def test_correction_lag_gate():
+    """Серво вмикається лише коли у вікні > lag вузлів; крок = gain*drift."""
+    sm = make_smoother(correction_lag=3)
     corrs = []
-    for k in range(5):
+    for k in range(6):
         corrs.append(
             sm.add_fix(
-                (k * 2.0, 0.0), dt=KF_DT, confidence=0.8, kf_xy=(k * 2.0 + 1.0, 1.0)
+                (k * 2.0, 0.0), dt=KF_DT, confidence=0.8, kf_xy=(k * 2.0 + 6.0, 0.0)
             )
         )
-    assert all(c is None for c in corrs[:4])
-    assert corrs[4] is not None  # 5th node, kf offset (1,1) -> correction
+    assert all(c is None for c in corrs[:3])  # вікно <= lag
+    assert corrs[3] is not None  # drift 6 m > deadband -> перший крок
+    assert np.linalg.norm(corrs[3]) == pytest.approx(1.5, abs=0.01)  # 6*0.25
+
+
+def test_kf_drift_converges_geometrically():
+    """Систематичний офсет KF: серво прибирає його кроками <= max_step_m до
+    deadband і замовкає (ребейз kf_xy гарантує геометричну збіжність)."""
+    rng = np.random.default_rng(37)
+    sm = make_smoother(correction_lag=5)
+    sc = Scenario(
+        sm,
+        lambda t: (10.0 * t, 0.0),
+        rng=rng,
+        fix_noise=1.0,
+        of_noise=0.2,
+        kf_bias=(8.0, 0.0),
+    )
+    corr = sc.run(30)
+    applied = [c for c in corr if c is not None]
+    assert applied, "servo must engage on systematic drift"
+    for c in applied:
+        assert np.linalg.norm(c) <= 3.0 + 1e-9
+    # залишковий офсет — під deadband (із запасом на шум оцінки)
+    assert np.linalg.norm(sc.kf_offset) < 2.5
+    assert all(c is None for c in corr[-3:])  # серво замовкло
+
+
+def test_hostile_config_sanitized():
+    """Живий інцидент 2026-07-18: huber_k=-0.8 в user_config -> усі ваги
+    фіксів від'ємні, система не SPD, серво-кроки — сміття. Конструктор
+    мусить клампити невалідні параметри і лишатись робочим."""
+    rng = np.random.default_rng(41)
+    sm = make_smoother(huber_k=-0.8, gain=5.0, odom_sigma_base_m=-1.0)
+    assert sm.huber_k == pytest.approx(0.1)
+    assert sm.gain == pytest.approx(1.0)
+    assert sm.odom_sigma_base_m == pytest.approx(0.1)
+    Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=1.0, of_noise=0.2).run(
+        15
+    )
+    p = sm.solve()
+    assert p is not None and np.all(np.isfinite(p))
+    hw = np.array(list(sm.last_fix_weights.values()))
+    assert np.all((hw >= 0.0) & (hw <= 1.0)), "ваги мають лишатись у [0,1]"
 
 
 # ── odometry edge construction ───────────────────────────────────────────────

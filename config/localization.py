@@ -81,6 +81,12 @@ class TrackingConfig(BaseModel):
     smoother_max_correction_m: float = 50.0
     smoother_entry_prior_sigma_m: float = 15.0
     smoother_irls_iterations: int = 4
+    # Fixed-lag servo (v2 після живого прогону): корекція по вузлу з лагом,
+    # deadband проти смикання на шумі, гейн + ліміт кроку проти телепортів.
+    smoother_correction_lag: int = 10
+    smoother_deadband_m: float = 2.0
+    smoother_gain: float = 0.25
+    smoother_max_step_m: float = 3.0
 
 
 class HomographyConfig(BaseModel):

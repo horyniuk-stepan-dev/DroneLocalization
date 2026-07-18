@@ -89,6 +89,12 @@ class Localizer:
                 irls_iterations=get_cfg(
                     self.config, "tracking.smoother_irls_iterations", 4
                 ),
+                correction_lag=get_cfg(
+                    self.config, "tracking.smoother_correction_lag", 10
+                ),
+                deadband_m=get_cfg(self.config, "tracking.smoother_deadband_m", 2.0),
+                gain=get_cfg(self.config, "tracking.smoother_gain", 0.25),
+                max_step_m=get_cfg(self.config, "tracking.smoother_max_step_m", 3.0),
             )
 
         # Retriever: при мульти-режимі він у db_manager, тут — для single-mode

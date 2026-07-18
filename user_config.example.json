@@ -150,14 +150,18 @@
         "max_consecutive_outliers": 3,
         "process_fps": 1.0,
         "keyframe_interval": 30,
-        "smoother_enabled": false,
+        "smoother_enabled": true,
         "smoother_window": 60,
         "smoother_huber_k": 1.2,
         "smoother_fix_sigma_base_m": 5.0,
         "smoother_odom_sigma_base_m": 3.0,
         "smoother_max_correction_m": 50.0,
         "smoother_entry_prior_sigma_m": 15.0,
-        "smoother_irls_iterations": 4
+        "smoother_irls_iterations": 4,
+        "smoother_correction_lag": 10,
+        "smoother_deadband_m": 2.0,
+        "smoother_gain": 0.25,
+        "smoother_max_step_m": 3.0
     },
     "preprocessing": {
         "clahe_clip_limit": 3.0,
