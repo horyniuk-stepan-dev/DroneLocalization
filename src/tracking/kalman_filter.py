@@ -27,7 +27,12 @@ class TrajectoryFilter:
         self.kf.P *= 1000.0
 
         self.kf.F = np.array(
-            [[1.0, 0.0, dt, 0.0], [0.0, 1.0, 0.0, dt], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
         )
 
         self.kf.H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
@@ -57,7 +62,9 @@ class TrajectoryFilter:
         self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
         self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
 
-    def update(self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0) -> tuple:
+    def update(
+        self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0
+    ) -> tuple:
         """noise_scale — адаптивний множник шуму вимірювання (B2):
         > 1 для слабких/відносних вимірювань (низький confidence, optical flow),
         1.0 для впевнених. Дозволяє фільтру менше довіряти поганим вимірюванням.
@@ -67,7 +74,9 @@ class TrajectoryFilter:
         if not self.is_initialized:
             self.kf.x = np.array([[measurement[0]], [measurement[1]], [0.0], [0.0]])
             self.is_initialized = True
-            logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
+            logger.info(
+                f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})"
+            )
             return measurement
 
         ns = float(np.clip(noise_scale, 0.25, 25.0))
@@ -83,6 +92,16 @@ class TrajectoryFilter:
         filtered_y = float(self.kf.x[1, 0])
 
         return filtered_x, filtered_y
+
+    def shift(self, dx: float, dy: float) -> None:
+        """Зсув позиційної частини стану (корекція від back-end smoother'а,
+        RESEARCH 3.1). Швидкості та коваріація не чіпаються: корекція — це
+        зсув системи відліку оцінки, а не нове вимірювання.
+        """
+        if not self.is_initialized:
+            return
+        self.kf.x[0, 0] += dx
+        self.kf.x[1, 0] += dy
 
     def reset(self) -> None:
         """

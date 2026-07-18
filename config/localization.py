@@ -70,6 +70,18 @@ class TrackingConfig(BaseModel):
     process_fps: float = 1.0
     keyframe_interval: int = 30
 
+    # ── RESEARCH 3.1: ковзний віконний back-end smoother (дефолт: вимкнено) ──
+    # Вікно keyframe-фіксів + OF-одометрії, Huber-IRLS вага замість бінарного
+    # Z-score-відкидання; корекція KF зсувом (TrajectoryFilter.shift).
+    smoother_enabled: bool = False
+    smoother_window: int = 60
+    smoother_huber_k: float = 1.2
+    smoother_fix_sigma_base_m: float = 5.0
+    smoother_odom_sigma_base_m: float = 3.0
+    smoother_max_correction_m: float = 50.0
+    smoother_entry_prior_sigma_m: float = 15.0
+    smoother_irls_iterations: int = 4
+
 
 class HomographyConfig(BaseModel):
     backend: str = "opencv"  # "poselib" | "opencv"

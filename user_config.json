@@ -68,7 +68,7 @@
                 0.143
             ],
             "hf_model_id": "facebook/dinov3-vitl16-pretrain-sat493m",
-            "hf_revision": "",
+            "hf_revision": "f692fa42da72c6797b67cd73494a168d1120d3ee",
             "vram_required_mb": 1600.0
         }
     },
@@ -149,7 +149,15 @@
         "max_speed_mps": 120.0,
         "max_consecutive_outliers": 3,
         "process_fps": 1.0,
-        "keyframe_interval": 30
+        "keyframe_interval": 30,
+        "smoother_enabled": false,
+        "smoother_window": 60,
+        "smoother_huber_k": 1.2,
+        "smoother_fix_sigma_base_m": 5.0,
+        "smoother_odom_sigma_base_m": 3.0,
+        "smoother_max_correction_m": 50.0,
+        "smoother_entry_prior_sigma_m": 15.0,
+        "smoother_irls_iterations": 4
     },
     "preprocessing": {
         "clahe_clip_limit": 3.0,
@@ -394,6 +402,7 @@
         "gnc_spatial": false,
         "gnc_rounds": 5,
         "gnc_mad_k": 3.0,
+        "kinematic_prior_weight": 0.0,
         "pchip_gap_fill": true,
         "log_scale_interp": false,
         "temporal_weight_use_fit_quality": true,

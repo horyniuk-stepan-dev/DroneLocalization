@@ -369,6 +369,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         gnc_spatial: bool = False,
         gnc_rounds: int = 5,
         gnc_mad_k: float = 3.0,
+        kinematic_prior_weight: float = 0.0,
     ) -> dict[int, np.ndarray]:
 
         if not self._edges:
@@ -414,9 +415,21 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 anchor_w_list.append(a_w)
         n_anch = len(anchor_var_idx)
 
-        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5
+        # ── Кінематичний prior (Етап 7.1): фактори другої різниці центрів ──
+        # w=0 (дефолт) → n_kin=0 → блок повністю відсутній, структура резидуалів
+        # незмінна (контракт 5·E+N+5·A зберігається байт-у-байт).
+        kin_ids, kin_alpha_l, kin_w_l = self._build_kinematic_triples(
+            id_to_var, kinematic_prior_weight
+        )
+        n_kin = len(kin_ids)
+
+        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5 + 2 * n_kin
         jac_sp = self._build_jac_sparsity(
-            valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx
+            valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx,
+            kin_free=[
+                (id_to_var.get(a, -1), id_to_var.get(b, -1), id_to_var.get(c, -1))
+                for a, b, c in kin_ids
+            ],
         )
 
         logger.info(
@@ -473,6 +486,15 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             ),
             "anchor_w": np.array(anchor_w_list, dtype=np.float64),
             "n_anch": n_anch,
+            "kin_ia": np.array([node_id_to_idx[a] for a, _b, _c in kin_ids], dtype=np.int64),
+            "kin_ib": np.array([node_id_to_idx[b] for _a, b, _c in kin_ids], dtype=np.int64),
+            "kin_ic": np.array([node_id_to_idx[c] for _a, _b, c in kin_ids], dtype=np.int64),
+            "kin_fa": np.array([id_to_var.get(a, -1) for a, _b, _c in kin_ids], dtype=np.int64),
+            "kin_fb": np.array([id_to_var.get(b, -1) for _a, b, _c in kin_ids], dtype=np.int64),
+            "kin_fc": np.array([id_to_var.get(c, -1) for _a, _b, c in kin_ids], dtype=np.int64),
+            "kin_alpha": np.array(kin_alpha_l, dtype=np.float64),
+            "kin_w": np.array(kin_w_l, dtype=np.float64),
+            "n_kin": n_kin,
             "callback": progress_callback,
         }
 
@@ -532,6 +554,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 tolerance=tolerance,
                 progress_callback=progress_callback,
                 use_analytic_jac=use_analytic_jac,
+                kinematic_prior_weight=kinematic_prior_weight,
             )
 
         # ── Етап 3: two-stage L2 → prune → L2 (за прапорцем, дефолт off) ──
@@ -551,9 +574,44 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                     progress_callback=progress_callback,
                     use_analytic_jac=use_analytic_jac,
                     two_stage_prune=False,
+                    kinematic_prior_weight=kinematic_prior_weight,
                 )
 
         return self._export_results()
+
+    def _build_kinematic_triples(
+        self, id_to_var: dict[int, int], weight: float
+    ) -> tuple[list[tuple[int, int, int]], list[float], list[float]]:
+        """Трійки (a, b, c) сусідніх вузлів для кінематичного prior (Етап 7.1).
+
+        Нееквідистантні слоти (гепи keyframe selection, мости): центр b
+        порівнюється з α·a + (1−α)·c, α = h2/(h1+h2), h1 = b−a, h2 = c−b;
+        вага масштабується 2/(h1+h2) — при кроці 1 це рівно ``weight`` і
+        відповідає (a − 2b + c)/2, далі prior слабшає пропорційно гепу.
+        Трійки з усіма трьома фіксованими вузлами пропускаються (константа).
+        """
+        if weight <= 0.0:
+            return [], [], []
+        participating = sorted(
+            fid
+            for fid in self._node_ids
+            if fid in id_to_var or fid in self._fixed_nodes
+        )
+        ids: list[tuple[int, int, int]] = []
+        alphas: list[float] = []
+        weights: list[float] = []
+        for a, b, c in zip(participating, participating[1:], participating[2:]):
+            if a not in id_to_var and b not in id_to_var and c not in id_to_var:
+                continue
+            h1 = float(b - a)
+            h2 = float(c - b)
+            denom = h1 + h2
+            if denom <= 0.0:
+                continue
+            ids.append((a, b, c))
+            alphas.append(h2 / denom)
+            weights.append(weight * 2.0 / denom)
+        return ids, alphas, weights
 
     def _residuals_vec(self, x: np.ndarray, d: dict) -> np.ndarray:
         X_full = d["X_full"]
@@ -576,18 +634,33 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         x_reshaped = x.reshape(-1, 5)
         res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
 
+        parts = [res_edges.flatten(), res_reg]
+
         if d.get("n_anch", 0) > 0:
             # Унарний пріор якоря: w_a·(state − state_anchor), кут SO(2)-safe.
             ap = x_reshaped[d["anchor_var_idx"]]  # (n_anch, 5)
             diff = ap - d["anchor_states"]
             ang = np.arctan2(np.sin(diff[:, 4]), np.cos(diff[:, 4]))
             aw = d["anchor_w"][:, None]
-            res_anchor = (
-                aw * np.column_stack([diff[:, 0], diff[:, 1], diff[:, 2], diff[:, 3], ang])
-            ).ravel()
-            return np.concatenate([res_edges.flatten(), res_reg, res_anchor])
+            parts.append(
+                (
+                    aw
+                    * np.column_stack(
+                        [diff[:, 0], diff[:, 1], diff[:, 2], diff[:, 3], ang]
+                    )
+                ).ravel()
+            )
 
-        return np.concatenate([res_edges.flatten(), res_reg])
+        if d.get("n_kin", 0) > 0:
+            # Кінематичний prior (Етап 7.1): r = w·(α·a + (1−α)·c − b), центри.
+            ca = X_full[d["kin_ia"]][:, :2]
+            cb = X_full[d["kin_ib"]][:, :2]
+            cc = X_full[d["kin_ic"]][:, :2]
+            al = d["kin_alpha"][:, None]
+            wk = d["kin_w"][:, None]
+            parts.append((wk * (al * ca + (1.0 - al) * cc - cb)).ravel())
+
+        return np.concatenate(parts)
 
     def _jacobian_vec(self, x: np.ndarray, d: dict):
         """Аналітичний якобіан _residuals_vec (Етап 4.1).
@@ -642,6 +715,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         n_edges = d["n_edges"]
         n_free = d["n_free"]
         n_anch = int(d.get("n_anch", 0))
+        n_kin = int(d.get("n_kin", 0))
         ff = d["edge_from_free"]
         ft = d["edge_to_free"]
         base_r = 5 * np.arange(n_edges)
@@ -698,18 +772,34 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             for comp in range(5):
                 add(a_rows + comp, 5 * av + comp, aw)
 
+        # Кінематичний prior (Етап 7.1): r = w·(α·a + (1−α)·c − b), лише центри —
+        # лінійний по станах, тож входи якобіана константні.
+        if n_kin > 0:
+            fa = d["kin_fa"]
+            fb = d["kin_fb"]
+            fc = d["kin_fc"]
+            al = d["kin_alpha"]
+            wk = d["kin_w"]
+            base_k = 5 * n_edges + n_free + 5 * n_anch + 2 * np.arange(n_kin)
+            for f_idx, coef in ((fa, wk * al), (fc, wk * (1.0 - al)), (fb, -wk)):
+                m = f_idx >= 0
+                if np.any(m):
+                    add(base_k[m] + 0, 5 * f_idx[m] + 0, coef[m])
+                    add(base_k[m] + 1, 5 * f_idx[m] + 1, coef[m])
+
         rows = np.concatenate(rows)
         cols = np.concatenate(cols)
         data = np.concatenate(data)
         J = coo_matrix(
             (data, (rows, cols)),
-            shape=(5 * n_edges + n_free + 5 * n_anch, 5 * n_free),
+            shape=(5 * n_edges + n_free + 5 * n_anch + 2 * n_kin, 5 * n_free),
             dtype=np.float64,
         )
         return J.tocsr()
 
     def _build_jac_sparsity(
-        self, valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx=None
+        self, valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx=None,
+        kin_free=None,
     ):
         # COO-конструктор (rows/cols списками) швидший за поелементний lil на
         # великих графах. Патерн розрідженості ІДЕНТИЧНИЙ попередньому.
@@ -748,6 +838,14 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             for comp in range(5):
                 rows.append(base + comp)
                 cols.append(5 * v + comp)
+
+        # Кінематичний prior (Етап 7.1): 2 рядки/трійку, входи tx/ty вільних вузлів.
+        base_k = n_edges * 5 + n_free + 5 * len(anchor_var_idx or [])
+        for t, (fa, fb, fc) in enumerate(kin_free or []):
+            for f_idx in (fa, fb, fc):
+                if f_idx >= 0:
+                    rows += [base_k + 2 * t, base_k + 2 * t + 1]
+                    cols += [5 * f_idx + 0, 5 * f_idx + 1]
 
         data = np.ones(len(rows), dtype=np.int8)
         sp = coo_matrix((data, (rows, cols)), shape=(n_residuals, n_vars), dtype=np.int8)

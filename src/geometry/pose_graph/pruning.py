@@ -88,6 +88,7 @@ class PruningMixin:
         tolerance: float,
         progress_callback,
         use_analytic_jac: bool,
+        kinematic_prior_weight: float = 0.0,
     ) -> dict[int, np.ndarray]:
         """GNC-переваження spatial-ребер (Етап 3) — плавна еволюція two-stage prune.
 
@@ -133,6 +134,7 @@ class PruningMixin:
             use_analytic_jac=use_analytic_jac,
             gnc_spatial=False,
             two_stage_prune=False,
+            kinematic_prior_weight=kinematic_prior_weight,
         )
         mu = max(1.0, float(np.max(vals0)) / max(thr, 1e-9))
         for _ in range(max(1, rounds)):

@@ -9,7 +9,7 @@ from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.localization.result_builder import ResultBuilder
 from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
 from src.localization.rotation_selector import RotationSelector
-from src.localization.scale_manager import ScaleManager
+from src.localization.scale_manager import ScaleManager, crop_to_affine
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
@@ -63,6 +63,33 @@ class Localizer:
             max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 120.0),
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
         )
+
+        # RESEARCH 3.1: ковзний віконний back-end smoother (флаг, дефолт off).
+        # Синхронний 2D Huber-IRLS поверх keyframe-фіксів + OF-одометрії;
+        # корекція KF зсувом. Див. src/tracking/smoother.py.
+        self._smoother = None
+        if get_cfg(self.config, "tracking.smoother_enabled", False):
+            from src.tracking.smoother import SlidingWindowSmoother
+
+            self._smoother = SlidingWindowSmoother(
+                window=get_cfg(self.config, "tracking.smoother_window", 60),
+                huber_k=get_cfg(self.config, "tracking.smoother_huber_k", 1.2),
+                fix_sigma_base_m=get_cfg(
+                    self.config, "tracking.smoother_fix_sigma_base_m", 5.0
+                ),
+                odom_sigma_base_m=get_cfg(
+                    self.config, "tracking.smoother_odom_sigma_base_m", 3.0
+                ),
+                max_correction_m=get_cfg(
+                    self.config, "tracking.smoother_max_correction_m", 50.0
+                ),
+                entry_prior_sigma_m=get_cfg(
+                    self.config, "tracking.smoother_entry_prior_sigma_m", 15.0
+                ),
+                irls_iterations=get_cfg(
+                    self.config, "tracking.smoother_irls_iterations", 4
+                ),
+            )
 
         # Retriever: при мульти-режимі він у db_manager, тут — для single-mode
         self.retriever = None
@@ -208,6 +235,8 @@ class Localizer:
         self._last_state = None
         self._scale_manager.reset()
         self._debug_depth_counter = 0
+        if self._smoother is not None:
+            self._smoother.reset()
 
     def _maybe_set_depth_hint(self, frame: np.ndarray) -> None:
         """Soft depth-based reorder of the scale pyramid (every N keyframes; hint only)."""
@@ -529,14 +558,39 @@ class Localizer:
             )
             return {"success": False, "error": "Failed to compute transform"}
 
-        # ── Крок 5: Зберігаємо стан для Optical Flow ────────────────────────
-        self._last_state = {
+        # ── FOV-remap (IMPLEMENTATION_PLAN, Фаза 1.2) ────────────────────────────────────
+        # H знайдена в координатах GSD-нормалізованого кадру (crop/resize).
+        # Композиція з A (rotated→normalized) переводить H у координати
+        # повернутого кадру — далі центр (Крок 6), FOV (Крок 8), OF-стан
+        # (Крок 5) і scale-prior (update_from_homography) рахуються в одній
+        # системі координат. Без цього при r < 0.85 центр зміщений на
+        # ~(1−r)/2 кадру, полігон завищений у 1/r, а prior колапсує до 1.
+        if _crop_info is not None and _crop_info.resize_scale != 1.0:
+            n_h, n_w = best_rotated_frame.shape[:2]
+            _A_norm = crop_to_affine(_crop_info, n_w, n_h)
+            M_query_to_ref = M_query_to_ref @ _A_norm
+            if best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
+                # mkpts лишаються в нормалізованих координатах лише для
+                # collector (він малює по нормалізованому кадру); для
+                # build_fov (кламп до rot_width/rot_height) переводимо в
+                # координати повернутого кадру.
+                _A_inv = crop_to_affine(_crop_info, n_w, n_h, inverse=True)
+                best_mkpts_q_inliers = GeometryTransforms.apply_homography(
+                    np.asarray(best_mkpts_q_inliers, dtype=np.float64), _A_inv
+                )
+
+        # ── Крок 5: Стан для Optical Flow (коміт — ПІСЛЯ outlier-гейту) ─────
+        pending_state = {
             "H": M_query_to_ref,
             "affine": affine_ref,
             "candidate_id": best_candidate_id,
             "inliers": best_inliers,
             "global_angle": best_global_angle,
             "source_id": self._active_source_id,
+            # Масштаб нормалізації САМЕ ЦЬОГО keyframe: OF має працювати в
+            # системі кадру, якому належить H (свіжий self._last_scale на
+            # наступних кадрах може вже відрізнятись).
+            "scale": self._last_scale,
         }
 
         # ── Крок 6: Query center → Reference → Metric → GPS ─────────────────
@@ -572,8 +626,27 @@ class Localizer:
                 f"Position jump was too large relative to recent trajectory."
             )
             self._log_failure(FAILURE_TYPES["Outlier detected"], inliers=best_inliers)
+            # RESEARCH 3.1: відхилений фікс усе одно входить у вікно
+            # smoother-а — Huber-вага арбітрує замість бінарного відкидання
+            # (страхує Z-score false positives на різких маневрах).
+            if self._smoother is not None:
+                conf_rej = self._compute_confidence(
+                    best_candidate_id, best_inliers, best_total_matches, best_rmse
+                )
+                self._smoother.add_fix(
+                    metric_pt,
+                    dt=dt,
+                    confidence=conf_rej,
+                    source_id=self._active_source_id,
+                    accepted=False,
+                )
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
+        # БАГФІКС (OF-шов): коміт стану лише ПІСЛЯ outlier-гейту. Раніше стан
+        # комітився на Кроці 5 — і для відхилених кадрів, і до
+        # homography-failure return — тож OF отримував H, неузгоджену з
+        # prev_pts воркера (він не ребейзить точки без success).
+        self._last_state = pending_state
         self._consecutive_failures = 0
 
         # Confidence рахуємо ДО фільтрації — B2: адаптивний шум вимірювання,
@@ -585,6 +658,27 @@ class Localizer:
         filtered_pt = self.trajectory_filter.update(
             metric_pt, dt=dt, noise_scale=1.0 / max(confidence, 0.25)
         )
+        # RESEARCH 3.1: back-end smoother — вікно фіксів + OF-одометрії;
+        # корекція KF зсувом ДО запису в історію детектора та GPS/FOV,
+        # щоб виправлення потрапило в ЦЕЙ же кадр.
+        if self._smoother is not None:
+            corr = self._smoother.add_fix(
+                metric_pt,
+                dt=dt,
+                confidence=confidence,
+                source_id=self._active_source_id,
+                accepted=True,
+                kf_xy=filtered_pt,
+            )
+            if corr is not None:
+                self.trajectory_filter.shift(float(corr[0]), float(corr[1]))
+                filtered_pt = (
+                    float(filtered_pt[0]) + float(corr[0]),
+                    float(filtered_pt[1]) + float(corr[1]),
+                )
+                logger.debug(
+                    f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m"
+                )
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
@@ -662,7 +756,9 @@ class Localizer:
             if self.calib_manager is not None:
                 self.calibration = self.calib_manager.get(last_source_id)
 
-        scale = self._last_scale
+        # Масштаб зі збереженого стану keyframe-а (узгоджений з його H);
+        # фолбек на _last_scale для станів, записаних до цього поля.
+        scale = self._last_state.get("scale", self._last_scale)
         angle = self._last_state.get("global_angle", 0)
 
         # ── 1. Вектор зсуву: оригінальний простір → нормалізований + повернутий ──
@@ -729,6 +825,11 @@ class Localizer:
 
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
+
+        # RESEARCH 3.1: сирий OF-фікс у вікно smoother-а — відносна одометрія,
+        # прив'язана до H останнього прийнятого keyframe.
+        if self._smoother is not None:
+            self._smoother.note_of(metric_pt, dt=dt, quality=flow_quality)
 
         # B2: чесний confidence OF (раніше хардкод 0.8) + більший шум вимірювання
         # для Kalman (OF — відносне вимірювання, воно дрейфує від KF)

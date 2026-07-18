@@ -48,6 +48,49 @@ class CropInfo:
     """The actual resize factor applied to the crop (may differ from r due to rounding)."""
 
 
+def crop_to_affine(
+    crop_info: CropInfo, norm_w: int, norm_h: int, inverse: bool = False
+) -> np.ndarray:
+    """3x3 affine mapping pre-normalize frame coords -> normalized frame coords.
+
+    ``normalize()`` applies (center-crop -> resize); for a point ``p_o`` in the
+    pre-normalize (rotated) frame the normalized coords are ``p_n = S @ (p_o - c)``
+    with ``S = diag(norm_w / crop_w, norm_h / crop_h)`` and ``c = (crop_x, crop_y)``.
+    The per-axis scales are derived from the *actual* crop/output sizes, so the
+    integer-rounding aspect drift of ``resize_scale`` is not accumulated.
+
+    Args:
+        crop_info: CropInfo returned by ``normalize()``.
+        norm_w: width of the normalized frame (``frame.shape[1]`` after normalize).
+        norm_h: height of the normalized frame.
+        inverse: if True, return the exact analytic inverse (normalized -> original).
+
+    Returns:
+        (3, 3) float64 matrix. Degenerate crop sizes (<= 0) yield the identity.
+    """
+    if crop_info.crop_w <= 0 or crop_info.crop_h <= 0:
+        return np.eye(3, dtype=np.float64)
+    sx = norm_w / crop_info.crop_w
+    sy = norm_h / crop_info.crop_h
+    if inverse:
+        return np.array(
+            [
+                [1.0 / sx, 0.0, float(crop_info.crop_x)],
+                [0.0, 1.0 / sy, float(crop_info.crop_y)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+    return np.array(
+        [
+            [sx, 0.0, -crop_info.crop_x * sx],
+            [0.0, sy, -crop_info.crop_y * sy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
 class ScaleManager:
     """GSD-ratio estimation & tracking (query altitude / DB altitude) without telemetry.
 

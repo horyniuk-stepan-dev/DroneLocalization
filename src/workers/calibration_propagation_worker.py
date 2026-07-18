@@ -142,6 +142,9 @@ class CalibrationPropagationWorker(QThread):
         self.gnc_spatial = get_cfg(self.config, go + "gnc_spatial", False)
         self.gnc_rounds = get_cfg(self.config, go + "gnc_rounds", 5)
         self.gnc_mad_k = get_cfg(self.config, go + "gnc_mad_k", 3.0)
+        self.kinematic_prior_weight = get_cfg(
+            self.config, go + "kinematic_prior_weight", 0.0
+        )
         self.pchip_gap_fill = get_cfg(self.config, go + "pchip_gap_fill", False)
         self.log_scale_interp = get_cfg(self.config, go + "log_scale_interp", False)
         self.edge_gate_enabled = get_cfg(self.config, go + "edge_gate_enabled", False)
@@ -406,6 +409,7 @@ class CalibrationPropagationWorker(QThread):
             gnc_spatial=self.gnc_spatial,
             gnc_rounds=self.gnc_rounds,
             gnc_mad_k=self.gnc_mad_k,
+            kinematic_prior_weight=self.kinematic_prior_weight,
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
 

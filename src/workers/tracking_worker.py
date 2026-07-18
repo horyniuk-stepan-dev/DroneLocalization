@@ -238,7 +238,10 @@ class RealtimeTrackingWorker(QThread):
                 # Завжди оновлюємо час останнього keyframe, навіть якщо він rejected
                 last_keyframe_video_time = current_video_time_sec
 
-                if loc_result.get("success"):
+                # БАГФІКС (OF-шов): retrieval-only fallback не має H і не
+                # оновлює _last_state — ребейз OF-точок на ньому дав би OF
+                # з новими точками на старій гомографії.
+                if loc_result.get("success") and loc_result.get("fallback_mode") != "retrieval_only":
                     # Зберігаємо стан для OF на наступні кадри
                     prev_gray_for_of = curr_gray
                     # Трекаємо гарні точки (corners) для стабільного OF
@@ -259,7 +262,9 @@ class RealtimeTrackingWorker(QThread):
 
                         if H is not None and affine is not None:
                             # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
-                            scale = getattr(self.localizer, "_last_scale", 1.0)
+                            scale = loc_state.get(
+                                "scale", getattr(self.localizer, "_last_scale", 1.0)
+                            )
 
                             # Shallow copy достатньо: перезаписуємо лише center_px і bbox
                             # (deepcopy на кожен об'єкт кожного keyframe — зайвий CPU)
