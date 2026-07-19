@@ -15,7 +15,7 @@ import pyarrow as pa
 import torch
 
 from config import get_active_descriptor_cfg, get_cfg
-from src.database import keyframe_selector
+from src.database import keyframe_selector, keypoint_video_writer
 from src.localization.matcher import FeatureMatcher, extract_sift_features
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
@@ -607,66 +607,11 @@ class DatabaseBuilder:
         frame_id: int,
         total_frames: int,
     ) -> np.ndarray:
-        vis = frame_bgr.copy()
-
-        if static_mask is not None:
-            dynamic_zone = static_mask == 0
-            if dynamic_zone.any():
-                overlay = vis.copy()
-                overlay[dynamic_zone] = (0, 0, 200)
-                cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
-
-        for x, y in keypoints:
-            cx, cy = int(round(x)), int(round(y))
-            cv2.circle(vis, (cx, cy), radius=3, color=(0, 255, 0), thickness=-1)
-            cv2.circle(vis, (cx, cy), radius=4, color=(0, 180, 0), thickness=1)
-
-        info_lines = [
-            f"Frame: {frame_id:05d} / {total_frames:05d}",
-            f"Keypoints: {len(keypoints)}",
-            f"Dynamic mask: {'YES' if static_mask is not None else 'NO'}",
-        ]
-        panel_h = len(info_lines) * 28 + 14
-        cv2.rectangle(vis, (0, 0), (340, panel_h), (0, 0, 0), -1)
-        cv2.rectangle(vis, (0, 0), (340, panel_h), (80, 80, 80), 1)
-
-        for idx, line in enumerate(info_lines):
-            cv2.putText(
-                vis,
-                line,
-                (8, 22 + idx * 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-
-        legend_y = vis.shape[0] - 10
-        cv2.circle(vis, (12, legend_y - 4), 5, (0, 255, 0), -1)
-        cv2.putText(
-            vis,
-            "XFeat keypoint",
-            (22, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
+        """Delegates to ``keypoint_video_writer.draw_keypoints_frame`` (pure,
+        headless-tested); kept as a thin method to avoid call-site churn."""
+        return keypoint_video_writer.draw_keypoints_frame(
+            frame_bgr, keypoints, static_mask, frame_id, total_frames
         )
-        cv2.rectangle(vis, (200, legend_y - 10), (218, legend_y + 2), (0, 0, 200), -1)
-        cv2.putText(
-            vis,
-            "YOLO dynamic zone",
-            (224, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 200),
-            1,
-            cv2.LINE_AA,
-        )
-
-        return vis
 
     def _compute_inter_frame_H(self, fa: dict, fb: dict) -> np.ndarray | None:
         """H(fb → fa): гомографія з поточного кадру в попередній.
