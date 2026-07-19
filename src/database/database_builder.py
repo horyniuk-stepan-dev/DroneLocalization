@@ -15,7 +15,7 @@ import pyarrow as pa
 import torch
 
 from config import get_active_descriptor_cfg, get_cfg
-from src.geometry.transformations import GeometryTransforms
+from src.database import keyframe_selector
 from src.localization.matcher import FeatureMatcher, extract_sift_features
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
@@ -669,65 +669,40 @@ class DatabaseBuilder:
         return vis
 
     def _compute_inter_frame_H(self, fa: dict, fb: dict) -> np.ndarray | None:
-        """
-        Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
-        """
-        min_matches = get_cfg(self.config, "database.inter_frame_min_matches", 15)
-        ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
-        homography_backend = get_cfg(self.config, "homography.backend", "opencv")
-        use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
-        mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
+        """H(fb → fa): гомографія з поточного кадру в попередній.
 
+        Обчислення винесене в ``keyframe_selector.compute_inter_frame_homography``
+        (headless-тестоване); тут лишається лише лінива ініціалізація матчера.
+        """
         if self.matcher is None:
             # Спробуємо отримати model_manager з контексту, якщо він є
             mm = getattr(self, "_temp_model_manager", None)
             self.matcher = FeatureMatcher(model_manager=mm, config=self.config)
 
-        mkpts_a, mkpts_b = self.matcher.match(fa, fb)
-
-        if len(mkpts_a) < min_matches:
-            return None
-
-        H, mask = GeometryTransforms.estimate_homography(
-            mkpts_a,
-            mkpts_b,
-            ransac_threshold=ransac_thresh,
-            backend=homography_backend,
-            use_mad_ransac=use_mad_ransac,
-            mad_k_factor=mad_k_factor,
+        return keyframe_selector.compute_inter_frame_homography(
+            self.matcher,
+            fa,
+            fb,
+            min_matches=get_cfg(self.config, "database.inter_frame_min_matches", 15),
+            ransac_thresh=get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0),
+            homography_backend=get_cfg(self.config, "homography.backend", "opencv"),
+            use_mad_ransac=get_cfg(self.config, "homography.use_mad_ransac", True),
+            mad_k_factor=get_cfg(self.config, "homography.mad_k_factor", 2.5),
         )
 
-        if H is None or int(np.sum(mask)) < min_matches:
-            return None
-
-        return H.astype(np.float64)
-
     def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:
+        """True, якщо H відповідає значному руху (вибір keyframe).
+
+        Логіка винесена в ``keyframe_selector.is_significant_motion``
+        (headless-тестована); тут лишається лише читання порогів із config.
         """
-        Повертає True якщо гомографія H відповідає значному руху.
-        H: (3,3) float32 — матриця з frame_b до frame_a.
-        """
-        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
-        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
-
-        # Трансляція: зсув центру кадру через H
-        cx, cy = frame_w / 2.0, frame_h / 2.0
-        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
-        p_dst = H.astype(np.float64) @ p_src
-        p_dst /= p_dst[2]
-        translation = np.linalg.norm(p_dst[:2] - np.array([cx, cy]))
-
-        if translation >= min_t:
-            return True
-
-        # Кут: з лінійної частини H (2×2 зліва вгорі)
-        A = H[:2, :2].astype(np.float64)
-        det = np.linalg.det(A)
-        if abs(det) < 1e-6:
-            return True  # вироджена матриця → вважаємо рухом
-        angle_rad = np.arctan2(A[1, 0], A[0, 0])
-        angle_deg = abs(np.degrees(angle_rad))
-        return angle_deg >= min_r
+        return keyframe_selector.is_significant_motion(
+            H,
+            frame_w,
+            frame_h,
+            min_translation_px=get_cfg(self.config, "database.keyframe_min_translation_px", 15.0),
+            min_rotation_deg=get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5),
+        )
 
     def create_hdf5_structure(
         self,
