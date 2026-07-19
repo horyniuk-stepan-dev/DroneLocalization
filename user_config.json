@@ -145,7 +145,7 @@
         "kalman_process_noise": 2.0,
         "kalman_measurement_noise": 5.0,
         "outlier_window": 10,
-        "outlier_threshold_std": 16.0,
+        "outlier_threshold_std": 80.0,
         "max_speed_mps": 350.0,
         "max_consecutive_outliers": 3,
         "process_fps": 1.0,

@@ -18,6 +18,12 @@ class TrajectoryFilter:
         # дозволяють фільтру швидше реагувати на зміни курсу на високих швидкостях
         self.process_noise = process_noise
         self.is_initialized = False
+        # Two-point velocity seed (живий інцидент 2026-07-18): перше update()
+        # після ініціалізації задає vx/vy з різниці перших двох сирих точок
+        # замість v=0 — без цього на траєкторіях зі сталою високою швидкістю
+        # (виміряно ~150 м/с на симуляторному польоті) filtered-позиція кілька
+        # кроків відстає від сирих фіксів, поки KF "вивчає" швидкість із нуля.
+        self._prev_raw: tuple[float, float] | None = None
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(
@@ -62,9 +68,7 @@ class TrajectoryFilter:
         self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
         self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
 
-    def update(
-        self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0
-    ) -> tuple:
+    def update(self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0) -> tuple:
         """noise_scale — адаптивний множник шуму вимірювання (B2):
         > 1 для слабких/відносних вимірювань (низький confidence, optical flow),
         1.0 для впевнених. Дозволяє фільтру менше довіряти поганим вимірюванням.
@@ -74,10 +78,21 @@ class TrajectoryFilter:
         if not self.is_initialized:
             self.kf.x = np.array([[measurement[0]], [measurement[1]], [0.0], [0.0]])
             self.is_initialized = True
-            logger.info(
-                f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})"
-            )
+            self._prev_raw = (float(measurement[0]), float(measurement[1]))
+            logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
             return measurement
+
+        if self._prev_raw is not None:
+            # Two-point seed: рахуємо швидкість з ПЕРШОЇ пари сирих точок і
+            # підставляємо в стан ДО predict/update цього кроку. Лише один раз
+            # (одразу після ініціалізації) — далі фільтр веде швидкість сам.
+            safe_seed_dt = max(dt, 0.01)
+            vx = (measurement[0] - self._prev_raw[0]) / safe_seed_dt
+            vy = (measurement[1] - self._prev_raw[1]) / safe_seed_dt
+            self.kf.x[2, 0] = vx
+            self.kf.x[3, 0] = vy
+            self._prev_raw = None
+            logger.debug(f"Kalman two-point velocity seed: ({vx:.2f}, {vy:.2f}) m/s")
 
         ns = float(np.clip(noise_scale, 0.25, 25.0))
         self.kf.R = self._base_R * ns
@@ -110,6 +125,7 @@ class TrajectoryFilter:
         хибних передбачень на основі швидкості попередньої сесії.
         """
         self.is_initialized = False
+        self._prev_raw = None
         self.kf.x = np.zeros((4, 1))
         self.kf.P = np.eye(4) * 1000.0
         logger.info("Kalman filter reset to initial state")
