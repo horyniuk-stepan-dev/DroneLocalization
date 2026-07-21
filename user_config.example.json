@@ -145,7 +145,14 @@
         "spread_floor": 0.35,
         "recovery_cascade": false,
         "candidate_prefilter": false,
-        "prefilter_keep": 2
+        "prefilter_keep": 2,
+        "max_local_edge": 1600,
+        "temporal_candidate_prior": false,
+        "temporal_prior_window": 2,
+        "temporal_prior_keep": 1,
+        "temporal_prior_min_mnn": 20,
+        "temporal_prior_accept_inliers": 25,
+        "temporal_prior_audit_every": 10
     },
     "tracking": {
         "kalman_process_noise": 2.0,
@@ -169,7 +176,9 @@
         "smoother_gain": 0.25,
         "smoother_max_step_m": 3.0,
         "of_fb_check": false,
-        "of_fb_max_px": 2.0
+        "of_fb_max_px": 2.0,
+        "of_stride": 1,
+        "of_half_res": false
     },
     "preprocessing": {
         "clahe_clip_limit": 3.0,

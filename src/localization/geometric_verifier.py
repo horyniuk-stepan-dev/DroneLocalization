@@ -56,7 +56,11 @@ class GeometricVerifier:
         self.prefilter_keep = prefilter_keep
 
     def verify(
-        self, query_features: dict, candidates: list, database: Any
+        self,
+        query_features: dict,
+        candidates: list,
+        database: Any,
+        ref_cache: dict | None = None,
     ) -> VerificationResult | None:
         best_inliers = 0
         best_candidate_id = -1
@@ -70,7 +74,7 @@ class GeometricVerifier:
 
         # ADDENDUM §1: дешевий MNN-скоринг усіх кандидатів, LightGlue — лише
         # на найкращих. ref_cache уникає повторного читання фіч із БД.
-        ref_cache: dict = {}
+        ref_cache = {} if ref_cache is None else ref_cache
         if self.prefilter_enabled and len(candidates) > self.prefilter_keep:
             candidates = self._prefilter(query_features, candidates, database, ref_cache)
 
@@ -142,19 +146,30 @@ class GeometricVerifier:
 
     # ── ADDENDUM §1: MNN-передфільтр кандидатів ──────────────────────────
 
-    def _prefilter(
-        self, query_features: dict, candidates: list, database: Any, ref_cache: dict
-    ) -> list:
-        """Ранжує кандидатів за кількістю mutual-NN пар дескрипторів і лишає
-        ``prefilter_keep`` найкращих (LightGlue далі йде лише по них).
+    def mnn_counts(
+        self,
+        query_features: dict,
+        candidates: list,
+        database: Any,
+        ref_cache: dict | None = None,
+    ) -> list[tuple[int, int, float]] | None:
+        """Кількість mutual-NN пар (з Lowe ratio) між query і кожним кандидатом.
 
-        Консервативність: якщо жоден кандидат не набрав жодної MNN-пари
-        (виродження: порожні/несумісні дескриптори) — список без змін.
-        GPU-шлях (один матмул на кандидата) з фолбеком на numpy.
+        Повертає ``[(пар, candidate_id, score), ...]`` або ``None``, якщо
+        дескриптори query вироджені. Два споживачі:
+        передфільтр нижче (ADDENDUM §1) і темпоральний prior
+        (PIPELINE_OPTIMIZATION_PLAN §A1), для якого це дешева проба гіпотези —
+        один матмул замість повного LightGlue.
+
+        Lowe ratio обовʼязковий: голий mutual-NN рахує ~50% випадкових пар
+        між будь-якими наборами (перевірено юніт-тестом), ratio їх зрізає.
+        Той самий поріг, що і в ``_fast_numpy_match`` (L2-нормовані
+        дескриптори: d = sqrt(2-2s)). GPU-шлях (один матмул на кандидата)
+        з фолбеком на numpy.
         """
-        q = np.asarray(query_features.get("descriptors"))
+        q = np.asarray(query_features.get("descriptors")) if query_features else None
         if q is None or q.ndim != 2 or len(q) == 0:
-            return candidates
+            return None
         q32 = np.ascontiguousarray(q, dtype=np.float32)
 
         use_torch = False
@@ -168,10 +183,6 @@ class GeometricVerifier:
         except Exception:  # noqa: BLE001 — GPU-шлях опційний, фолбек numpy
             use_torch = False
 
-        # Lowe ratio обовʼязковий: голий mutual-NN рахує ~50% випадкових пар
-        # між будь-якими наборами (перевірено юніт-тестом), ratio їх зрізає.
-        # Той самий поріг, що і в _fast_numpy_match (L2-нормовані дескриптори:
-        # d = sqrt(2-2s)).
         ratio = 0.75
 
         def _mnn_count(r: np.ndarray) -> int:
@@ -202,17 +213,40 @@ class GeometricVerifier:
             mutual = nn21[nn12] == np.arange(sim.shape[0])
             return int(np.sum(mutual & ratio_ok))
 
+        scored: list[tuple[int, int, float]] = []
         with Telemetry.profile("prefilter"):
-            scored = []
             for candidate_id, score in candidates:
-                ref = database.get_local_features(candidate_id)
-                ref_cache[candidate_id] = ref
+                ref = ref_cache.get(candidate_id) if ref_cache is not None else None
+                if ref is None:
+                    try:
+                        ref = database.get_local_features(candidate_id)
+                    except (ValueError, KeyError) as e:
+                        # Темпоральний prior пропонує сусідів за індексом —
+                        # частина з них може бути відсутня у БД. Це не помилка.
+                        logger.debug(f"MNN probe: candidate {candidate_id} unreadable ({e})")
+                        scored.append((0, candidate_id, score))
+                        continue
+                    if ref_cache is not None:
+                        ref_cache[candidate_id] = ref
                 r = np.asarray(ref.get("descriptors"))
                 if r is None or r.ndim != 2 or len(r) == 0 or r.shape[1] != q.shape[1]:
                     scored.append((0, candidate_id, score))
                     continue
                 scored.append((_mnn_count(r), candidate_id, score))
+        return scored
 
+    def _prefilter(
+        self, query_features: dict, candidates: list, database: Any, ref_cache: dict
+    ) -> list:
+        """Ранжує кандидатів за кількістю MNN-пар і лишає ``prefilter_keep``
+        найкращих (LightGlue далі йде лише по них).
+
+        Консервативність: якщо жоден кандидат не набрав жодної MNN-пари
+        (виродження: порожні/несумісні дескриптори) — список без змін.
+        """
+        scored = self.mnn_counts(query_features, candidates, database, ref_cache)
+        if scored is None:
+            return candidates
         if all(s[0] == 0 for s in scored):
             logger.debug("Prefilter: no MNN pairs on any candidate — keeping full list")
             return candidates

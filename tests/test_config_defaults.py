@@ -1,4 +1,7 @@
+import json
 from config import APP_CONFIG
+from config.access import load_user_config
+from config.app import AppConfig
 
 
 def test_config_structure():
@@ -42,3 +45,21 @@ def test_config_types():
     assert isinstance(APP_CONFIG["preprocessing"]["clahe_tile_grid"], list)
     assert isinstance(APP_CONFIG["homography"]["backend"], str)
     assert isinstance(APP_CONFIG["homography"]["ransac_threshold"], float)
+
+
+def test_auto_create_default_config(tmp_path, monkeypatch):
+    """Verify that if no user_config.json exists, load_user_config creates a new file with defaults."""
+    fake_config_file = tmp_path / "user_config.json"
+    monkeypatch.setattr("config.access.CONFIG_FILE_PATH", str(fake_config_file))
+    monkeypatch.setattr("config.access.user_config_candidates", lambda: [fake_config_file])
+
+    assert not fake_config_file.exists()
+    cfg = load_user_config()
+    assert fake_config_file.exists()
+
+    with open(fake_config_file, encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert "global_descriptor" in data
+    assert cfg.global_descriptor == AppConfig().global_descriptor
+

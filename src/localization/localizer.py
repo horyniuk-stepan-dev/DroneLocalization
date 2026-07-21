@@ -118,6 +118,27 @@ class Localizer:
         )
         self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
 
+        # ── PIPELINE_OPTIMIZATION_PLAN §A1: темпоральний prior кандидатів ───
+        # У steady state глобальний дескриптор коштує половину keyframe-а
+        # (470 мс із 945 на GTX 1650), хоча відповідь — номер кадру БД — уже
+        # відома з попереднього keyframe: дрон за секунду не телепортується.
+        # Прапорець дефолтом вимкнено: поведінка без нього побітово стара.
+        self._temporal_prior = get_cfg(
+            self.config, "localization.temporal_candidate_prior", False
+        )
+        self._tp_window = int(get_cfg(self.config, "localization.temporal_prior_window", 2))
+        self._tp_keep = int(get_cfg(self.config, "localization.temporal_prior_keep", 1))
+        self._tp_min_mnn = int(get_cfg(self.config, "localization.temporal_prior_min_mnn", 20))
+        self._tp_accept = int(
+            get_cfg(self.config, "localization.temporal_prior_accept_inliers", 25)
+        )
+        self._tp_audit_every = int(
+            get_cfg(self.config, "localization.temporal_prior_audit_every", 10)
+        )
+        self._tp_counter = 0
+        self._tp_tries = 0
+        self._tp_hits = 0
+
         # ADDENDUM 1.1: статистика розкиду інлаєрів. Без неї прогін не дає
         # вердикту — критерій приймання сформульований саме як ЧАСТОТА
         # спрацювання («< 1% keyframe-ів зі spread < 0.10 → пункт відкотити»).
@@ -257,6 +278,9 @@ class Localizer:
         self._last_state = None
         self._scale_manager.reset()
         self._debug_depth_counter = 0
+        self._tp_counter = 0
+        self._tp_tries = 0
+        self._tp_hits = 0
         if self._smoother is not None:
             self._smoother.reset()
 
@@ -354,119 +378,160 @@ class Localizer:
 
         top_k = self.retrieval_top_k
 
-        # ── RESEARCH 2.3: зовнішній yaw-hint (симулятор / телеметрія) ────────
-        # yaw_hint_deg — кут CW у градусах, на який слід повернути кадр, щоб
-        # він збігся з орієнтацією БД (north-up); конвертацію з курсу дрона
-        # робить викликач. Квантуємо до 90° — весь rotation-тракт працює з
-        # k·90. Хибний hint самовиліковується: якщо retrieval-score prior-кута
-        # нижчий за rotation_rescan_min_score, RotationSelector сам виконає
-        # повний батчований скан 4 кутів.
-        prior_angle = self._last_best_angle
-        use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
-        if yaw_hint_deg is not None and self.enable_auto_rotation:
-            prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
-            use_prior = True
-            logger.debug(f"Yaw hint {yaw_hint_deg:.1f}° → prior rotation {prior_angle}°")
+        # §A1: кеш (кут, масштаб) → (кадр, маска, crop, фічі) на ОДИН виклик.
+        # Якщо темпоральна гіпотеза провалилась, а повний шлях обрав ті самі
+        # кут і масштаб — ALIKED не рахується вдруге (217-339 мс на GTX 1650).
+        _feat_cache: dict = {}
 
-        rot = self._rotation_selector.select(
-            query_frame,
-            prior_angle,
-            use_prior,
-            angles_to_try,
-            top_k,
-            scale_manager=self._scale_manager,
-        )
-        if rot is None:
-            self._consecutive_failures += 1
-            self._log_failure(FAILURE_TYPES["No candidates"])
-            return {
-                "success": False,
-                "error": (
-                    f"No candidates found via global descriptor (DINOv2) in any rotation. "
-                    f"Tested angles: {angles_to_try}. "
-                    f"Image {width}x{height} may not match any frame in the database."
-                ),
-            }
-        best_global_score = rot.score
-        best_global_angle = rot.angle
-        best_global_candidates = rot.candidates
-        best_source_id_per_angle = rot.source_id
-        best_scale = rot.best_scale
-
-        if collector is not None:
-            collector.global_score = float(best_global_score)
-            collector.global_angle = int(best_global_angle)
-            collector.scale = float(best_scale)
-            collector.retrieval_candidates = [
-                (int(cid), float(sc)) for cid, sc in best_global_candidates
-            ][: self.retrieval_top_k]
-
-        logger.debug(
-            f"Selected rotation {best_global_angle}° scale {best_scale:.2f} "
-            f"with global score {best_global_score:.3f}"
-        )
-
-        # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
-        if self.db_manager is not None and best_source_id_per_angle is not None:
-            self._active_source_id = best_source_id_per_angle
-            self.database = self.db_manager.get_database(best_source_id_per_angle)
-            if self.calib_manager is not None:
-                self.calibration = self.calib_manager.get(best_source_id_per_angle)
-            logger.debug(f"Active source switched to '{best_source_id_per_angle}'")
-
-        # ── Крок 1.5: Готуємо повернутий кадр для найкращого ракурсу ────────
-        k = best_global_angle // 90
-        best_rotated_frame = np.rot90(query_frame, k=k).copy()
-        best_rotated_mask = (
-            np.rot90(static_mask, k=k).copy() if static_mask is not None else None
-        )
-
-        # ── Крок 1.5b: GSD-нормалізація (ScaleManager) ────────────────────────
-        # Normalize the rotated frame to match DB's GSD before feature extraction.
-        # In steady-state best_scale ≈ 1.0 and this is a no-op.
-        _crop_info = None
-        if abs(best_scale - 1.0) > 0.15:
-            best_rotated_frame, _crop_info = self._scale_manager.normalize(
-                best_rotated_frame, best_scale
-            )
-            if best_rotated_mask is not None:
-                best_rotated_mask, _ = self._scale_manager.normalize(
-                    best_rotated_mask, best_scale
-                )
-            logger.debug(
-                f"GSD-normalized frame for scale {best_scale:.2f}: "
-                f"{best_rotated_frame.shape[1]}x{best_rotated_frame.shape[0]}"
-            )
-
-        # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
-        # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
-        # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
-        # (наприклад, при зміні висоти польоту).
-        best_global_candidates = self._candidate_retriever.expand(
-            best_rotated_frame, best_global_candidates, top_k
-        )
-
-        # ── Крок 2: Локальна екстракція (ALIKED/RDD) для найкращого ракурсу ─
-        best_query_features = self.feature_extractor.extract_local_features(
-            best_rotated_frame, static_mask=best_rotated_mask
-        )
-
-        if collector is not None:
-            collector.rotated_frame = best_rotated_frame
-            collector.query_features = best_query_features
-            if collector.want_dino_pca:
-                try:
-                    tokens, h_p, w_p = self.feature_extractor.extract_patch_tokens(
-                        best_rotated_frame
+        # ── §A1: спроба локалізуватись БЕЗ глобального дескриптора ──────────
+        # yaw_hint_deg вимикає цей шлях: зовнішній курс — це нова інформація
+        # про орієнтацію, її треба відпрацювати повним ротаційним трактом.
+        _tp = None
+        if self._temporal_prior and yaw_hint_deg is None:
+            self._tp_counter += 1
+            audit = self._tp_audit_every
+            if audit <= 0 or (self._tp_counter % audit) != 0:
+                self._tp_tries += 1
+                _tp = self._try_temporal_prior(query_frame, static_mask, _feat_cache)
+                if _tp is not None:
+                    self._tp_hits += 1
+                if self._tp_tries % 50 == 0:
+                    logger.info(
+                        f"[temporal-prior] tries={self._tp_tries} "
+                        f"hits={self._tp_hits} "
+                        f"({100.0 * self._tp_hits / self._tp_tries:.0f}%)"
                     )
-                    collector.patch_tokens = tokens
-                    collector.patch_grid = (h_p, w_p)
-                except Exception as e:
-                    logger.debug(f"Debug DINO tokens skipped: {e}")
 
-        ver = self._geometric_verifier.verify(
-            best_query_features, best_global_candidates, self.database
-        )
+        if _tp is not None:
+            (
+                ver,
+                best_global_angle,
+                best_scale,
+                best_rotated_frame,
+                best_rotated_mask,
+                _crop_info,
+                best_query_features,
+                best_global_candidates,
+            ) = _tp
+            # Retrieval не виконувався — глобального score не існує. -1.0
+            # свідомо не проходить retrieval_only_min_score, тож фолбек
+            # «за схожістю» на цьому шляху не спрацює; кандидати й так
+            # відібрані за наявністю пропагованої калібрації.
+            best_global_score = -1.0
+            best_source_id_per_angle = self._active_source_id
+            if collector is not None:
+                collector.global_score = best_global_score
+                collector.global_angle = int(best_global_angle)
+                collector.scale = float(best_scale)
+                collector.retrieval_candidates = [
+                    (int(cid), float(sc)) for cid, sc in best_global_candidates
+                ]
+                collector.rotated_frame = best_rotated_frame
+                collector.query_features = best_query_features
+            logger.debug(
+                f"Temporal prior HIT: frame={ver.candidate_id}, "
+                f"inliers={ver.inliers}, angle={best_global_angle} deg "
+                f"(global descriptor skipped)"
+            )
+        else:
+            # ── RESEARCH 2.3: зовнішній yaw-hint (симулятор / телеметрія) ────────
+            # yaw_hint_deg — кут CW у градусах, на який слід повернути кадр, щоб
+            # він збігся з орієнтацією БД (north-up); конвертацію з курсу дрона
+            # робить викликач. Квантуємо до 90° — весь rotation-тракт працює з
+            # k·90. Хибний hint самовиліковується: якщо retrieval-score prior-кута
+            # нижчий за rotation_rescan_min_score, RotationSelector сам виконає
+            # повний батчований скан 4 кутів.
+            prior_angle = self._last_best_angle
+            use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
+            if yaw_hint_deg is not None and self.enable_auto_rotation:
+                prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
+                use_prior = True
+                logger.debug(f"Yaw hint {yaw_hint_deg:.1f}° → prior rotation {prior_angle}°")
+
+            rot = self._rotation_selector.select(
+                query_frame,
+                prior_angle,
+                use_prior,
+                angles_to_try,
+                top_k,
+                scale_manager=self._scale_manager,
+            )
+            if rot is None:
+                self._consecutive_failures += 1
+                self._log_failure(FAILURE_TYPES["No candidates"])
+                return {
+                    "success": False,
+                    "error": (
+                        f"No candidates found via global descriptor (DINOv2) in any rotation. "
+                        f"Tested angles: {angles_to_try}. "
+                        f"Image {width}x{height} may not match any frame in the database."
+                    ),
+                }
+            best_global_score = rot.score
+            best_global_angle = rot.angle
+            best_global_candidates = rot.candidates
+            best_source_id_per_angle = rot.source_id
+            best_scale = rot.best_scale
+
+            if collector is not None:
+                collector.global_score = float(best_global_score)
+                collector.global_angle = int(best_global_angle)
+                collector.scale = float(best_scale)
+                collector.retrieval_candidates = [
+                    (int(cid), float(sc)) for cid, sc in best_global_candidates
+                ][: self.retrieval_top_k]
+
+            logger.debug(
+                f"Selected rotation {best_global_angle}° scale {best_scale:.2f} "
+                f"with global score {best_global_score:.3f}"
+            )
+
+            # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
+            if self.db_manager is not None and best_source_id_per_angle is not None:
+                self._active_source_id = best_source_id_per_angle
+                self.database = self.db_manager.get_database(best_source_id_per_angle)
+                if self.calib_manager is not None:
+                    self.calibration = self.calib_manager.get(best_source_id_per_angle)
+                logger.debug(f"Active source switched to '{best_source_id_per_angle}'")
+
+            # ── Кроки 1.5 + 1.5b + 2: поворот, GSD-нормалізація, ALIKED ─────────
+            # §A1: через _prepare_and_extract, щоб фічі, вже пораховані невдалою
+            # темпоральною гіпотезою на тих самих (кут, масштаб), не рахувались
+            # удруге. Крок 1.6 (patchify-expand) переїхав НИЖЧЕ екстракції — вони
+            # незалежні: expand читає лише кадр, а не фічі.
+            (
+                best_rotated_frame,
+                best_rotated_mask,
+                _crop_info,
+                best_query_features,
+            ) = self._prepare_and_extract(
+                query_frame, static_mask, best_global_angle, best_scale, _feat_cache
+            )
+
+            # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
+            # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
+            # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
+            # (наприклад, при зміні висоти польоту).
+            best_global_candidates = self._candidate_retriever.expand(
+                best_rotated_frame, best_global_candidates, top_k
+            )
+
+            if collector is not None:
+                collector.rotated_frame = best_rotated_frame
+                collector.query_features = best_query_features
+                if collector.want_dino_pca:
+                    try:
+                        tokens, h_p, w_p = self.feature_extractor.extract_patch_tokens(
+                            best_rotated_frame
+                        )
+                        collector.patch_tokens = tokens
+                        collector.patch_grid = (h_p, w_p)
+                    except Exception as e:
+                        logger.debug(f"Debug DINO tokens skipped: {e}")
+
+            ver = self._geometric_verifier.verify(
+                best_query_features, best_global_candidates, self.database
+            )
         if ver is not None:
             best_inliers = ver.inliers
             best_candidate_id = ver.candidate_id
@@ -895,6 +960,132 @@ class Localizer:
         }
 
     # ─────────────────────────────────────────────────────────────────────────
+
+    # ── PIPELINE_OPTIMIZATION_PLAN §A1 ──────────────────────────────────────
+
+    def _prepare_and_extract(
+        self,
+        query_frame: np.ndarray,
+        static_mask: np.ndarray | None,
+        angle: int,
+        scale: float,
+        cache: dict,
+    ) -> tuple:
+        """Повернути кадр на ``angle``, нормалізувати до ``scale``, витягти ALIKED.
+
+        ``cache`` живе рівно один виклик ``localize_frame``: якщо темпоральна
+        гіпотеза провалилась і повний шлях обрав ті самі (кут, масштаб),
+        екстракція не повторюється. Повертає
+        ``(rotated_frame, rotated_mask, crop_info, features)``.
+        """
+        key = (int(angle), round(float(scale), 3))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        k = int(angle) // 90
+        rotated = np.rot90(query_frame, k=k).copy()
+        rot_mask = np.rot90(static_mask, k=k).copy() if static_mask is not None else None
+
+        # GSD-нормалізація: у сталому польоті scale ≈ 1.0 і це no-op.
+        crop_info = None
+        if abs(float(scale) - 1.0) > 0.15:
+            rotated, crop_info = self._scale_manager.normalize(rotated, float(scale))
+            if rot_mask is not None:
+                rot_mask, _ = self._scale_manager.normalize(rot_mask, float(scale))
+            logger.debug(
+                f"GSD-normalized frame for scale {scale:.2f}: "
+                f"{rotated.shape[1]}x{rotated.shape[0]}"
+            )
+
+        feats = self.feature_extractor.extract_local_features(
+            rotated, static_mask=rot_mask
+        )
+        cache[key] = (rotated, rot_mask, crop_info, feats)
+        return cache[key]
+
+    def _tp_neighbour_ids(self) -> list[int]:
+        """Кандидати з околу останнього збігу — без жодного forward-пасу.
+
+        Порядок: сам останній кадр, далі симетрично id±1, id±2 … Кадри без
+        пропагованої калібрації відкидаються одразу: без ``frame_affine``
+        локалізація по них однаково не завершиться, а перевірка — це
+        звернення до масиву.
+        """
+        st = self.last_state
+        if not st:
+            return []
+        cid = int(st.get("candidate_id", -1))
+        if cid < 0:
+            return []
+        ids: list[int] = []
+        for d in range(0, max(0, self._tp_window) + 1):
+            for c in (cid,) if d == 0 else (cid - d, cid + d):
+                if c < 0 or c in ids:
+                    continue
+                try:
+                    if self.database.get_frame_affine(c) is None:
+                        continue
+                except Exception as e:  # noqa: BLE001 — БД може не мати кадру
+                    logger.debug(f"Temporal prior: frame {c} rejected ({e})")
+                    continue
+                ids.append(c)
+        return ids
+
+    def _try_temporal_prior(
+        self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
+    ) -> tuple | None:
+        """§A1: локалізація без глобального дескриптора.
+
+        Повертає кортеж для гілки в ``localize_frame`` або ``None`` — тоді
+        викликач іде повним шляхом (фічі вже лежать у ``cache``, тож ALIKED
+        не повториться).
+
+        Ціна промаху навмисно тримається низькою: гіпотеза спершу перевіряється
+        MNN-скорером (один матмул на кандидата), і лише пройшовши поріг
+        ``temporal_prior_min_mnn``, доходить до LightGlue.
+        """
+        angle = self._last_best_angle
+        if angle is None:
+            return None
+        ids = self._tp_neighbour_ids()
+        if not ids:
+            return None
+
+        scale = self._scale_manager.prior
+        scale = 1.0 if scale is None else float(scale)
+
+        rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
+            query_frame, static_mask, angle, scale, cache
+        )
+
+        cands = [(int(i), 0.0) for i in ids]
+        ref_cache: dict = {}
+        scored = self._geometric_verifier.mnn_counts(
+            feats, cands, self.database, ref_cache
+        )
+        if not scored:
+            return None
+        scored.sort(key=lambda t: -t[0])
+        if scored[0][0] < self._tp_min_mnn:
+            logger.debug(
+                f"Temporal prior: MNN probe too weak "
+                f"({scored[0][0]} < {self._tp_min_mnn}) — full path"
+            )
+            return None
+
+        probe = [(cid, float(m)) for m, cid, _ in scored[: max(1, self._tp_keep)]]
+        ver = self._geometric_verifier.verify(
+            feats, probe, self.database, ref_cache=ref_cache
+        )
+        if ver is None or ver.inliers < self._tp_accept:
+            got = ver.inliers if ver is not None else 0
+            logger.debug(
+                f"Temporal prior: rejected ({got} inliers < {self._tp_accept}) — full path"
+            )
+            return None
+
+        return (ver, int(angle), float(scale), rotated, rot_mask, crop_info, feats, probe)
 
     def _compute_confidence(
         self,

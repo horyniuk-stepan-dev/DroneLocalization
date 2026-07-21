@@ -84,6 +84,34 @@ class LocalizationConfig(BaseModel):
     # Скільки найкращих (за MNN-парами) кандидатів іде в повний LightGlue.
     prefilter_keep: int = 2
 
+    # ── PIPELINE_OPTIMIZATION_PLAN §A3: довга сторона кадру для локального
+    # екстрактора. Раніше жила ЛИШЕ як дефолт у get_cfg(..., 1600) і не була
+    # у pydantic — тобто ключ у user_config.json мовчки ігнорувався
+    # (APP_CONFIG = AppConfig(**data).model_dump() відкидає невідомі ключі).
+    # Менше значення = менше часу ALIKED і менший пік VRAM, ціною дрібних фіч.
+    max_local_edge: int = 1600
+
+    # ── PIPELINE_OPTIMIZATION_PLAN §A1: темпоральний prior кандидатів ────────
+    # off = ПОТОЧНА поведінка: кожен keyframe рахує глобальний дескриптор
+    # (на GTX 1650 це 470 мс із 945, тобто половина keyframe-а).
+    # on = у steady state кандидати беруться з околу останнього збігу, а
+    # DINOv3 не запускається взагалі; хибна гіпотеза відсіюється дешевим MNN.
+    temporal_candidate_prior: bool = False
+    # Півширина вікна сусідів за індексом кадру БД: id-w … id+w.
+    temporal_prior_window: int = 2
+    # Скільки найкращих за MNN сусідів іде в повний LightGlue.
+    temporal_prior_keep: int = 1
+    # Мінімум MNN-пар, щоб гіпотеза взагалі дійшла до LightGlue. Це і є
+    # «дешева проба»: одиниці мс на кандидата замість ~128 мс LightGlue, тому
+    # промах не ламає бюджет worst case.
+    temporal_prior_min_mnn: int = 20
+    # Скільки інлаєрів потрібно, щоб ПРИЙНЯТИ результат темпорального шляху.
+    # Суворіше за min_matches навмисно: помилка тут тиха і самопідтверджувана.
+    temporal_prior_accept_inliers: int = 25
+    # Кожен N-й keyframe примусово йде повним шляхом — аудит проти дрейфу.
+    # 0 = аудит вимкнено (не рекомендується).
+    temporal_prior_audit_every: int = 10
+
 
 class TrackingConfig(BaseModel):
     kalman_process_noise: float = 2.0
@@ -124,6 +152,15 @@ class TrackingConfig(BaseModel):
     # flow_quality, який іде в Kalman R. Це фікс чесності метрики.
     of_fb_check: bool = False
     of_fb_max_px: float = 2.0
+
+    # ── PIPELINE_OPTIMIZATION_PLAN §B1: рахувати OF не на кожному кадрі ──────
+    # OF-кадри НЕЗАЛЕЖНІ один від одного: кожен трекається від keyframe-а
+    # (tracking_worker навмисно не оновлює prev_gray/prev_pts на OF-кадрах),
+    # тож пропуск не накопичує помилку — падає лише частота видачі позиції.
+    # 1 = ПОТОЧНА поведінка (кожен кадр). 3 → 30 Гц стає 10 Гц.
+    of_stride: int = 1
+    # §B2: рахувати LK на половинній роздільності (≈4× дешевше, грубіший зсув).
+    of_half_res: bool = False
 
 
 class HomographyConfig(BaseModel):

@@ -50,6 +50,10 @@ SEED = 42
 # трекінг — кожен кадр.
 KEYFRAME_BUDGET_MS = 1000.0
 TRACKING_BUDGET_MS = 33.0
+# tracking_worker.py: cv2.goodFeaturesToTrack(maxCorners=200) — саме стільки
+# точок реально веде LK. Старий проксі на 2000 точках завищував ціну
+# трекінгу вчетверо і давав хибний вердикт «30 fps не тримаємо».
+OF_REAL_POINTS = 200
 
 
 # ── Тайминг ──────────────────────────────────────────────────────────────────
@@ -207,7 +211,28 @@ def run_micro(results: dict) -> None:
         nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, curr_g, pts, None)
         cv2.calcOpticalFlowPyrLK(curr_g, prev_g, nxt, None)
 
+    # ЛЕГАСІ-проксі (дефолтні winSize=(21,21), maxLevel=3, 2000 точок).
+    # Лишається ЛИШЕ для порівнюваності зі звітами до 2026-07-21.
     results["of_pyrlk_fb_2000pts"] = bench(of_proxy, warmup=2, iters=15)
+
+    # РЕАЛЬНА конфігурація трекера: 200 точок, winSize=(15,15), maxLevel=2.
+    pts_real = np.ascontiguousarray(pts[:OF_REAL_POINTS])
+
+    def of_real(g0=prev_g, g1=curr_g, p0=pts_real):
+        nxt, st, _ = cv2.calcOpticalFlowPyrLK(
+            g0, g1, p0, None, winSize=(15, 15), maxLevel=2
+        )
+        cv2.calcOpticalFlowPyrLK(g1, g0, nxt, None, winSize=(15, 15), maxLevel=2)
+
+    results[f"of_pyrlk_fb_{OF_REAL_POINTS}pts"] = bench(of_real, warmup=2, iters=15)
+
+    # §B2: той самий трек на половинній роздільності.
+    prev_h = cv2.resize(prev_g, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    curr_h = cv2.resize(curr_g, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    pts_h = np.ascontiguousarray(pts_real * 0.5, dtype=np.float32)
+    results[f"of_pyrlk_fb_{OF_REAL_POINTS}pts_halfres"] = bench(
+        lambda: of_real(prev_h, curr_h, pts_h), warmup=2, iters=15
+    )
 
     # MAGSAC-проксі: 2000 пар, 30% викидів (як transformations.py, USAC_MAGSAC)
     src = rng.uniform(0, 1900, (2000, 2)).astype(np.float64)
@@ -337,6 +362,16 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
             "torch_compile": get_cfg(
                 APP_CONFIG, "models.performance.torch_compile", False
             ),
+            "keyframe_interval": get_cfg(APP_CONFIG, "tracking.keyframe_interval", 30),
+            "of_stride": get_cfg(APP_CONFIG, "tracking.of_stride", 1),
+            "of_half_res": get_cfg(APP_CONFIG, "tracking.of_half_res", False),
+            "temporal_candidate_prior": get_cfg(
+                APP_CONFIG, "localization.temporal_candidate_prior", False
+            ),
+            "candidate_prefilter": get_cfg(
+                APP_CONFIG, "localization.candidate_prefilter", False
+            ),
+            "fp16_enabled": get_cfg(APP_CONFIG, "models.performance.fp16_enabled", True),
         }
     )
 
@@ -421,6 +456,34 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
     results["retrieval_numpy_8192"] = bench(
         lambda: retr.find_similar_frames(gd, top_k=12), warmup=2, iters=20
     )
+
+    # Препроцес глобального дескриптора: rot90 + float32 на CPU + H2D + resize.
+    # Виконується на КОЖЕН варіант (кут, масштаб) у RotationSelector, тобто до
+    # 20 разів на recovery, і в keyframe-ланцюг вище не входив.
+    def prep_global():
+        rot = np.ascontiguousarray(np.rot90(frame, k=1))
+        t = torch.from_numpy(rot).float().div_(255.0)
+        t = t.permute(2, 0, 1).unsqueeze(0).to(mm.device, non_blocking=True)
+        fe.dinov2_transform(t)
+
+    results["preprocess_global_1080p"] = bench(
+        prep_global, warmup=3, iters=15, sync=sync
+    )
+
+    # YOLO11n-seg: маскування динаміки на КОЖНОМУ keyframe
+    # (preprocessing.masking_strategy = "yolo"), теж поза старим ланцюгом.
+    if get_cfg(APP_CONFIG, "preprocessing.masking_strategy", "yolo") == "yolo":
+        try:
+            from src.models.wrappers.yolo_wrapper import YOLOWrapper
+
+            yolo = YOLOWrapper(mm.load_yolo(), mm.device)
+            vram_peak_reset()
+            results["yolo_seg_1080p"] = bench(
+                lambda: yolo.detect_and_mask(frame), warmup=2, iters=10, sync=sync
+            )
+            results["yolo_seg_1080p"]["peak_vram_mb"] = vram_peak_mb()
+        except Exception as e:  # noqa: BLE001 — стадія опційна, не валимо звіт
+            print(f"[models] YOLO stage skipped: {e}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -515,10 +578,38 @@ def compute_aggregates(results: dict, config_snapshot: dict) -> dict:
         agg["steady_keyframe_ms"] = round(g + loc + m + retr + hom, 1)
         agg["worst_keyframe_ms"] = round(g + loc + top_k * m + retr + top_k * hom, 1)
         agg["keyframe_budget_ms"] = KEYFRAME_BUDGET_MS
-    of = med("of_pyrlk_fb_2000pts")
-    if of is not None:
-        agg["tracking_frame_ms"] = of
+    if "steady_keyframe_ms" in agg:
+        # Той самий ланцюг, але з двома стадіями, яких у ньому бракувало.
+        extra = (med("yolo_seg_1080p") or 0.0) + (med("preprocess_global_1080p") or 0.0)
+        if extra > 0:
+            agg["steady_keyframe_full_ms"] = round(agg["steady_keyframe_ms"] + extra, 1)
+
+    of_real = med(f"of_pyrlk_fb_{OF_REAL_POINTS}pts")
+    of_legacy = med("of_pyrlk_fb_2000pts")
+    if of_real is not None or of_legacy is not None:
+        # Чесна цифра — 200 точок; 2000 лишається лише як legacy-довідка.
+        agg["tracking_frame_ms"] = of_real if of_real is not None else of_legacy
         agg["tracking_budget_ms"] = TRACKING_BUDGET_MS
+    if of_legacy is not None:
+        agg["tracking_frame_proxy2000_ms"] = of_legacy
+    half = med(f"of_pyrlk_fb_{OF_REAL_POINTS}pts_halfres")
+    if half is not None:
+        agg["tracking_frame_halfres_ms"] = half
+
+    # Пропускна здатність місії: на секунду відео припадає 1 keyframe і
+    # (keyframe_interval - 1) OF-кадрів, поділені на of_stride. Це і є
+    # метрика «встигаємо за відео чи ні» — гейти на окремі стадії її не
+    # замінюють.
+    steady = agg.get("steady_keyframe_full_ms") or agg.get("steady_keyframe_ms")
+    of_ms = agg.get("tracking_frame_ms")
+    if steady is not None and of_ms is not None:
+        kf_int = int(config_snapshot.get("keyframe_interval") or 30)
+        stride = max(1, int(config_snapshot.get("of_stride") or 1))
+        # Скільки кадрів циклу реально рахують OF: i у 1..kf-1 з i % stride == 0.
+        n_of = max(0, kf_int - 1) // stride
+        sec = steady + n_of * of_ms
+        agg["video_second_ms"] = round(sec, 1)
+        agg["realtime_factor"] = round(sec / 1000.0, 2)
     return agg
 
 

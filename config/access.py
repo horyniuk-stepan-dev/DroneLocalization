@@ -80,42 +80,6 @@ CONFIG_LOADED_FROM: str | None = None
 CONFIG_LOAD_STATUS: str = "not loaded yet"
 
 
-def load_user_config() -> AppConfig:
-    """Завантажує налаштування користувача з першого наявного кандидата.
-
-    Пошкоджений конфіг НЕ підмінюється наступним кандидатом: тихо підставити
-    інший файл — це той самий клас помилки, що й тихо підставити дефолти.
-    """
-    global CONFIG_LOADED_FROM, CONFIG_LOAD_STATUS
-
-    candidates = user_config_candidates()
-    for path in candidates:
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            cfg = AppConfig(**data)
-            CONFIG_LOADED_FROM = str(path)
-            CONFIG_LOAD_STATUS = f"User config loaded from {path}"
-            return cfg
-        except Exception as e:
-            CONFIG_LOADED_FROM = None
-            CONFIG_LOAD_STATUS = (
-                f"User config at {path} is unreadable ({e}) — BUILT-IN DEFAULTS in use. "
-                f"Your settings are NOT active."
-            )
-            print(CONFIG_LOAD_STATUS)
-            return AppConfig()
-
-    CONFIG_LOADED_FROM = None
-    CONFIG_LOAD_STATUS = (
-        f"No user_config.json found (looked in: {', '.join(str(p) for p in candidates)}) "
-        f"— BUILT-IN DEFAULTS in use. Your settings are NOT active."
-    )
-    print(CONFIG_LOAD_STATUS)
-    return AppConfig()
-
 def save_user_config(config: AppConfig) -> None:
     """Зберігає налаштування атомарно: пишемо в тимчасовий файл поруч і
     робимо os.replace, щоб перерваний запис не пошкодив основний конфіг."""
@@ -144,6 +108,47 @@ def save_user_config(config: AppConfig) -> None:
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+def load_user_config() -> AppConfig:
+    """Завантажує налаштування користувача з першого наявного кандидата.
+
+    Пошкоджений конфіг НЕ підмінюється наступним кандидатом: тихо підставити
+    інший файл — це той самий клас помилки, що й тихо підставити дефолти.
+    Якщо конфіг-файлів не знайдено зовсім, автоматично створюється новий
+    user_config.json із дефолтними налаштуваннями.
+    """
+    global CONFIG_LOADED_FROM, CONFIG_LOAD_STATUS
+
+    candidates = user_config_candidates()
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = AppConfig(**data)
+            CONFIG_LOADED_FROM = str(path)
+            CONFIG_LOAD_STATUS = f"User config loaded from {path}"
+            return cfg
+        except Exception as e:
+            CONFIG_LOADED_FROM = None
+            CONFIG_LOAD_STATUS = (
+                f"User config at {path} is unreadable ({e}) — BUILT-IN DEFAULTS in use. "
+                f"Your settings are NOT active."
+            )
+            print(CONFIG_LOAD_STATUS)
+            return AppConfig()
+
+    default_cfg = AppConfig()
+    save_user_config(default_cfg)
+    CONFIG_LOADED_FROM = str(CONFIG_FILE_PATH)
+    CONFIG_LOAD_STATUS = (
+        f"No user_config.json found (looked in: {', '.join(str(p) for p in candidates)}). "
+        f"Created default user_config.json at {CONFIG_FILE_PATH}."
+    )
+    print(CONFIG_LOAD_STATUS)
+    return default_cfg
 
 # Екземпляр конфігу за замовчуванням (зчитаний з файлу або дефолтний).
 APP_SETTINGS = load_user_config()
