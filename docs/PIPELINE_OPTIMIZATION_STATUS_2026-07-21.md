@@ -39,6 +39,20 @@ git add config/localization.py src/localization/localizer.py src/localization/ge
 
 ---
 
+## Валідація якості на Stozhar (2026-07-21, A/B по app.log)
+
+Інструмент: `scripts/ab_localization.py` (Jaccard matched-frame + агрегати; парсить app.log). Місія: `TEST/newZap.mp4`, 186 keyframe-успіхів, 7 outlier-невдач в обох прогонах.
+
+- **candidate_prefilter** (baseline off → on): Jaccard **1.000**, success/inliers ідентичні, зсув позиції median 0.00 м / max 1.22 м. Розбіжність «frame по парах 89%» — доброякісне переставляння порядку кандидатів (той самий набір), не втрата якості. → **quality-neutral, увімкнено.**
+- **temporal_candidate_prior** (prefilter-on baseline → +A1): hit-rate **99%** (149/150), Jaccard **1.000**, frame по парах **100%**, зсув позиції median 0.00 / **max 0.13 м**. → **quality-neutral на цій місії, увімкнено.**
+  - Застереження: 99% — best-case (добре покриття); на recovery hit-rate падає, A1 відкочується на повний шлях (safe by design). Виграш часу тут мізерний (DINOv3 17 мс на Stozhar) — реальна економія 470 мс лише на Shtepsill.
+
+Ще не валідовано на Stozhar: `of_stride` / `of_half_res` (трекінг між keyframe — компаратор їх не бачить, потрібна траєкторна звірка), `max_local_edge` (якісний A/B), швидкість усього набору (лише на Shtepsill).
+
+Спостереження, що коригує план: на реальній ріллі inliers median = **2048** (стеля ref-точок) — тобто query-точок значно більше за 2048, і важіль зрізання keypoints на Shtepsill **живий** (на синтетиці був no-op).
+
+---
+
 ## Тести (2026-07-21, Stozhar — основна dev-машина)
 
 Набір був **червоний ще до цієї сесії**: 4 падіння, усі під старі сигнатури або старий стек, не через мій код (`git log`: тести востаннє чіпані в `39bf749`/`8be2d8c`, до модульного рефактора).
