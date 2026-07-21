@@ -1,6 +1,7 @@
 import numpy as np
 
 from config import get_cfg
+from src.geometry.point_spread import inlier_spread
 from src.geometry.transformations import GeometryTransforms
 from src.localization.candidate_retriever import CandidateRetriever
 from src.localization.failure_log import FAILURE_TYPES, FailureLogger
@@ -116,6 +117,19 @@ class Localizer:
             self.config, "localization.sift_fallback_max_candidates", 3
         )
         self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
+
+        # ADDENDUM 1.1: статистика розкиду інлаєрів. Без неї прогін не дає
+        # вердикту — критерій приймання сформульований саме як ЧАСТОТА
+        # спрацювання («< 1% keyframe-ів зі spread < 0.10 → пункт відкотити»).
+        # Лічильники живуть лише коли увімкнено spread_confidence_enabled.
+        self._spread_stats_enabled = get_cfg(
+            self.config, "localization.spread_confidence_enabled", False
+        )
+        self._spread_log_every = get_cfg(self.config, "localization.spread_log_every", 50)
+        self._spread_n = 0
+        self._spread_n_low = 0
+        self._spread_min = 1.0
+        self._spread_sum = 0.0
 
         # Fix #1: Захист від нескінченного циклу при виході за межі покриття
         self._consecutive_failures = 0
@@ -476,6 +490,12 @@ class Localizer:
             collector.mkpts_q_inliers = best_mkpts_q_inliers
             collector.mkpts_r_inliers = best_mkpts_r_inliers
 
+        # ADDENDUM 1.1: розкид інлаєрів — рахуємо ДО SIFT-фолбеку і
+        # перераховуємо після нього, бо він підміняє набір точок.
+        best_spread = self._inlier_spread(best_mkpts_q_inliers, best_query_features)
+        if collector is not None:
+            collector.spread = best_spread
+
         # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ────────────────────
         # ALIKED (як і SuperPoint) втрачає матчі при великому in-plane rotation
         # та екстремальній похилості [ISPRS 2025; MDPI RS 17(22)]. Одноразовий
@@ -499,6 +519,12 @@ class Localizer:
                     best_total_matches,
                     best_rmse,
                 ) = rescue
+                # Точки підмінені SIFT-ом — розкид більше не той, що вище.
+                best_spread = self._inlier_spread(best_mkpts_q_inliers, best_query_features)
+                if collector is not None:
+                    collector.spread = best_spread
+
+        self._record_spread(best_spread)
 
         if (
             best_inliers < self.min_matches
@@ -637,7 +663,7 @@ class Localizer:
             # (страхує Z-score false positives на різких маневрах).
             if self._smoother is not None:
                 conf_rej = self._compute_confidence(
-                    best_candidate_id, best_inliers, best_total_matches, best_rmse
+                    best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
                 )
                 self._smoother.add_fix(
                     metric_pt,
@@ -658,7 +684,7 @@ class Localizer:
         # Confidence рахуємо ДО фільтрації — B2: адаптивний шум вимірювання,
         # слабка локалізація впливає на траєкторію менше, впевнена — більше
         confidence = self._compute_confidence(
-            best_candidate_id, best_inliers, best_total_matches, best_rmse
+            best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
         )
 
         filtered_pt = self.trajectory_filter.update(
@@ -869,11 +895,56 @@ class Localizer:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compute_confidence(
-        self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
+        self,
+        best_candidate_id: int,
+        best_inliers: int,
+        total_matches: int,
+        rmse_val: float,
+        spread: float | None = None,
     ) -> float:
         return self._result_builder.compute_confidence(
-            best_candidate_id, best_inliers, total_matches, rmse_val, self.database
+            best_candidate_id,
+            best_inliers,
+            total_matches,
+            rmse_val,
+            self.database,
+            spread=spread,
         )
+
+    def _record_spread(self, spread: float | None) -> None:
+        """Накопичує статистику розкиду і періодично друкує її в лог.
+
+        LOW_SPREAD = 0.10 — поріг із критерію приймання (≈ третина рівномірного
+        покриття 0.289), а НЕ поріг штрафу (той — ``spread_ref`` = 0.15).
+        """
+        if not self._spread_stats_enabled or spread is None:
+            return
+        self._spread_n += 1
+        self._spread_sum += spread
+        self._spread_min = min(self._spread_min, spread)
+        if spread < 0.10:
+            self._spread_n_low += 1
+        if self._spread_log_every > 0 and self._spread_n % self._spread_log_every == 0:
+            pct = 100.0 * self._spread_n_low / self._spread_n
+            logger.info(
+                f"[spread] keyframes={self._spread_n} | spread<0.10: "
+                f"{self._spread_n_low} ({pct:.1f}%) | mean={self._spread_sum / self._spread_n:.3f} "
+                f"| min={self._spread_min:.3f} (норма ≈0.29; <1% → пункт 1.1 відкотити)"
+            )
+
+    @staticmethod
+    def _inlier_spread(pts_q: np.ndarray | None, query_features: dict) -> float | None:
+        """ADDENDUM 1.1: розкид інлаєрів у системі координат query-кадру.
+
+        Розміри беремо з ``query_features["image_size"]`` (= [H, W] кадру, з
+        якого екстрагувались фічі), а не з ``frame.shape``: keypoints живуть
+        саме в цьому просторі — після ротації та scale-нормалізації, але вже
+        відмасштабовані назад із ``max_local_edge`` (feature_extractor:250).
+        """
+        size = query_features.get("image_size") if query_features else None
+        if size is None or len(size) < 2:
+            return None
+        return inlier_spread(pts_q, float(size[1]), float(size[0]))
 
     def _try_sift_rescue(
         self,

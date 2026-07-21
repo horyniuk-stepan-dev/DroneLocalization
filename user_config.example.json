@@ -139,7 +139,11 @@
         "scale_rescan_min_score": 0.65,
         "scale_prior_ema": 0.7,
         "scale_use_depth_hint": true,
-        "depth_hint_every_n": 30
+        "depth_hint_every_n": 30,
+        "spread_confidence_enabled": false,
+        "spread_ref": 0.15,
+        "spread_floor": 0.35,
+        "recovery_cascade": false
     },
     "tracking": {
         "kalman_process_noise": 2.0,
@@ -161,7 +165,9 @@
         "smoother_correction_lag": 10,
         "smoother_deadband_m": 2.0,
         "smoother_gain": 0.25,
-        "smoother_max_step_m": 3.0
+        "smoother_max_step_m": 3.0,
+        "of_fb_check": false,
+        "of_fb_max_px": 2.0
     },
     "preprocessing": {
         "clahe_clip_limit": 3.0,
@@ -389,7 +395,7 @@
         "anchor_sigma_floor_m": 0.05,
         "anchor_loo_threshold_m": 5.0,
         "max_iterations": 50,
-        "convergence_tolerance": 1e-6,
+        "convergence_tolerance": 1e-06,
         "use_bfs_initialization": true,
         "export_geojson": true,
         "use_analytic_jacobian": false,
@@ -418,7 +424,11 @@
         "temporal_gate_max_shift_frac": 1.2,
         "anchor_gap_check": false,
         "anchor_gap_max_dev_m": 150.0,
-        "anchor_gap_downweight": 0.05
+        "anchor_gap_downweight": 0.05,
+        "edge_spread_weight": false,
+        "edge_spread_ref": 0.15,
+        "edge_spread_k": 10.0,
+        "edge_gate_min_spread": 0.0
     },
     "propagation": {
         "max_skip_frames": 3,

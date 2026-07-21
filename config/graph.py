@@ -177,3 +177,16 @@ class GraphOptimizationConfig(BaseModel):
     anchor_gap_check: bool = False
     anchor_gap_max_dev_m: float = 150.0
     anchor_gap_downweight: float = 0.05
+
+    # ── ADDENDUM 1.1: просторовий розкид інлаєрів ребра. Дефолт off. ──
+    # Ребро, всі інлаєри якого скупчені в кутку кадру, дає ill-conditioned H:
+    # трансформація екстраполюється на решту кадру, а центр кадру далі
+    # визначає позицію вузла. Ні кількість інлаєрів, ні inlier_ratio, ні
+    # RMSE цього не бачать (локальний кластер — валідний RANSAC-консенсус).
+    # Вага ×1/(1+k·max(0, ref−spread)) — та сама форма, що у fit_quality (6.2).
+    edge_spread_weight: bool = False
+    edge_spread_ref: float = 0.15
+    edge_spread_k: float = 10.0
+    # Жорсткий гейт лише на екстремумі (spatial-ребра, разом з edge_gate_enabled):
+    # 0.0 = вимкнено. 0.03 ≈ «всі точки в ~3% сторони кадру».
+    edge_gate_min_spread: float = 0.0

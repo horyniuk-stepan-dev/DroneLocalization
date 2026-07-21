@@ -55,6 +55,25 @@ class LocalizationConfig(BaseModel):
     # How often (in keyframes) to recompute the depth-based scale hint.
     depth_hint_every_n: int = 30
 
+    # ── ADDENDUM 1.1: просторовий розкид інлаєрів → confidence. Дефолт off. ──
+    # Інлаєрів може бути досить, але всі в одному куті кадру → гомографія
+    # ill-conditioned (OrthoTrack §3.4, «spatial collapse»). Не відкидаємо кадр
+    # (на межі покриття скупчення легітимне), а множимо confidence — далі він
+    # їде в Kalman R (B2), тож слабкий фікс отримує меншу вагу, а не бан.
+    spread_confidence_enabled: bool = False
+    # Розкид, вище якого штрафу нема. 0.15 ≈ половина рівномірного покриття
+    # (σ/L = 1/√12 ≈ 0.289 для точок, розкиданих по всьому кадру).
+    spread_ref: float = 0.15
+    # Нижня межа множника — вироджена хмара не обнуляє confidence.
+    spread_floor: float = 0.35
+
+    # ── ADDENDUM 2.1: каскадний recovery замість повного добутку. Дефолт off. ──
+    # off = ПОТОЧНА поведінка: 4 кути × 5 масштабів = 20 ViT-forward одним батчем.
+    # on: етап 1 — 4 кути на ОДНОМУ масштабі (prior → hint-найближчий → 1.0);
+    # етап 2 (лише якщо скор етапу 1 < rotation_rescan_min_score) — РЕШТА
+    # комбінацій. Найгірший випадок лишається 20, типовий стає 4.
+    recovery_cascade: bool = False
+
 
 class TrackingConfig(BaseModel):
     kalman_process_noise: float = 2.0
@@ -87,6 +106,14 @@ class TrackingConfig(BaseModel):
     smoother_deadband_m: float = 2.0
     smoother_gain: float = 0.25
     smoother_max_step_m: float = 3.0
+
+    # ── ADDENDUM 1.2: forward-backward перевірка optical flow. Дефолт off. ──
+    # Зараз LK фільтрується лише за status==1; треки, що «сповзли», доживають
+    # до estimateAffinePartial2D. RANSAC там їх відкидає, тож на трансформацію
+    # вплив малий — але вони роздувають знаменник inlier_ratio і ЗАНИЖУЮТЬ
+    # flow_quality, який іде в Kalman R. Це фікс чесності метрики.
+    of_fb_check: bool = False
+    of_fb_max_px: float = 2.0
 
 
 class HomographyConfig(BaseModel):

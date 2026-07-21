@@ -53,7 +53,7 @@ import traceback
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
-from config import APP_SETTINGS, user_data_dir
+from config import APP_SETTINGS, CONFIG_LOAD_STATUS, CONFIG_LOADED_FROM, user_data_dir
 from src.core.headless_runner import HeadlessRunner
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import get_logger, setup_logging
@@ -103,6 +103,14 @@ def main() -> None:
 
     logger.info(f"Python: {sys.version}")
     logger.info(f"PyTorch: {torch.__version__}")
+
+    # Звідки взято налаштування. Якщо файл не знайдено — це WARNING, а не тиша:
+    # старт на вбудованих дефолтах вимикає smoother, edge-гейти й torch_compile,
+    # і раніше про це не було жодного сигналу в логах.
+    if CONFIG_LOADED_FROM:
+        logger.info(CONFIG_LOAD_STATUS)
+    else:
+        logger.warning(CONFIG_LOAD_STATUS)
 
     # ── Hardware auto-detection & compute auto-tuning ────────────────────────
     from src.utils.hardware_profile import HardwareProfile

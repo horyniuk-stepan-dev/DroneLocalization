@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from config import get_cfg
+from src.geometry.point_spread import spread_confidence_factor
 from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
 
@@ -28,10 +29,21 @@ class ResultBuilder:
         self.ransac_thresh = ransac_thresh
 
     def compute_confidence(
-        self, best_candidate_id: int, best_inliers: int, total_matches: int,
-        rmse_val: float, database: Any,
+        self,
+        best_candidate_id: int,
+        best_inliers: int,
+        total_matches: int,
+        rmse_val: float,
+        database: Any,
+        spread: float | None = None,
     ) -> float:
-        """Confidence from DB QA (rmse/disagreement) + inliers + match ratio/RMSE."""
+        """Confidence from DB QA (rmse/disagreement) + inliers + match ratio/RMSE.
+
+        ``spread`` (ADDENDUM 1.1) — просторовий розкид інлаєрів у кадрі,
+        ``src.geometry.point_spread.inlier_spread``. ``None`` = сигнал
+        недоступний → множник 1.0. Застосовується лише за прапорцем
+        ``localization.spread_confidence_enabled``.
+        """
         max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
         rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
         diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
@@ -62,6 +74,20 @@ class ResultBuilder:
         match_score = ratio_score * 0.5 + rmse_score_val * 0.5
 
         final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
+
+        # ADDENDUM 1.1: скупчені інлаєри → ill-conditioned H. Множник, а не
+        # відкидання: далі confidence керує R у Kalman (B2), тож слабкий фікс
+        # просто важить менше. На межі покриття скупчення легітимне.
+        if get_cfg(self.config, "localization.spread_confidence_enabled", False):
+            factor = spread_confidence_factor(
+                spread,
+                spread_ref=get_cfg(self.config, "localization.spread_ref", 0.15),
+                floor=get_cfg(self.config, "localization.spread_floor", 0.35),
+            )
+            if factor < 1.0:
+                logger.debug(f"Spatial collapse: spread={spread:.4f} → confidence ×{factor:.2f}")
+            final_conf *= factor
+
         return float(np.clip(final_conf, 0.05, 1.0))
 
     def fallback(self, frame_id: int, score: float, database: Any, calibration: Any) -> dict | None:

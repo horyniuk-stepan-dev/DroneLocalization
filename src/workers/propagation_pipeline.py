@@ -24,6 +24,7 @@ from src.geometry.affine_utils import (
     decompose_affine_5dof,
     unwrap_angles,
 )
+from src.geometry.point_spread import inlier_spread, spread_weight_factor
 from src.geometry.pose_graph.vo_guards import (
     check_anchor_gaps,
     downweight_gap_edges,
@@ -167,6 +168,12 @@ class PropagationPipeline:
         self.spatial_weight_use_sim = get_cfg(
             self.config, go + "spatial_weight_use_similarity", False
         )
+
+        # ── ADDENDUM 1.1: просторовий розкид інлаєрів ребра. Дефолти off. ──
+        self.edge_spread_weight = get_cfg(self.config, go + "edge_spread_weight", False)
+        self.edge_spread_ref = get_cfg(self.config, go + "edge_spread_ref", 0.15)
+        self.edge_spread_k = get_cfg(self.config, go + "edge_spread_k", 10.0)
+        self.edge_gate_min_spread = get_cfg(self.config, go + "edge_gate_min_spread", 0.0)
 
         # М'які якорі (Етап 1.1). off = fix_node (жорсткий, поточна поведінка).
         self.soft_anchors = get_cfg(self.config, go + "soft_anchors", False)
@@ -516,6 +523,7 @@ class PropagationPipeline:
         self._n_rotation_retry = 0
         n_gated = 0
         n_bridged = 0
+        n_spread_down = 0
         # ВИПРАВЛЕНО (раніше): ребро будується до попереднього кадру-З-ФІЧАМИ,
         # незалежно від гепа keyframe selection. Етап 8 (2026-07-12): опційно
         # (а) санітарний гейт трансформації ребра, (б) мости через розриви —
@@ -540,7 +548,7 @@ class PropagationPipeline:
                     )
                 candidates = recent[::-1] if self.skip_bridges else recent[-1:]
                 for depth, (last_id, last_feat) in enumerate(candidates):
-                    similarity, inliers, rmse_val, result = self._try_temporal_pair(
+                    similarity, inliers, rmse_val, result, spread = self._try_temporal_pair(
                         feat_i, last_feat, last_id, i
                     )
                     if similarity is None:
@@ -566,6 +574,12 @@ class PropagationPipeline:
                         fit_res = affine_fit_residual(result[0], self.frame_w, self.frame_h)
                         if fit_res is not None:
                             weight *= 1.0 / (1.0 + self.temporal_fit_k * fit_res)
+                    # ADDENDUM 1.1: скупчені інлаєри → ill-conditioned H → менша довіра.
+                    if self.edge_spread_weight:
+                        sf = spread_weight_factor(spread, self.edge_spread_ref, self.edge_spread_k)
+                        if sf < 1.0:
+                            n_spread_down += 1
+                        weight *= sf
                     optimizer.add_edge(
                         from_id=last_id,
                         to_id=i,
@@ -599,6 +613,11 @@ class PropagationPipeline:
             )
         if n_bridged:
             logger.info(f"Skip-мости з'єднали {n_bridged} розривів temporal-ланцюга")
+        if n_spread_down:
+            logger.info(
+                f"Spatial collapse: {n_spread_down}/{count} temporal-ребер отримали "
+                f"знижену вагу (інлаєри скупчені, ref={self.edge_spread_ref})"
+            )
         return count
 
     def _try_temporal_pair(self, feat_i, last_feat, last_id, i):
@@ -608,10 +627,11 @@ class PropagationPipeline:
         similarity = None
         inliers = 0
         rmse_val = 0.0
+        spread = None
         # H maps feat_i → last_feat (to→from direction)
         result = self._match_and_build_edge(feat_i, last_feat)
         if result is not None:
-            H, inliers, rmse_val, _n_matches = result
+            H, inliers, rmse_val, _n_matches, spread = result
             similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
 
         # Ротаційна робастність (Етап 5): матч упав → пробуємо з поворотом
@@ -619,16 +639,20 @@ class PropagationPipeline:
         if similarity is None and self.rotation_retry:
             retry = self._temporal_rotation_retry(feat_i, last_feat, last_id, i)
             if retry is not None:
-                similarity, inliers, rmse_val = retry
+                similarity, inliers, rmse_val, spread = retry
                 self._n_rotation_retry += 1
 
-        return similarity, inliers, rmse_val, result
+        return similarity, inliers, rmse_val, result, spread
 
     def _temporal_rotation_retry(self, feat_i, last_feat, from_id, to_id):
         """Повторний temporal-матч із поворотом query (Етап 5). Повертає
-        (similarity, inliers, rmse) або None. Кут — із ланцюга frame_poses БД
-        (одометричний пріор), fallback — перебір k·90°. Отриману H_r
-        (rotated_query→ref) компонуємо назад: H_true = H_r · R(θ)."""
+        (similarity, inliers, rmse, spread) або None. Кут — із ланцюга
+        frame_poses БД (одометричний пріор), fallback — перебір k·90°. Отриману
+        H_r (rotated_query→ref) компонуємо назад: H_true = H_r · R(θ).
+
+        ``spread`` рахується по ПОВЕРНУТИХ точках, тобто в тому ж кадрі, що й
+        матч — розкид інваріантний до повороту навколо центру, тож значення
+        порівнянне зі значеннями звичайних ребер."""
         from src.localization.rotation_geometry import (
             chain_relative_angle_deg,
             rotate_keypoints,
@@ -650,14 +674,14 @@ class PropagationPipeline:
             result = self._match_and_build_edge(feat_rot, last_feat)
             if result is None:
                 continue
-            H_r, inliers, rmse_val, _n = result
+            H_r, inliers, rmse_val, _n, spread = result
             H_true = np.asarray(H_r, dtype=np.float64) @ rotation_homography(ang, cx, cy)
             similarity = homography_to_similarity(H_true, self.frame_w, self.frame_h)
             if similarity is not None:
                 logger.debug(
                     f"Rotation-retry {from_id}→{to_id} OK @ {ang_deg:.1f}° (chain={chain_angle})"
                 )
-                return similarity, inliers, rmse_val
+                return similarity, inliers, rmse_val, spread
         return None
 
     # ─── Phase 2: Loop closure detection ─────────────────────────────────────
@@ -788,7 +812,7 @@ class PropagationPipeline:
                 if result is None:
                     continue
 
-                H, inliers, rmse_val, n_matches = result
+                H, inliers, rmse_val, n_matches, spread = result
                 if inliers < self.lc_min_inliers:
                     continue
 
@@ -798,7 +822,7 @@ class PropagationPipeline:
 
                 # 2.1 фізичні межі відносної трансформації
                 if self.edge_gate_enabled and not self._passes_physical_gate(
-                    similarity, inliers, n_matches
+                    similarity, inliers, n_matches, spread
                 ):
                     n_gated_phys += 1
                     continue
@@ -811,6 +835,7 @@ class PropagationPipeline:
                         "inliers": inliers,
                         "rmse": rmse_val,
                         "sim": float(sim_score),
+                        "spread": spread,
                     }
                 )
 
@@ -849,6 +874,10 @@ class PropagationPipeline:
                 weight *= cluster_factor[idx]
             if odometry_factor is not None:  # 2.3 (odometry): несумісне ребро → ×factor
                 weight *= odometry_factor[idx]
+            if self.edge_spread_weight:  # ADDENDUM 1.1: скупчені інлаєри → ×factor
+                weight *= spread_weight_factor(
+                    spec.get("spread"), self.edge_spread_ref, self.edge_spread_k
+                )
             optimizer.add_edge(
                 from_id=spec["i"],
                 to_id=spec["j"],
@@ -896,8 +925,16 @@ class PropagationPipeline:
                     candidates.append((int(faiss_id_map[raw_idx]), float(sim_score)))
         return candidates
 
-    def _passes_physical_gate(self, similarity, inliers: int, n_matches: int) -> bool:
-        """Фізичні межі відносної трансформації хибного loop closure (2.1)."""
+    def _passes_physical_gate(
+        self, similarity, inliers: int, n_matches: int, spread: float | None = None
+    ) -> bool:
+        """Фізичні межі відносної трансформації хибного loop closure (2.1).
+
+        ``spread`` (ADDENDUM 1.1) — жорсткий відсів лише на екстремумі
+        (``edge_gate_min_spread``, дефолт 0.0 = вимкнено): всі інлаєри в
+        крихітній зоні кадру = вироджена оцінка, а не слабке ребро.
+        Помірне скупчення обробляється вагою (``edge_spread_weight``), не тут.
+        """
         _, _, sx, sy, angle = decompose_affine_5dof(similarity)
         if abs(np.degrees(angle)) > self.edge_gate_max_rot:
             return False
@@ -905,6 +942,12 @@ class PropagationPipeline:
         if abs(np.log(max(sx, 1e-9))) > max_log or abs(np.log(max(sy, 1e-9))) > max_log:
             return False
         if n_matches > 0 and (inliers / n_matches) < self.edge_gate_min_inlier_ratio:
+            return False
+        if (
+            self.edge_gate_min_spread > 0.0
+            and spread is not None
+            and spread < self.edge_gate_min_spread
+        ):
             return False
         return True
 
@@ -1107,10 +1150,15 @@ class PropagationPipeline:
 
     def _match_and_build_edge(
         self, features_a: dict, features_b: dict
-    ) -> tuple[np.ndarray, int, float, int] | None:
-        """Матчить дві фічі та повертає (H, inliers, rmse, n_matches) або None.
+    ) -> tuple[np.ndarray, int, float, int, float | None] | None:
+        """Матчить дві фічі та повертає (H, inliers, rmse, n_matches, spread) або None.
 
         H maps features_a (src) → features_b (dst).
+
+        ``spread`` (ADDENDUM 1.1) — просторовий розкид інлаєрів у кадрі src;
+        ``None``, якщо порахувати неможливо. Раніше точки інлаєрів тут
+        обчислювались і викидались — лишався тільки їхній лічильник, а він
+        скупчення всіх точок в одному кутку кадру не бачить.
         """
         try:
             mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
@@ -1147,7 +1195,9 @@ class PropagationPipeline:
             pts_b_in = mkpts_b[inlier_mask]
             rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
 
-            return H, inliers, rmse, int(len(mkpts_a))
+            spread = inlier_spread(pts_a_in, self.frame_w, self.frame_h)
+
+            return H, inliers, rmse, int(len(mkpts_a)), spread
         except Exception:
             return None
 

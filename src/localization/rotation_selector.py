@@ -52,6 +52,7 @@ class RotationSelector:
         best_scale: float = 1.0
 
         rescan_min = get_cfg(self.config, "localization.rotation_rescan_min_score", 0.70)
+        use_cascade = get_cfg(self.config, "localization.recovery_cascade", False)
 
         # Determine scale candidates
         if scale_manager is not None:
@@ -89,41 +90,47 @@ class RotationSelector:
 
         if not best_global_candidates:
             # A2: all rotations × all scales in ONE batched forward pass.
-            combos = []
-            frames = []
-            for a in angles_to_try:
-                rotated = np.ascontiguousarray(np.rot90(query_frame, k=a // 90))
-                for sc in scale_candidates:
-                    if scale_manager is not None and abs(sc - 1.0) > 0.15:
-                        scaled, _ = scale_manager.normalize(rotated, sc)
-                    else:
-                        scaled = rotated
-                    combos.append((a, sc))
-                    frames.append(scaled)
+            # ADDENDUM 2.1 (recovery_cascade): у два етапи — спершу лише кути
+            # на одному масштабі, повна піраміда лише за потреби.
+            stages = self._plan_stages(angles_to_try, scale_candidates, scale_manager, use_cascade)
 
-            # Batch extraction
-            if len(frames) > 1 and hasattr(
-                self.feature_extractor, "extract_global_descriptors_multi"
-            ):
-                descs = self.feature_extractor.extract_global_descriptors_multi(frames)
-            else:
-                descs = [
-                    self.feature_extractor.extract_global_descriptor(f)
-                    for f in frames
+            for stage_combos in stages:
+                if not stage_combos:
+                    continue
+                # rot90 кешується per-angle: інакше кадр копіювався б на
+                # кожну (кут, масштаб) пару замість одного разу на кут
+                # (на 4K це десятки МБ memcpy на кожну зайву копію).
+                rot_cache: dict[int, Any] = {}
+                frames = [
+                    self._prepare_frame(query_frame, a, sc, scale_manager, rot_cache)
+                    for a, sc in stage_combos
                 ]
 
-            for (angle, sc), global_desc in zip(combos, descs):
-                with Telemetry.profile("retrieval"):
-                    src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+                # Batch extraction
+                if len(frames) > 1 and hasattr(
+                    self.feature_extractor, "extract_global_descriptors_multi"
+                ):
+                    descs = self.feature_extractor.extract_global_descriptors_multi(frames)
+                else:
+                    descs = [self.feature_extractor.extract_global_descriptor(f) for f in frames]
 
-                if candidates:
-                    top_score = candidates[0][1]
-                    if top_score > best_global_score:
-                        best_global_score = top_score
-                        best_global_angle = angle
-                        best_global_candidates = candidates
-                        best_source_id_per_angle = src_id
-                        best_scale = sc
+                for (angle, sc), global_desc in zip(stage_combos, descs):
+                    with Telemetry.profile("retrieval"):
+                        src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+
+                    if candidates:
+                        top_score = candidates[0][1]
+                        if top_score > best_global_score:
+                            best_global_score = top_score
+                            best_global_angle = angle
+                            best_global_candidates = candidates
+                            best_source_id_per_angle = src_id
+                            best_scale = sc
+
+                # Етап 1 дав достатньо впевнений збіг — решту піраміди
+                # (16 із 20 форвардів у типовій конфігурації) не рахуємо.
+                if best_global_score >= rescan_min:
+                    break
 
         if not best_global_candidates:
             return None
@@ -135,3 +142,69 @@ class RotationSelector:
             source_id=best_source_id_per_angle,
             best_scale=best_scale,
         )
+
+    # ── ADDENDUM 2.1: планування етапів recovery ─────────────────────────────
+
+    @staticmethod
+    def _plan_stages(
+        angles_to_try: list[int],
+        scale_candidates: list[float],
+        scale_manager: Any,
+        use_cascade: bool,
+    ) -> list[list[tuple[int, float]]]:
+        """Комбінації (кут, масштаб), розбиті на етапи.
+
+        ``use_cascade=False`` → один етап із повним декартовим добутком
+        (ПОТОЧНА поведінка, побітово та сама послідовність).
+
+        ``use_cascade=True`` → етап 1: усі кути × ОДИН масштаб; етап 2: усі
+        ІНШІ комбінації. Ключова властивість — етап 2 не повторює вже
+        пораховане, тож найгірший випадок (етап 1 провалився) лишається рівно
+        стільки ж форвардів, скільки й зараз. Каскад не може бути повільнішим
+        за поточну поведінку — лише швидшим.
+
+        Опорний масштаб етапу 1: prior ScaleManager-а, якщо він є; інакше
+        перший елемент ``scale_candidates`` (``ScaleManager.candidates()`` уже
+        сортує піраміду за близькістю до depth-hint); інакше 1.0.
+        """
+        combos = [(a, sc) for a in angles_to_try for sc in scale_candidates]
+        if not use_cascade or len(scale_candidates) <= 1:
+            return [combos]
+
+        primary = None
+        prior = getattr(scale_manager, "prior", None) if scale_manager is not None else None
+        if prior is not None and prior in scale_candidates:
+            primary = prior
+        elif 1.0 in scale_candidates:
+            # Масштаб 1.0 — «як у БД»; найімовірніший, коли prior відсутній.
+            primary = 1.0
+        else:
+            primary = scale_candidates[0]
+
+        stage1 = [c for c in combos if c[1] == primary]
+        stage2 = [c for c in combos if c[1] != primary]
+        return [stage1, stage2]
+
+    @staticmethod
+    def _prepare_frame(
+        query_frame: Any,
+        angle: int,
+        sc: float,
+        scale_manager: Any,
+        rot_cache: dict[int, Any] | None = None,
+    ) -> Any:
+        """Кадр, повернутий на ``angle`` і нормалізований до масштабу ``sc``.
+
+        ``rot_cache`` — спільний на етап словник {кут: повернутий кадр}:
+        повороти дорогі (копія повного кадру), а масштабів на кут кілька.
+        """
+        if rot_cache is not None and angle in rot_cache:
+            rotated = rot_cache[angle]
+        else:
+            rotated = np.ascontiguousarray(np.rot90(query_frame, k=angle // 90))
+            if rot_cache is not None:
+                rot_cache[angle] = rotated
+        if scale_manager is not None and abs(sc - 1.0) > 0.15:
+            scaled, _ = scale_manager.normalize(rotated, sc)
+            return scaled
+        return rotated

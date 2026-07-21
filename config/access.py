@@ -4,7 +4,7 @@ from typing import Any, cast
 
 from config.app import AppConfig
 from config.models import Dinov2ModelConfig, Dinov3ModelConfig
-from config.paths import models_root, user_data_dir
+from config.paths import models_root, user_config_candidates, user_data_dir
 
 
 def get_cfg(config: Any, path: str, default: Any = None) -> Any:
@@ -69,17 +69,51 @@ import json
 import os
 import tempfile
 
+# Куди ПИШЕМО (save_user_config). Читання йде за списком кандидатів нижче.
 CONFIG_FILE_PATH = str(user_data_dir() / "user_config.json")
 
+# Звідки конфіг реально прочитано цього запуску (None = вбудовані дефолти) та
+# людський опис для логів. Раніше відсутній файл не давав ЖОДНОГО сигналу —
+# застосунок мовчки стартував на дефолтах, і зрозуміти це можна було лише за
+# поведінкою. main.py друкує CONFIG_LOAD_STATUS у лог одразу після setup_logging.
+CONFIG_LOADED_FROM: str | None = None
+CONFIG_LOAD_STATUS: str = "not loaded yet"
+
+
 def load_user_config() -> AppConfig:
-    """Завантажує налаштування користувача з файлу, якщо він існує. Інакше повертає дефолтні."""
-    if os.path.exists(CONFIG_FILE_PATH):
+    """Завантажує налаштування користувача з першого наявного кандидата.
+
+    Пошкоджений конфіг НЕ підмінюється наступним кандидатом: тихо підставити
+    інший файл — це той самий клас помилки, що й тихо підставити дефолти.
+    """
+    global CONFIG_LOADED_FROM, CONFIG_LOAD_STATUS
+
+    candidates = user_config_candidates()
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
         try:
-            with open(CONFIG_FILE_PATH, encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            return AppConfig(**data)
+            cfg = AppConfig(**data)
+            CONFIG_LOADED_FROM = str(path)
+            CONFIG_LOAD_STATUS = f"User config loaded from {path}"
+            return cfg
         except Exception as e:
-            print(f"Failed to load user config from {CONFIG_FILE_PATH}: {e}. Using defaults.")
+            CONFIG_LOADED_FROM = None
+            CONFIG_LOAD_STATUS = (
+                f"User config at {path} is unreadable ({e}) — BUILT-IN DEFAULTS in use. "
+                f"Your settings are NOT active."
+            )
+            print(CONFIG_LOAD_STATUS)
+            return AppConfig()
+
+    CONFIG_LOADED_FROM = None
+    CONFIG_LOAD_STATUS = (
+        f"No user_config.json found (looked in: {', '.join(str(p) for p in candidates)}) "
+        f"— BUILT-IN DEFAULTS in use. Your settings are NOT active."
+    )
+    print(CONFIG_LOAD_STATUS)
     return AppConfig()
 
 def save_user_config(config: AppConfig) -> None:

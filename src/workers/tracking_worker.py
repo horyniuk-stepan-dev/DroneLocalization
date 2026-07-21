@@ -40,6 +40,9 @@ class RealtimeTrackingWorker(QThread):
             self.config, "tracking.process_fps", 30.0 / self.keyframe_interval
         )
         self.tracking_config = get_cfg(self.config, "object_tracking", {})
+        # ADDENDUM 1.2: forward-backward фільтр треків optical flow. Дефолт off.
+        self.of_fb_check = get_cfg(self.config, "tracking.of_fb_check", False)
+        self.of_fb_max_px = get_cfg(self.config, "tracking.of_fb_max_px", 2.0)
 
         # ── Debug views (вікна «очима моделей») ─────────────────────────────
         # Порожній набір каналів ⇒ нуль overhead: колектор не створюється.
@@ -312,8 +315,39 @@ class RealtimeTrackingWorker(QThread):
                         winSize=(15, 15),
                         maxLevel=2,
                     )
-                    good_new = curr_pts[status == 1]
-                    good_old = prev_pts_for_of[status == 1]
+                    keep = status.reshape(-1) == 1
+
+                    # ADDENDUM 1.2: forward-backward перевірка. Трек, який не
+                    # повертається у власну стартову точку, «сповз» на схожу
+                    # текстуру (рілля, ліс). RANSAC нижче його й так відкине —
+                    # але доти він сидить у знаменнику inlier_ratio і ЗАНИЖУЄ
+                    # flow_quality, від якого залежить R у Калмані. Тобто це
+                    # фікс чесності метрики якості, а не самої трансформації.
+                    if self.of_fb_check and keep.any():
+                        back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
+                            curr_gray,
+                            prev_gray_for_of,
+                            curr_pts,
+                            None,
+                            winSize=(15, 15),
+                            maxLevel=2,
+                        )
+                        rt_err = np.linalg.norm(
+                            back_pts.reshape(-1, 2) - prev_pts_for_of.reshape(-1, 2), axis=1
+                        )
+                        fb_ok = (back_status.reshape(-1) == 1) & (rt_err <= self.of_fb_max_px)
+                        # Захист: якщо перевірка зрізала майже все (різка зміна
+                        # експозиції, розмиття), лишаємо початковий набір —
+                        # краще шумний OF, ніж примусовий keyframe.
+                        if int((keep & fb_ok).sum()) >= 10:
+                            keep = keep & fb_ok
+
+                    # reshape(-1, 2) перед маскою: маска плоска (N,), а масиви
+                    # від goodFeaturesToTrack/LK мають форму (N, 1, 2).
+                    # Результат (M, 2) — точно як у попередньої версії
+                    # `curr_pts[status == 1]`, downstream не змінюється.
+                    good_new = curr_pts.reshape(-1, 2)[keep]
+                    good_old = prev_pts_for_of.reshape(-1, 2)[keep]
 
                     if len(good_new) > 10:
                         # Зсув у пікселях (fallback, якщо симілярність не зійдеться)

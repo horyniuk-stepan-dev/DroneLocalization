@@ -5,11 +5,13 @@ APP_SETTINGS``). The old ``config.config`` module remains as a deprecated
 shim for one release.
 """
 
-from config.paths import ensure_model_cache_env, user_data_dir
+from config.paths import ensure_model_cache_env, user_config_candidates, user_data_dir
 from config.access import (
     APP_CONFIG,
     APP_SETTINGS,
     CONFIG_FILE_PATH,
+    CONFIG_LOAD_STATUS,
+    CONFIG_LOADED_FROM,
     get_active_descriptor_cfg,
     get_cfg,
     load_user_config,
@@ -88,6 +90,9 @@ __all__ = [
     "load_user_config",
     "save_user_config",
     "CONFIG_FILE_PATH",
+    "CONFIG_LOAD_STATUS",
+    "CONFIG_LOADED_FROM",
+    "user_config_candidates",
     "APP_SETTINGS",
     "APP_CONFIG",
     "user_data_dir",

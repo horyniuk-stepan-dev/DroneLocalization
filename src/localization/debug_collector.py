@@ -36,6 +36,9 @@ class DebugCollector:
     total_matches: int = 0
     inliers: int = 0
     rmse: float = 0.0
+    # ADDENDUM 1.1: просторовий розкид інлаєрів, min(σx,σy)/min(W,H).
+    # None = порахувати не вдалося. Норма ≈ 0.29, колапс у кут < 0.05.
+    spread: float | None = None
 
     # ── Вихід: retrieval / rotation панель ──────────────────────────────────
     candidate_id: int = -1
