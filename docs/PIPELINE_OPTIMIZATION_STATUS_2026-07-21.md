@@ -39,6 +39,31 @@ git add config/localization.py src/localization/localizer.py src/localization/ge
 
 ---
 
+## Тести (2026-07-21, Stozhar — основна dev-машина)
+
+Набір був **червоний ще до цієї сесії**: 4 падіння, усі під старі сигнатури або старий стек, не через мій код (`git log`: тести востаннє чіпані в `39bf749`/`8be2d8c`, до модульного рефактора).
+
+Полагоджено (перевірено ruff + перерахунком):
+
+- `tests/test_localization.py::test_compute_confidence` — стара сигнатура `(inliers, max_inliers, rmse, features)`. Переписано під `(candidate_id, inliers, total_matches, rmse_val)` з DB-QA через `frame_rmse`/`frame_disagreement`; очікувані значення перераховані незалежно (high ≈ 0.956 > 0.8; low ≈ 0.095 < 0.4).
+- `tests/test_localization.py::test_localize_optical_flow` — бракувало `rot_width`/`rot_height`; кликало неіснуючий `localizer.converter`. Виправлено на `calibration.converter.metric_to_gps` + розміри кадру.
+- `tests/benchmarks/test_benchmark_tracking.py` — `DummyDatabase` без `get_frame_size` (потрібен `result_builder.fallback`). Додано `get_frame_size` + `frame_rmse=None`/`frame_disagreement=None`.
+
+Лишилось (потребує torch, лише на Windows):
+
+- `tests/test_localization_characterization.py` — golden-снапшот. Різниться рівно один сценарій (`after_reset`, шлях scale≠1 з cv2-resize), решта збігається. Мій код на цьому шляху **побайтово ідентичний** старому (temporal prior дефолтом off), тож це дрейф стеку (cv2 4.13 / poselib 2.0.5 новіші за момент зняття базлайна), а не регресія. Перезняти базлайн на HEAD:
+
+```
+git stash
+$env:CAPTURE=1; python -m pytest tests/test_localization_characterization.py -q; $env:CAPTURE=""
+git stash pop
+python -m pytest tests/test_localization_characterization.py -q   # має пройти з моїми змінами
+```
+
+Якщо крок 2 (з моїми змінами) впаде — це вже реальна регресія, скинь `-vv` diff.
+
+---
+
 ## Не зроблено — код, свідомо відкладено
 
 | Захід | Чому не зараз |

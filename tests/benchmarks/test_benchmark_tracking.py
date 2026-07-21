@@ -8,6 +8,9 @@ from src.localization.localizer import Localizer
 class DummyDatabase:
     def __init__(self):
         self.global_descriptors = np.random.randn(100, 1024).astype(np.float32)
+        # Confidence reads these directly; None → 0.0 branch (no DB QA arrays).
+        self.frame_rmse = None
+        self.frame_disagreement = None
 
     def get_local_features(self, candidate_id):
         return {
@@ -17,6 +20,10 @@ class DummyDatabase:
 
     def get_frame_affine(self, candidate_id):
         return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+
+    def get_frame_size(self, candidate_id):
+        # Retrieval-only fallback (result_builder.fallback) needs (H, W).
+        return (480, 640)
 
 
 class DummyExtractor:

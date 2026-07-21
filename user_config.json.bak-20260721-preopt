@@ -1,0 +1,451 @@
+{
+    "live_stream": {
+        "enabled": false,
+        "source_type": "file",
+        "rtsp_url": "",
+        "usb_device": 0,
+        "reconnect_attempts": 5,
+        "reconnect_delay_sec": 2.0,
+        "buffer_size": 1
+    },
+    "network_api": {
+        "enabled": true,
+        "ws_enabled": true,
+        "ws_host": "127.0.0.1",
+        "ws_port": 8765,
+        "rest_enabled": true,
+        "rest_host": "127.0.0.1",
+        "rest_port": 8081,
+        "api_token": ""
+    },
+    "object_tracking": {
+        "enabled": true,
+        "track_activation_threshold": 0.25,
+        "lost_track_buffer": 30,
+        "minimum_matching_threshold": 0.8,
+        "tracked_classes": [
+            0,
+            1,
+            2,
+            3,
+            5,
+            7
+        ],
+        "show_on_video": true,
+        "show_on_map": true,
+        "project_to_gps": true
+    },
+    "global_descriptor": {
+        "backend": "dinov3",
+        "dinov2": {
+            "descriptor_dim": 1024,
+            "input_size": 336,
+            "normalize_mean": [
+                0.485,
+                0.456,
+                0.406
+            ],
+            "normalize_std": [
+                0.229,
+                0.224,
+                0.225
+            ],
+            "hub_repo": "facebookresearch/dinov2",
+            "hub_model": "dinov2_vitl14",
+            "vram_required_mb": 1600.0
+        },
+        "dinov3": {
+            "descriptor_dim": 1024,
+            "input_size": 224,
+            "normalize_mean": [
+                0.43,
+                0.411,
+                0.296
+            ],
+            "normalize_std": [
+                0.213,
+                0.156,
+                0.143
+            ],
+            "hf_model_id": "facebook/dinov3-vitl16-pretrain-sat493m",
+            "hf_revision": "f692fa42da72c6797b67cd73494a168d1120d3ee",
+            "vram_required_mb": 1600.0
+        }
+    },
+    "database": {
+        "frame_step": 30,
+        "prefetch_queue_size": 64,
+        "keypoint_video_scale": 0.5,
+        "inter_frame_min_matches": 15,
+        "inter_frame_ransac_thresh": 3.0,
+        "keyframe_min_translation_px": 15.0,
+        "keyframe_min_rotation_deg": 1.5,
+        "keyframe_always_save_first": true,
+        "use_decord": true,
+        "decode_batch_size": 64,
+        "depth_every_n": 10,
+        "use_lancedb": true,
+        "store_sift_features": false,
+        "sift_max_keypoints": 2048,
+        "lancedb_batch_size": 64,
+        "lancedb_index_min_frames": 256,
+        "yolo_batch_size": 4
+    },
+    "localization": {
+        "min_matches": 12,
+        "min_inliers_accept": 10,
+        "ratio_threshold": 0.75,
+        "ransac_threshold": 3.0,
+        "retrieval_top_k": 12,
+        "early_stop_inliers": 40,
+        "retrieval_only_min_score": 0.9,
+        "auto_rotation": true,
+        "rotation_rescan_min_score": 0.7,
+        "enable_lightglue_fallback": true,
+        "sift_fallback": false,
+        "sift_fallback_max_candidates": 3,
+        "fallback_extractor": "aliked",
+        "confidence": {
+            "inlier_weight": 0.7,
+            "stability_weight": 0.3,
+            "rmse_norm_m": 10.0,
+            "disagreement_norm_m": 5.0,
+            "confidence_max_inliers": 80
+        },
+        "use_patchify": false,
+        "patchify_grids": [
+            [
+                1,
+                1
+            ],
+            [
+                2,
+                2
+            ],
+            [
+                3,
+                3
+            ]
+        ],
+        "patchify_batch_size": 1,
+        "patchify_merge_weight": 0.4,
+        "scale_pyramid": [
+            0.5,
+            0.7,
+            1.0,
+            1.4,
+            2.0
+        ],
+        "scale_rescan_min_score": 0.65,
+        "scale_prior_ema": 0.7,
+        "scale_use_depth_hint": true,
+        "depth_hint_every_n": 30,
+        "spread_confidence_enabled": true,
+        "spread_ref": 0.15,
+        "spread_floor": 0.35,
+        "recovery_cascade": true,
+        "candidate_prefilter": false,
+        "prefilter_keep": 2,
+        "max_local_edge": 1600,
+        "temporal_candidate_prior": false,
+        "temporal_prior_window": 2,
+        "temporal_prior_keep": 1,
+        "temporal_prior_min_mnn": 20,
+        "temporal_prior_accept_inliers": 25,
+        "temporal_prior_audit_every": 10
+    },
+    "tracking": {
+        "kalman_process_noise": 2.0,
+        "kalman_measurement_noise": 5.0,
+        "outlier_window": 10,
+        "outlier_threshold_std": 80.0,
+        "max_speed_mps": 350.0,
+        "max_consecutive_outliers": 3,
+        "process_fps": 1.0,
+        "keyframe_interval": 30,
+        "smoother_enabled": true,
+        "smoother_window": 60,
+        "smoother_huber_k": 1.2,
+        "smoother_fix_sigma_base_m": 5.0,
+        "smoother_odom_sigma_base_m": 3.0,
+        "smoother_max_correction_m": 90.0,
+        "smoother_entry_prior_sigma_m": 15.0,
+        "smoother_irls_iterations": 4,
+        "smoother_correction_lag": 10,
+        "smoother_deadband_m": 2.0,
+        "smoother_gain": 0.25,
+        "smoother_max_step_m": 3.0,
+        "of_fb_check": true,
+        "of_fb_max_px": 2.0,
+        "of_stride": 1,
+        "of_half_res": false
+    },
+    "preprocessing": {
+        "clahe_clip_limit": 3.0,
+        "clahe_tile_grid": [
+            8,
+            8
+        ],
+        "histogram_matching": false,
+        "reference_image_path": "config/reference_style.png",
+        "masking_strategy": "yolo"
+    },
+    "gui": {
+        "video_fps": 30,
+        "verify_display_mode": "center",
+        "verify_label_mode": "number"
+    },
+    "debug_views": {
+        "max_width": 640,
+        "depth_every_n_keyframes": 15,
+        "dino_pca_enabled": true,
+        "show_yolo": false,
+        "show_depth": false,
+        "show_dino": false,
+        "show_matches": false
+    },
+    "models": {
+        "use_cuda": true,
+        "local_extractor": "aliked",
+        "yolo": {
+            "model_path": "models/yolo11n-seg.pt",
+            "vram_required_mb": 200.0,
+            "description": "YOLOv11n-seg (Nano) for dynamic object masking"
+        },
+        "xfeat": {
+            "hub_repo": "verlab/accelerated_features",
+            "hub_model": "XFeat",
+            "top_k": 2048,
+            "vram_required_mb": 300.0,
+            "model_path": "",
+            "backend": "git",
+            "auto_convert": true,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "aliked": {
+            "hub_repo": "",
+            "hub_model": "",
+            "top_k": 2048,
+            "vram_required_mb": 400.0,
+            "model_path": "",
+            "backend": "git",
+            "auto_convert": true,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "rdd": {
+            "hub_repo": "",
+            "hub_model": "",
+            "top_k": 2048,
+            "vram_required_mb": 500.0,
+            "model_path": "models/RDD-v2.pth",
+            "backend": "git",
+            "auto_convert": true,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "superpoint": {
+            "hub_repo": "",
+            "hub_model": "",
+            "top_k": 2048,
+            "vram_required_mb": 500.0,
+            "model_path": "",
+            "backend": "git",
+            "auto_convert": true,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "lightglue": {
+            "hub_repo": "",
+            "hub_model": "",
+            "top_k": 2048,
+            "vram_required_mb": 800.0,
+            "model_path": "models/lightglue_aliked.pth",
+            "backend": "git",
+            "auto_convert": false,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "lightglue_superpoint": {
+            "hub_repo": "",
+            "hub_model": "",
+            "top_k": 2048,
+            "vram_required_mb": 800.0,
+            "model_path": "models/lightglue_superpoint.pth",
+            "backend": "git",
+            "auto_convert": false,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "lightglue_rdd": {
+            "hub_repo": "",
+            "hub_model": "",
+            "top_k": 2048,
+            "vram_required_mb": 800.0,
+            "model_path": "models/RDD_lg-v2.pth",
+            "backend": "git",
+            "auto_convert": false,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "lightglue_sift": {
+            "hub_repo": "",
+            "hub_model": "",
+            "top_k": 2048,
+            "vram_required_mb": 800.0,
+            "model_path": "",
+            "backend": "git",
+            "auto_convert": false,
+            "dtype": "float16",
+            "max_keypoints": 4096,
+            "nms_radius": 4,
+            "depth_confidence": -1.0,
+            "width_confidence": -1.0,
+            "detection_threshold": 0.001
+        },
+        "cesp": {
+            "enabled": false,
+            "weights_path": null,
+            "scales": [
+                1,
+                2,
+                4
+            ]
+        },
+        "vlad": {
+            "enabled": false,
+            "vocab_path": null,
+            "n_clusters": 32,
+            "pca_dim": 512,
+            "layer": null,
+            "low_norm_fraction": 0.0
+        },
+        "vram_management": {
+            "max_vram_ratio": 0.85,
+            "default_required_mb": 2000.0
+        },
+        "performance": {
+            "auto_tune": true,
+            "auto_tune_vram_headroom": 0.0,
+            "propagation_max_workers": 8,
+            "fp16_enabled": true,
+            "global_batch_max": 0,
+            "torch_compile": true,
+            "use_tensorrt_for_yolo": true,
+            "log_level": "INFO",
+            "debug_mode": true
+        },
+        "engines_cache": {
+            "engine_cache_dir": "models/engines/",
+            "auto_compile": false
+        }
+    },
+    "projection": {
+        "default_mode": "UTM",
+        "strict_projection": true,
+        "fallback_to_webmercator": true,
+        "anchor_rmse_threshold_m": 3.0,
+        "anchor_max_error_m": 5.0,
+        "propagation_disagreement_threshold_m": 2.0,
+        "localizer_sample_points": 9,
+        "localizer_expected_spread_m": 150.0
+    },
+    "homography": {
+        "backend": "poselib",
+        "ransac_threshold": 3.0,
+        "max_iters": 2000,
+        "confidence": 0.99,
+        "use_mad_ransac": true,
+        "mad_k_factor": 2.5
+    },
+    "graph_optimization": {
+        "loop_closure_top_k": 5,
+        "loop_closure_min_similarity": 0.8,
+        "loop_closure_min_frame_gap": 30,
+        "loop_closure_min_inliers": 30,
+        "loop_closure_auto_min_gap": false,
+        "loop_closure_overlap_factor": 1.0,
+        "loop_closure_dist_prefilter": true,
+        "loop_closure_dist_margin": 2.0,
+        "loop_closure_odometry_check": true,
+        "odometry_consistency_margin": 1.5,
+        "odometry_drift_frac": 0.25,
+        "odometry_inconsistency_factor": 0.3,
+        "temporal_edge_base_weight": 1.0,
+        "spatial_edge_base_weight": 1.0,
+        "soft_anchors": true,
+        "anchor_base_w": 200.0,
+        "anchor_sigma_floor_m": 0.05,
+        "anchor_loo_threshold_m": 5.0,
+        "max_iterations": 50,
+        "convergence_tolerance": 1e-6,
+        "use_bfs_initialization": true,
+        "export_geojson": true,
+        "use_analytic_jacobian": false,
+        "warm_start": false,
+        "edge_gate_enabled": true,
+        "edge_gate_max_rotation_deg": 15.0,
+        "edge_gate_max_scale_ratio": 1.3,
+        "edge_gate_min_inlier_ratio": 0.3,
+        "edge_gate_mutual_check": true,
+        "edge_gate_cluster_consistency": true,
+        "two_stage_prune": true,
+        "prune_mad_k": 5.0,
+        "prune_max_spatial_frac": 0.3,
+        "gnc_spatial": false,
+        "gnc_rounds": 5,
+        "gnc_mad_k": 3.0,
+        "kinematic_prior_weight": 0.0,
+        "pchip_gap_fill": true,
+        "log_scale_interp": false,
+        "temporal_weight_use_fit_quality": true,
+        "temporal_fit_quality_k": 0.05,
+        "spatial_weight_use_similarity": true,
+        "temporal_edge_gate": true,
+        "temporal_gate_max_rotation_deg": 30.0,
+        "temporal_gate_max_scale_ratio": 1.4,
+        "temporal_gate_max_shift_frac": 1.2,
+        "anchor_gap_check": true,
+        "anchor_gap_max_dev_m": 150.0,
+        "anchor_gap_downweight": 0.05,
+        "edge_spread_weight": true,
+        "edge_spread_ref": 0.15,
+        "edge_spread_k": 10.0,
+        "edge_gate_min_spread": 0.03
+    },
+    "propagation": {
+        "max_skip_frames": 3,
+        "rotation_retry": false,
+        "skip_bridges": false,
+        "mnn_fallback": false
+    }
+}
