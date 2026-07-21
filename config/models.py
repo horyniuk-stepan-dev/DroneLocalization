@@ -103,6 +103,11 @@ class PerformanceConfig(BaseModel):
     auto_tune_vram_headroom: float = 0.0  # Extra VRAM (MB) to reserve beyond tier default (0 = auto)
     propagation_max_workers: int = 4
     fp16_enabled: bool = True
+    # ADDENDUM §3 (слабкі GPU): максимальний батч ViT-форварда в
+    # extract_global_descriptors_multi (recovery: до 20 кадрів разом).
+    # 0 = без ліміту (ПОТОЧНА поведінка). На 4 GB VRAM безпечно 4-6.
+    # Впливає лише на пік памʼяті; дескриптори побітово ті самі.
+    global_batch_max: int = 0
     torch_compile: bool = False
     use_tensorrt_for_yolo: bool = False  # portable across GPUs; TRT engines are hardware-specific
     log_level: str = "INFO"

@@ -143,7 +143,9 @@
         "spread_confidence_enabled": false,
         "spread_ref": 0.15,
         "spread_floor": 0.35,
-        "recovery_cascade": false
+        "recovery_cascade": false,
+        "candidate_prefilter": false,
+        "prefilter_keep": 2
     },
     "tracking": {
         "kalman_process_noise": 2.0,
@@ -347,6 +349,7 @@
             "auto_tune_vram_headroom": 0.0,
             "propagation_max_workers": 4,
             "fp16_enabled": true,
+            "global_batch_max": 0,
             "torch_compile": false,
             "use_tensorrt_for_yolo": true,
             "log_level": "INFO",

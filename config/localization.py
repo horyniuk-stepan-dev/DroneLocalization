@@ -74,6 +74,16 @@ class LocalizationConfig(BaseModel):
     # комбінацій. Найгірший випадок лишається 20, типовий стає 4.
     recovery_cascade: bool = False
 
+    # ── ADDENDUM §1: MNN-передфільтр кандидатів перед LightGlue. Дефолт off. ──
+    # off = ПОТОЧНА поведінка: LightGlue послідовно по всіх top-K з early-stop.
+    # on: спершу дешевий mutual-NN скоринг дескрипторів КОЖНОГО кандидата
+    # (один матмул на кандидата, ~мс), потім повний LightGlue лише на
+    # prefilter_keep найкращих. Найбільший ефект на слабких GPU, де LightGlue
+    # дорогий, а поганий кадр інакше коштує top_k повних прогонів.
+    candidate_prefilter: bool = False
+    # Скільки найкращих (за MNN-парами) кандидатів іде в повний LightGlue.
+    prefilter_keep: int = 2
+
 
 class TrackingConfig(BaseModel):
     kalman_process_noise: float = 2.0

@@ -209,6 +209,8 @@ class Localizer:
             self.matcher, self.min_matches, self.ransac_thresh,
             self.homography_backend, self.use_mad_ransac, self.mad_k_factor,
             self.early_stop_inliers,
+            prefilter_enabled=get_cfg(self.config, "localization.candidate_prefilter", False),
+            prefilter_keep=get_cfg(self.config, "localization.prefilter_keep", 2),
         )
         self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
         self._rotation_selector = RotationSelector(

@@ -33,9 +33,18 @@ class VerificationResult:
 class GeometricVerifier:
     """Match each candidate, estimate a homography, keep the best (with early stop)."""
 
-    def __init__(self, matcher: Any, min_matches: int, ransac_thresh: float,
-                 homography_backend: str, use_mad_ransac: bool, mad_k_factor: float,
-                 early_stop_inliers: int) -> None:
+    def __init__(
+        self,
+        matcher: Any,
+        min_matches: int,
+        ransac_thresh: float,
+        homography_backend: str,
+        use_mad_ransac: bool,
+        mad_k_factor: float,
+        early_stop_inliers: int,
+        prefilter_enabled: bool = False,
+        prefilter_keep: int = 2,
+    ) -> None:
         self.matcher = matcher
         self.min_matches = min_matches
         self.ransac_thresh = ransac_thresh
@@ -43,9 +52,12 @@ class GeometricVerifier:
         self.use_mad_ransac = use_mad_ransac
         self.mad_k_factor = mad_k_factor
         self.early_stop_inliers = early_stop_inliers
+        self.prefilter_enabled = prefilter_enabled
+        self.prefilter_keep = prefilter_keep
 
-    def verify(self, query_features: dict, candidates: list, database: Any
-               ) -> VerificationResult | None:
+    def verify(
+        self, query_features: dict, candidates: list, database: Any
+    ) -> VerificationResult | None:
         best_inliers = 0
         best_candidate_id = -1
         best_H_query_to_ref = None
@@ -56,9 +68,17 @@ class GeometricVerifier:
 
         early_stop = self.early_stop_inliers
 
+        # ADDENDUM §1: дешевий MNN-скоринг усіх кандидатів, LightGlue — лише
+        # на найкращих. ref_cache уникає повторного читання фіч із БД.
+        ref_cache: dict = {}
+        if self.prefilter_enabled and len(candidates) > self.prefilter_keep:
+            candidates = self._prefilter(query_features, candidates, database, ref_cache)
+
         for candidate_id, score in candidates:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
-            ref_features = database.get_local_features(candidate_id)
+            ref_features = ref_cache.get(candidate_id)
+            if ref_features is None:
+                ref_features = database.get_local_features(candidate_id)
 
             with Telemetry.profile("match"):
                 mkpts_q, mkpts_r = self.matcher.match(query_features, ref_features)
@@ -119,3 +139,87 @@ class GeometricVerifier:
             total_matches=best_total_matches,
             rmse=best_rmse,
         )
+
+    # ── ADDENDUM §1: MNN-передфільтр кандидатів ──────────────────────────
+
+    def _prefilter(
+        self, query_features: dict, candidates: list, database: Any, ref_cache: dict
+    ) -> list:
+        """Ранжує кандидатів за кількістю mutual-NN пар дескрипторів і лишає
+        ``prefilter_keep`` найкращих (LightGlue далі йде лише по них).
+
+        Консервативність: якщо жоден кандидат не набрав жодної MNN-пари
+        (виродження: порожні/несумісні дескриптори) — список без змін.
+        GPU-шлях (один матмул на кандидата) з фолбеком на numpy.
+        """
+        q = np.asarray(query_features.get("descriptors"))
+        if q is None or q.ndim != 2 or len(q) == 0:
+            return candidates
+        q32 = np.ascontiguousarray(q, dtype=np.float32)
+
+        use_torch = False
+        q_t = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                q_t = torch.from_numpy(q32).cuda()
+                use_torch = True
+        except Exception:  # noqa: BLE001 — GPU-шлях опційний, фолбек numpy
+            use_torch = False
+
+        # Lowe ratio обовʼязковий: голий mutual-NN рахує ~50% випадкових пар
+        # між будь-якими наборами (перевірено юніт-тестом), ratio їх зрізає.
+        # Той самий поріг, що і в _fast_numpy_match (L2-нормовані дескриптори:
+        # d = sqrt(2-2s)).
+        ratio = 0.75
+
+        def _mnn_count(r: np.ndarray) -> int:
+            r32 = np.ascontiguousarray(r, dtype=np.float32)
+            if r32.shape[0] < 2:
+                return 0
+            if use_torch:
+                try:
+                    r_t = torch.from_numpy(r32).cuda()
+                    sim = q_t @ r_t.T
+                    top2 = torch.topk(sim, 2, dim=1).values
+                    d1 = torch.sqrt(torch.clamp(2.0 - 2.0 * top2[:, 0], min=0.0))
+                    d2 = torch.sqrt(torch.clamp(2.0 - 2.0 * top2[:, 1], min=0.0))
+                    ratio_ok = d1 < ratio * d2
+                    nn12 = sim.argmax(dim=1)
+                    nn21 = sim.argmax(dim=0)
+                    idx = torch.arange(sim.shape[0], device=sim.device)
+                    return int(((nn21[nn12] == idx) & ratio_ok).sum().item())
+                except Exception:  # noqa: BLE001 — OOM тощо → numpy
+                    pass
+            sim = q32 @ r32.T
+            top2 = -np.partition(-sim, 1, axis=1)[:, :2]
+            d1 = np.sqrt(np.clip(2.0 - 2.0 * top2[:, 0], 0.0, None))
+            d2 = np.sqrt(np.clip(2.0 - 2.0 * top2[:, 1], 0.0, None))
+            ratio_ok = d1 < ratio * d2
+            nn12 = sim.argmax(axis=1)
+            nn21 = sim.argmax(axis=0)
+            mutual = nn21[nn12] == np.arange(sim.shape[0])
+            return int(np.sum(mutual & ratio_ok))
+
+        with Telemetry.profile("prefilter"):
+            scored = []
+            for candidate_id, score in candidates:
+                ref = database.get_local_features(candidate_id)
+                ref_cache[candidate_id] = ref
+                r = np.asarray(ref.get("descriptors"))
+                if r is None or r.ndim != 2 or len(r) == 0 or r.shape[1] != q.shape[1]:
+                    scored.append((0, candidate_id, score))
+                    continue
+                scored.append((_mnn_count(r), candidate_id, score))
+
+        if all(s[0] == 0 for s in scored):
+            logger.debug("Prefilter: no MNN pairs on any candidate — keeping full list")
+            return candidates
+        scored.sort(key=lambda t: (-t[0], -t[2]))
+        kept = [(cid, sc) for _, cid, sc in scored[: self.prefilter_keep]]
+        logger.debug(
+            f"Prefilter kept {len(kept)}/{len(candidates)} candidates "
+            f"(mnn top: {[(c, m) for m, c, _ in scored[: self.prefilter_keep]]})"
+        )
+        return kept

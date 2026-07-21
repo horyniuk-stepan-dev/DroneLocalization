@@ -177,20 +177,29 @@ class FeatureExtractor:
                 prepped.append(self.dinov2_transform(t)[0])
             batch = torch.stack(prepped)  # (B, 3, S, S)
 
-            if self.vlad_aggregator is not None:
-                return self._vlad_descriptors(batch)
-
-            if self.cesp_module is not None:
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
-                    features = self.global_model.forward_features(batch)
-                patch_tokens = features["x_norm_patchtokens"].float()
-                h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
-                out = self.cesp_module(patch_tokens, h_p, w_p)
+            # ADDENDUM §3: чанкування батча — кап піку VRAM на слабких GPU.
+            # global_batch_max=0 (дефолт) → один форвард, поведінка без змін.
+            max_b = int(get_cfg(self.config, "models.performance.global_batch_max", 0) or 0)
+            if max_b > 0 and batch.shape[0] > max_b:
+                chunks = torch.split(batch, max_b)
             else:
-                with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
-                    out = self.global_model(batch)
+                chunks = (batch,)
 
-            return out.float().cpu().numpy()
+            outs = []
+            for chunk in chunks:
+                if self.vlad_aggregator is not None:
+                    outs.append(np.asarray(self._vlad_descriptors(chunk)))
+                elif self.cesp_module is not None:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                        features = self.global_model.forward_features(chunk)
+                    patch_tokens = features["x_norm_patchtokens"].float()
+                    h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
+                    outs.append(self.cesp_module(patch_tokens, h_p, w_p).float().cpu().numpy())
+                else:
+                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                        outs.append(self.global_model(chunk).float().cpu().numpy())
+
+            return np.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
 
     @torch.no_grad()
     def extract_patch_tokens(self, image: np.ndarray):
