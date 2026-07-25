@@ -112,6 +112,27 @@ class PerformanceConfig(BaseModel):
     use_tensorrt_for_yolo: bool = False  # portable across GPUs; TRT engines are hardware-specific
     log_level: str = "INFO"
     debug_mode: bool = True
+    # HARDENING P0-5: коли True — сирі lat/lon та координати якорів у логах
+    # округлюються/маскуються (щоб захоплений app.log не видавав маршрут місії).
+    # Дефолт False = ПОТОЧНА поведінка (повна точність). Вмикається у
+    # user_config.json для польових збірок.
+    redact_coords_in_logs: bool = False
+
+    # HARDENING P1-8 (safe slice): детермінований режим для обмеження
+    # найгіршої латентності. True вимикає cudnn.benchmark (прибирає змінну
+    # вартість першого виклику та недетермінований вибір ядер). Дефолт
+    # False = ПОТОЧНА поведінка (benchmark=True, кращий throughput).
+    deterministic: bool = False
+    # Логувати перцентилі per-frame латентності (p50/p95/p99/max) кожні
+    # latency_log_interval кадрів. Дефолт off = поточна поведінка.
+    log_latency_stats: bool = False
+    latency_log_interval: int = 100
+
+    # HARDENING P2-12: перевірка цілісності ваг на старті проти закріпленого
+    # SHA-256 маніфесту (models/weights_manifest.json). "off" (дефолт) =
+    # поточна поведінка; "warn" = логувати розбіжності; "enforce" = аварійно
+    # завершити старт, якщо файл ваг відсутній/змінений (захист від підміни).
+    weight_integrity_mode: str = "off"
 
 
 # Canonical local feature extractor — FIXED and hardware-independent.
@@ -135,8 +156,16 @@ def get_default_local_extractor() -> str:
 
 
 class ModelsConfig(BaseModel):
+    # Явний режим пристрою — керується конфігом, не кодом:
+    #   "auto" — CUDA якщо доступна, інакше CPU-фолбек (локалізація повільна);
+    #   "cuda" — форс GPU, чітка помилка на старті якщо CUDA недоступна;
+    #   "cpu"  — форс CPU (повний робочий фолбек лише для локалізації;
+    #            збудову/модифікацію БД усе одно робити на GPU-машині).
+    device: str = "auto"  # "auto" | "cuda" | "cpu"
+    # Legacy-аліас: use_cuda:false = device:"cpu". Лишений для сумісності зі
+    # старими user_config.json; нове — через models.device.
     use_cuda: bool = True
-    local_extractor: str = Field(default_factory=get_default_local_extractor)  # "aliked" | "rdd"
+    local_extractor: str = Field(default_factory=get_default_local_extractor)  # "aliked" | "rdd" | "xfeat"
     yolo: YoloConfig = YoloConfig()
     xfeat: ModelSettings = ModelSettings(
         hub_repo="verlab/accelerated_features",

@@ -53,6 +53,75 @@ def get_logger(name: str | None = None) -> Any:
     return logger
 
 
+# Kept at module scope so the raw file descriptor stays open for the whole
+# process lifetime — faulthandler writes to it directly from the crash handler.
+_FAULT_LOG_FH = None
+
+
+def enable_crash_handler(log_dir: Any) -> None:
+    """Capture native (CUDA/cv2/torch) crashes that ``sys.excepthook`` cannot.
+
+    HARDENING P0-2. A segfault or native abort kills the process before Python's
+    exception hook runs, leaving no trace. ``faulthandler`` dumps the C-level
+    traceback of all threads to a breadcrumb file so a field crash is
+    diagnosable. Best-effort: diagnostics setup never breaks startup.
+    """
+    global _FAULT_LOG_FH
+    import faulthandler
+
+    try:
+        from datetime import datetime
+
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        crash_path = log_path / "faulthandler.log"
+
+        # Simple size-cap rotation: retain the previous dump, bound growth.
+        try:
+            if crash_path.exists() and crash_path.stat().st_size > 5 * 1024 * 1024:
+                crash_path.replace(crash_path.parent / (crash_path.name + ".1"))
+        except OSError:
+            pass
+
+        _FAULT_LOG_FH = open(crash_path, "a", buffering=1, encoding="utf-8")
+        _FAULT_LOG_FH.write(f"\n=== session start {datetime.now().isoformat()} ===\n")
+        _FAULT_LOG_FH.flush()
+        faulthandler.enable(file=_FAULT_LOG_FH, all_threads=True)
+    except Exception:
+        # Fall back to stderr rather than leaving native crashes untraceable.
+        try:
+            faulthandler.enable()
+        except Exception:
+            pass
+
+
+def fmt_coord(lat: float, lon: float, precision: int = 6) -> str:
+    """Format a lat/lon pair for logging, honoring the redaction flag.
+
+    HARDENING P0-5. When ``models.performance.redact_coords_in_logs`` is True,
+    coordinates are masked so a captured ``app.log`` does not reveal the mission
+    route. Default (flag False) preserves full precision — current behavior.
+
+    Reads the flag defensively (like ``silent_output``): any config-access
+    failure degrades to full precision rather than crashing the caller.
+    """
+    redact = False
+    try:
+        from config import APP_SETTINGS
+
+        if APP_SETTINGS:
+            _models = getattr(APP_SETTINGS, "models", None)
+            _perf = getattr(_models, "performance", None) if _models else None
+            if _perf is not None:
+                redact = getattr(_perf, "redact_coords_in_logs", False)
+    except Exception:
+        redact = False
+
+    if redact:
+        return "lat=<redacted>, lon=<redacted>"
+    return f"lat={lat:.{precision}f}, lon={lon:.{precision}f}"
+
+
 @contextmanager
 def silent_output(force: bool = False) -> Iterator[None]:
     """

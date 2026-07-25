@@ -12,7 +12,7 @@ from src.gui.widgets.map_widget import MapWidget
 from src.gui.widgets.video_widget import VideoWidget
 from src.models.model_manager import ModelManager
 from src.network.coordinates_broker import CoordinatesBroker
-from src.utils.logging_utils import get_logger
+from src.utils.logging_utils import fmt_coord, get_logger
 
 logger = get_logger(__name__)
 
@@ -166,7 +166,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         """Handle map click by showing coordinates in the status bar."""
         msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
         self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
-        logger.info(f"Map click: {lat=}, {lon=}")
+        logger.info(f"Map click: {fmt_coord(lat, lon)}")
 
     def on_open_config(self):
         """Open the configuration editor dialog."""

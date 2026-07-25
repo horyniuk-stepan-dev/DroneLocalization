@@ -17,11 +17,21 @@ COMBO_OPTIONS = {
         "homography": ["poselib", "opencv"],
         "lightglue": ["git", "torchscript", "tensorrt"],
         "lightglue_superpoint": ["git", "torchscript", "tensorrt"],
-        "lightglue_rdd": ["git", "torchscript", "tensorrt"]
+        "lightglue_rdd": ["git", "torchscript", "tensorrt"],
+        # Backend-и локальних екстракторів (раніше падали у free-text)
+        "aliked": ["git", "torchscript", "tensorrt"],
+        "xfeat": ["git", "torchscript", "tensorrt"],
+        "rdd": ["git", "torchscript", "tensorrt"],
+        "superpoint": ["git", "torchscript", "tensorrt"],
     },
+    # Пристрій інференсу: auto (CUDA→CPU фолбек) | cuda (форс) | cpu (форс)
+    "device": ["auto", "cuda", "cpu"],
     "masking_strategy": ["yolo", "none"],
     "local_extractor": ["rdd", "aliked", "superpoint", "xfeat"],
+    "fallback_extractor": ["aliked", "rdd", "superpoint", "xfeat"],
     "dtype": ["float16", "float32"],
+    # Повний набір рівнів loguru — щоб combo не «загубив» нестандартний рівень
+    "log_level": ["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
     # ВИПРАВЛЕНО: "WGS84" не є режимом конвертера (підтримуються UTM/WEB_MERCATOR)
     "default_mode": ["UTM", "WEB_MERCATOR"],
     "verify_display_mode": ["center", "center_corners", "full"],
@@ -126,8 +136,12 @@ class ConfigDialog(QDialog):
         if combo_options is not None:
             cb = QComboBox()
             cb.addItems(combo_options)
-            if str(value) in combo_options:
-                cb.setCurrentText(str(value))
+            # Якщо поточне значення не входить у відомий набір — не «губимо» його
+            # (інакше на збереженні combo мовчки скинув би на перший пункт), а
+            # додаємо окремим пунктом і показуємо.
+            if value is not None and str(value) not in combo_options:
+                cb.addItem(str(value))
+            cb.setCurrentText(str(value))
             return cb
 
         # Стандартні типи

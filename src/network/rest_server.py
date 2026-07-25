@@ -11,20 +11,31 @@ class RestApiServer:
     явно та api_token (перевіряється заголовок Authorization: Bearer <token>).
     """
 
-    def __init__(self, broker, host="127.0.0.1", port=8080, api_token: str | None = None):
+    def __init__(
+        self,
+        broker,
+        host="127.0.0.1",
+        port=8080,
+        api_token: str | None = None,
+        certfile: str | None = None,
+        keyfile: str | None = None,
+    ):
         self.broker = broker
         self.host = host
         self.port = port
         self.api_token = api_token
+        self.certfile = certfile
+        self.keyfile = keyfile
         self.app = web.Application(middlewares=[self._auth_middleware])
         self.runner = None
         self.site = None
 
+        # HARDENING P0-4: fail closed (see WebSocketServer for rationale).
         if host not in ("127.0.0.1", "localhost", "::1") and not api_token:
-            logger.warning(
-                f"REST API binds to '{host}' WITHOUT api_token — "
-                f"position/trajectory endpoints will be public on the network. "
-                f"Set network.api_token or use 127.0.0.1."
+            raise ValueError(
+                f"Refusing to start REST API server on routable host '{host}' "
+                f"without api_token — position/trajectory endpoints would be "
+                f"public on the network. Set network.api_token or bind 127.0.0.1."
             )
 
         self.app.add_routes([
@@ -62,16 +73,32 @@ class RestApiServer:
         return web.json_response(history)
 
     async def get_status(self, request):
-        return web.json_response({
+        resp = {
             "state": "tracking" if self.broker.is_tracking_active else "idle",
-            "uptime_sec": self.broker.get_uptime()
-        })
+            "uptime_sec": self.broker.get_uptime(),
+        }
+        # HARDENING P1-9/10: additive, flag-gated operating-state + stall info.
+        if getattr(self.broker.config, "expose_operating_state", False):
+            resp.update(self.broker.get_operating_state())
+        return web.json_response(resp)
+
+    def _build_ssl_context(self):
+        """HARDENING P1-7: TLS context or None (see WebSocketServer). Fail closed."""
+        if not (self.certfile and self.keyfile):
+            return None
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        return ctx
 
     async def start(self):
-        logger.info(f"Starting REST API server on {self.host}:{self.port}...")
+        ssl_ctx = self._build_ssl_context()
+        scheme = "https" if ssl_ctx else "http"
+        logger.info(f"Starting REST API server on {scheme}://{self.host}:{self.port}...")
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
-        self.site = web.TCPSite(self.runner, self.host, self.port)
+        self.site = web.TCPSite(self.runner, self.host, self.port, ssl_context=ssl_ctx)
         await self.site.start()
 
     async def stop(self):

@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 import threading
 import time
 from collections import deque
@@ -27,6 +28,11 @@ class CoordinatesBroker(QObject):
         self._tracking_start_time: float = 0.0
         self.is_tracking_active: bool = False
 
+        # HARDENING P1-9/10: monotonic timestamp of the last successful fix,
+        # drives the operating-state machine and stall detector. None = no fix
+        # since the current tracking session began.
+        self._last_fix_mono: float | None = None
+
         self._ws_server = None
         self._rest_server = None
 
@@ -47,10 +53,43 @@ class CoordinatesBroker(QObject):
 
         token = getattr(self.config, "api_token", "") or None
 
+        # HARDENING P0-4: if any server would bind a routable host without a
+        # token, self-heal to secure rather than crash — generate one and log
+        # it so the operator can hand it to clients. Localhost stays tokenless.
+        _local = ("127.0.0.1", "localhost", "::1")
+        _remote_ws = self.config.ws_enabled and self.config.ws_host not in _local
+        _remote_rest = self.config.rest_enabled and self.config.rest_host not in _local
+        if token is None and (_remote_ws or _remote_rest):
+            token = secrets.token_urlsafe(32)
+            logger.warning(
+                "Telemetry bound to a routable host without api_token — "
+                "generated one automatically. Clients must authenticate with "
+                "this token (Authorization: Bearer <token> or ?token=<token>):\n"
+                f"    api_token = {token}\n"
+                "Set network.api_token in user_config.json to pin a fixed token."
+            )
+
+        # HARDENING P1-7: resolve optional TLS. Fail closed — if TLS is enabled
+        # but the cert/key pair is missing, do NOT silently serve plaintext.
+        certfile = keyfile = None
+        if getattr(self.config, "tls_enabled", False):
+            certfile = getattr(self.config, "tls_certfile", "") or ""
+            keyfile = getattr(self.config, "tls_keyfile", "") or ""
+            if not (certfile and keyfile):
+                raise ValueError(
+                    "network_api.tls_enabled=True but tls_certfile/tls_keyfile "
+                    "are not both set — refusing to start telemetry in plaintext."
+                )
+            logger.info("Telemetry TLS enabled (wss/https).")
+
         tasks = []
         if self.config.ws_enabled:
             self._ws_server = WebSocketServer(
-                host=self.config.ws_host, port=self.config.ws_port, api_token=token
+                host=self.config.ws_host,
+                port=self.config.ws_port,
+                api_token=token,
+                certfile=certfile,
+                keyfile=keyfile,
             )
             tasks.append(self._ws_server.start())
 
@@ -60,11 +99,16 @@ class CoordinatesBroker(QObject):
                 host=self.config.rest_host,
                 port=self.config.rest_port,
                 api_token=token,
+                certfile=certfile,
+                keyfile=keyfile,
             )
             tasks.append(self._rest_server.start())
 
         if tasks:
             self._loop.run_until_complete(asyncio.gather(*tasks))
+            # HARDENING P1-10: liveness heartbeat over WS, flag-gated.
+            if getattr(self.config, "expose_operating_state", False):
+                self._loop.create_task(self._heartbeat_loop())
             # Запускаємо безкінечний цикл для обробки підключень
             self._loop.run_forever()
 
@@ -87,11 +131,65 @@ class CoordinatesBroker(QObject):
         self.is_tracking_active = active
         if active:
             self._tracking_start_time = time.time()
+            # New session starts in ACQUIRING until the first fix arrives.
+            self._last_fix_mono = None
 
     def get_uptime(self) -> float:
         if self.is_tracking_active:
             return time.time() - self._tracking_start_time
         return 0.0
+
+    def get_operating_state(self) -> dict:
+        """HARDENING P1-9/10: honest operating state + stall info.
+
+        IDLE       — tracking not active.
+        ACQUIRING  — tracking active, no fix yet this session.
+        LOST       — tracking active, last fix older than fix_stale_sec (stall).
+        DEGRADED   — recent fix but below configured inlier/confidence floor.
+        TRACKING   — recent, healthy fix.
+        """
+        stale_sec = getattr(self.config, "fix_stale_sec", 3.0)
+        min_inl = getattr(self.config, "degraded_min_inliers", 0)
+        min_conf = getattr(self.config, "degraded_min_confidence", 0.0)
+
+        age = None
+        if not self.is_tracking_active:
+            state = "IDLE"
+        elif self._last_fix_mono is None:
+            state = "ACQUIRING"
+        else:
+            age = time.monotonic() - self._last_fix_mono
+            if age > stale_sec:
+                state = "LOST"
+            else:
+                last = self._last_position or {}
+                inl = last.get("inliers", 0)
+                conf = last.get("confidence", 1.0)
+                if (min_inl and inl < min_inl) or (min_conf and conf < min_conf):
+                    state = "DEGRADED"
+                else:
+                    state = "TRACKING"
+
+        return {
+            "op_state": state,
+            "last_fix_age_sec": round(age, 3) if age is not None else None,
+            "stale_after_sec": stale_sec,
+        }
+
+    async def _heartbeat_loop(self):
+        """HARDENING P1-10: periodic liveness beacon so consumers detect a hung
+        pipeline even when no position is being produced (i.e. LOST)."""
+        interval = getattr(self.config, "heartbeat_interval_sec", 1.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if self._ws_server is None:
+                    continue
+                msg = {"type": "heartbeat", "timestamp": time.time()}
+                msg.update(self.get_operating_state())
+                await self._ws_server.broadcast(msg)
+        except asyncio.CancelledError:
+            pass
 
     def get_last_position(self) -> dict | None:
         return self._last_position
@@ -116,6 +214,7 @@ class CoordinatesBroker(QObject):
             "timestamp": time.time(),
         }
         self._last_position = msg
+        self._last_fix_mono = time.monotonic()  # HARDENING P1-9/10: stall clock
         self._history.append(msg)
         self._broadcast(msg)
 

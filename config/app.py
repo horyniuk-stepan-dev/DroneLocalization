@@ -85,6 +85,28 @@ class NetworkApiConfig(BaseModel):
     # (Authorization: Bearer). Порожній = без автентифікації (тільки локально!)
     api_token: str = ""
 
+    # --- HARDENING P1-7: опційний TLS для WS/REST телеметрії ---
+    # tls_enabled=False (дефолт) = поточна поведінка (plaintext ws://, http://).
+    # Увімкнення вимагає валідних certfile+keyfile — інакше сервер НЕ стартує
+    # (fail closed, як і auth). Для закритих мереж підходить self-signed.
+    tls_enabled: bool = False
+    tls_certfile: str = ""
+    tls_keyfile: str = ""
+
+    # --- HARDENING P1-9/10: машина операційного стану + детектор зависання ---
+    # expose_operating_state=False (дефолт) = поточний вивід /api/status.
+    # Увімкнено: /api/status додає op_state (IDLE/ACQUIRING/TRACKING/DEGRADED/
+    # LOST) + вік останнього фіксу, а WS отримує періодичний heartbeat — щоб
+    # споживач довіряв чесному сигналу "LOST", а вартовий бачив завислий процес.
+    expose_operating_state: bool = False
+    # Фікс, старіший за це (сек) під час активного трекінгу => LOST (зависання).
+    fix_stale_sec: float = 3.0
+    # Період WS-heartbeat (сек), коли expose_operating_state=True.
+    heartbeat_interval_sec: float = 1.0
+    # Пороги DEGRADED; 0 вимикає перевірку (дефолт: стан лише за часом фіксу).
+    degraded_min_inliers: int = 0
+    degraded_min_confidence: float = 0.0
+
 
 class AppConfig(BaseModel):
     live_stream: LiveStreamConfig = LiveStreamConfig()

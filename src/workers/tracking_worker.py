@@ -56,6 +56,19 @@ class RealtimeTrackingWorker(QThread):
         self._debug_inflight = {}  # {канал: monotonic-час emit} — backpressure (self-healing)
         self._debug_inflight_stale_sec = 1.0  # авто-скидання, якщо ack від GUI не прийшов
 
+        # HARDENING P1-8: optional per-frame latency stats (measurement only,
+        # no effect on timing). Off by default = поточна поведінка.
+        self._latency_tracker = None
+        if get_cfg(self.config, "models.performance.log_latency_stats", False):
+            from src.utils.latency_tracker import LatencyTracker
+
+            self._latency_tracker = LatencyTracker(
+                log_interval=get_cfg(
+                    self.config, "models.performance.latency_log_interval", 100
+                ),
+                logger=logger,
+            )
+
     def run(self):
         # Fix #3: скидаємо стан сесії через публічний API (без приватних полів)
         if hasattr(self.localizer, "reset_session"):
@@ -485,6 +498,8 @@ class RealtimeTrackingWorker(QThread):
                 self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 
             process_duration = time.time() - start_process
+            if self._latency_tracker is not None:
+                self._latency_tracker.record(process_duration)
             self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
 
             frame_idx += 1

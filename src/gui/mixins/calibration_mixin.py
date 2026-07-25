@@ -28,7 +28,7 @@ from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
 from src.localization.matcher import FeatureMatcher
-from src.utils.logging_utils import get_logger
+from src.utils.logging_utils import fmt_coord, get_logger
 from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
 
 logger = get_logger(__name__)
@@ -281,7 +281,8 @@ class CalibrationMixin:
                         f"  Pt {j}: px={p2d} -> err={err:.3f}м ({dist_err:.3f}м по Хаверсину)"
                     )
                     logger.debug(
-                        f"    GPS Calc: ({lat_c:.7f}, {lon_c:.7f}) | Target: ({lat_t:.7f}, {lon_t:.7f})"
+                        f"    GPS Calc: {fmt_coord(lat_c, lon_c, precision=7)} | "
+                        f"Target: {fmt_coord(lat_t, lon_t, precision=7)}"
                     )
 
             logger.info(

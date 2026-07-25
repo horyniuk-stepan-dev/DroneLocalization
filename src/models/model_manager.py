@@ -68,13 +68,29 @@ class ModelManager:
     def __init__(self, config=None, device="cuda"):
         self.config = config or {}
 
-        use_cuda = get_cfg(self.config, "models.use_cuda", True)
-        if not use_cuda:
-            logger.info("CUDA force disabled in configuration")
+        # Пристрій керується конфігом (models.device), не кодом.
+        # use_cuda:false — легасі-аліас на "cpu".
+        mode = str(get_cfg(self.config, "models.device", "auto")).lower()
+        if not get_cfg(self.config, "models.use_cuda", True):
+            mode = "cpu"
+        if mode not in ("auto", "cuda", "cpu"):
+            logger.warning(f"Unknown models.device={mode!r} — using 'auto'")
+            mode = "auto"
 
-        self.device = (
-            device if (use_cuda and torch.cuda.is_available() and device == "cuda") else "cpu"
-        )
+        cuda_ok = torch.cuda.is_available()
+        if mode == "cuda":
+            if not cuda_ok:
+                raise RuntimeError(
+                    "models.device='cuda' but no CUDA GPU is available. "
+                    "Set models.device='auto' for automatic CPU fallback, "
+                    "or 'cpu' to force CPU."
+                )
+            self.device = "cuda"
+        elif mode == "cpu":
+            self.device = "cpu"
+            logger.info("models.device='cpu' — running on CPU (localization only, slow)")
+        else:  # auto: стара поведінка (respects legacy use_cuda + requested device)
+            self.device = "cuda" if (cuda_ok and device == "cuda") else "cpu"
         self.models = {}
         self.model_usage = {}
 
@@ -186,10 +202,15 @@ class ModelManager:
         logger.success("Centralized model prewarm complete")
 
     def load_local_extractor(self):
-        """Завантажує поточний локальний екстрактор згідно конфігу (aliked або rdd)."""
+        """Завантажує поточний локальний екстрактор згідно конфігу (aliked | rdd | xfeat)."""
         local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
         if local_extractor == "rdd":
             return self.load_rdd()
+        if local_extractor == "xfeat":
+            # XFeat-шлях (легший екстрактор + 64-dim → MNN замість LightGlue).
+            # DatabaseBuilder уже кликав load_xfeat() напряму; тепер онлайн-шлях
+            # локалізації теж отримує XFeat замість тихого фолбеку на ALIKED.
+            return self.load_xfeat()
         return self.load_aliked()
 
     def load_yolo(self):
@@ -706,7 +727,11 @@ class ModelManager:
                     # Завантаження pretrained ваг (якщо є)
                     weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
                     if weights_path:
-                        cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
+                        cesp.load_state_dict(
+                            torch.load(
+                                weights_path, map_location=self.device, weights_only=True
+                            )
+                        )
                         logger.success(f"CESP pretrained weights loaded from {weights_path}")
                     else:
                         logger.warning("CESP initialized WITHOUT pretrained weights (random init)")

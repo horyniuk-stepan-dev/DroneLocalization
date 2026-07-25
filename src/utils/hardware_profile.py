@@ -375,7 +375,7 @@ class HardwareProfile:
                 target = target[k]
             target[keys[-1]] = new_val
 
-    def apply_torch_backends(self) -> None:
+    def apply_torch_backends(self, deterministic: bool = False) -> None:
         """Configure PyTorch global backend settings based on hardware.
 
         Should be called once at startup, after detection. Sets:
@@ -383,6 +383,11 @@ class HardwareProfile:
         - TF32 matmul/convolution on Ampere+ GPUs
         - ``torch.set_num_threads`` for CPU parallelism
         - ``cv2.setNumThreads`` for OpenCV parallelism
+
+        HARDENING P1-8: when ``deterministic`` is True, cuDNN benchmarking is
+        disabled to bound worst-case latency (no variable first-call autotuning,
+        no nondeterministic kernel selection). Trades some throughput for
+        predictability. Default False = current throughput-tuned behavior.
         """
         # ── CPU thread tuning ────────────────────────────────────────────────
         try:
@@ -407,9 +412,19 @@ class HardwareProfile:
         try:
             import torch
 
-            # cuDNN benchmark: always beneficial for repeated same-size convolutions
-            torch.backends.cudnn.benchmark = True
-            logger.info("cudnn.benchmark = True")
+            # cuDNN benchmark: beneficial for repeated same-size convolutions,
+            # but its autotuning makes first-call cost and kernel choice vary.
+            # Deterministic mode (P1-8) disables it for worst-case latency bounding.
+            if deterministic:
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+                logger.info(
+                    "cudnn.benchmark = False, cudnn.deterministic = True "
+                    "(P1-8 deterministic mode — bounded worst-case latency)"
+                )
+            else:
+                torch.backends.cudnn.benchmark = True
+                logger.info("cudnn.benchmark = True")
 
             # TF32: ~2× matmul throughput on Ampere+ with negligible precision loss
             # for inference workloads (DINOv2, ALIKED, LightGlue, YOLO)

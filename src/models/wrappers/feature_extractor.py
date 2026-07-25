@@ -69,8 +69,21 @@ class FeatureExtractor:
         )
         self.amp_dtype = torch.float16 if self.use_half else torch.float32
 
+        # CPU-фолбек локалізації: на CPU-only torch device_type="cuda" в
+        # autocast може впасти (а легасі torch.cuda.amp.autocast — тим паче).
+        # use_half на CPU завжди False, тож autocast лишається no-op — але
+        # device_type має бути коректним, інакше конструктор контексту трипить.
+        self._amp_device_type = (
+            "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+        )
+
         if self.use_half:
             logger.info("FP16 mixed precision ENABLED for inference")
+        elif device != "cuda" or not torch.cuda.is_available():
+            logger.warning(
+                "Running feature extraction on CPU (no CUDA). Localization will "
+                "work but be slow; build/modify the database on a GPU machine."
+            )
 
         cesp_status = "with CESP" if cesp_module is not None else "without CESP"
         local_name = type(local_model).__name__
@@ -117,7 +130,7 @@ class FeatureExtractor:
         kwargs = {}
         if self._vlad_layer is not None:
             kwargs["layer"] = self._vlad_layer
-        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+        with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
             try:
                 features = self.global_model.forward_features(dino_input, **kwargs)
             except TypeError:
@@ -141,7 +154,7 @@ class FeatureExtractor:
 
         if self.cesp_module is not None:
             # CESP mode: отримуємо patch tokens замість CLS
-            with torch.cuda.amp.autocast(dtype=self.amp_dtype, enabled=self.use_half):
+            with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                 features = self.global_model.forward_features(dino_input)
                 patch_tokens = features["x_norm_patchtokens"].float()
 
@@ -152,7 +165,7 @@ class FeatureExtractor:
             global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
             # Стандартний mode: CLS token
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+            with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                 global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
 
         return global_desc
@@ -190,13 +203,13 @@ class FeatureExtractor:
                 if self.vlad_aggregator is not None:
                     outs.append(np.asarray(self._vlad_descriptors(chunk)))
                 elif self.cesp_module is not None:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                         features = self.global_model.forward_features(chunk)
                     patch_tokens = features["x_norm_patchtokens"].float()
                     h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
                     outs.append(self.cesp_module(patch_tokens, h_p, w_p).float().cpu().numpy())
                 else:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                         outs.append(self.global_model(chunk).float().cpu().numpy())
 
             return np.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
@@ -215,7 +228,7 @@ class FeatureExtractor:
             dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
         )
         dino_input = self.dinov2_transform(dino_tensor)
-        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+        with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
             features = self.global_model.forward_features(dino_input)
         tokens = features["x_norm_patchtokens"][0].float().cpu().numpy()  # (N, D)
         side = self._patch_grid_side(tokens.shape[0])
@@ -223,11 +236,11 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def extract_local_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
-        logger.debug(f"Extracting local features (ALIKED) from image: {image.shape}")
+        logger.debug(f"Extracting local features from image: {image.shape}")
 
         enhanced_image = self.preprocessor.preprocess(image)
 
-        # Підготовка зображення для ALIKED (LightGlue format)
+        # Підготовка тензора (LightGlue format для ALIKED/RDD; сирий (1,3,H,W) для XFeat)
         rgb_tensor = torch.from_numpy(enhanced_image).float().div_(255.0)
         rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
 
@@ -243,17 +256,25 @@ class FeatureExtractor:
             )
             logger.debug(f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
 
-        # ALIKED очікує словник зі списком/тензором 'image'
-        input_dict = {"image": rgb_tensor}
+        # XFeat має інший інтерфейс (detectAndCompute на сирому тензорі), ніж
+        # ALIKED/RDD (виклик як {"image": tensor}). Ця гілка дзеркалить
+        # batch-шлях extract_features_batch, щоб онлайн-локалізація давала той
+        # самий формат ознак, що й БД, збудована XFeat-ом.
+        is_xfeat = "XFeat" in self.local_model.__class__.__name__
 
-        # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
         with Telemetry.profile("local_extractor"):
-            with contextlib.nullcontext():
-                aliked_out = self.local_model(input_dict)
-
-        # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
-        keypoints = aliked_out["keypoints"][0].cpu().numpy()
-        descriptors = aliked_out["descriptors"][0].cpu().numpy()
+            if is_xfeat:
+                top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
+                xf = self.local_model.detectAndCompute(rgb_tensor, top_k=top_k)[0]
+                keypoints = xf["keypoints"].cpu().numpy()
+                descriptors = xf["descriptors"].cpu().numpy()
+            else:
+                # ALIKED нестабільний усередині AMP autocast (NaN) — тримаємо FP32.
+                with contextlib.nullcontext():
+                    aliked_out = self.local_model({"image": rgb_tensor})
+                # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
+                keypoints = aliked_out["keypoints"][0].cpu().numpy()
+                descriptors = aliked_out["descriptors"][0].cpu().numpy()
 
         if scale_factor != 1.0:
             keypoints = keypoints / scale_factor
@@ -358,14 +379,14 @@ class FeatureExtractor:
                 if self.vlad_aggregator is not None:
                     out_global = torch.from_numpy(self._vlad_descriptors(dino_input))
                 elif self.cesp_module is not None:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                         features = self.global_model.forward_features(dino_input)
                     patch_tokens = features["x_norm_patchtokens"].float()
                     # RESEARCH 1.1: сітка з фактичної кількості токенів, не //14
                     h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
                     out_global = self.cesp_module(patch_tokens, h_p, w_p)
                 else:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                         out_global = self.global_model(dino_input).float()
 
         out_kpts = []

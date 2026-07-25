@@ -39,6 +39,20 @@ git add config/localization.py src/localization/localizer.py src/localization/ge
 
 ---
 
+## ФІНАЛ — валідовано на Shtepsill (2026-07-22, жива місія)
+
+Користувач підтвердив на цільовій GTX 1650 усі три гейти (числа місії не збережені тут — підтвердження словом):
+
+- **Швидкість:** бенч на Shtepsill дав `global_descriptor 470→133 мс` (fp32, 0.28x) і `steady_keyframe 945→500 мс` (0.53x); `tracking_frame 14.8 мс` (< 33, гейт узято 2.2×). Реальний steady нижчий за бенчові 500 мс, бо A1 пропускає DINOv3 на ~99% keyframe.
+- **Worst-case:** бенчові 1982 мс — це теоретична стеля `12×LightGlue` (бенч не бачить prefilter); з увімкненим `candidate_prefilter` реальний worst ≈ 665 мс (арифметика), місією підтверджено в бюджеті.
+- **VRAM < 4 ГБ:** підтверджено на живій місії (`global_batch_max:4` як страховка recovery).
+
+Активний набір на Shtepsill: `candidate_prefilter` + `temporal_candidate_prior` + `of_stride:3` + `of_half_res` + `fp16_enabled:false` + `global_batch_max:4` (+ ймовірно `max_local_edge:1280`).
+
+Резерв (НЕ знадобився, гейти взято без ребілду БД): A5 ONNX/TRT, A6 препроцес, C3 depth-unload, D1 input 224→160, D2 XFeat.
+
+---
+
 ## Валідація якості на Stozhar (2026-07-21, A/B по app.log)
 
 Інструмент: `scripts/ab_localization.py` (Jaccard matched-frame + агрегати; парсить app.log). Місія: `TEST/newZap.mp4`, 186 keyframe-успіхів, 7 outlier-невдач в обох прогонах.

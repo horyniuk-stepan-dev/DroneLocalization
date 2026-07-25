@@ -56,7 +56,7 @@ from PyQt6.QtWidgets import QApplication
 from config import APP_SETTINGS, CONFIG_LOAD_STATUS, CONFIG_LOADED_FROM, user_data_dir
 from src.core.headless_runner import HeadlessRunner
 from src.gui.main_window import MainWindow
-from src.utils.logging_utils import get_logger, setup_logging
+from src.utils.logging_utils import enable_crash_handler, get_logger, setup_logging
 
 
 class StartupWorker(QThread):
@@ -87,6 +87,76 @@ def _build_exception_hook(log):
     return hook
 
 
+def _run_supervised(args, logger) -> int:
+    """HARDENING P0-3: run the headless pipeline in a child process and restart
+    it on crash with exponential backoff.
+
+    Because the pipeline runs as a separate process, even a native segfault
+    (CUDA/cv2/torch) is survivable — the supervisor sees a non-zero exit and
+    relaunches. Turns "silent death" into "logged auto-recovery". Active only
+    with ``--supervise --headless``; default behavior is unchanged.
+    """
+    import subprocess
+    import time as _time
+
+    if getattr(sys, "frozen", False):
+        base_cmd = [sys.executable]
+    else:
+        base_cmd = [sys.executable, os.path.abspath(sys.argv[0])]
+
+    child_cmd = base_cmd + [
+        "--headless",
+        "--project", args.project,
+        "--source", args.source,
+        "--ws-port", str(args.ws_port),
+        "--rest-port", str(args.rest_port),
+    ]
+
+    backoff = 1.0
+    backoff_max = 60.0
+    restarts = 0
+    max_restarts = args.max_restarts  # 0 = unlimited
+
+    logger.info(
+        f"Supervisor starting | max_restarts={max_restarts or 'unlimited'} | "
+        f"child={' '.join(child_cmd)}"
+    )
+
+    while True:
+        start = _time.monotonic()
+        try:
+            rc = subprocess.run(child_cmd).returncode
+        except KeyboardInterrupt:
+            logger.info("Supervisor received interrupt — shutting down")
+            return 0
+        runtime = _time.monotonic() - start
+
+        if rc == 0:
+            logger.info("Supervised pipeline exited cleanly (rc=0) — supervisor stopping")
+            return 0
+
+        restarts += 1
+        logger.error(
+            f"Supervised pipeline crashed (rc={rc}) after {runtime:.1f}s — restart #{restarts}"
+        )
+
+        if max_restarts and restarts >= max_restarts:
+            logger.critical(f"Supervisor reached max_restarts={max_restarts}; giving up.")
+            return 1
+
+        # A child that ran long enough is 'healthy'; reset the backoff.
+        if runtime >= backoff_max:
+            backoff = 1.0
+
+        logger.warning(f"Restarting in {backoff:.0f}s (backoff)")
+        try:
+            _time.sleep(backoff)
+        except KeyboardInterrupt:
+            logger.info("Supervisor interrupted during backoff — shutting down")
+            return 0
+        backoff = min(backoff * 2, backoff_max)
+
+
 def main() -> None:
     try:
         log_level = APP_SETTINGS.models.performance.log_level
@@ -94,6 +164,9 @@ def main() -> None:
         log_level = "INFO"  # Safe default
     setup_logging(log_level=log_level, log_file=str(user_data_dir() / "logs" / "app.log"))
     logger = get_logger(__name__)
+
+    # HARDENING P0-2: capture native segfaults/aborts before the excepthook.
+    enable_crash_handler(user_data_dir() / "logs")
 
     sys.excepthook = _build_exception_hook(logger)
 
@@ -112,14 +185,39 @@ def main() -> None:
     else:
         logger.warning(CONFIG_LOAD_STATUS)
 
+    # ── HARDENING P2-12: weight-integrity preflight (fail-closed go/no-go) ────
+    try:
+        _wi_mode = APP_SETTINGS.models.performance.weight_integrity_mode
+    except Exception:
+        _wi_mode = "off"
+    if _wi_mode and _wi_mode.lower() != "off":
+        from src.utils.weight_integrity import WeightIntegrityError, run_preflight
+
+        _models_root = Path(__file__).parent / "models"
+        try:
+            run_preflight(
+                _models_root,
+                _models_root / "weights_manifest.json",
+                mode=_wi_mode,
+                logger=logger,
+            )
+        except WeightIntegrityError as e:
+            logger.critical(f"Weight integrity preflight failed — aborting startup.\n{e}")
+            sys.exit(1)
+
     # ── Hardware auto-detection & compute auto-tuning ────────────────────────
     from src.utils.hardware_profile import HardwareProfile
 
     hw_profile = HardwareProfile.detect()
     hw_profile.log_summary()
 
-    # Apply PyTorch backend optimizations (TF32, cudnn.benchmark, thread counts)
-    hw_profile.apply_torch_backends()
+    # Apply PyTorch backend optimizations (TF32, cudnn.benchmark, thread counts).
+    # HARDENING P1-8: deterministic mode bounds worst-case latency when enabled.
+    try:
+        _deterministic = APP_SETTINGS.models.performance.deterministic
+    except Exception:
+        _deterministic = False
+    hw_profile.apply_torch_backends(deterministic=_deterministic)
 
     # Auto-tune config values if enabled
     if APP_SETTINGS.models.performance.auto_tune:
@@ -148,8 +246,30 @@ def main() -> None:
     )
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket port")
     parser.add_argument("--rest-port", type=int, default=8080, help="REST API port")
+    parser.add_argument(
+        "--supervise",
+        action="store_true",
+        help="Headless: run the pipeline in a child process and auto-restart it on crash",
+    )
+    parser.add_argument(
+        "--max-restarts",
+        type=int,
+        default=0,
+        help="Supervisor: stop after N restarts (0 = unlimited)",
+    )
 
     args = parser.parse_args()
+
+    # HARDENING P0-3: supervisor mode wraps the headless pipeline in an
+    # auto-restarting parent process. Flag-gated; off = current behavior.
+    if args.supervise:
+        if not args.headless:
+            logger.error("--supervise requires --headless")
+            sys.exit(1)
+        if not args.project or not args.source:
+            logger.error("--project and --source are required with --supervise")
+            sys.exit(1)
+        sys.exit(_run_supervised(args, logger))
 
     try:
         if args.headless:
