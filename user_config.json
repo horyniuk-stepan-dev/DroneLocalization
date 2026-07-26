@@ -24,7 +24,8 @@
         "fix_stale_sec": 3.0,
         "heartbeat_interval_sec": 1.0,
         "degraded_min_inliers": 0,
-        "degraded_min_confidence": 0.0
+        "degraded_min_confidence": 0.0,
+        "propagation_stale_sec": 0.0
     },
     "object_tracking": {
         "enabled": true,

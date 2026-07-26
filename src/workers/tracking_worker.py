@@ -17,6 +17,9 @@ class RealtimeTrackingWorker(QThread):
 
     frame_ready = pyqtSignal(np.ndarray)
     location_found = pyqtSignal(float, float, float, int)
+    # HARDENING §4a: fired only on a fresh keyframe anchor (not an OF-propagated
+    # fix) — drives the broker's anchor-staleness DEGRADED clock.
+    anchor_fix = pyqtSignal()
     fps_updated = pyqtSignal(float)
     error = pyqtSignal(str)
     status_update = pyqtSignal(str)
@@ -467,6 +470,11 @@ class RealtimeTrackingWorker(QThread):
                     loc_result["confidence"],
                     loc_result["inliers"],
                 )
+                # HARDENING §4a: a fresh keyframe anchor (real re-localization)
+                # refreshes the broker's anchor-staleness clock; OF-propagated
+                # fixes do not, so a long OF coast honestly reads DEGRADED.
+                if not loc_result.get("is_of"):
+                    self.anchor_fix.emit()
                 if loc_result.get("fov_polygon"):
                     self.fov_found.emit(loc_result["fov_polygon"])
 

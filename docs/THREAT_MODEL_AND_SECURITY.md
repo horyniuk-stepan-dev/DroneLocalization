@@ -36,6 +36,7 @@ The payload is a GPS-denied localization system. Its working threat model:
 | P1-7 | Telemetry confidential in transit | Optional TLS (`wss`/`https`), fail-closed | `network_api.tls_enabled` + `tls_certfile`/`tls_keyfile` | off |
 | P1-9 | Honest operating state | State machine in `/api/status` | `network_api.expose_operating_state` | off |
 | P1-10 | Detect a hung pipeline | WS heartbeat + stall (`LOST`) detection | same flag + `fix_stale_sec`, `heartbeat_interval_sec` | off |
+| §4a | Detect content-blind OF coast | Anchor-staleness `DEGRADED` (fresh-keyframe clock) | `network_api.propagation_stale_sec` | off |
 | P1-8 | Bounded worst-case latency (partial) | Deterministic cuDNN + latency percentiles | `models.performance.deterministic`, `log_latency_stats` | off |
 | P2-12 | Weight tamper / swap detection | SHA-256 manifest preflight, fail-closed | `models.performance.weight_integrity_mode` | `off` |
 
@@ -67,7 +68,8 @@ To harden a fielded build, set in `user_config.json` (values are examples):
     "tls_keyfile":  "certs/telemetry.key",
     "api_token":    "<pin a fixed token, or leave empty to auto-generate on remote bind>",
     "expose_operating_state": true,
-    "fix_stale_sec": 3.0
+    "fix_stale_sec": 3.0,
+    "propagation_stale_sec": 8.0
   },
   "models": {
     "performance": {
@@ -163,13 +165,37 @@ inlier/confidence signal the `DEGRADED` branch inspects is stale, not the curren
 frame's. No threshold can separate blackout from clean (it would need
 `> 1318` inliers, which flags healthy frames too).
 
-**Closing the gap therefore needs a NEW signal — current-frame quality,
-independent of propagation.** Cheap candidates (deferred design work): a
-frame-content sanity gate before localization (near-zero variance ⇒ black /
-blanked; identical-to-previous ⇒ frozen; abnormal statistics ⇒ corrupt), or a
-"frames since a fresh *successful keyframe* localization" counter that trips
-`DEGRADED` when optical flow has been propagating too long without a real fix.
-Either feeds the state machine a truth the inlier/confidence path cannot see.
+**Gap CLOSED — anchor-staleness DEGRADED signal (implemented, flag-gated, verified).**
+The pipeline already distinguishes a fresh keyframe localization from an
+optical-flow coast (`loc_result["is_of"]`). A second staleness clock, symmetric
+to the `LOST` fix-clock, now watches the *fresh keyframe anchor*: if tracking
+coasts on OF with no fresh anchor for longer than
+`network_api.propagation_stale_sec` (default `0.0` = off), the state machine
+reports `DEGRADED` — even while the propagated fix clock is still fresh. Design:
+`docs/superpowers/specs/2026-07-26-anchor-staleness-degraded-design.md`.
+
+Verified end-to-end on the harness (RTX 5070 Ti, `newzap`, `propagation_stale_sec = 6.0`):
+
+| Run | anchor age (max) | fix age (max) | State outcome |
+|---|---|---|---|
+| `clean` (8 loops, 31 117 frames) | 4.375 s (< 6) | 0.453 s | `TRACKING` throughout — **0 false DEGRADED** |
+| `blackout` (401 black frames) | **24.875 s** (> 6) | 0.672 s (< 3) | `TRACKING → DEGRADED` @20.4 s, recovered @39.4 s |
+
+So blackout — invisible to both the fix clock (0.672 s, no `LOST`) and the
+inlier/confidence knobs (frozen at 1318) — now honestly reads `DEGRADED`, while a
+healthy 8-loop run does not false-positive. Precedence unchanged: `LOST`
+(fix-clock) still outranks anchor-staleness `DEGRADED`.
+
+**Tuning note:** set `propagation_stale_sec` above the *worst-case healthy* anchor
+cadence with margin. Here the healthy peak was 4.375 s; 6.0 s worked but leaves
+only ~1.6 s of margin — a fielded value of ~8–10 s trades slower DEGRADED
+detection for zero false-positive risk. Default stays `0` (off) so the operator
+tunes it against their own observed cadence.
+
+**Residual:** a *partially* degraded frame that still yields a false keyframe DB
+match (`is_of=False`) would reset the anchor clock and evade `DEGRADED`. Unlikely
+for true blackout (no features — confirmed by the frozen inlier count); a pixel
+gate would not reliably catch that case either.
 
 ---
 
@@ -202,3 +228,9 @@ reliability + latency.
   (`src/utils/fault_injection.py`, `scripts/soak_test.py`,
   `tests/test_fault_injection.py`). A bench test rig, not shipped in the app —
   no config flag, no production-path change.
+- §4a anchor-staleness `DEGRADED`: closes the content-blind gap found by P3-15.
+  New `anchor_fix` worker signal (fired only on a fresh keyframe anchor) →
+  broker's `on_anchor_fix` clock → `get_operating_state` DEGRADED branch, gated on
+  `network_api.propagation_stale_sec` (default 0 = off). Unit-tested
+  (`tests/test_operating_state.py`, 8 tests) + verified end-to-end on the harness
+  (blackout → DEGRADED; 8-loop clean → no false positive).

@@ -32,6 +32,10 @@ class CoordinatesBroker(QObject):
         # drives the operating-state machine and stall detector. None = no fix
         # since the current tracking session began.
         self._last_fix_mono: float | None = None
+        # HARDENING §4a: monotonic timestamp of the last *fresh keyframe anchor*
+        # (a real re-localization, not an optical-flow-propagated fix). Drives
+        # the anchor-staleness DEGRADED branch. None = no anchor yet this session.
+        self._last_anchor_mono: float | None = None
 
         self._ws_server = None
         self._rest_server = None
@@ -133,6 +137,7 @@ class CoordinatesBroker(QObject):
             self._tracking_start_time = time.time()
             # New session starts in ACQUIRING until the first fix arrives.
             self._last_fix_mono = None
+            self._last_anchor_mono = None
 
     def get_uptime(self) -> float:
         if self.is_tracking_active:
@@ -151,14 +156,18 @@ class CoordinatesBroker(QObject):
         stale_sec = getattr(self.config, "fix_stale_sec", 3.0)
         min_inl = getattr(self.config, "degraded_min_inliers", 0)
         min_conf = getattr(self.config, "degraded_min_confidence", 0.0)
+        prop_stale = getattr(self.config, "propagation_stale_sec", 0.0)
 
+        now = time.monotonic()
         age = None
+        anchor_age = None if self._last_anchor_mono is None else now - self._last_anchor_mono
+
         if not self.is_tracking_active:
             state = "IDLE"
         elif self._last_fix_mono is None:
             state = "ACQUIRING"
         else:
-            age = time.monotonic() - self._last_fix_mono
+            age = now - self._last_fix_mono
             if age > stale_sec:
                 state = "LOST"
             else:
@@ -167,6 +176,12 @@ class CoordinatesBroker(QObject):
                 conf = last.get("confidence", 1.0)
                 if (min_inl and inl < min_inl) or (min_conf and conf < min_conf):
                     state = "DEGRADED"
+                elif prop_stale and (self._last_anchor_mono is None or anchor_age > prop_stale):
+                    # HARDENING §4a: tracking is coasting on optical-flow
+                    # propagation with no fresh keyframe anchor for too long —
+                    # honest DEGRADED even though the (propagated) fix clock is
+                    # still fresh. Closes the content-blind gap.
+                    state = "DEGRADED"
                 else:
                     state = "TRACKING"
 
@@ -174,6 +189,7 @@ class CoordinatesBroker(QObject):
             "op_state": state,
             "last_fix_age_sec": round(age, 3) if age is not None else None,
             "stale_after_sec": stale_sec,
+            "anchor_age_sec": round(anchor_age, 3) if anchor_age is not None else None,
         }
 
     async def _heartbeat_loop(self):
@@ -217,6 +233,13 @@ class CoordinatesBroker(QObject):
         self._last_fix_mono = time.monotonic()  # HARDENING P1-9/10: stall clock
         self._history.append(msg)
         self._broadcast(msg)
+
+    @pyqtSlot()
+    def on_anchor_fix(self):
+        """HARDENING §4a: a fresh keyframe anchor landed (a real re-localization,
+        not an optical-flow-propagated fix). Refreshes the anchor-staleness clock
+        the DEGRADED branch watches. Wired to the worker's ``anchor_fix`` signal."""
+        self._last_anchor_mono = time.monotonic()
 
     @pyqtSlot(object)
     def on_objects_gps_updated(self, objects_gps: list):

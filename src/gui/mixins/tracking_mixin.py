@@ -165,6 +165,7 @@ class TrackingMixin:
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
+            self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
             self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
             self.coordinates_broker.set_tracking_active(True)
 

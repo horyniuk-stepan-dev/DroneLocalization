@@ -163,6 +163,7 @@ class HeadlessRunner:
 
         # Підключаємо брокер координат
         self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
+        self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
         self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
 
         def on_tracking_finished():

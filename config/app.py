@@ -106,6 +106,11 @@ class NetworkApiConfig(BaseModel):
     # Пороги DEGRADED; 0 вимикає перевірку (дефолт: стан лише за часом фіксу).
     degraded_min_inliers: int = 0
     degraded_min_confidence: float = 0.0
+    # §4a: якщо трекінг коастить на optical-flow-пропагації без свіжого
+    # keyframe-якоря довше за це (сек) => DEGRADED, навіть коли годинник фіксу
+    # свіжий (пропаговані фікси несуть застарілі inliers). 0 = вимкнено (дефолт).
+    # Задавати з запасом над спостережуваним інтервалом свіжого якоря.
+    propagation_stale_sec: float = 0.0
 
 
 class AppConfig(BaseModel):

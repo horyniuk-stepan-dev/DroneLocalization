@@ -113,6 +113,9 @@ class _StateMonitor(threading.Thread):
         # burst actually starved the fix clock or just flew past below threshold.
         self.max_fix_age_sec = 0.0
         self.stale_after_sec = None
+        # §4a: how stale the fresh-keyframe-anchor clock ever got. Reveals whether
+        # an OF-coast (e.g. blackout) drove TRACKING -> DEGRADED via anchor age.
+        self.max_anchor_age_sec = 0.0
         # Worst fix quality seen (from broker._last_position). Tells us what
         # inliers/confidence a degraded burst actually produces — i.e. whether
         # the DEGRADED thresholds could ever catch it.
@@ -138,6 +141,9 @@ class _StateMonitor(threading.Thread):
                 self.max_fix_age_sec = max(self.max_fix_age_sec, age)
             if op.get("stale_after_sec") is not None:
                 self.stale_after_sec = op["stale_after_sec"]
+            anchor_age = op.get("anchor_age_sec")
+            if anchor_age is not None:
+                self.max_anchor_age_sec = max(self.max_anchor_age_sec, anchor_age)
             lp = getattr(broker, "_last_position", None)
             if lp:
                 inl = lp.get("inliers")
@@ -216,6 +222,12 @@ def main() -> int:
         "--degraded-min-confidence", type=float, default=0.0,
         help="Flag a fix below this confidence as DEGRADED (0 = off)",
     )
+    parser.add_argument(
+        "--propagation-stale-sec", type=float, default=0.0,
+        help="Flag TRACKING as DEGRADED after this many seconds with no fresh "
+             "keyframe anchor (0 = off; tests the §4a anchor-staleness gate that "
+             "closes the content-blind blackout gap)",
+    )
     args = parser.parse_args()
 
     # WinError 1114 workaround (mirrors main.py): torch's DLLs must load BEFORE
@@ -237,14 +249,16 @@ def main() -> int:
 
     # Apply DEGRADED thresholds to the broker config BEFORE HeadlessRunner builds
     # the broker. Harness-local; not persisted to user_config.json.
-    if args.degraded_min_inliers or args.degraded_min_confidence:
+    if args.degraded_min_inliers or args.degraded_min_confidence or args.propagation_stale_sec:
         import config
 
         config.APP_SETTINGS.network_api.degraded_min_inliers = args.degraded_min_inliers
         config.APP_SETTINGS.network_api.degraded_min_confidence = args.degraded_min_confidence
+        config.APP_SETTINGS.network_api.propagation_stale_sec = args.propagation_stale_sec
         logger.info(
             f"DEGRADED thresholds set | min_inliers={args.degraded_min_inliers} "
-            f"min_confidence={args.degraded_min_confidence}"
+            f"min_confidence={args.degraded_min_confidence} "
+            f"propagation_stale_sec={args.propagation_stale_sec}"
         )
 
     profile = _load_profile(args.profile)
@@ -295,6 +309,8 @@ def main() -> int:
         "fix_clock": {
             "max_fix_age_sec": round(monitor.max_fix_age_sec, 3),
             "stale_after_sec": monitor.stale_after_sec,
+            "max_anchor_age_sec": round(monitor.max_anchor_age_sec, 3),
+            "propagation_stale_sec": args.propagation_stale_sec,
         },
         "fix_quality": {
             "min_inliers": monitor.min_inliers,
