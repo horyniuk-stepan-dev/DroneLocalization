@@ -18,7 +18,7 @@ The payload is a GPS-denied localization system. Its working threat model:
 | Threat | Assumption | Primary controls |
 |---|---|---|
 | Contested RF / EW | Network link hostile or absent; operator may need air-gap | Localhost-default telemetry; fail-closed auth; optional TLS |
-| Airframe loss / capture | Recovery by an adversary is realistic | (Deferred) encryption-at-rest; weight-integrity pinning; log redaction |
+| Airframe loss / capture | Recovery by an adversary is realistic | Passphrase encryption-at-rest (geo-anchors done; h5/lance deferred); weight-integrity pinning; log redaction |
 | Unattended long-duration op | No engineer to restart a crash | Supervisor auto-restart; faulthandler; liveness/stall detection |
 | Deadline-bound output | A late fix can be worse than no fix | Deterministic mode; per-frame latency stats; (deferred) drop policy |
 
@@ -38,6 +38,7 @@ The payload is a GPS-denied localization system. Its working threat model:
 | P1-10 | Detect a hung pipeline | WS heartbeat + stall (`LOST`) detection | same flag + `fix_stale_sec`, `heartbeat_interval_sec` | off |
 | §4a | Detect content-blind OF coast | Anchor-staleness `DEGRADED` (fresh-keyframe clock) | `network_api.propagation_stale_sec` | off |
 | P1-8 | Bounded worst-case latency (partial) | Deterministic cuDNN + latency percentiles | `models.performance.deterministic`, `log_latency_stats` | off |
+| P1-6a | Map geo-anchors unreadable on capture | Passphrase AES-256-GCM at-rest (calibration + graph geojson) | `DRONELOC_PASSPHRASE` + `scripts/encrypt_project.py` | off (plaintext) |
 | P2-12 | Weight tamper / swap detection | SHA-256 manifest preflight, fail-closed | `models.performance.weight_integrity_mode` | `off` |
 
 ### Behavior notes
@@ -100,6 +101,11 @@ python main.py --headless --project <dir> --source <src> --supervise
 - **Token (P0-4):** if `api_token` is empty and a routable host is configured, the
   generated token is logged at WARNING on startup — capture it for clients
   (`Authorization: Bearer <token>` or `?token=<token>`), or pin a fixed one.
+- **Map encryption (P1-6a):** after building a project, run
+  `python scripts/encrypt_project.py --project <dir>` (prompts for a passphrase
+  twice) to encrypt the geo-anchors in place. Then launch with
+  `DRONELOC_PASSPHRASE` set (headless/supervised) or enter it when prompted.
+  Keep the passphrase safe — it is never stored and cannot be recovered.
 
 ---
 
@@ -206,7 +212,7 @@ operator decision or a focused session with GPU-side validation.
 
 | Item | Why deferred | What it needs to start |
 |---|---|---|
-| **P1-6 Encryption-at-rest** (map + calibration) | Largest item; wraps the map-load path; key-management is an operator decision | Key model: passphrase-derived vs machine-bound (DPAPI/TPM); decrypt-to-RAM vs temp; co-design with cold-start latency |
+| **P1-6 Encryption-at-rest** — SP1 (geo-anchors) **DONE**: passphrase-derived AES-256-GCM foundation (`src/security/at_rest.py`) + auto-detected decrypt-on-load for `calibration.json` + `scripts/encrypt_project.py`. Remaining: **SP2** `database.h5` (in-RAM decrypt via h5py core/BytesIO) and **SP3** `vectors.lance/` (decrypt-to-temp-dir + secure wipe) | SP2/SP3 wrap the lazy-access map-load paths | SP2: h5py-from-memory perf check; SP3: lance temp-dir lifecycle + wipe |
 | **P1-8 Deadline + drop policy** | Needs a consumer SLA; touches the hot per-frame loop | Target FPS, max acceptable latency at the consumer, drop strategy (drop-oldest vs skip-to-latest) |
 | **P2-11 Anti-tamper / dead-man zeroize** | Destructive (wipes map + keys); trigger policy is a decision | Trigger source (timeout / tamper switch / remote command); depends on P1-6 |
 | **P2-13 Weight encryption / device binding** | Large; so captured `.engine/.pth` aren't reusable | Key model (shared with P1-6); per-load decrypt path |
@@ -228,6 +234,14 @@ reliability + latency.
   (`src/utils/fault_injection.py`, `scripts/soak_test.py`,
   `tests/test_fault_injection.py`). A bench test rig, not shipped in the app —
   no config flag, no production-path change.
+- P1-6 SP1 (geo-anchor encryption-at-rest): passphrase-derived AES-256-GCM
+  foundation (`src/security/at_rest.py`, Scrypt KDF), auto-detected decrypt-on-load
+  hook in `MultiAnchorCalibration.load`, operator tool `scripts/encrypt_project.py`,
+  new `cryptography` dependency. Fail-closed (no/wrong passphrase → `EncryptionError`);
+  plaintext projects byte-for-byte unchanged (auto-detect). 10 unit tests
+  (`tests/test_at_rest.py`) + verified end-to-end (encrypted `newzap` calibration
+  loads 8 anchors identically to plaintext). Design:
+  `docs/superpowers/specs/2026-07-26-encryption-at-rest-geo-anchors-design.md`.
 - §4a anchor-staleness `DEGRADED`: closes the content-blind gap found by P3-15.
   New `anchor_fix` worker signal (fired only on a fresh keyframe anchor) →
   broker's `on_anchor_fix` clock → `get_operating_state` DEGRADED branch, gated on

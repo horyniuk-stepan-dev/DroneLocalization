@@ -13,6 +13,7 @@ import numpy as np
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
+from src.security.at_rest import decrypt_bytes, get_passphrase, is_encrypted
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -372,6 +373,11 @@ class MultiAnchorCalibration:
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
         with open(path, "rb") as f:
             content = f.read()
+
+        # HARDENING P1-6: transparently decrypt an at-rest-encrypted calibration.
+        # Auto-detected by header, so plaintext projects are unaffected.
+        if is_encrypted(content):
+            content = decrypt_bytes(content, get_passphrase())
 
         if _USE_ORJSON:
             data = _json_lib.loads(content)
