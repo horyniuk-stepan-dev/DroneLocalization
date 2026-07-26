@@ -114,10 +114,62 @@ Verified by executing the actual behavior (not just import), plus the green
 - P1-7/9/10: live `https` `/api/status` and `wss` heartbeat over a self-signed cert; all 6 state transitions (IDLE→ACQUIRING→TRACKING→DEGRADED→LOST→IDLE); `/api/status` unchanged when flag off.
 - P1-8: `LatencyTracker` percentiles exact on a known distribution; interval logging fires on boundary.
 - P2-12: manifest excludes cache/non-weights; tamper→MISMATCH; enforce raises on tamper and on missing manifest; warn/off semantics correct.
+- P3-15 (first slice): fault injector deterministic per seed; schedule > window >
+  probability precedence; each fault (corrupt/black/freeze/shape/delay/eof/exception)
+  transforms correctly; FREEZE repeats the *previous* good frame; harness
+  transition-report math (dwell, LOST episodes + recovery) correct. **22 tests
+  passing** (`tests/test_fault_injection.py`).
 
 **Not verified here (needs a Windows/GPU run):** deterministic cuDNN effect and
 latency percentiles under real load; supervisor against a real native crash;
 integrity preflight over the real ~640 MB weight set.
+
+---
+
+## 4a. Empirical finding — coverage of the LOST detector (P1-10)
+
+Established by running the P3-15 harness against the real pipeline (RTX 5070 Ti,
+project `newzap`, ~3600-frame clip). Each row is a full run; `max_fix_age_sec` is
+the peak staleness the fix clock reached against its 3.0 s `fix_stale_sec`.
+
+| Scenario | Injected | max_fix_age | LOST? | Meaning |
+|---|---|---|---|---|
+| `clean` | — | 0.59 s | no | baseline; a fix lands ~every 0.6 s |
+| `stall` | 121 freeze + 70 delay | — | no | a frozen frame is still *valid* → it re-localizes |
+| `blackout` | 401 black frames | 0.67 s | no | **bad frame content does not starve the fix clock** |
+| `linkstall` | one 6 s silent gap | 5.86 s | **yes — 2.86 s, then recovered** | detector fires on true fix absence and recovers |
+
+**Conclusion — the LOST detector is sound but content-blind:**
+
+- ✅ **Absence of fixes is caught.** A 6 s link stall drove `TRACKING → LOST` at
+  the 3 s threshold and recovered to `TRACKING` when frames resumed (2.86 s
+  episode). The heartbeat/stall path (P1-10) works as designed.
+- ⚠️ **Degraded frame *content* is invisible.** 401 black frames moved the fix
+  clock by only 0.08 s versus the clean baseline (0.67 vs 0.59 s) — the pipeline
+  keeps emitting a position on unlocalizable frames (most likely optical-flow
+  propagation; mechanism inferred, not yet traced). So a camera that degrades to
+  garbage *while still delivering frames* would keep the payload reporting
+  `TRACKING` with a possibly-wrong fix, and **would not raise LOST**. This is a
+  silent-failure mode.
+
+**The existing DEGRADED knobs do NOT close this gap (measured, not assumed).**
+The state machine's `DEGRADED` branch keys off `network_api.degraded_min_inliers`
+/ `degraded_min_confidence`. A blackout run instrumented for worst-case fix
+quality showed **`min_inliers` = 1318, `min_confidence` = 0.506 over the whole
+run** — i.e. every fix emitted *during* the 401 black frames carried
+healthy-tracking quality numbers. The position is optical-flow propagated from
+the last good keyframe and **inherits that keyframe's quality metadata**, so the
+inlier/confidence signal the `DEGRADED` branch inspects is stale, not the current
+frame's. No threshold can separate blackout from clean (it would need
+`> 1318` inliers, which flags healthy frames too).
+
+**Closing the gap therefore needs a NEW signal — current-frame quality,
+independent of propagation.** Cheap candidates (deferred design work): a
+frame-content sanity gate before localization (near-zero variance ⇒ black /
+blanked; identical-to-previous ⇒ frozen; abnormal statistics ⇒ corrupt), or a
+"frames since a fresh *successful keyframe* localization" counter that trips
+`DEGRADED` when optical flow has been propagating too long without a real fix.
+Either feeds the state machine a truth the inlier/confidence path cannot see.
 
 ---
 
@@ -133,7 +185,7 @@ operator decision or a focused session with GPU-side validation.
 | **P2-11 Anti-tamper / dead-man zeroize** | Destructive (wipes map + keys); trigger policy is a decision | Trigger source (timeout / tamper switch / remote command); depends on P1-6 |
 | **P2-13 Weight encryption / device binding** | Large; so captured `.engine/.pth` aren't reusable | Key model (shared with P1-6); per-load decrypt path |
 | **P2-14 Embedded/edge build** | XL; gated on the hardware decision | Chosen target (e.g. Jetson), onboard-vs-groundstation compute, power/weight budget |
-| **P3-15 Soak + fault-injection harness** | Its own project; produces the reliability numbers that re-rank the above | Induced GPU-OOM / corrupt-frame / link-loss / thermal scenarios; multi-hour runs |
+| **P3-15 Soak + fault-injection harness** | **First slice landed** — stream-level fault injection (`src/utils/fault_injection.py`) + harness (`scripts/soak_test.py`) that drives the real pipeline and reports operating-state/latency reaction. Remaining: resource-level scenarios (induced GPU-OOM / thermal) and the actual multi-hour Windows/GPU runs | A GPU box + a built project; run `python scripts/soak_test.py --project <dir> --source flight.mp4 --profile stall` and collect the report |
 
 **Assumption most worth confirming (from the plan):** that adversary capture is
 in-scope. If this is a training/civilian build where capture is not a concern,
@@ -146,3 +198,7 @@ reliability + latency.
 
 - `hardening/p0` branch: implemented P0 (1–5), P1 (7, 9, 10, and the safe slice of
   8), and P2-12. All flag-gated; `user_config.json` unchanged by the code.
+- P3-15 first slice: stream-level fault injection + soak harness
+  (`src/utils/fault_injection.py`, `scripts/soak_test.py`,
+  `tests/test_fault_injection.py`). A bench test rig, not shipped in the app —
+  no config flag, no production-path change.

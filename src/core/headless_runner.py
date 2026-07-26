@@ -74,13 +74,25 @@ class HeadlessRunner:
                     f"sources={self.db_manager.all_source_ids}"
                 )
             else:
-                # Single-source mode
-                db_path = self.project_dir / "database.h5"
+                # Single-source mode. Resolve the DB/calibration from the paths
+                # the project actually declares (modern layout: sources/main/…),
+                # falling back to the legacy flat root so old projects still load.
+                db_path = Path(pm.database_path) if pm.database_path else self.project_dir / "database.h5"
                 if not db_path.exists():
-                    raise FileNotFoundError(f"Database not found at {db_path}")
+                    legacy_db = self.project_dir / "database.h5"
+                    if legacy_db.exists():
+                        db_path = legacy_db
+                    else:
+                        raise FileNotFoundError(f"Database not found at {db_path}")
                 self.database = DatabaseLoader(str(db_path))
 
-                calib_path = self.project_dir / "calibration.json"
+                calib_path = (
+                    Path(pm.calibration_path)
+                    if pm.calibration_path
+                    else self.project_dir / "calibration.json"
+                )
+                if not calib_path.exists():
+                    calib_path = self.project_dir / "calibration.json"
                 if calib_path.exists():
                     self.calibration.load(str(calib_path))
         else:
