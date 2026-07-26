@@ -28,14 +28,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 import numpy as np
 
 from src.video.video_source import VideoSource, VideoSourceConfig
 
 
-class FaultType(str, Enum):
+class FaultType(StrEnum):
     """A single injectable fault. String-valued so profiles round-trip to JSON."""
 
     NONE = "none"  # pass the frame through unchanged
