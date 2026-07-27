@@ -1,3 +1,4 @@
+import io
 import json
 import threading
 from collections import OrderedDict
@@ -9,9 +10,28 @@ import lancedb
 import numpy as np
 
 from src.geometry.coordinates import CoordinateConverter
+from src.security.at_rest import MAGIC, decrypt_bytes, get_passphrase
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def open_maybe_encrypted_h5(path: str) -> tuple[h5py.File, io.BytesIO | None]:
+    """Open an HDF5 database, transparently decrypting an at-rest-encrypted map.
+
+    HARDENING P1-6 SP2: h5py needs a seekable source for the whole session. A
+    plaintext DB is opened straight from the path (h5py reads lazily — no full
+    load, zero overhead). An encrypted DB (`MAGIC` header) is decrypted whole into
+    RAM and served from a ``BytesIO`` (67 MB fits comfortably); the buffer is
+    returned so the caller can keep it alive for the file handle's lifetime.
+    """
+    with open(path, "rb") as f:
+        head = f.read(len(MAGIC))
+    if head != MAGIC:
+        return h5py.File(path, "r"), None  # plaintext: unchanged lazy path
+    plaintext = decrypt_bytes(Path(path).read_bytes(), get_passphrase())
+    buf = io.BytesIO(plaintext)
+    return h5py.File(buf, "r"), buf
 
 
 def _synchronized(method):
@@ -32,6 +52,9 @@ class DatabaseLoader:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.db_file: h5py.File | None = None
+        # HARDENING P1-6 SP2: holds the decrypted-map RAM buffer (encrypted DBs
+        # only), kept alive for the h5py handle's lifetime; None when plaintext.
+        self._decrypted_buf: io.BytesIO | None = None
         self.global_descriptors: np.ndarray | None = None
         self.lance_table = None
         self.frame_poses: np.ndarray | None = None
@@ -78,7 +101,7 @@ class DatabaseLoader:
         logger.info(f"Loading hot data into RAM from: {self.db_path}")
 
         try:
-            self.db_file = h5py.File(self.db_path, "r")
+            self.db_file, self._decrypted_buf = open_maybe_encrypted_h5(self.db_path)
             logger.debug(f"HDF5 file opened | top-level groups: {list(self.db_file.keys())}")
 
             if "global_descriptors" not in self.db_file:

@@ -20,6 +20,8 @@ from __future__ import annotations
 import getpass
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -91,6 +93,57 @@ def decrypt_bytes(container: bytes, passphrase: str) -> bytes:
         return AESGCM(key).decrypt(nonce, ciphertext, None)
     except InvalidTag as e:
         raise EncryptionError("wrong passphrase or corrupted data") from e
+
+
+def encrypt_file(src_path: str, dst_path: str, passphrase: str) -> None:
+    """Encrypt ``src_path`` into an at-rest container at ``dst_path`` (atomic
+    write). Used by the encrypted-copy builder. ``dst`` may equal ``src`` for
+    in-place, but the copy model keeps the plaintext master untouched."""
+    container = encrypt_bytes(Path(src_path).read_bytes(), passphrase)
+    dst = Path(dst_path)
+    tmp = dst.with_name(dst.name + ".enc-tmp")
+    with open(tmp, "wb") as f:
+        f.write(container)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, dst)
+
+
+def decrypt_to_tempfile(src_path: str, passphrase: str, *, suffix: str = "") -> str:
+    """Decrypt an encrypted file to a fresh temp file and return its path. For
+    artifacts a library must open by path (e.g. a video, a lance data file). The
+    caller MUST :func:`wipe_file` it when done. Fails closed (never leaves a
+    partial plaintext temp on a bad passphrase)."""
+    plaintext = decrypt_bytes(Path(src_path).read_bytes(), passphrase)
+    fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="dlmap_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(plaintext)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        wipe_file(tmp)
+        raise
+    return tmp
+
+
+def wipe_file(path: str) -> None:
+    """Best-effort secure delete: overwrite with random bytes, then unlink. Note:
+    on SSD/copy-on-write/journaling filesystems this does NOT guarantee the old
+    blocks are physically erased (that needs full-disk encryption or a device
+    secure-erase); it raises the bar against casual recovery of a decrypted temp."""
+    p = Path(path)
+    if not p.exists():
+        return
+    try:
+        size = p.stat().st_size
+        with open(p, "r+b") as f:
+            f.write(os.urandom(size))
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass  # overwrite is best-effort; still unlink below
+    p.unlink(missing_ok=True)
 
 
 def get_passphrase() -> str:

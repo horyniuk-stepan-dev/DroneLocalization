@@ -160,8 +160,13 @@ two things:
   encrypted artifact is detected; feed `at_rest.get_passphrase`'s cache).
 - **Copy builder** — rewrite `scripts/encrypt_project.py` to `--project/--output`,
   walking the tree, encrypting the five sensitive artifacts, copying the rest.
-- **SP2 load hook** — `DatabaseLoader`: decrypt `database.h5` in-RAM (h5py
-  `BytesIO`/`core` driver) when the file is an encrypted container.
+- **SP2 load hook — DONE.** `open_maybe_encrypted_h5` in `database_loader.py`
+  peeks the `MAGIC` header: plaintext DBs open on the unchanged lazy path (zero
+  overhead), encrypted DBs decrypt whole into a `BytesIO` and open from RAM. Kept
+  alive via `DatabaseLoader._decrypted_buf`. 3 tests (`tests/test_db_encryption.py`).
+  Note: an encrypted DB is read-only in the field (the propagation close→write→
+  reload rewrite path assumes plaintext — fine, calibration/rebuild happens on the
+  plaintext master).
 - **SP3 load hooks** — `vectors.lance/` and `database_keypoints.mp4`:
   decrypt-to-temp-dir, secure-wipe on exit. Accepted trade-off: transient
   plaintext on the temp disk while the app runs (protected at-rest; exposed only

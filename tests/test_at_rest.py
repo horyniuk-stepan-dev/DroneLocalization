@@ -7,6 +7,10 @@ depends on `cryptography`); no torch/Qt.
 
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from src.security import at_rest
@@ -83,3 +87,41 @@ def test_get_passphrase_raises_when_unset_and_no_tty(monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     with pytest.raises(at_rest.EncryptionError):
         at_rest.get_passphrase()
+
+
+# --- file-level helpers (copy builder + SP3 temp-decrypt) --------------------
+
+
+def test_encrypt_file_then_decrypt_tempfile_round_trips(tmp_path):
+    src = tmp_path / "map.bin"
+    src.write_bytes(PLAINTEXT)
+    dst = tmp_path / "map.bin.enc"
+
+    at_rest.encrypt_file(str(src), str(dst), PW)
+    assert at_rest.is_encrypted(dst.read_bytes())
+    assert src.read_bytes() == PLAINTEXT  # source untouched (copy model)
+
+    tmp = at_rest.decrypt_to_tempfile(str(dst), PW, suffix=".bin")
+    try:
+        assert Path(tmp).read_bytes() == PLAINTEXT
+    finally:
+        at_rest.wipe_file(tmp)
+        assert not Path(tmp).exists()
+
+
+def test_decrypt_to_tempfile_wrong_passphrase_leaves_no_temp(tmp_path):
+    src = tmp_path / "map.bin"
+    src.write_bytes(PLAINTEXT)
+    dst = tmp_path / "map.bin.enc"
+    at_rest.encrypt_file(str(src), str(dst), PW)
+
+    tdir = tempfile.gettempdir()
+    before = {n for n in os.listdir(tdir) if n.startswith("dlmap_")}
+    with pytest.raises(at_rest.EncryptionError):
+        at_rest.decrypt_to_tempfile(str(dst), "wrong")
+    after = {n for n in os.listdir(tdir) if n.startswith("dlmap_")}
+    assert before == after  # no lingering plaintext temp from the failed decrypt
+
+
+def test_wipe_file_is_idempotent_on_missing(tmp_path):
+    at_rest.wipe_file(str(tmp_path / "does-not-exist"))  # must not raise
