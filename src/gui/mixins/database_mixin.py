@@ -12,8 +12,12 @@ from src.database.multi_database_manager import MultiDatabaseManager
 from src.geometry.coordinates import CoordinateConverter
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
+from src.gui.dialogs.passphrase_dialog import NewPassphraseDialog, PassphraseDialog
+from src.security.at_rest import clear_passphrase
+from src.security.project_scan import find_encrypted_artifacts
 from src.utils.logging_utils import get_logger
 from src.workers.database_worker import DatabaseGenerationWorker
+from src.workers.encrypt_copy_worker import EncryptCopyWorker
 
 logger = get_logger(__name__)
 
@@ -216,10 +220,103 @@ class DatabaseMixin:
 
         self._open_project(path)
 
+    # ── Зашифрована копія проєкту ─────────────────────────────────────────────
+
+    @pyqtSlot()
+    def on_create_encrypted_copy(self):
+        """Побудувати зашифровану копію поточного проєкту (майстер не змінюється)."""
+        if not self.project_manager.is_loaded:
+            QMessageBox.warning(self, "Увага", "Спочатку відкрийте проєкт!")
+            return
+
+        src_dir = Path(self.project_manager.project_dir)
+        parent_dir = QFileDialog.getExistingDirectory(
+            self, "Куди зберегти зашифровану копію", str(src_dir.parent)
+        )
+        if not parent_dir:
+            return
+
+        dst_dir = Path(parent_dir) / f"{src_dir.name}_encrypted"
+        if dst_dir.exists():
+            QMessageBox.critical(
+                self, "Помилка", f"Тека вже існує (перезапис заборонено):\n{dst_dir}"
+            )
+            return
+
+        dialog = NewPassphraseDialog(self)
+        if not dialog.exec() or not dialog.passphrase:
+            return
+
+        self.status_bar.showMessage(f"Створення зашифрованої копії: {dst_dir.name}...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        self._encrypt_worker = EncryptCopyWorker(str(src_dir), str(dst_dir), dialog.passphrase)
+        self._encrypt_worker.progress.connect(self.status_bar.showMessage)
+        self._encrypt_worker.completed.connect(self._on_encrypted_copy_done)
+        self._encrypt_worker.error.connect(self._on_encrypted_copy_error)
+        self._encrypt_worker.start()
+
+    @pyqtSlot(dict)
+    def _on_encrypted_copy_done(self, summary: dict):
+        QApplication.restoreOverrideCursor()
+        self.status_bar.showMessage("Зашифровану копію створено")
+        if not summary["encrypted"]:
+            QMessageBox.warning(
+                self,
+                "Увага",
+                "Копію створено, але жодного чутливого артефакту не знайдено — "
+                "перевірте структуру проєкту.",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "Готово",
+            f"Зашифровано артефактів: {len(summary['encrypted'])}\n"
+            f"Скопійовано без змін: {summary['copied']} файл(ів)\n\n"
+            f"Оригінал проєкту не змінено. Пароль неможливо відновити — "
+            f"збережіть його в безпечному місці.",
+        )
+
+    @pyqtSlot(str)
+    def _on_encrypted_copy_error(self, message: str):
+        QApplication.restoreOverrideCursor()
+        self.status_bar.showMessage("Помилка створення зашифрованої копії")
+        QMessageBox.critical(self, "Помилка", f"Не вдалося створити копію:\n{message}")
+
+    def _prompt_passphrase_if_encrypted(self) -> bool:
+        """Ask for the map passphrase if the just-loaded project is encrypted.
+
+        Returns True when loading may proceed: either the project is plaintext
+        (no prompt at all — behaviour identical to before this feature) or the
+        operator supplied a passphrase that provably decrypts an artifact.
+        Returns False if the operator cancelled or exhausted their attempts, in
+        which case the caller must abort the load rather than fail deep inside
+        h5py with an opaque error."""
+        encrypted = find_encrypted_artifacts(self.project_manager)
+        if not encrypted:
+            return True
+
+        dialog = PassphraseDialog(
+            self.project_manager.project_name, encrypted[0], parent=self
+        )
+        if dialog.exec():
+            return True
+
+        clear_passphrase()
+        self.status_bar.showMessage("Завантаження скасовано: потрібен пароль карти")
+        return False
+
     def _open_project(self, path: str):
         """Завантажити проєкт за шляхом (використовується і для recent menu)."""
+        # A passphrase belongs to one project only — never let the previous one
+        # silently decrypt (or fail against) the project being opened now.
+        clear_passphrase()
+
         if not self.project_manager.load_project(path):
             QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
+            return
+
+        if not self._prompt_passphrase_if_encrypted():
             return
 
         try:

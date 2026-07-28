@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.project_registry import ProjectRegistry
+from src.security.project_scan import project_is_encrypted
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -33,6 +34,9 @@ class OpenProjectDialog(QDialog):
         super().__init__(parent)
         self.registry = registry
         self.selected_path: str | None = None
+        # HARDENING P1-6: encryption state per project path. The list is rebuilt
+        # on every keystroke in the search box, so the disk probe is cached.
+        self._encrypted_cache: dict[str, bool] = {}
 
         self.setWindowTitle("Відкрити проєкт")
         self.setMinimumSize(600, 450)
@@ -101,6 +105,18 @@ class OpenProjectDialog(QDialog):
         buttons_row.addWidget(self.btn_open)
         layout.addLayout(buttons_row)
 
+    def _is_encrypted(self, path: str) -> bool:
+        """Cached encryption probe — see ``_encrypted_cache``."""
+        if not path:
+            return False
+        if path not in self._encrypted_cache:
+            try:
+                self._encrypted_cache[path] = project_is_encrypted(path)
+            except Exception as e:  # a broken project must not break the picker
+                logger.debug(f"Encryption probe failed for {path}: {e}")
+                self._encrypted_cache[path] = False
+        return self._encrypted_cache[path]
+
     def _populate_list(self, filter_text: str = ""):
         """Заповнити список проєктів."""
         self.project_list.clear()
@@ -130,9 +146,12 @@ class OpenProjectDialog(QDialog):
             except (ValueError, TypeError):
                 date_str = "—"
 
-            item_text = f"{status}  {name}   [останній: {date_str}]"
+            lock = "🔒 " if self._is_encrypted(proj.get("path", "")) else ""
+            item_text = f"{status}  {lock}{name}   [останній: {date_str}]"
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, proj)
+            if lock:
+                item.setToolTip("🔒 Зашифрований проєкт — при відкритті запитає пароль карти")
 
             # Позначаємо недоступні проєкти
             if not Path(proj["path"]).is_dir():
@@ -187,7 +206,13 @@ class OpenProjectDialog(QDialog):
             f"<b>Відео:</b> {Path(video).name if video else '—'}<br>"
             f"<b>Створено:</b> {created}<br>"
             f"<b>База даних:</b> {'✅ ' + db_size if proj.get('has_database') else '❌ відсутня'}<br>"
-            f"<b>Калібрація:</b> {'✅ є' if proj.get('has_calibration') else '❌ відсутня'}"
+            f"<b>Калібрація:</b> {'✅ є' if proj.get('has_calibration') else '❌ відсутня'}<br>"
+            f"<b>Шифрування:</b> "
+            + (
+                "🔒 зашифровано (потрібен пароль карти)"
+                if self._is_encrypted(path)
+                else "відкритий текст"
+            )
         )
 
     def _on_double_click(self, item: QListWidgetItem):

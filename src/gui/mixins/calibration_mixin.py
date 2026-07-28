@@ -28,10 +28,28 @@ from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
 from src.localization.matcher import FeatureMatcher
+from src.security.at_rest import decrypt_to_tempfile, get_passphrase, is_encrypted, wipe_file
 from src.utils.logging_utils import fmt_coord, get_logger
 from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
 
 logger = get_logger(__name__)
+
+
+def _materialize_keypoints_video(path: str) -> tuple[str, str | None]:
+    """Return a path the video reader can open, plus a temp file to wipe (or None).
+
+    HARDENING P1-6 SP3: a plaintext keypoint video is used in place (unchanged);
+    an encrypted one is decrypted to a temp file the caller must wipe. A missing
+    video is not an error — the dialog already handles its absence."""
+    src = Path(path)
+    if not src.is_file():
+        return path, None
+    with open(src, "rb") as f:
+        if not is_encrypted(f.read(64)):
+            return path, None  # plaintext: unchanged path
+    tmp = decrypt_to_tempfile(str(src), get_passphrase(), suffix=".mp4")
+    logger.info("Decrypted keypoint video to a temp file for calibration")
+    return tmp, tmp
 
 
 class CalibrationMixin:
@@ -58,6 +76,10 @@ class CalibrationMixin:
                 f"If the DB was built with a different step, anchor frame ids may be wrong."
             )
         kp_video_path = str(Path(self.database.db_path).with_suffix("")) + "_keypoints.mp4"
+        # HARDENING P1-6 SP3: the keypoint video is opened by path (decord/cv2),
+        # so an encrypted one is decrypted to a temp file for the dialog's
+        # lifetime and wiped as soon as it closes.
+        kp_video_path, kp_tempfile = _materialize_keypoints_video(kp_video_path)
 
         self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
@@ -71,9 +93,13 @@ class CalibrationMixin:
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
         self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)
         self._calib_dialog.calibration_complete.connect(self.on_run_propagation)
-        self._calib_dialog.exec()
-
-        self._calib_dialog = None
+        try:
+            self._calib_dialog.exec()
+        finally:
+            self._calib_dialog = None
+            if kp_tempfile:
+                wipe_file(kp_tempfile)
+                logger.info("Decrypted keypoint video wiped")
 
     @pyqtSlot(object)
     def on_anchor_added(self, anchor_data: dict):

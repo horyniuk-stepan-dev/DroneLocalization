@@ -166,3 +166,44 @@ def get_passphrase() -> str:
 
     _CACHED_PASSPHRASE = pw
     return pw
+
+
+def set_passphrase(passphrase: str) -> None:
+    """Inject a passphrase into the process-wide cache.
+
+    Injection point for callers that resolve the passphrase themselves — the GUI
+    dialog above all: ``get_passphrase`` would otherwise block on ``getpass``
+    (stdin looks like a TTY under a GUI launch) with the prompt invisible behind
+    the window. Callers should verify the passphrase before injecting it, since
+    a wrong one poisons every subsequent load in the process."""
+    global _CACHED_PASSPHRASE
+    if not passphrase:
+        raise EncryptionError("refusing to cache an empty passphrase")
+    _CACHED_PASSPHRASE = passphrase
+
+
+def clear_passphrase() -> None:
+    """Drop the cached passphrase. Called when switching projects, so a passphrase
+    entered for one project never silently decrypts another."""
+    global _CACHED_PASSPHRASE
+    _CACHED_PASSPHRASE = None
+
+
+def verify_passphrase(path: str, passphrase: str) -> bool:
+    """Return True if ``passphrase`` decrypts the encrypted artifact at ``path``.
+
+    Used to validate operator input before caching it. Decrypts in full, so pass
+    the smallest encrypted artifact available (calibration.json, a few KB) rather
+    than the map database. Returns False for a wrong passphrase, a tampered or
+    malformed container, or a plaintext file (nothing to verify against)."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    if not is_encrypted(data):
+        return False
+    try:
+        decrypt_bytes(data, passphrase)
+    except EncryptionError:
+        return False
+    return True

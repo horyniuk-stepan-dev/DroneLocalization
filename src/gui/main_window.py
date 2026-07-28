@@ -90,6 +90,8 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         file_menu = menubar.addMenu("Файл")
         file_menu.addAction("Налаштування...", self.on_open_config)
         file_menu.addSeparator()
+        file_menu.addAction("Створити зашифровану копію...", self.on_create_encrypted_copy)
+        file_menu.addSeparator()
         file_menu.addAction("Вихід", self.close)
 
         calib_menu = menubar.addMenu("Калібрування")
@@ -229,4 +231,16 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
             save_user_config(cfg)
         except Exception as e:
             logger.debug(f"Failed to persist debug view visibility: {e}")
+
+        # HARDENING P1-6 SP3: closing the databases is what wipes the decrypted
+        # LanceDB temp directory. Without this a clean exit leaves the plaintext
+        # global descriptors on the temp disk until the OS cleans it up.
+        try:
+            if getattr(self, "db_manager", None) is not None:
+                self.db_manager.close_all()
+            elif getattr(self, "database", None) is not None:
+                self.database.close()
+        except Exception as e:
+            logger.warning(f"Error closing databases on exit: {e}")
+
         super().closeEvent(event)

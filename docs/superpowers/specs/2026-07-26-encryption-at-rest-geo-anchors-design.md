@@ -156,10 +156,13 @@ two things:
 
 ### Remaining work (next session), in priority order
 
-- **GUI passphrase dialog** wired into the project-load path (prompt when an
-  encrypted artifact is detected; feed `at_rest.get_passphrase`'s cache).
-- **Copy builder** — rewrite `scripts/encrypt_project.py` to `--project/--output`,
-  walking the tree, encrypting the five sensitive artifacts, copying the rest.
+- **GUI passphrase dialog — DONE.** See "Revision 2026-07-28" below.
+- **Copy builder — DONE.** `scripts/encrypt_project.py` rewritten to
+  `--project/--output`: `build_encrypted_copy` walks the tree, encrypts the five
+  sensitive artifacts (incl. every file under `vectors.lance/`), copies the rest
+  verbatim, refuses an existing output, never touches the source master. Pure
+  function + 2 tests (`tests/test_encrypt_project.py`). The copy is fully
+  encrypted on the write side; lance/mp4 still need SP3 load hooks to run.
 - **SP2 load hook — DONE.** `open_maybe_encrypted_h5` in `database_loader.py`
   peeks the `MAGIC` header: plaintext DBs open on the unchanged lazy path (zero
   overhead), encrypted DBs decrypt whole into a `BytesIO` and open from RAM. Kept
@@ -174,3 +177,141 @@ two things:
 
 The `src/security/at_rest.py` foundation, `MultiAnchorCalibration.load` hook, and
 `tests/test_at_rest.py` from SP1 all carry forward unchanged.
+
+## Revision 2026-07-28 — GUI passphrase dialog + artifact-path correction
+
+The operator runs the GUI, not the headless runner, so `DRONELOC_PASSPHRASE` and
+the `getpass` fallback are both unusable: under a GUI launch stdin still looks
+like a TTY, so `get_passphrase` blocks the process on a prompt rendered behind
+the window. The GUI must therefore resolve the passphrase itself and inject it.
+
+### Defect fixed first: artifacts are per-source, not at the project root
+
+`ProjectSettings` defaults are `sources/main/database.h5` and
+`sources/main/calibration.json`, and `vectors.lance` / `<db_stem>_keypoints.mp4`
+are created next to the database. The copy builder matched `SENSITIVE_FILES`
+only when `rel_dir == Path(".")`, so for every real project it encrypted
+`vectors.lance/**` but left the geo-anchors and the map database in plaintext
+inside a copy advertised as encrypted. The root-only fixture hid this.
+
+`_is_sensitive` now matches by basename at **any** depth, plus
+`SENSITIVE_SUFFIXES = ("_keypoints.mp4", ".h5")` — a source may declare its own
+database filename (`db_area2.h5`), and the keypoint video is named after it, so
+a literal-name match let a renamed map escape encryption. Covered by
+`test_encrypts_per_source_artifacts` (nested two-source tree, 7 artifacts).
+
+### Passphrase injection API (`src/security/at_rest.py`)
+
+- `set_passphrase(pw)` — fill the process-wide cache; rejects empty.
+- `clear_passphrase()` — drop it; called on every project open so a passphrase
+  never carries from one project to the next.
+- `verify_passphrase(path, pw) -> bool` — full decrypt of one artifact; False on
+  wrong passphrase, tampering, or plaintext. Caches nothing.
+
+`get_passphrase` is unchanged — it simply finds the cache filled and never
+reaches `getpass`.
+
+### Detection (`src/security/project_scan.py`, Qt-free)
+
+`candidate_artifacts(project_manager)` resolves paths through
+`settings.get_enabled_sources()` (never hard-coded roots), ordered
+cheapest-to-decrypt first: calibrations → databases → lance/keypoints. A lance
+dataset is a directory, so one file inside it is probed. Only the first 64 bytes
+of each file are read — a 67 MB database is classified without loading it.
+`find_encrypted_artifacts` filters to those carrying the container header.
+
+**An empty result means the project is plaintext and loads exactly as before —
+no prompt, no behaviour change.** This is why the feature needs no
+`user_config.json` flag: it self-gates on the presence of ciphertext.
+
+### Dialogs (`src/gui/dialogs/passphrase_dialog.py`)
+
+- `PassphraseDialog` — modal, password echo, up to 3 attempts. Each attempt runs
+  `verify_passphrase` against `found[0]` (calibration.json, a few KB) and calls
+  `set_passphrase` **only after** a proven decryption; a typo can therefore never
+  poison later loads in the session.
+- `NewPassphraseDialog` — passphrase + confirmation for a new encrypted copy.
+  The result is deliberately not cached: the session keeps working against the
+  plaintext master.
+
+### Integration (`src/gui/mixins/database_mixin.py`)
+
+`_open_project` calls `clear_passphrase()`, then `load_project`, then
+`_prompt_passphrase_if_encrypted()` **before** any artifact is touched. Cancel or
+exhausted attempts abort the load with a status-bar message rather than failing
+deep inside h5py with an opaque error.
+
+`on_create_encrypted_copy` (menu Файл → «Створити зашифровану копію...») picks a
+destination, prompts for a new passphrase, and runs `build_encrypted_copy` in
+`EncryptCopyWorker` (`src/workers/encrypt_copy_worker.py`). Whole-file AES-GCM
+over hundreds of MB would freeze the GUI thread, hence the `QThread`.
+
+### Testing
+
+`tests/test_project_scan.py` (10 tests) covers detection on plaintext /
+encrypted / unloaded projects, per-source path resolution, verification order,
+and the set/clear/verify API — including an autouse fixture resetting the
+process-wide cache. The `QDialog` classes themselves are verified by a manual
+GUI run. 28 tests green across the four encryption suites.
+
+### Residual risk
+
+Verification proves only that `found[0]` decrypts. A copy whose artifacts were
+encrypted under different passphrases would pass the dialog and fail later on
+the database. `build_encrypted_copy` uses one passphrase per run, so this cannot
+arise from the supported workflow.
+
+---
+
+## Revision 2026-07-28b — SP3 load hooks (lance index + keypoint video)
+
+The first GUI run exposed the gap: the encrypted copy built fine (12 artifacts),
+but opening it would have failed at `lancedb.connect` on an encrypted index —
+`_load_hot_data` has no fallback there. The copy was write-complete and
+load-incomplete, so SP3 was promoted from "next session" to blocking.
+
+### `vectors.lance/` — `materialize_maybe_encrypted_lance` (`database_loader.py`)
+
+LanceDB opens a *filesystem directory* and manages its own handles, so there is
+no in-RAM route like SP2's. Plaintext index → opened in place, unchanged path,
+zero overhead (detected from the first file's header). Encrypted index →
+materialised into `tempfile.mkdtemp(prefix="droneloc_lance_")` preserving the
+dataset layout, and `lancedb.connect` points at the temp copy. Returns
+`(path_to_open, temp_dir_or_None)`; a failed decryption wipes the partial temp
+tree before raising.
+
+`DatabaseLoader._lance_tempdir` holds it; `close()` drops `lance_table` **before**
+`wipe_tree` — an open dataset would otherwise pin the decrypted files on disk.
+
+### `<db_stem>_keypoints.mp4` — `_materialize_keypoints_video` (`calibration_mixin.py`)
+
+The video is opened by path by the reader, so an encrypted one is decrypted via
+`decrypt_to_tempfile` before `CalibrationDialog` is constructed and wiped in a
+`finally` around `exec()` — the plaintext exists only while the dialog is open.
+A missing video stays a non-error (the dialog already handles absence).
+
+### Testing
+
+4 new tests in `tests/test_db_encryption.py`: plaintext index opens in place;
+encrypted index materialises with layout preserved, wipes on close, leaves the
+source ciphertext untouched; wrong passphrase leaves no `droneloc_lance_*` temp
+dir behind; empty directory opens in place. 32 green across the four suites.
+
+### Residual risk
+
+Decrypted lance files and the keypoint video exist as plaintext on the temp disk
+while the app runs — the accepted decrypt-to-use trade-off already recorded for
+SP3. `wipe_tree`/`wipe_file` are best-effort on SSD/CoW filesystems. At-rest
+(powered-off) protection is unaffected.
+
+**Leak found in the first end-to-end GUI run and fixed:** the wipe is driven by
+`DatabaseLoader.close()`, but `MainWindow.closeEvent` never closed the databases,
+so even a *clean* exit left a populated `droneloc_lance_*` directory (≈500 KB of
+plaintext global descriptors) on the temp disk. `closeEvent` now closes
+`db_manager`/`database` before delegating to Qt. Regression test:
+`test_close_wipes_lance_tempdir`.
+
+Still open: a hard crash (kill, power loss) skips `closeEvent` entirely and
+leaves the directory behind. Sweeping stale `droneloc_lance_*` directories at
+startup is not implemented — it needs care not to delete a concurrently running
+instance's directory.

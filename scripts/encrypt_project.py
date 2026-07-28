@@ -1,49 +1,97 @@
-"""HARDENING P1-6: encrypt a project's geo-revealing artifacts at rest.
+"""HARDENING P1-6: build an encrypted COPY of a project (non-destructive).
 
-Encrypts the small, whole-file artifacts that leak the operational area in
-plaintext — ``calibration.json`` (geo anchors) and ``database_graph.geojson``
-(per-frame GPS) — in place, so the app auto-detects and decrypts them on load
-given the passphrase (``DRONELOC_PASSPHRASE`` env or an interactive prompt).
+Produces a separate, fully-encrypted copy of a project directory, leaving the
+plaintext master untouched. Deployment model: the ground station keeps the
+master; the drone carries only the encrypted copy, so airframe capture yields
+ciphertext.
 
-    python scripts/encrypt_project.py --project <dir>
+    python scripts/encrypt_project.py --project <src> --output <dst>
 
-The passphrase is prompted twice (confirmation) and never stored. Each file is
-encrypted only after a round-trip decrypt is verified in RAM, and written
-atomically, so an interrupted run cannot corrupt an artifact. Keep the passphrase
-safe: it cannot be recovered, and without it the map is unreadable — that is the
-point.
+Every sensitive artifact is encrypted (passphrase-derived AES-256-GCM); every
+other file is copied verbatim. The passphrase is prompted twice and never
+stored — keep it safe, it cannot be recovered.
 
-The big map artifacts (``database.h5``, ``vectors.lance/``) are handled by later
-sub-projects and are NOT touched here.
+Sensitive artifacts, encrypted per-file into the copy, matched by name at any
+depth (projects store them per source, e.g. ``sources/main/database.h5``):
+  * calibration.json          (geo anchors)
+  * database_graph.geojson    (per-frame GPS)
+  * database.h5               (keypoints/descriptors)  — loads decrypted (SP2)
+  * database_keypoints.mp4    (used by calibration)
+  * vectors.lance/**          (retrieval index, every file within)
+
+The app auto-detects and decrypts calibration.json and database.h5 on load given
+the passphrase. Load support for vectors.lance/ and database_keypoints.mp4 is
+SP3 (pending) — they are encrypted in the copy already so the build is complete.
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
-import os
+import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Whole-file artifacts that leak the mission; encrypted into the copy wherever
+# they appear in the tree (root, or per-source under sources/<id>/).
+SENSITIVE_FILES = {
+    "calibration.json",
+    "database_graph.geojson",
+    "database.h5",
+    "database_keypoints.mp4",
+}
+# Directories whose every file is sensitive (the retrieval index).
+SENSITIVE_DIRS = {"vectors.lance"}
+# Names are not fixed per source: a source may declare its own database file, and
+# the keypoint video is named after it (<db_stem>_keypoints.mp4, see
+# DatabaseBuilder). Match by suffix so a renamed map cannot dodge encryption —
+# every .h5 in a project IS map data.
+SENSITIVE_SUFFIXES = ("_keypoints.mp4", ".h5")
 
-def _resolve_targets(project_dir: str) -> list[Path]:
-    """The geo-revealing whole-file artifacts of a project, in load order."""
-    from src.core.project import ProjectManager
 
-    pm = ProjectManager()
-    if not pm.load_project(project_dir):
-        raise SystemExit(f"Could not load project: {project_dir}")
+def _is_sensitive(rel_dir: Path, name: str) -> bool:
+    """Match sensitive artifacts by basename at ANY depth.
 
-    targets: list[Path] = []
-    if pm.calibration_path and Path(pm.calibration_path).exists():
-        targets.append(Path(pm.calibration_path))
-    if pm.database_path:
-        geojson = Path(str(pm.database_path).replace(".h5", "_graph.geojson"))
-        if geojson.exists():
-            targets.append(geojson)
-    return targets
+    Projects keep their artifacts per source (``sources/main/database.h5``,
+    ``sources/area2/calibration.json`` — see ProjectSettings defaults), so a
+    root-only match would leave the geo-anchors of every real project in
+    plaintext inside a copy advertised as encrypted."""
+    if any(part in SENSITIVE_DIRS for part in rel_dir.parts):
+        return True
+    return name in SENSITIVE_FILES or name.endswith(SENSITIVE_SUFFIXES)
+
+
+def build_encrypted_copy(src_dir: str, dst_dir: str, passphrase: str) -> dict:
+    """Copy ``src_dir`` to ``dst_dir``, encrypting every sensitive artifact.
+
+    Returns a summary ``{"encrypted": [...], "copied": n}``. The source is never
+    modified. ``dst_dir`` must not already exist (refuse to overwrite)."""
+    from src.security.at_rest import encrypt_file
+
+    src, dst = Path(src_dir), Path(dst_dir)
+    if not src.is_dir():
+        raise SystemExit(f"Source project not found: {src}")
+    if dst.exists():
+        raise SystemExit(f"Output already exists (refusing to overwrite): {dst}")
+
+    encrypted: list[str] = []
+    copied = 0
+    for path in sorted(src.rglob("*")):
+        rel = path.relative_to(src)
+        target = dst / rel
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if _is_sensitive(rel.parent, path.name):
+            encrypt_file(str(path), str(target), passphrase)
+            encrypted.append(str(rel))
+        else:
+            shutil.copy2(path, target)
+            copied += 1
+    return {"encrypted": encrypted, "copied": copied}
 
 
 def _prompt_new_passphrase() -> str:
@@ -55,52 +103,26 @@ def _prompt_new_passphrase() -> str:
     return pw
 
 
-def _write_atomic(path: Path, data: bytes) -> None:
-    tmp = path.with_name(path.name + ".enc-tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)  # atomic on the same filesystem
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--project", required=True, help="Project directory")
+    parser.add_argument("--project", required=True, help="Source project directory (master)")
+    parser.add_argument("--output", required=True, help="Destination for the encrypted copy")
     args = parser.parse_args()
 
-    from src.security.at_rest import decrypt_bytes, encrypt_bytes, is_encrypted
-
-    targets = _resolve_targets(args.project)
-    if not targets:
-        print("No geo artifacts found (calibration.json / database_graph.geojson).")
-        return 1
-
-    pending = [p for p in targets if not is_encrypted(p.read_bytes())]
-    for p in targets:
-        mark = "already encrypted" if p not in pending else "will encrypt"
-        print(f"  [{mark}] {p}")
-    if not pending:
-        print("Nothing to do — all target artifacts are already encrypted.")
-        return 0
-
     pw = _prompt_new_passphrase()
+    summary = build_encrypted_copy(args.project, args.output, pw)
 
-    for path in pending:
-        data = path.read_bytes()
-        container = encrypt_bytes(data, pw)
-        # Verify the round-trip in RAM BEFORE overwriting — never destroy a
-        # plaintext we cannot decrypt back.
-        if decrypt_bytes(container, pw) != data:
-            raise SystemExit(f"Round-trip verify FAILED for {path} — aborting, file untouched.")
-        _write_atomic(path, container)
-        print(f"  encrypted in place: {path.name} ({len(data)} -> {len(container)} bytes)")
-
+    for rel in summary["encrypted"]:
+        print(f"  encrypted: {rel}")
+    print(f"  copied verbatim: {summary['copied']} file(s)")
+    if not summary["encrypted"]:
+        print("WARNING: no sensitive artifacts were found to encrypt.")
     print(
-        "\nDone. Keep the passphrase safe — it cannot be recovered.\n"
-        "Run the app with DRONELOC_PASSPHRASE set (or enter it when prompted)."
+        "\nDone. The plaintext master is untouched. Keep the passphrase safe — it "
+        "cannot be recovered.\nRun the app on the copy with DRONELOC_PASSPHRASE set "
+        "(or enter it when prompted)."
     )
     return 0
 

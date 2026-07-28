@@ -1,5 +1,7 @@
 import io
 import json
+import shutil
+import tempfile
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -10,7 +12,13 @@ import lancedb
 import numpy as np
 
 from src.geometry.coordinates import CoordinateConverter
-from src.security.at_rest import MAGIC, decrypt_bytes, get_passphrase
+from src.security.at_rest import (
+    MAGIC,
+    decrypt_bytes,
+    get_passphrase,
+    is_encrypted,
+    wipe_file,
+)
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -34,6 +42,51 @@ def open_maybe_encrypted_h5(path: str) -> tuple[h5py.File, io.BytesIO | None]:
     return h5py.File(buf, "r"), buf
 
 
+def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None]:
+    """Return a path LanceDB can open, decrypting an at-rest-encrypted index first.
+
+    HARDENING P1-6 SP3: LanceDB opens a *filesystem directory* and manages its own
+    file handles, so there is no in-RAM route like the h5 one. A plaintext index is
+    opened in place (unchanged path, zero overhead). An encrypted index is
+    materialised into a temp directory, preserving the dataset layout.
+
+    Returns ``(path_to_open, temp_dir_or_None)``; the caller must wipe the temp
+    directory when closing. Fails closed: a failed decryption leaves no partial
+    plaintext behind.
+    """
+    files = sorted(p for p in lance_path.rglob("*") if p.is_file())
+    if not files:
+        return str(lance_path), None
+    if not is_encrypted(files[0].read_bytes()[: len(MAGIC)]):
+        return str(lance_path), None  # plaintext: unchanged path
+
+    passphrase = get_passphrase()
+    tmpdir = tempfile.mkdtemp(prefix="droneloc_lance_")
+    try:
+        for src in files:
+            target = Path(tmpdir) / src.relative_to(lance_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = src.read_bytes()
+            target.write_bytes(decrypt_bytes(data, passphrase) if is_encrypted(data) else data)
+    except Exception:
+        wipe_tree(tmpdir)
+        raise
+    logger.info(f"Decrypted LanceDB index ({len(files)} files) into a temp directory")
+    return tmpdir, tmpdir
+
+
+def wipe_tree(dir_path: str) -> None:
+    """Best-effort secure delete of a decrypted temp directory (see ``wipe_file``
+    for the SSD/CoW caveat) — overwrite every file, then drop the tree."""
+    root = Path(dir_path)
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        if path.is_file():
+            wipe_file(str(path))
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def _synchronized(method):
     """Декоратор: виконує метод під self._lock (RLock — реентерабельний)."""
     import functools
@@ -55,6 +108,9 @@ class DatabaseLoader:
         # HARDENING P1-6 SP2: holds the decrypted-map RAM buffer (encrypted DBs
         # only), kept alive for the h5py handle's lifetime; None when plaintext.
         self._decrypted_buf: io.BytesIO | None = None
+        # HARDENING P1-6 SP3: temp directory holding the decrypted LanceDB index
+        # (encrypted projects only); wiped on close. None when plaintext.
+        self._lance_tempdir: str | None = None
         self.global_descriptors: np.ndarray | None = None
         self.lance_table = None
         self.frame_poses: np.ndarray | None = None
@@ -114,7 +170,8 @@ class DatabaseLoader:
             lance_path = Path(self.db_path).parent / "vectors.lance"
             if lance_path.exists():
                 logger.info(f"LanceDB index found at {lance_path}. Loading...")
-                db = lancedb.connect(str(lance_path))
+                open_path, self._lance_tempdir = materialize_maybe_encrypted_lance(lance_path)
+                db = lancedb.connect(open_path)
                 self.lance_table = db.open_table("global_vectors")
                 self.global_descriptors = None
             else:
@@ -421,6 +478,14 @@ class DatabaseLoader:
             self.db_file.close()
             self.db_file = None
             logger.info("Database file closed")
+
+        # HARDENING P1-6 SP3: drop the LanceDB handle before wiping its files,
+        # otherwise the open dataset keeps the decrypted temp copy on disk.
+        if self._lance_tempdir is not None:
+            self.lance_table = None
+            wipe_tree(self._lance_tempdir)
+            logger.info("Decrypted LanceDB temp directory wiped")
+            self._lance_tempdir = None
 
         # Очищення кешу при закритті БД
         self._size_cache.clear()
