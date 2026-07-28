@@ -37,6 +37,7 @@ from src.geometry.pose_graph_optimizer import (
     homography_to_similarity,
 )
 from src.geometry.transformations import GeometryTransforms
+from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -479,6 +480,7 @@ class PropagationPipeline:
                     origin_xy=self._origin_xy,
                 )
                 geojson_path = str(self.database.db_path).replace(".h5", "_graph.geojson")
+                assert_project_writable(geojson_path)
                 with open(geojson_path, "w", encoding="utf-8") as f:
                     json.dump(geojson, f, indent=2, ensure_ascii=False)
                 logger.success(f"Graph exported to GeoJSON: {geojson_path}")
@@ -1052,6 +1054,9 @@ class PropagationPipeline:
         # конкурентний get_local_features із GUI/трекінгу впаде на закритому
         # h5py-хендлі (RuntimeError у кращому разі, сегфолт у гіршому).
         db_path = self.database.db_path
+        # HARDENING P1-6: refuse before touching the handle — a rewrite here would
+        # replace an encrypted map with plaintext inside a deployment copy.
+        assert_project_writable(db_path)
         self.database.lock.acquire()
         self.database.close()
         try:

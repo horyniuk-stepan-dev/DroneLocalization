@@ -7,66 +7,35 @@ ciphertext.
 
     python scripts/encrypt_project.py --project <src> --output <dst>
 
-Every sensitive artifact is encrypted (passphrase-derived AES-256-GCM); every
-other file is copied verbatim. The passphrase is prompted twice and never
-stored — keep it safe, it cannot be recovered.
+EVERY file is encrypted (passphrase-derived AES-256-GCM) — there is no allowlist
+of "sensitive" files to get wrong. Two earlier allowlist bugs (root-only matching,
+then a renamed database) each shipped geo-anchors in plaintext inside a copy
+advertised as encrypted; encrypting everything removes that class of bug.
 
-Sensitive artifacts, encrypted per-file into the copy, matched by name at any
-depth (projects store them per source, e.g. ``sources/main/database.h5``):
-  * calibration.json          (geo anchors)
-  * database_graph.geojson    (per-frame GPS)
-  * database.h5               (keypoints/descriptors)  — loads decrypted (SP2)
-  * database_keypoints.mp4    (used by calibration)
-  * vectors.lance/**          (retrieval index, every file within)
+The passphrase is prompted twice and never stored — keep it safe, it cannot be
+recovered.
 
-The app auto-detects and decrypts calibration.json and database.h5 on load given
-the passphrase. Load support for vectors.lance/ and database_keypoints.mp4 is
-SP3 (pending) — they are encrypted in the copy already so the build is complete.
+Because ``project.json`` is encrypted too, it doubles as the marker: a project
+whose manifest carries the container header is an encrypted deployment copy. The
+app detects that before loading, prompts for the passphrase, and refuses every
+write into such a project — the copy is immutable by design. Rebuilds,
+calibration saves and propagation belong on the plaintext master.
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
-import shutil
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Whole-file artifacts that leak the mission; encrypted into the copy wherever
-# they appear in the tree (root, or per-source under sources/<id>/).
-SENSITIVE_FILES = {
-    "calibration.json",
-    "database_graph.geojson",
-    "database.h5",
-    "database_keypoints.mp4",
-}
-# Directories whose every file is sensitive (the retrieval index).
-SENSITIVE_DIRS = {"vectors.lance"}
-# Names are not fixed per source: a source may declare its own database file, and
-# the keypoint video is named after it (<db_stem>_keypoints.mp4, see
-# DatabaseBuilder). Match by suffix so a renamed map cannot dodge encryption —
-# every .h5 in a project IS map data.
-SENSITIVE_SUFFIXES = ("_keypoints.mp4", ".h5")
-
-
-def _is_sensitive(rel_dir: Path, name: str) -> bool:
-    """Match sensitive artifacts by basename at ANY depth.
-
-    Projects keep their artifacts per source (``sources/main/database.h5``,
-    ``sources/area2/calibration.json`` — see ProjectSettings defaults), so a
-    root-only match would leave the geo-anchors of every real project in
-    plaintext inside a copy advertised as encrypted."""
-    if any(part in SENSITIVE_DIRS for part in rel_dir.parts):
-        return True
-    return name in SENSITIVE_FILES or name.endswith(SENSITIVE_SUFFIXES)
-
 
 def build_encrypted_copy(src_dir: str, dst_dir: str, passphrase: str) -> dict:
-    """Copy ``src_dir`` to ``dst_dir``, encrypting every sensitive artifact.
+    """Copy ``src_dir`` to ``dst_dir``, encrypting every file without exception.
 
-    Returns a summary ``{"encrypted": [...], "copied": n}``. The source is never
+    Returns a summary ``{"encrypted": [...], "total": n}``. The source is never
     modified. ``dst_dir`` must not already exist (refuse to overwrite)."""
     from src.security.at_rest import encrypt_file
 
@@ -77,7 +46,6 @@ def build_encrypted_copy(src_dir: str, dst_dir: str, passphrase: str) -> dict:
         raise SystemExit(f"Output already exists (refusing to overwrite): {dst}")
 
     encrypted: list[str] = []
-    copied = 0
     for path in sorted(src.rglob("*")):
         rel = path.relative_to(src)
         target = dst / rel
@@ -85,13 +53,9 @@ def build_encrypted_copy(src_dir: str, dst_dir: str, passphrase: str) -> dict:
             target.mkdir(parents=True, exist_ok=True)
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        if _is_sensitive(rel.parent, path.name):
-            encrypt_file(str(path), str(target), passphrase)
-            encrypted.append(str(rel))
-        else:
-            shutil.copy2(path, target)
-            copied += 1
-    return {"encrypted": encrypted, "copied": copied}
+        encrypt_file(str(path), str(target), passphrase)
+        encrypted.append(str(rel))
+    return {"encrypted": encrypted, "total": len(encrypted)}
 
 
 def _prompt_new_passphrase() -> str:
@@ -116,13 +80,13 @@ def main() -> int:
 
     for rel in summary["encrypted"]:
         print(f"  encrypted: {rel}")
-    print(f"  copied verbatim: {summary['copied']} file(s)")
+    print(f"\n  {summary['total']} file(s) encrypted, none left in plaintext.")
     if not summary["encrypted"]:
-        print("WARNING: no sensitive artifacts were found to encrypt.")
+        print("WARNING: the source project is empty — nothing was encrypted.")
     print(
         "\nDone. The plaintext master is untouched. Keep the passphrase safe — it "
-        "cannot be recovered.\nRun the app on the copy with DRONELOC_PASSPHRASE set "
-        "(or enter it when prompted)."
+        "cannot be recovered.\nThe copy is read-only: the app refuses to write into "
+        "it. Rebuild and recalibrate on the master."
     )
     return 0
 

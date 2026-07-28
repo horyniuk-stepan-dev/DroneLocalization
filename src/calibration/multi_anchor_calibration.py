@@ -14,6 +14,7 @@ import numpy as np
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.security.at_rest import decrypt_bytes, get_passphrase, is_encrypted
+from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -344,6 +345,7 @@ class MultiAnchorCalibration:
 
     def save(self, path: str) -> None:
         """Збереження якорів та метаданих проєкції у JSON."""
+        assert_project_writable(path)
         data = {
             "version": self.VERSION,
             "projection": self.converter.export_metadata(),

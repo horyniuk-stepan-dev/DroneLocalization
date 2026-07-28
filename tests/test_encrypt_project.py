@@ -1,8 +1,7 @@
-"""HARDENING P1-6: encrypted-copy builder (non-destructive).
+"""HARDENING P1-6: encrypted-copy builder (non-destructive, no allowlist).
 
-Tests the pure ``build_encrypted_copy`` function: every sensitive artifact is
-encrypted into the copy, non-sensitive files are copied verbatim, and the source
-master is never modified.
+Every file in the copy is encrypted — project.json included, which is what makes
+the copy self-identifying and immutable. The source master is never modified.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from src.security.at_rest import is_encrypted
+from src.security.at_rest import decrypt_bytes, is_encrypted
 
 _REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("encrypt_project", _REPO / "scripts" / "encrypt_project.py")
@@ -22,78 +21,82 @@ _spec.loader.exec_module(encrypt_project)
 PW = "copy-passphrase"
 
 
-def _make_project(root: Path) -> None:
-    (root / "sources" / "main").mkdir(parents=True)
-    (root / "calibration.json").write_bytes(b'{"anchors":[]}')
-    (root / "database.h5").write_bytes(b"\x89HDF\r\n\x1a\nfake-h5-bytes")
-    (root / "database_graph.geojson").write_bytes(b'{"type":"FeatureCollection"}')
-    (root / "database_keypoints.mp4").write_bytes(b"fake-mp4")
-    (root / "project.json").write_bytes(b'{"name":"p"}')  # non-sensitive
-    (root / "vectors.lance").mkdir()
-    (root / "vectors.lance" / "data-0.lance").write_bytes(b"vector-bytes")
+def _make_project(root: Path) -> dict[str, bytes]:
+    """A realistic per-source tree, including files no allowlist would list."""
+    files = {
+        "project.json": b'{"project_name": "p"}',
+        "sources/main/calibration.json": b'{"anchors":[]}',
+        "sources/main/database.h5": b"\x89HDF\r\n\x1a\nfake-h5-bytes",
+        "sources/main/database_graph.geojson": b'{"type":"FeatureCollection"}',
+        "sources/main/database_keypoints.mp4": b"fake-mp4",
+        "sources/main/vectors.lance/data-0.lance": b"vector-bytes",
+        "sources/area2/db_area2.h5": b"area2-h5",
+        "panoramas/pano_01.jpg": b"jpeg-bytes",
+        "notes.txt": b"operator notes about the area",
+    }
+    for rel, data in files.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    return files
 
 
-def test_copy_encrypts_sensitive_and_preserves_source(tmp_path):
+def test_every_file_is_encrypted(tmp_path):
+    src = tmp_path / "master"
+    src.mkdir()
+    files = _make_project(src)
+    dst = tmp_path / "encrypted"
+
+    summary = encrypt_project.build_encrypted_copy(str(src), str(dst), PW)
+
+    for rel, expected in files.items():
+        blob = (dst / rel).read_bytes()
+        assert is_encrypted(blob), f"{rel} left in plaintext"
+        assert decrypt_bytes(blob, PW) == expected, f"{rel} did not round-trip"
+
+    assert summary["total"] == len(files)
+    assert set(summary["encrypted"]) == {str(Path(r)) for r in files}
+
+
+def test_manifest_is_encrypted_so_the_copy_is_self_identifying(tmp_path):
+    """project.json carries the header — that is the marker the app detects."""
     src = tmp_path / "master"
     src.mkdir()
     _make_project(src)
     dst = tmp_path / "encrypted"
 
-    summary = encrypt_project.build_encrypted_copy(str(src), str(dst), PW)
+    encrypt_project.build_encrypted_copy(str(src), str(dst), PW)
 
-    # Sensitive artifacts encrypted in the copy.
-    for rel in ["calibration.json", "database.h5", "database_graph.geojson",
-                "database_keypoints.mp4", "vectors.lance/data-0.lance"]:
-        assert is_encrypted((dst / rel).read_bytes()), f"{rel} not encrypted"
-
-    # Non-sensitive files copied verbatim.
-    assert (dst / "project.json").read_bytes() == b'{"name":"p"}'
-    assert not is_encrypted((dst / "project.json").read_bytes())
-
-    # Source master untouched (still plaintext).
-    assert (src / "calibration.json").read_bytes() == b'{"anchors":[]}'
-    assert not is_encrypted((src / "database.h5").read_bytes())
-
-    assert set(summary["encrypted"]) == {
-        "calibration.json", "database.h5", "database_graph.geojson",
-        "database_keypoints.mp4", str(Path("vectors.lance") / "data-0.lance"),
-    }
+    assert is_encrypted((dst / "project.json").read_bytes())
 
 
-def test_encrypts_per_source_artifacts(tmp_path):
-    """Real projects keep artifacts under sources/<id>/, not at the root — a
-    root-only match would ship the geo-anchors in plaintext."""
+def test_source_master_untouched(tmp_path):
     src = tmp_path / "master"
-    (src / "sources" / "main").mkdir(parents=True)
-    (src / "sources" / "area2").mkdir(parents=True)
-    (src / "project.json").write_bytes(b'{"name":"p"}')
-    (src / "sources" / "main" / "calibration.json").write_bytes(b'{"anchors":[1]}')
-    (src / "sources" / "main" / "database.h5").write_bytes(b"main-h5")
-    (src / "sources" / "main" / "database_keypoints.mp4").write_bytes(b"main-mp4")
-    (src / "sources" / "area2" / "calibration.json").write_bytes(b'{"anchors":[2]}')
-    (src / "sources" / "area2" / "db_area2.h5").write_bytes(b"area2-h5")
-    # Keypoint videos are named after their database, not always "database_*".
-    (src / "sources" / "area2" / "db_area2_keypoints.mp4").write_bytes(b"area2-mp4")
-    (src / "sources" / "main" / "vectors.lance").mkdir()
-    (src / "sources" / "main" / "vectors.lance" / "data-0.lance").write_bytes(b"vec")
-
+    src.mkdir()
+    files = _make_project(src)
     dst = tmp_path / "encrypted"
-    summary = encrypt_project.build_encrypted_copy(str(src), str(dst), PW)
 
-    for rel in [
-        "sources/main/calibration.json",
-        "sources/main/database.h5",
-        "sources/main/database_keypoints.mp4",
-        "sources/area2/calibration.json",
-        "sources/area2/db_area2.h5",
-        "sources/area2/db_area2_keypoints.mp4",
-        "sources/main/vectors.lance/data-0.lance",
-    ]:
-        assert is_encrypted((dst / rel).read_bytes()), f"{rel} not encrypted"
+    encrypt_project.build_encrypted_copy(str(src), str(dst), PW)
 
-    assert len(summary["encrypted"]) == 7
-    # project.json stays readable so the app can locate the sources.
-    assert (dst / "project.json").read_bytes() == b'{"name":"p"}'
+    for rel, expected in files.items():
+        assert (src / rel).read_bytes() == expected, f"{rel} modified in the master"
+
+
+def test_summary_contract(tmp_path):
+    """The GUI worker and the done-handler read these keys by name.
+
+    Regression: renaming ``copied`` to ``total`` left a stale key in the worker's
+    log line, which raised a KeyError *after* a perfectly good copy was built —
+    the operator saw a failure dialog for a build that had fully succeeded."""
+    src = tmp_path / "master"
+    src.mkdir()
+    files = _make_project(src)
+
+    summary = encrypt_project.build_encrypted_copy(str(src), str(tmp_path / "out"), PW)
+
+    assert set(summary) == {"encrypted", "total"}
+    assert isinstance(summary["encrypted"], list)
+    assert summary["total"] == len(summary["encrypted"]) == len(files)
 
 
 def test_refuses_existing_output(tmp_path):

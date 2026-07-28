@@ -19,6 +19,7 @@ from src.database import keyframe_selector, keypoint_video_writer
 from src.localization.matcher import FeatureMatcher, extract_sift_features
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
+from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger, silent_output
 from src.utils.telemetry import Telemetry
 
@@ -29,6 +30,10 @@ class DatabaseBuilder:
     """Builds HDF5 topometric database from reference video using XFeat & DINOv2"""
 
     def __init__(self, output_path, matcher=None, config=None):
+        # HARDENING P1-6: refuse up front — a build writes the database, the lance
+        # index and the keypoint video, all in plaintext, and an encrypted
+        # deployment copy must stay immutable.
+        assert_project_writable(output_path)
         self.output_path = output_path
         self.config = config or {}
         self.matcher = matcher

@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from src.core.project_video_source import ProjectVideoSource
+from src.security.at_rest import decrypt_bytes, get_passphrase, is_encrypted
+from src.security.project_scan import assert_project_writable, project_is_encrypted
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -117,6 +119,9 @@ class ProjectManager:
     def __init__(self):
         self.project_dir: Path | None = None
         self.settings: ProjectSettings | None = None
+        # HARDENING P1-6: True when project.json itself is encrypted, i.e. this is
+        # an immutable deployment copy. Write paths must refuse to touch it.
+        self.is_encrypted: bool = False
 
     @property
     def is_loaded(self) -> bool:
@@ -218,13 +223,27 @@ class ProjectManager:
                 )
                 return False
 
-            with open(json_file, encoding="utf-8") as f:
-                data = json.load(f)
+            # HARDENING P1-6: an encrypted copy encrypts the manifest too, so it
+            # is decrypted here before parsing. The passphrase must already be
+            # resolved (the GUI prompts before calling this).
+            content = json_file.read_bytes()
+            manifest_encrypted = is_encrypted(content)
+            if manifest_encrypted:
+                content = decrypt_bytes(content, get_passphrase())
+            data = json.loads(content)
 
             self.settings = ProjectSettings.from_dict(data)
             self.project_dir = dir_path
+            # Must agree with assert_project_writable, which scans artifacts too:
+            # a copy built before the manifest was encrypted has a plaintext
+            # manifest but encrypted artifacts, and a manifest-only check would
+            # leave every GUI pre-check passing until a write failed mid-way.
+            self.is_encrypted = manifest_encrypted or project_is_encrypted(dir_path)
 
-            logger.info(f"Project loaded successfully: {self.settings.project_name}")
+            logger.info(
+                f"Project loaded successfully: {self.settings.project_name}"
+                + (" (encrypted, read-only)" if self.is_encrypted else "")
+            )
             return True
 
         except Exception as e:
@@ -235,6 +254,7 @@ class ProjectManager:
             )
             self.project_dir = None
             self.settings = None
+            self.is_encrypted = False
             return False
 
     def save_project(self) -> bool:
@@ -246,6 +266,7 @@ class ProjectManager:
             from src.utils.atomic_io import atomic_write_text
 
             json_file = self.project_dir / "project.json"
+            assert_project_writable(json_file)
             atomic_write_text(
                 str(json_file), json.dumps(asdict(self.settings), indent=4, ensure_ascii=False)
             )

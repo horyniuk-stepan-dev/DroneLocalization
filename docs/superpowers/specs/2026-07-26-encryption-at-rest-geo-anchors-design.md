@@ -315,3 +315,78 @@ Still open: a hard crash (kill, power loss) skips `closeEvent` entirely and
 leaves the directory behind. Sweeping stale `droneloc_lance_*` directories at
 startup is not implemented — it needs care not to delete a concurrently running
 instance's directory.
+
+---
+
+## Revision 2026-07-28c — encrypt everything, and make the copy immutable
+
+Operator decision after a rebuild inside `newzap_encrypted` silently replaced
+every encrypted artifact with plaintext: the allowlist goes, and the copy becomes
+read-only.
+
+### No allowlist
+
+`build_encrypted_copy` now encrypts **every file** in the tree. The allowlist was
+the source of both earlier leaks (root-only matching, then a renamed `.h5`);
+there is nothing left to forget. Summary shape changed to
+`{"encrypted": [...], "total": n}` — nothing is copied verbatim any more.
+
+### The manifest is the marker
+
+`project.json` is encrypted too, so a single 7-byte header read identifies an
+encrypted deployment copy before anything is loaded — no per-source artifact
+scan, and no ambiguity. It is also the cheapest verification target for the
+passphrase dialog (a few hundred bytes versus `calibration.json`'s 17 KB).
+
+**This forces the open order to flip.** `load_project` cannot parse an encrypted
+manifest, so `_open_project` now runs: `clear_passphrase()` → detect → prompt →
+`load_project` (which decrypts the manifest) → load artifacts. The dialog shows
+the *folder* name, since the project's display name lives inside the manifest.
+
+`encrypted_artifacts_at(project_dir)` replaces the ProjectManager-based
+`find_encrypted_artifacts`: path-based, quiet, returns the manifest for a fully
+encrypted copy and falls back to the artifact scan for copies built before this
+change (plaintext manifest, encrypted artifacts) so they keep opening.
+
+### Immutability
+
+`ProjectManager.is_encrypted` is set at load. `assert_project_writable(path)`
+walks up to the nearest `project.json` and raises `EncryptedProjectWriteError`
+if that project is encrypted. Wired into every write path into a project:
+
+| Write | Guard site |
+|---|---|
+| `project.json` | `ProjectManager.save_project` |
+| `calibration.json` | `MultiAnchorCalibration.save` (covers all 6 call sites) |
+| `database.h5`, lance, keypoint video | `DatabaseBuilder.__init__` |
+| h5 calibration rewrite | `propagation_pipeline` before `close()` |
+| `database_graph.geojson` | `propagation_pipeline` graph export |
+
+Path-based rather than manager-based deliberately: the builder and the pipeline
+have a target path but no `ProjectManager`, and a guard that has to be threaded
+through call chains is a guard that gets missed.
+
+The GUI refuses earlier for a clean message (`_refuse_if_encrypted_project`) on
+database generation, propagation, calibration save, and anchor add — the last one
+before mutating in-memory state, so the anchor list cannot drift from disk.
+Viewing an encrypted project's calibration stays allowed; it reads nothing back.
+
+No OS read-only attribute is set: it is trivially cleared and would only make the
+copy annoying to delete. The refusal lives where it can be enforced.
+
+### Testing
+
+`tests/test_project_scan.py` (20 tests) covers detection across plaintext / fully
+encrypted / legacy trees, manifest decryption on load, `find_project_root`, and
+the guard refusing on both copy generations while leaving plaintext projects and
+non-project paths alone. `tests/test_encrypt_project.py` (4) asserts every file
+round-trips and the master is untouched. Full suite: 501 passed, 8 skipped.
+
+### Residual risk
+
+An operator who knows the passphrase can still decrypt the copy with the CLI and
+rebuild from the plaintext result — the guard protects against accident, not
+against a determined authorised user. Copies built before this revision have a
+plaintext `project.json`; they are still detected and still guarded, but their
+manifest (mission name, video path, camera parameters) is readable at rest.
+Rebuild them to get full coverage.

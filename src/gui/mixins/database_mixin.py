@@ -14,7 +14,7 @@ from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
 from src.gui.dialogs.passphrase_dialog import NewPassphraseDialog, PassphraseDialog
 from src.security.at_rest import clear_passphrase
-from src.security.project_scan import find_encrypted_artifacts
+from src.security.project_scan import encrypted_artifacts_at
 from src.utils.logging_utils import get_logger
 from src.workers.database_worker import DatabaseGenerationWorker
 from src.workers.encrypt_copy_worker import EncryptCopyWorker
@@ -84,6 +84,9 @@ class DatabaseMixin:
         return None
 
     def _start_database_generation(self, video_path: str, save_path: str):
+        if self._refuse_if_encrypted_project("Генерація бази даних"):
+            return
+
         # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
         # UTM-конвертер буде ініціалізований автоматично після отримання першого
         # GPS-якоря у CalibrationMixin (через _on_first_gps_anchor або еквівалент),
@@ -264,17 +267,16 @@ class DatabaseMixin:
             QMessageBox.warning(
                 self,
                 "Увага",
-                "Копію створено, але жодного чутливого артефакту не знайдено — "
-                "перевірте структуру проєкту.",
+                "Копію створено, але вихідний проєкт порожній — нічого шифрувати.",
             )
             return
         QMessageBox.information(
             self,
             "Готово",
-            f"Зашифровано артефактів: {len(summary['encrypted'])}\n"
-            f"Скопійовано без змін: {summary['copied']} файл(ів)\n\n"
-            f"Оригінал проєкту не змінено. Пароль неможливо відновити — "
-            f"збережіть його в безпечному місці.",
+            f"Зашифровано файлів: {summary['total']} (усі, без винятків)\n\n"
+            f"Оригінал проєкту не змінено. Копія незмінна: застосунок відмовиться "
+            f"писати в неї — перебудову й калібрування робіть на майстрі.\n\n"
+            f"Пароль неможливо відновити — збережіть його в безпечному місці.",
         )
 
     @pyqtSlot(str)
@@ -283,8 +285,30 @@ class DatabaseMixin:
         self.status_bar.showMessage("Помилка створення зашифрованої копії")
         QMessageBox.critical(self, "Помилка", f"Не вдалося створити копію:\n{message}")
 
-    def _prompt_passphrase_if_encrypted(self) -> bool:
-        """Ask for the map passphrase if the just-loaded project is encrypted.
+    def _refuse_if_encrypted_project(self, action: str) -> bool:
+        """True (and shows why) if ``action`` would write into an encrypted copy.
+
+        The write guards in the core raise regardless — this only turns the
+        refusal into a clear message before any work starts, instead of an
+        exception surfacing from a worker thread."""
+        if not getattr(self.project_manager, "is_encrypted", False):
+            return False
+        QMessageBox.critical(
+            self,
+            "Зашифрований проєкт",
+            f"{action} неможливо: це зашифрована копія для розгортання, "
+            f"вона незмінна.\n\nВиконайте цю дію на відкритому майстер-проєкті, "
+            f"а потім зберіть із нього нову зашифровану копію.",
+        )
+        return True
+
+    def _prompt_passphrase_if_encrypted(self, path: str) -> bool:
+        """Ask for the map passphrase if the project at ``path`` is encrypted.
+
+        Runs BEFORE the project is loaded: a fully encrypted copy encrypts
+        project.json too, so ``load_project`` cannot even parse the manifest
+        without the passphrase. The project's display name is unknown at this
+        point for the same reason — the folder name is used instead.
 
         Returns True when loading may proceed: either the project is plaintext
         (no prompt at all — behaviour identical to before this feature) or the
@@ -292,13 +316,11 @@ class DatabaseMixin:
         Returns False if the operator cancelled or exhausted their attempts, in
         which case the caller must abort the load rather than fail deep inside
         h5py with an opaque error."""
-        encrypted = find_encrypted_artifacts(self.project_manager)
+        encrypted = encrypted_artifacts_at(path)
         if not encrypted:
             return True
 
-        dialog = PassphraseDialog(
-            self.project_manager.project_name, encrypted[0], parent=self
-        )
+        dialog = PassphraseDialog(Path(path).name, encrypted[0], parent=self)
         if dialog.exec():
             return True
 
@@ -312,11 +334,13 @@ class DatabaseMixin:
         # silently decrypt (or fail against) the project being opened now.
         clear_passphrase()
 
-        if not self.project_manager.load_project(path):
-            QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
+        # The passphrase must be resolved BEFORE loading: an encrypted copy
+        # encrypts project.json itself, so the manifest is unparseable without it.
+        if not self._prompt_passphrase_if_encrypted(path):
             return
 
-        if not self._prompt_passphrase_if_encrypted():
+        if not self.project_manager.load_project(path):
+            QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
             return
 
         try:
@@ -489,6 +513,11 @@ class DatabaseMixin:
     def on_rebuild_database(self):
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Увага", "Спочатку завантажте проєкт!")
+            return
+
+        # Before the confirmation prompt AND before the calibration save below —
+        # that save is a write into the project and would otherwise raise.
+        if self._refuse_if_encrypted_project("Перегенерація бази даних"):
             return
 
         video_path = self.project_manager.settings.video_path

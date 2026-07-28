@@ -43,10 +43,7 @@ class EncryptCopyWorker(QThread):
             from scripts.encrypt_project import build_encrypted_copy
 
             summary = build_encrypted_copy(self.src_dir, self.dst_dir, self._passphrase)
-            logger.info(
-                f"Encrypted copy built: {len(summary['encrypted'])} encrypted, "
-                f"{summary['copied']} copied verbatim"
-            )
+            logger.info(f"Encrypted copy built: {summary['total']} file(s) encrypted")
             self.completed.emit(summary)
 
         except Exception as e:

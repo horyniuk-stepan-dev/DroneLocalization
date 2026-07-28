@@ -103,6 +103,11 @@ class CalibrationMixin:
 
     @pyqtSlot(object)
     def on_anchor_added(self, anchor_data: dict):
+        # Refuse before mutating in-memory state: the save below would raise and
+        # leave the anchor list out of sync with what is on disk. Viewing an
+        # encrypted project's calibration stays allowed.
+        if self._refuse_if_encrypted_project("Додавання якоря"):
+            return
         try:
             points_2d = anchor_data.get("points_2d")
             points_gps = anchor_data.get("points_gps")
@@ -331,6 +336,10 @@ class CalibrationMixin:
     @pyqtSlot(int)
     def on_anchor_removed(self, frame_id: int):
         """Видалення якоря та маркування пропагації застарілою."""
+        # Refuse before remove_anchor mutates memory — the save below would
+        # raise and leave the anchor list out of sync with disk.
+        if self._refuse_if_encrypted_project("Видалення якоря"):
+            return
         try:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
@@ -353,6 +362,8 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_run_propagation(self):
+        if self._refuse_if_encrypted_project("Пропагація калібрування"):
+            return
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Додайте хоча б один якір калібрування!")
             return
@@ -649,6 +660,8 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_save_calibration(self):
+        if self._refuse_if_encrypted_project("Збереження калібрування"):
+            return
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
@@ -692,6 +705,11 @@ class CalibrationMixin:
             # (навіть якщо файл завантажено з іншого місця або скопійовано вручну)
             source_cal_path = self._get_calibration_save_path()
             copied_to_source = False
+            # An encrypted copy is immutable: load into memory for viewing, but
+            # never mirror the file into the project.
+            if getattr(self.project_manager, "is_encrypted", False):
+                source_cal_path = None
+                logger.info("Encrypted project: calibration loaded for viewing, not persisted")
             if source_cal_path:
                 norm_loaded = str(Path(path).resolve())
                 norm_source = str(Path(source_cal_path).resolve())

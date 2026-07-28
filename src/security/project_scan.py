@@ -1,11 +1,16 @@
-"""HARDENING P1-6: detect which artifacts of a project are encrypted at rest.
+"""HARDENING P1-6: detect encrypted projects on disk and keep them immutable.
 
 Kept free of Qt so it is unit-testable in the pure-Python suite; the GUI
 passphrase dialog is the only consumer that needs a widget toolkit.
 
-Artifacts live per source (``sources/main/database.h5``, see ProjectSettings),
-so paths are resolved through the project's own source configuration rather
-than guessed from the project root.
+An encrypted deployment copy has EVERY file encrypted, ``project.json``
+included, so the manifest header is the marker: one 7-byte read tells you
+whether a directory is an encrypted copy, before anything is loaded.
+
+Copies built before that (plaintext manifest, encrypted artifacts) still open —
+the artifact scan below is kept as a fallback. Artifacts live per source
+(``sources/main/database.h5``, see ProjectSettings), so their paths are resolved
+through the project's own source configuration rather than guessed.
 """
 
 from __future__ import annotations
@@ -13,13 +18,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.security.at_rest import is_encrypted
+from src.security.at_rest import EncryptionError, is_encrypted
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 # Only the header is needed to classify a file — never read a 67 MB database in.
 _HEADER_PROBE_BYTES = 64
+
+
+class EncryptedProjectWriteError(EncryptionError):
+    """Raised when something tries to write into an encrypted deployment copy."""
 
 
 def _file_is_encrypted(path: Path) -> bool:
@@ -67,43 +76,68 @@ def _artifacts_for(root: Path, settings) -> list[Path]:
     return resolved
 
 
-def candidate_artifacts(project_manager) -> list[Path]:
-    """Encryptable artifacts of a *loaded* project (see :func:`_artifacts_for`)."""
-    if not project_manager.is_loaded:
-        return []
-    return _artifacts_for(Path(project_manager.project_dir), project_manager.settings)
+def encrypted_artifacts_at(project_dir: str | Path) -> list[Path]:
+    """Encrypted artifacts of the project at ``project_dir``, cheapest first.
 
+    Works from a path alone — the project cannot be loaded before the passphrase
+    is known, since the manifest itself may be encrypted. An empty list means the
+    project is plaintext and must load exactly as before: no prompt, no change.
 
-def project_is_encrypted(project_dir: str | Path) -> bool:
-    """True if the project at ``project_dir`` holds any encrypted artifact.
-
-    Path-based and quiet — it reads ``project.json`` directly rather than going
-    through ``ProjectManager``, which logs a line per load. The project picker
-    calls this once per listed row, so noise and cost both matter; it returns on
-    the first encrypted artifact instead of collecting them all. A directory
-    that is not a project counts as not encrypted."""
+    Side-effect free and quiet: it reads ``project.json`` directly rather than
+    going through ``ProjectManager``, which logs a line per load, because the
+    project picker calls this once per listed row."""
     from src.core.project import ProjectSettings
 
     root = Path(project_dir)
     manifest = root / "project.json"
     if not manifest.is_file():
-        return False
+        return []
+
+    if _file_is_encrypted(manifest):
+        # Fully encrypted copy: the manifest is both the marker and the cheapest
+        # possible verification target (a few hundred bytes).
+        return [manifest]
+
     try:
         settings = ProjectSettings.from_dict(json.loads(manifest.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError, KeyError):
-        return False
-    return any(_file_is_encrypted(p) for p in _artifacts_for(root, settings))
+        return []
+    return [p for p in _artifacts_for(root, settings) if _file_is_encrypted(p)]
 
 
-def find_encrypted_artifacts(project_manager) -> list[Path]:
-    """Encrypted artifacts of the loaded project, cheapest-to-decrypt first.
+def project_is_encrypted(project_dir: str | Path) -> bool:
+    """True if the project at ``project_dir`` is an encrypted deployment copy."""
+    return bool(encrypted_artifacts_at(project_dir))
 
-    Empty list means the project is plaintext and must load exactly as before —
-    no passphrase prompt, no behaviour change."""
-    found = [p for p in candidate_artifacts(project_manager) if _file_is_encrypted(p)]
-    if found:
-        logger.info(
-            f"Encrypted-at-rest artifacts detected in "
-            f"'{project_manager.project_name}': {[p.name for p in found]}"
-        )
-    return found
+
+def find_project_root(path: str | Path) -> Path | None:
+    """Nearest ancestor directory (or ``path`` itself) holding a ``project.json``.
+
+    Write guards get a target file path, not a project, so they walk up to find
+    which project — if any — they are about to write into."""
+    start = Path(path)
+    start = start if start.is_dir() else start.parent
+    for candidate in [start, *start.parents]:
+        if (candidate / "project.json").is_file():
+            return candidate
+    return None
+
+
+def assert_project_writable(path: str | Path) -> None:
+    """Refuse any write that lands inside an encrypted deployment copy.
+
+    The copy is immutable by design: the ground station keeps the plaintext
+    master and the drone carries ciphertext. Without this guard a normal rebuild
+    or calibration save silently writes plaintext into a project the operator
+    believes is encrypted — observed in the field, hence the hard refusal.
+
+    Writes outside any project, or into a plaintext project, are unaffected."""
+    root = find_project_root(path)
+    if root is None or not project_is_encrypted(root):
+        return
+    logger.error(f"Refused write into encrypted project '{root.name}': {path}")
+    raise EncryptedProjectWriteError(
+        f"'{root.name}' is an encrypted deployment copy and cannot be modified. "
+        f"Rebuild, recalibrate and re-run propagation on the plaintext master "
+        f"project, then build a fresh encrypted copy from it."
+    )
