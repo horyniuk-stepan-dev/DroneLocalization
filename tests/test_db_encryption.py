@@ -8,6 +8,7 @@ closed. Runs on the Windows side (imports h5py/lancedb).
 
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 from collections import OrderedDict
@@ -17,6 +18,7 @@ import h5py
 import numpy as np
 import pytest
 
+from src.database import database_loader
 from src.database.database_loader import (
     DatabaseLoader,
     materialize_maybe_encrypted_lance,
@@ -49,8 +51,7 @@ def test_encrypted_h5_opens_with_passphrase(tmp_path, monkeypatch):
     enc = tmp_path / "db.h5"
     enc.write_bytes(encrypt_bytes(raw, "pw"))
 
-    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", None, raising=False)
-    monkeypatch.setenv("DRONELOC_PASSPHRASE", "pw")
+    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", "pw", raising=False)
 
     hf, buf = open_maybe_encrypted_h5(str(enc))
     try:
@@ -66,8 +67,7 @@ def test_encrypted_h5_wrong_passphrase_fails_closed(tmp_path, monkeypatch):
     enc = tmp_path / "db.h5"
     enc.write_bytes(encrypt_bytes(raw, "right"))
 
-    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", None, raising=False)
-    monkeypatch.setenv("DRONELOC_PASSPHRASE", "wrong")
+    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", "wrong", raising=False)
 
     with pytest.raises(EncryptionError):
         open_maybe_encrypted_h5(str(enc))
@@ -105,8 +105,7 @@ def test_encrypted_lance_materialized_to_temp_dir(tmp_path, monkeypatch):
     lance = tmp_path / "vectors.lance"
     payload = _make_lance_dir(lance, encrypted=True)
 
-    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", None, raising=False)
-    monkeypatch.setenv("DRONELOC_PASSPHRASE", "pw")
+    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", "pw", raising=False)
 
     open_path, tempdir = materialize_maybe_encrypted_lance(lance)
     try:
@@ -126,8 +125,7 @@ def test_encrypted_lance_wrong_passphrase_leaves_no_plaintext(tmp_path, monkeypa
     lance = tmp_path / "vectors.lance"
     _make_lance_dir(lance, encrypted=True, passphrase="right")
 
-    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", None, raising=False)
-    monkeypatch.setenv("DRONELOC_PASSPHRASE", "wrong")
+    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", "wrong", raising=False)
 
     before = set(Path(tempfile.gettempdir()).glob("droneloc_lance_*"))
     with pytest.raises(EncryptionError):
@@ -168,3 +166,72 @@ def test_close_wipes_lance_tempdir(tmp_path):
     assert loader.lance_table is None
     assert loader._lance_tempdir is None
     assert not Path(tempdir).exists()
+
+
+# ── SP3: stale temp-dir sweep ─────────────────────────────────────────────────
+
+
+def _make_stale_tempdir(pid: int) -> str:
+    """A decrypted-index temp directory stamped as owned by ``pid``."""
+    tmpdir = tempfile.mkdtemp(prefix="droneloc_lance_")
+    (Path(tmpdir) / "data").mkdir()
+    (Path(tmpdir) / "data" / "part-0.lance").write_bytes(b"plaintext-global-vectors")
+    Path(tmpdir + ".owner").write_text(str(pid), encoding="utf-8")
+    return tmpdir
+
+
+def test_sweep_wipes_directories_of_dead_owners(monkeypatch):
+    tmpdir = _make_stale_tempdir(424242)
+    monkeypatch.setattr(database_loader, "_pid_is_running", lambda pid: False)
+
+    assert database_loader.sweep_stale_lance_tempdirs() >= 1
+
+    assert not Path(tmpdir).exists()
+    assert not Path(tmpdir + ".owner").exists()
+
+
+def test_sweep_keeps_directories_of_live_owners(monkeypatch):
+    tmpdir = _make_stale_tempdir(os.getpid())
+    monkeypatch.setattr(database_loader, "_pid_is_running", lambda pid: True)
+    try:
+        assert database_loader.sweep_stale_lance_tempdirs() == 0
+        assert Path(tmpdir).exists()
+    finally:
+        wipe_tree(tmpdir)
+
+
+def test_sweep_keeps_directories_when_liveness_is_unknown(monkeypatch):
+    """psutil missing → we cannot tell → never delete on a guess."""
+    tmpdir = _make_stale_tempdir(424242)
+    monkeypatch.setattr(database_loader, "_pid_is_running", lambda pid: None)
+    try:
+        assert database_loader.sweep_stale_lance_tempdirs() == 0
+        assert Path(tmpdir).exists()
+    finally:
+        wipe_tree(tmpdir)
+
+
+def test_sweep_ignores_directories_without_a_stamp(monkeypatch):
+    tmpdir = tempfile.mkdtemp(prefix="droneloc_lance_")  # no .owner sibling
+    monkeypatch.setattr(database_loader, "_pid_is_running", lambda pid: False)
+    try:
+        assert database_loader.sweep_stale_lance_tempdirs() == 0
+        assert Path(tmpdir).exists()
+    finally:
+        wipe_tree(tmpdir)
+
+
+def test_materialize_stamps_the_owner_pid(tmp_path, monkeypatch):
+    lance = tmp_path / "vectors.lance"
+    _make_lance_dir(lance, encrypted=True)
+    monkeypatch.setattr("src.security.at_rest._CACHED_PASSPHRASE", "pw", raising=False)
+
+    _, tempdir = materialize_maybe_encrypted_lance(lance)
+    try:
+        stamp = Path(tempdir + ".owner")
+        assert stamp.read_text(encoding="utf-8").strip() == str(os.getpid())
+        # The stamp must not sit inside the dataset root LanceDB opens.
+        assert not (Path(tempdir) / ".owner").exists()
+    finally:
+        wipe_tree(tempdir)
+    assert not Path(tempdir + ".owner").exists()

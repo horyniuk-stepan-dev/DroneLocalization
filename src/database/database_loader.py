@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -42,6 +43,62 @@ def open_maybe_encrypted_h5(path: str) -> tuple[h5py.File, io.BytesIO | None]:
     return h5py.File(buf, "r"), buf
 
 
+_LANCE_TEMP_PREFIX = "droneloc_lance_"
+
+
+def _owner_file(tmpdir: str) -> Path:
+    """Sibling file holding the PID that owns a decrypted-index temp directory."""
+    return Path(str(tmpdir) + ".owner")
+
+
+def _pid_is_running(pid: int) -> bool | None:
+    """True/False if the PID's liveness can be determined, None if it cannot.
+
+    ``os.kill(pid, 0)`` is not usable here: on Windows it maps to TerminateProcess
+    and would kill the very process we are probing. Without psutil we return None
+    and the caller keeps the directory — never delete on a guess."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.pid_exists(pid)
+    except Exception:
+        return None
+
+
+def sweep_stale_lance_tempdirs() -> int:
+    """Wipe decrypted-index temp directories abandoned by crashed runs.
+
+    ``DatabaseLoader.close`` wipes its own directory, but a hard kill or power
+    loss skips it and leaves plaintext global descriptors on the temp disk. Called
+    once at startup. Returns the number of directories wiped.
+
+    Conservative by construction: a directory is removed only when its owner PID
+    is known to be gone. An unreadable stamp, a live PID, or no way to check
+    (psutil missing) all mean "leave it alone" — deleting a directory a
+    concurrently running instance is reading from would break that instance."""
+    wiped = 0
+    for path in Path(tempfile.gettempdir()).glob(_LANCE_TEMP_PREFIX + "*"):
+        if not path.is_dir():
+            continue  # the .owner stamps themselves
+        owner = _owner_file(str(path))
+        try:
+            pid = int(owner.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue  # no readable stamp: not ours to judge
+        if _pid_is_running(pid) is not False:
+            continue  # alive, or undeterminable
+        wipe_tree(str(path))
+        wiped += 1
+    if wiped:
+        logger.warning(
+            f"Wiped {wiped} decrypted LanceDB temp director(ies) left by a previous "
+            f"run that did not shut down cleanly"
+        )
+    return wiped
+
+
 def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None]:
     """Return a path LanceDB can open, decrypting an at-rest-encrypted index first.
 
@@ -61,8 +118,12 @@ def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None
         return str(lance_path), None  # plaintext: unchanged path
 
     passphrase = get_passphrase()
-    tmpdir = tempfile.mkdtemp(prefix="droneloc_lance_")
+    tmpdir = tempfile.mkdtemp(prefix=_LANCE_TEMP_PREFIX)
     try:
+        # Owner stamp, kept as a SIBLING file so LanceDB never sees a stray entry
+        # in its dataset root. Lets a later run tell an abandoned directory (crash)
+        # from one a concurrently running instance is still using.
+        _owner_file(tmpdir).write_text(str(os.getpid()), encoding="utf-8")
         for src in files:
             target = Path(tmpdir) / src.relative_to(lance_path)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -77,14 +138,15 @@ def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None
 
 def wipe_tree(dir_path: str) -> None:
     """Best-effort secure delete of a decrypted temp directory (see ``wipe_file``
-    for the SSD/CoW caveat) — overwrite every file, then drop the tree."""
+    for the SSD/CoW caveat) — overwrite every file, then drop the tree and its
+    owner stamp."""
     root = Path(dir_path)
-    if not root.exists():
-        return
-    for path in root.rglob("*"):
-        if path.is_file():
-            wipe_file(str(path))
-    shutil.rmtree(root, ignore_errors=True)
+    if root.exists():
+        for path in root.rglob("*"):
+            if path.is_file():
+                wipe_file(str(path))
+        shutil.rmtree(root, ignore_errors=True)
+    _owner_file(dir_path).unlink(missing_ok=True)
 
 
 def _synchronized(method):

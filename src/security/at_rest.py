@@ -147,25 +147,61 @@ def wipe_file(path: str) -> None:
 
 
 def get_passphrase() -> str:
-    """Resolve the map passphrase: env ``DRONELOC_PASSPHRASE`` (headless/supervised
-    — the parent holds it and passes it to restarted children), else an
-    interactive prompt on a TTY. Fail-closed if neither is available. Cached
-    process-wide after the first successful resolution."""
+    """Resolve the map passphrase: the process-wide cache (filled by the GUI
+    dialog via :func:`set_passphrase`), else an interactive prompt on a TTY.
+    Fail-closed if neither is available.
+
+    There is deliberately **no environment-variable channel**. An env var is
+    readable by any process running as the same user (Process Explorer,
+    ``Win32_Process``, ``/proc/<pid>/environ``), is inherited by every child
+    process, and can surface in crash dumps — for a passphrase whose whole
+    purpose is that it is never stored on the device, that is the wrong trade.
+    A future non-TTY deployment should pipe the passphrase over stdin rather
+    than reintroduce one."""
     global _CACHED_PASSPHRASE
     if _CACHED_PASSPHRASE is not None:
         return _CACHED_PASSPHRASE
 
-    pw = os.environ.get("DRONELOC_PASSPHRASE")
-    if not pw and sys.stdin is not None and sys.stdin.isatty():
+    pw = ""
+    if sys.stdin is not None and sys.stdin.isatty():
         pw = getpass.getpass("Enter map decryption passphrase: ")
     if not pw:
         raise EncryptionError(
             "encrypted artifact found but no passphrase available — "
-            "set DRONELOC_PASSPHRASE or run interactively"
+            "run interactively, or enter it in the application"
         )
 
     _CACHED_PASSPHRASE = pw
     return pw
+
+
+def prompt_and_verify_passphrase(artifact_path: str, *, attempts: int = 3) -> bool:
+    """Prompt on the TTY until ``artifact_path`` decrypts, or attempts run out.
+
+    The console counterpart of the GUI passphrase dialog, with the same contract:
+    verify first, cache only on success, give the operator more than one try. A
+    typo must not abort a headless run, and must not leave a wrong passphrase in
+    the cache to break every later load.
+
+    Returns True once the passphrase is cached, False if the operator gave up,
+    exhausted the attempts, or there is no TTY to prompt on."""
+    if _CACHED_PASSPHRASE is not None:
+        return True
+    if sys.stdin is None or not sys.stdin.isatty():
+        return False
+
+    for remaining in range(attempts, 0, -1):
+        try:
+            pw = getpass.getpass("Enter map decryption passphrase: ")
+        except (KeyboardInterrupt, EOFError):
+            print()  # leave the cancelled prompt on its own line
+            return False
+        if pw and verify_passphrase(artifact_path, pw):
+            set_passphrase(pw)
+            return True
+        if remaining > 1:
+            print(f"Wrong passphrase — {remaining - 1} attempt(s) left.")
+    return False
 
 
 def set_passphrase(passphrase: str) -> None:

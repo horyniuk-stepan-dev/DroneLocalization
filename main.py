@@ -76,6 +76,13 @@ def _build_exception_hook(log):
     """Return sys.excepthook that logs unhandled exceptions before exit."""
 
     def hook(exctype, value, tb):
+        # Ctrl+C is a deliberate cancellation, not a crash — it must not print a
+        # traceback or be logged as one. It reaches here because KeyboardInterrupt
+        # is a BaseException and slips past every `except Exception`.
+        if issubclass(exctype, KeyboardInterrupt):
+            log.info("Interrupted by user (Ctrl+C) — exiting")
+            sys.exit(130)
+
         log.critical(
             "Unhandled exception caught — application will exit",
             exc_info=(exctype, value, tb),
@@ -271,6 +278,16 @@ def main() -> None:
             sys.exit(1)
         sys.exit(_run_supervised(args, logger))
 
+    # HARDENING P1-6 SP3: a crashed run leaves decrypted global descriptors in a
+    # temp directory. Wipe only those whose owner process is gone. Applies to both
+    # modes — a headless run decrypts the same LanceDB index.
+    try:
+        from src.database.database_loader import sweep_stale_lance_tempdirs
+
+        sweep_stale_lance_tempdirs()
+    except Exception as e:
+        logger.warning(f"Stale decrypted-index sweep failed: {e}")
+
     try:
         if args.headless:
             logger.info("Running in headless mode")
@@ -305,6 +322,11 @@ def main() -> None:
 
             exit_code = app.exec()
 
+    except KeyboardInterrupt:
+        # Most likely Ctrl+C at the map passphrase prompt. Cancelling a decrypt is
+        # a normal outcome, so exit quietly with the conventional 130.
+        logger.info("Interrupted by user (Ctrl+C) — exiting")
+        sys.exit(130)
     except Exception as e:
         logger.critical(f"Fatal error during startup: {e}", exc_info=True)
         sys.exit(1)

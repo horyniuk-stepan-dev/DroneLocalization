@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from src.core.project_video_source import ProjectVideoSource
-from src.security.at_rest import decrypt_bytes, get_passphrase, is_encrypted
+from src.security.at_rest import (
+    EncryptionError,
+    decrypt_bytes,
+    get_passphrase,
+    is_encrypted,
+)
 from src.security.project_scan import assert_project_writable, project_is_encrypted
 from src.utils.logging_utils import get_logger
 
@@ -245,6 +250,17 @@ class ProjectManager:
                 + (" (encrypted, read-only)" if self.is_encrypted else "")
             )
             return True
+
+        except EncryptionError as e:
+            # Do not blame the manifest: it is intact, we just cannot read it.
+            logger.error(
+                f"Cannot decrypt project manifest: {e} | dir={project_dir}. "
+                f"This project is encrypted — supply the correct map passphrase."
+            )
+            self.project_dir = None
+            self.settings = None
+            self.is_encrypted = False
+            return False
 
         except Exception as e:
             logger.error(

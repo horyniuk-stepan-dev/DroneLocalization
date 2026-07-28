@@ -4,6 +4,7 @@ from typing import Any
 
 import geojson
 
+from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -25,6 +26,9 @@ class ResultExporter:
         if not results:
             logger.warning("No results to export")
             return
+        # HARDENING P1-6: the track IS the mission — never write it in plaintext
+        # into an encrypted deployment copy.
+        assert_project_writable(output_path)
 
         fieldnames = [
             "frame_id",
@@ -47,6 +51,7 @@ class ResultExporter:
     @staticmethod
     def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
         """Експорт у GeoJSON (для GIS-систем). Додає точки та полігони FOV."""
+        assert_project_writable(output_path)
         features = []
         for r in results:
             if "lat" not in r or "lon" not in r:
@@ -99,6 +104,7 @@ class ResultExporter:
         results: list[dict[str, Any]], output_path: str, name: str = "Drone Track"
     ) -> None:
         """Експорт у KML (для Google Earth)."""
+        assert_project_writable(output_path)
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<kml xmlns="http://www.opengis.net/kml/2.2">',
@@ -168,6 +174,7 @@ class ResultExporter:
         """Експорт об'єктів у CSV файл."""
         if not results:
             return
+        assert_project_writable(output_path)
         fieldnames = ["track_id", "class_name", "timestamp", "lat", "lon", "confidence"]
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -181,6 +188,7 @@ class ResultExporter:
         """Експорт об'єктів у GeoJSON."""
         if not results:
             return
+        assert_project_writable(output_path)
         features = []
         for r in results:
             if "lat" not in r or "lon" not in r:

@@ -390,3 +390,135 @@ against a determined authorised user. Copies built before this revision have a
 plaintext `project.json`; they are still detected and still guarded, but their
 manifest (mission name, video path, camera parameters) is readable at rest.
 Rebuild them to get full coverage.
+
+---
+
+## Revision 2026-07-28d — export guard + stale temp-dir sweep
+
+Two gaps left open by the immutability work.
+
+### Result export could write plaintext into an encrypted copy
+
+`on_export_results` takes an operator-chosen destination, so a CSV/GeoJSON/KML
+track — the mission trajectory in plaintext — could land inside the encrypted
+copy. `assert_project_writable(output_path)` now guards all five `ResultExporter`
+entry points, and the GUI refuses earlier with a clear message pointing the
+operator at a directory outside the project.
+
+### Sweeping temp directories left by a crashed run
+
+`DatabaseLoader.close` wipes its own decrypted LanceDB directory and
+`MainWindow.closeEvent` now calls it, but a hard kill skips both and leaves
+plaintext global descriptors on the temp disk.
+
+`materialize_maybe_encrypted_lance` now stamps each temp directory with the owner
+PID in a **sibling** `<dir>.owner` file — sibling, not inside, so LanceDB never
+sees a stray entry in its dataset root. `sweep_stale_lance_tempdirs()` runs once
+at startup (`main.py`, before the main window) and wipes only directories whose
+owner PID is provably gone.
+
+Conservative by construction — an unreadable stamp, a live PID, or no way to
+check all mean "leave it". Deleting a directory a concurrently running instance
+is reading from would break that instance. Liveness uses `psutil.pid_exists`;
+`os.kill(pid, 0)` is unusable here because on Windows it maps to TerminateProcess
+and would kill the process being probed. `psutil` is imported lazily and its
+absence degrades to "cannot tell", so nothing hard-depends on it — note that it
+is already used by `hardware_profile` but is not declared in `pyproject.toml`.
+
+Directories created before this revision carry no stamp and are therefore never
+swept; they must be removed by hand once.
+
+### Testing
+
+5 new tests in `tests/test_db_encryption.py`: sweep wipes a dead owner's
+directory (and its stamp), keeps a live owner's, keeps it when liveness is
+unknown, ignores unstamped directories, and `materialize` writes the stamp beside
+— not inside — the dataset. Full suite: 508 passed, 8 skipped.
+
+---
+
+## Revision 2026-07-28e — the environment-variable channel is removed
+
+`DRONELOC_PASSPHRASE` is gone. `get_passphrase` now resolves from the
+process-wide cache (filled by the GUI dialog via `set_passphrase`) or an
+interactive `getpass` prompt on a TTY, and fails closed otherwise.
+
+Operator decision. Nothing ever *set* the variable — only `at_rest` read it — so
+removing it breaks no implemented path.
+
+**Correction to a claim made while deciding this:** the supervisor *does* spawn
+child processes. `main.py::_run_supervised` runs the headless pipeline via
+`subprocess.run(child_cmd)` and restarts it on crash, so the docstring's "parent
+passes it to restarted children" described a real topology, even though no code
+ever populated the variable. The removal therefore has a live consequence,
+recorded under Known limitation below.
+
+Meanwhile the exposure is real: an env var is readable by any process running as
+the same user (Process Explorer / `Win32_Process`, `/proc/<pid>/environ`), is
+inherited by every child process, and can surface in a crash dump. For a
+passphrase whose entire purpose is that it is never stored on the device, that is
+the wrong trade.
+
+A headless run from a terminal is unaffected — stdin is a TTY, so it prompts.
+
+**Known limitation — `--supervise --headless` on an encrypted project.** The
+supervised child inherits the parent's stdin, so launched from a terminal it
+prompts the operator *on every restart*, and launched without a TTY (service,
+detached) it fails closed on the first start. Unattended supervised operation on
+an encrypted project therefore does not work today.
+
+The fix is the stdin pipe, not a new environment variable: the supervisor prompts
+once, holds the passphrase in its own memory, and feeds it to each child via
+`subprocess.run(..., input=...)`; `get_passphrase` grows a non-TTY branch that
+reads one line from stdin. Not implemented — the GUI, plain headless, and
+single-run flows all work without it.
+
+Tests that used `monkeypatch.setenv` now inject via the cache, plus a new
+`test_get_passphrase_ignores_the_environment` pins the removal so it cannot creep
+back. Operator docs in `THREAT_MODEL_AND_SECURITY.md` updated. Full suite: 509
+passed, 8 skipped.
+
+### Ctrl+C at the passphrase prompt
+
+Cancelling the prompt raised `KeyboardInterrupt`, which is a `BaseException` and
+so slipped past every `except Exception` up to the global crash hook — the
+operator saw a CRITICAL traceback for a deliberate cancellation. `main.py` now
+handles it in both places (the hook and `main`'s try block): a one-line message
+and exit code 130, no traceback. The stale-temp-dir sweep also moved above the
+headless/GUI branch — a headless run decrypts the same LanceDB index and was
+skipping it.
+
+### Headless: a wrong passphrase must not end the run
+
+The first headless attempt against an encrypted project exposed two defects.
+`get_passphrase` prompted **once**, with no verification and no retry, so a typo
+ended the run — and the failure was reported as `Database not found at
+<root>/database.h5`, because `load_project` had returned False and the DB path
+fell back to the legacy root. `load_project` compounded it by logging "the
+project.json file may be corrupted" for what was purely a passphrase problem.
+
+`at_rest.prompt_and_verify_passphrase(artifact, attempts=3)` is now the console
+counterpart of the GUI dialog, with the same contract: verify against the
+cheapest encrypted artifact, cache only on success, allow retries, treat Ctrl+C
+and EOF as a clean "no". `HeadlessRunner._setup_project` calls it before
+`load_project`, and `load_project` grew a dedicated `EncryptionError` branch that
+names the real cause instead of blaming the manifest.
+
+Verified end-to-end on `newzap_encrypted`: manifest decrypted, LanceDB index
+materialised (8 files), 121 frames, 8 anchors, tracking started — with no
+environment variable anywhere. 7 new tests; full suite: 515 passed, 8 skipped.
+
+---
+
+## Status
+
+P1-6 is complete: SP1 (geo-anchors), SP2 (`database.h5`), SP3 (`vectors.lance/`
+and the keypoint video), the encrypted-copy model, immutability, the GUI and
+console passphrase flows. Verified end-to-end in both the GUI and headless on
+`newzap_encrypted`.
+
+The consolidated list of what is left — the `--supervise` stdin-pipe decision,
+undeclared dependencies (`psutil`, `triton-windows`), operator housekeeping for
+pre-existing copies and temp directories, and the one unconfirmed `moov atom`
+observation — lives in **`docs/THREAT_MODEL_AND_SECURITY.md` §7**, not here, so
+there is a single place to check before fielding.

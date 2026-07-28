@@ -75,15 +75,24 @@ def test_non_container_raises():
 # --- passphrase source -------------------------------------------------------
 
 
-def test_get_passphrase_reads_env(monkeypatch):
+def test_get_passphrase_reads_the_injected_cache(monkeypatch):
+    monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
+    at_rest.set_passphrase("injected")
+    assert at_rest.get_passphrase() == "injected"
+
+
+def test_get_passphrase_ignores_the_environment(monkeypatch):
+    """No env-var channel: it is readable by any same-user process, inherited by
+    every child, and can land in a crash dump."""
     monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
     monkeypatch.setenv("DRONELOC_PASSPHRASE", "from-env")
-    assert at_rest.get_passphrase() == "from-env"
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(at_rest.EncryptionError):
+        at_rest.get_passphrase()
 
 
 def test_get_passphrase_raises_when_unset_and_no_tty(monkeypatch):
     monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
-    monkeypatch.delenv("DRONELOC_PASSPHRASE", raising=False)
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     with pytest.raises(at_rest.EncryptionError):
         at_rest.get_passphrase()
@@ -125,3 +134,66 @@ def test_decrypt_to_tempfile_wrong_passphrase_leaves_no_temp(tmp_path):
 
 def test_wipe_file_is_idempotent_on_missing(tmp_path):
     at_rest.wipe_file(str(tmp_path / "does-not-exist"))  # must not raise
+
+
+# --- console prompt with retries (headless) ----------------------------------
+
+
+@pytest.fixture
+def encrypted_artifact(tmp_path, monkeypatch):
+    monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    p = tmp_path / "calibration.json"
+    p.write_bytes(at_rest.encrypt_bytes(b'{"anchors": []}', "right"))
+    return str(p)
+
+
+def _answers(monkeypatch, *replies):
+    """Feed getpass a scripted sequence of operator inputs."""
+    seq = iter(replies)
+    monkeypatch.setattr(at_rest.getpass, "getpass", lambda *a, **k: next(seq))
+
+
+def test_prompt_accepts_correct_passphrase(encrypted_artifact, monkeypatch):
+    _answers(monkeypatch, "right")
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is True
+    assert at_rest._CACHED_PASSPHRASE == "right"
+
+
+def test_prompt_retries_after_a_typo(encrypted_artifact, monkeypatch):
+    """A typo must not abort a headless run."""
+    _answers(monkeypatch, "typo", "right")
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is True
+    assert at_rest._CACHED_PASSPHRASE == "right"
+
+
+def test_prompt_gives_up_after_the_attempt_limit(encrypted_artifact, monkeypatch):
+    _answers(monkeypatch, "no", "nope", "still-no")
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact, attempts=3) is False
+    # A wrong passphrase must never be cached — it would break every later load.
+    assert at_rest._CACHED_PASSPHRASE is None
+
+
+def test_prompt_returns_false_on_ctrl_c(encrypted_artifact, monkeypatch):
+    def interrupt(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(at_rest.getpass, "getpass", interrupt)
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is False
+    assert at_rest._CACHED_PASSPHRASE is None
+
+
+def test_prompt_returns_false_without_a_tty(encrypted_artifact, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr(
+        at_rest.getpass, "getpass", lambda *a, **k: pytest.fail("prompted without a TTY")
+    )
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is False
+
+
+def test_prompt_is_a_noop_when_already_cached(encrypted_artifact, monkeypatch):
+    at_rest.set_passphrase("right")
+    monkeypatch.setattr(
+        at_rest.getpass, "getpass", lambda *a, **k: pytest.fail("prompted despite cache")
+    )
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is True

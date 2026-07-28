@@ -14,7 +14,11 @@ from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
 from src.gui.dialogs.passphrase_dialog import NewPassphraseDialog, PassphraseDialog
 from src.security.at_rest import clear_passphrase
-from src.security.project_scan import encrypted_artifacts_at
+from src.security.project_scan import (
+    encrypted_artifacts_at,
+    find_project_root,
+    project_is_encrypted,
+)
 from src.utils.logging_utils import get_logger
 from src.workers.database_worker import DatabaseGenerationWorker
 from src.workers.encrypt_copy_worker import EncryptCopyWorker
@@ -573,6 +577,18 @@ class DatabaseMixin:
             "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
         )
         if not path:
+            return
+
+        # The destination is operator-chosen, so it may land inside an encrypted
+        # copy — where the exported track would sit in plaintext.
+        export_root = find_project_root(path)
+        if export_root is not None and project_is_encrypted(export_root):
+            QMessageBox.critical(
+                self,
+                "Зашифрований проєкт",
+                "Експорт у зашифровану копію неможливий: трек місії потрапив би "
+                "туди у відкритому вигляді.\n\nОберіть теку поза проєктом.",
+            )
             return
 
         try:

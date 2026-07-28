@@ -38,7 +38,6 @@ MANIFEST = {
 def _no_cached_passphrase(monkeypatch):
     """The passphrase cache is process-wide; never let it leak between tests."""
     monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
-    monkeypatch.delenv("DRONELOC_PASSPHRASE", raising=False)
 
 
 def _make_project(root, *, mode: str):

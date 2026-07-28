@@ -1,3 +1,11 @@
+# isort: off
+# WORKAROUND FOR PYTORCH + WINDOWS WinError 1114 (mirrors main.py): torch must be
+# imported before pyproj (src.geometry.coordinates) and PoseLib
+# (src.geometry.transformations), or loading c10.dll fails. Import order here is
+# load-bearing — do not let a formatter move this line.
+import torch  # noqa: F401
+# isort: on
+
 import signal
 import sys
 from pathlib import Path
@@ -15,6 +23,8 @@ from src.localization.matcher import FeatureMatcher
 from src.models.model_manager import ModelManager
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.network.coordinates_broker import CoordinatesBroker
+from src.security.at_rest import EncryptionError, prompt_and_verify_passphrase
+from src.security.project_scan import encrypted_artifacts_at
 from src.utils.logging_utils import get_logger
 from src.workers.tracking_worker import RealtimeTrackingWorker
 
@@ -47,6 +57,17 @@ class HeadlessRunner:
     def _setup_project(self):
         """Завантажує БД та калібрування з проекту."""
         logger.info(f"Loading project from {self.project_dir}")
+
+        # HARDENING P1-6: resolve the passphrase BEFORE loading — an encrypted copy
+        # encrypts project.json itself, so the manifest is unparseable without it.
+        # Verified up front and retried, so a typo does not abort the run and never
+        # poisons the cache. Mirrors the GUI dialog.
+        encrypted = encrypted_artifacts_at(self.project_dir)
+        if encrypted and not prompt_and_verify_passphrase(str(encrypted[0])):
+            raise EncryptionError(
+                f"'{Path(self.project_dir).name}' is encrypted and no valid passphrase "
+                f"was given — cannot load the project."
+            )
 
         # Завантажуємо проект через ProjectManager для підтримки multi-source
         pm = ProjectManager()
