@@ -72,6 +72,32 @@ class RealtimeTrackingWorker(QThread):
                 logger=logger,
             )
 
+    def _models_to_pin(self) -> list[str]:
+        """Імена моделей, які треба закріпити у VRAM на час трекінгу.
+
+        Виводяться з ``models.local_extractor``, а не хардкодяться: назви мають
+        збігатися з ключами реєстру ModelManager ("aliked" | "rdd" | "xfeat",
+        "lightglue_<features>", "dinov2").
+
+        Дзеркалить ModelManager.load_local_extractor() і prewarm() ТОЧНО:
+        завантажувач розрізняє лише "rdd" і "xfeat", будь-що інше (зокрема
+        "superpoint") тихо падає на ALIKED. Якщо там колись зʼявиться новий
+        екстрактор, оновити треба обидва місця.
+        """
+        local = str(get_cfg(self.config, "models.local_extractor", "aliked")).lower()
+        if local not in ("rdd", "xfeat"):
+            if local != "aliked":
+                logger.warning(
+                    f"models.local_extractor={local!r} не підтримується "
+                    f"ModelManager.load_local_extractor() — фактично вантажиться "
+                    f"ALIKED, закріплюємо його ж"
+                )
+            local = "aliked"
+        # XFeat матчиться власним MNN, окремий LightGlue йому не потрібен.
+        if local == "xfeat":
+            return ["xfeat", "dinov2"]
+        return [local, "dinov2", f"lightglue_{local}"]
+
     def run(self):
         # Fix #3: скидаємо стан сесії через публічний API (без приватних полів)
         if hasattr(self.localizer, "reset_session"):
@@ -82,7 +108,12 @@ class RealtimeTrackingWorker(QThread):
             self._debug_inflight.clear()
 
         if self.model_manager:
-            self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
+            # ВИПРАВЛЕНО: список був захардкоджений під ALIKED. При
+            # models.local_extractor = "rdd" | "xfeat" він закріплював моделі,
+            # які взагалі не вантажаться, а ті, що реально в роботі, лишались
+            # витискуваними — _ensure_vram_available вивантажував їх саме тоді,
+            # коли VRAM закінчувалась. Імена — ті самі, що в ModelManager.
+            self.model_manager.pin(self._models_to_pin())
 
         from src.tracking.object_projector import ObjectProjector
         from src.tracking.object_tracker import ObjectTracker

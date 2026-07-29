@@ -5,8 +5,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # --- PyInstaller: fix DLL loading & redirect caches for frozen builds ---
 if getattr(sys, "frozen", False):
-    import ctypes
-    import glob
     from pathlib import Path
 
     _meipass = getattr(sys, "_MEIPASS", str(Path(sys.executable).parent))
@@ -29,10 +27,10 @@ if getattr(sys, "frozen", False):
 
 # WORKAROUND FOR PYINSTALLER + PYTORCH + WINDOWS WinError 1114:
 # Import torch BEFORE anything else to prevent DLL conflicts
-import torch
-
 import warnings
 from pathlib import Path
+
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -115,9 +113,37 @@ def _run_supervised(args, logger) -> int:
         "--headless",
         "--project", args.project,
         "--source", args.source,
-        "--ws-port", str(args.ws_port),
-        "--rest-port", str(args.rest_port),
     ]
+    # Порти передаємо дитині ЛИШЕ якщо їх явно задали в CLI: інакше дитина має
+    # взяти їх із user_config.json так само, як це зробив би одиночний запуск.
+    if args.ws_port is not None:
+        child_cmd += ["--ws-port", str(args.ws_port)]
+    if args.rest_port is not None:
+        child_cmd += ["--rest-port", str(args.rest_port)]
+
+    # HARDENING P1-6: an encrypted project needs the passphrase on EVERY child
+    # start. Ask once here, in the supervisor, and pipe it to each child on its
+    # stdin — unattended restart is the whole point of this mode, so re-prompting
+    # a human per restart would defeat it. A pipe (unlike an env var) is invisible
+    # in process listings, not inherited by grandchildren, and consumed once.
+    child_input = None
+    try:
+        from src.security.at_rest import get_passphrase, prompt_and_verify_passphrase
+        from src.security.project_scan import encrypted_artifacts_at
+
+        encrypted = encrypted_artifacts_at(args.project)
+        if encrypted:
+            if not prompt_and_verify_passphrase(str(encrypted[0])):
+                logger.error(
+                    "Project is encrypted and no valid passphrase was given — "
+                    "supervisor will not start."
+                )
+                return 1
+            child_input = get_passphrase().encode("utf-8") + b"\n"
+            logger.info("Map passphrase accepted — it will be piped to each child")
+    except Exception as e:
+        logger.error(f"Could not resolve the map passphrase: {e}")
+        return 1
 
     backoff = 1.0
     backoff_max = 60.0
@@ -132,7 +158,10 @@ def _run_supervised(args, logger) -> int:
     while True:
         start = _time.monotonic()
         try:
-            rc = subprocess.run(child_cmd).returncode
+            # Passing input= replaces the child's stdin with a pipe, which is what
+            # its get_passphrase reads. Plaintext projects pass None and keep
+            # inheriting the terminal exactly as before.
+            rc = subprocess.run(child_cmd, input=child_input).returncode
         except KeyboardInterrupt:
             logger.info("Supervisor received interrupt — shutting down")
             return 0
@@ -251,8 +280,18 @@ def main() -> None:
     parser.add_argument(
         "--source", type=str, help="Video source URL or path (required for headless)"
     )
-    parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket port")
-    parser.add_argument("--rest-port", type=int, default=8080, help="REST API port")
+    # ВАЖЛИВО: default=None, а не число. Раніше дефолти argparse (8765/8080)
+    # БЕЗУМОВНО перезаписували network_api.ws_port / rest_port із user_config.json
+    # навіть коли прапорець не передавали — headless завжди слухав 8080, хоча
+    # конфіг казав 8081.
+    parser.add_argument(
+        "--ws-port", type=int, default=None,
+        help="WebSocket port (default: network_api.ws_port from config)",
+    )
+    parser.add_argument(
+        "--rest-port", type=int, default=None,
+        help="REST API port (default: network_api.rest_port from config)",
+    )
     parser.add_argument(
         "--supervise",
         action="store_true",
@@ -295,8 +334,15 @@ def main() -> None:
                 logger.error("--project and --source are required in headless mode")
                 sys.exit(1)
 
-            APP_SETTINGS.network_api.ws_port = args.ws_port
-            APP_SETTINGS.network_api.rest_port = args.rest_port
+            # Перекриваємо конфіг лише тим, що явно задане в CLI.
+            if args.ws_port is not None:
+                APP_SETTINGS.network_api.ws_port = args.ws_port
+            if args.rest_port is not None:
+                APP_SETTINGS.network_api.rest_port = args.rest_port
+            logger.info(
+                f"Network API ports: ws={APP_SETTINGS.network_api.ws_port}, "
+                f"rest={APP_SETTINGS.network_api.rest_port}"
+            )
 
             runner = HeadlessRunner(args.project, args.source)
             runner.run()

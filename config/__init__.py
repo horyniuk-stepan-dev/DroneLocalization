@@ -5,7 +5,6 @@ APP_SETTINGS``). The old ``config.config`` module remains as a deprecated
 shim for one release.
 """
 
-from config.paths import ensure_model_cache_env, user_config_candidates, user_data_dir
 from config.access import (
     APP_CONFIG,
     APP_SETTINGS,
@@ -47,6 +46,7 @@ from config.models import (
     YoloConfig,
     get_default_local_extractor,
 )
+from config.paths import ensure_model_cache_env, user_config_candidates, user_data_dir
 
 # Keep torch.hub / HuggingFace downloads inside <repo>/models/.cache in dev
 # (single storage location for all model weights).

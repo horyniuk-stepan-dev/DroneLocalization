@@ -61,6 +61,19 @@ class FeatureExtractor:
                 T.Normalize(mean=dino_mean, std=dino_std),
             ]
         )
+        # Аудит §2.1: варіант із CPU-resize. Зменшення вже зроблено на numpy,
+        # тож лишається сама нормалізація — Resize тут був би no-op на (S, S),
+        # але зайвим ядром.
+        self._dino_normalize = T.Normalize(mean=dino_mean, std=dino_std)
+        self._dino_cpu_resize = bool(
+            get_cfg(self.config, "models.performance.dino_cpu_resize", False)
+        )
+        if self._dino_cpu_resize:
+            logger.info(
+                f"DINO input resize on CPU ENABLED (cv2 → {dino_size}x{dino_size} "
+                f"uint8 before upload). Databases built with this ON are NOT "
+                f"interchangeable with those built OFF — schema fingerprint differs."
+            )
 
         self.use_half = (
             device == "cuda"
@@ -124,6 +137,57 @@ class FeatureExtractor:
             return self.vlad_aggregator.out_dim
         return get_active_descriptor_cfg(self.config).descriptor_dim
 
+    def _upload_chw(self, image: np.ndarray) -> torch.Tensor:
+        """(H, W, 3) uint8 → (1, 3, H, W) float32 [0..1] на self.device.
+
+        ОПТИМІЗАЦІЯ (аудит §2.1): раніше кадр конвертувався у float32 на CPU
+        і вже вчетверо більшим їхав по PCIe, щоб на GPU одразу зменшитись до
+        (S, S) — для DINOv3 це 224. На 1080p це ~25 МБ трансферу і ~25 МБ
+        CPU-алокації на КОЖЕН форвард; при скані 4 кутів × 5 масштабів —
+        до 500 МБ на keyframe.
+
+        Тепер на девайс їде uint8 (вчетверо менше), а .float()/.div_ рахуються
+        вже там. Результат ПОБІТОВО той самий: uint8→float32 точний, а ділення
+        на 255.0 — одна IEEE-754 операція з тим самим округленням на CPU і CUDA.
+        Тому дескриптори лишаються сумісними з уже збудованими базами.
+        """
+        t = torch.from_numpy(np.ascontiguousarray(image))
+        t = t.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+        return t.float().div_(255.0)
+
+    def _cpu_resize_dino(self, image: np.ndarray) -> np.ndarray:
+        """(H, W, 3) uint8 → (S, S, 3) uint8 на CPU, де S = self.dino_size.
+
+        Аудит §2.1 (повна форма). Зменшення робиться на uint8 ДО завантаження,
+        тому по PCIe їде ~S²·3 байт замість H·W·3: для 1080p → 224 це ~0.15 МБ
+        замість ~6.2 МБ, тобто ~40×.
+
+        Фільтр обирається як у ResolutionNormalizer: INTER_AREA на зменшення
+        (коректне усереднення площі), INTER_CUBIC на збільшення. Це НЕ той
+        самий фільтр, що torchvision Resize(antialias=True), тож значення
+        дескрипторів зміщуються — саме тому прапорець сидить у SCHEMA_FIELDS.
+
+        Аспект навмисно не зберігається: цільова форма квадратна, точно як у
+        ``T.Resize((S, S))``, який цей шлях заміщає. Інакше геометрія входу
+        розійшлася б із GPU-варіантом.
+        """
+        import cv2
+
+        s = int(self.dino_size)
+        h, w = image.shape[:2]
+        interp = cv2.INTER_AREA if (h > s or w > s) else cv2.INTER_CUBIC
+        return cv2.resize(np.ascontiguousarray(image), (s, s), interpolation=interp)
+
+    def _dino_input(self, image: np.ndarray) -> torch.Tensor:
+        """(H, W, 3) uint8 → (1, 3, S, S) нормалізований тензор на self.device.
+
+        Єдина точка препроцесу DINO. І онлайн-локалізація, і побудова бази
+        ходять сюди, тож query та БД не можуть розійтися препроцесом.
+        """
+        if self._dino_cpu_resize:
+            return self._dino_normalize(self._upload_chw(self._cpu_resize_dino(image)))
+        return self.dinov2_transform(self._upload_chw(image))
+
     @torch.no_grad()
     def _vlad_descriptors(self, dino_input: torch.Tensor) -> np.ndarray:
         """(B, 3, S, S) → (B, out_dim) через VLAD-агрегацію патч-токенів."""
@@ -143,11 +207,7 @@ class FeatureExtractor:
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
         with Telemetry.profile("dinov2"):
             logger.debug("Extracting global descriptor with DINOv2...")
-            dino_tensor = torch.from_numpy(image).float().div_(255.0)
-            dino_tensor = (
-                dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
-            )
-            dino_input = self.dinov2_transform(dino_tensor)
+            dino_input = self._dino_input(image)
 
         if self.vlad_aggregator is not None:
             return self._vlad_descriptors(dino_input)[0]
@@ -183,12 +243,24 @@ class FeatureExtractor:
             return np.empty((0, 0), dtype=np.float32)
 
         with Telemetry.profile("dinov2"):
-            prepped = []
-            for img in images:
-                t = torch.from_numpy(np.ascontiguousarray(img)).float().div_(255.0)
-                t = t.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
-                prepped.append(self.dinov2_transform(t)[0])
-            batch = torch.stack(prepped)  # (B, 3, S, S)
+            if self._dino_cpu_resize:
+                # §2.1: усі кадри стають (S, S) ще на numpy, тож батч
+                # збирається одним стеком і йде на девайс ОДНИМ трансфером —
+                # замість B окремих завантажень повнорозмірних кадрів.
+                stacked = np.stack([self._cpu_resize_dino(img) for img in images])
+                t = (
+                    torch.from_numpy(np.ascontiguousarray(stacked))
+                    .permute(0, 3, 1, 2)
+                    .to(self.device, non_blocking=True)
+                    .float()
+                    .div_(255.0)
+                )
+                batch = self._dino_normalize(t)  # (B, 3, S, S)
+            else:
+                prepped = [
+                    self.dinov2_transform(self._upload_chw(img))[0] for img in images
+                ]
+                batch = torch.stack(prepped)  # (B, 3, S, S)
 
             # ADDENDUM §3: чанкування батча — кап піку VRAM на слабких GPU.
             # global_batch_max=0 (дефолт) → один форвард, поведінка без змін.
@@ -223,11 +295,7 @@ class FeatureExtractor:
         tokens — (N, D) float32 на CPU, N = h_p * w_p. Той самий препроцес
         (dinov2_transform) і той самий backend (DINOv2/DINOv3), що і retrieval.
         """
-        dino_tensor = torch.from_numpy(np.ascontiguousarray(image)).float().div_(255.0)
-        dino_tensor = (
-            dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
-        )
-        dino_input = self.dinov2_transform(dino_tensor)
+        dino_input = self._dino_input(image)
         with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
             features = self.global_model.forward_features(dino_input)
         tokens = features["x_norm_patchtokens"][0].float().cpu().numpy()  # (N, D)
@@ -240,9 +308,9 @@ class FeatureExtractor:
 
         enhanced_image = self.preprocessor.preprocess(image)
 
-        # Підготовка тензора (LightGlue format для ALIKED/RDD; сирий (1,3,H,W) для XFeat)
-        rgb_tensor = torch.from_numpy(enhanced_image).float().div_(255.0)
-        rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+        # Підготовка тензора (LightGlue format для ALIKED/RDD; сирий (1,3,H,W) для XFeat).
+        # §2.1: uint8 на девайс, float/div — уже там (той самий результат, 4× менше PCIe).
+        rgb_tensor = self._upload_chw(enhanced_image)
 
         # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
         max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
@@ -294,9 +362,12 @@ class FeatureExtractor:
                 keypoints = keypoints[valid]
                 descriptors = descriptors[valid]
             else:
+                # ВИПРАВЛЕНО: тут було len(aliked_out[...]), а aliked_out існує
+                # лише в ALIKED/RDD-гілці — на XFeat це UnboundLocalError у
+                # момент, коли маска зрізала все. keypoints у скоупі завжди.
                 logger.warning(
                     f"All keypoints filtered out by YOLO mask! "
-                    f"Image {image.shape[:2]}, total_kpts={len(aliked_out['keypoints'][0])}, "
+                    f"Image {image.shape[:2]}, total_kpts={len(keypoints)}, "
                     f"mask_static_ratio={np.mean(static_mask > 128):.1%}. "
                     f"The entire image may be covered by dynamic objects (vehicles, people)."
                 )
@@ -331,20 +402,43 @@ class FeatureExtractor:
             return []
 
         # 1. Prepare DINOv2 Tensor
-        dino_tensors = []
-        for img in images:
-            rgb = torch.tensor(img, pin_memory=True).float().div_(255.0)
-            dino_tensors.append(rgb.permute(2, 0, 1))
-        dino_batch = torch.stack(dino_tensors).to(self.device, non_blocking=True)
-        dino_input = self.dinov2_transform(dino_batch)
+        # Аудит §2.1/§2.4: раніше кожне зображення окремо йшло через
+        # torch.tensor(..., pin_memory=True).float() — тобто (а) копія + власна
+        # pinned-алокація на КОЖЕН кадр (cudaHostAlloc синхронізує драйвер), і
+        # (б) float32 їхав по PCIe вчетверо більшим за потрібне. Тепер батч
+        # збирається як uint8 одним numpy-стеком, а .float()/.div_ рахуються
+        # на девайсі. Числовий результат той самий.
+        # §2.1: коли CPU-resize увімкнено, зменшуємо ДО стеку — тоді на девайс
+        # їде (B, 3, S, S) замість (B, 3, H, W). Це ТОЙ САМИЙ препроцес, що в
+        # _dino_input на онлайн-шляху: інакше дескриптори БД і запиту були б
+        # порахованими різними фільтрами.
+        _dino_src = (
+            [self._cpu_resize_dino(img) for img in images]
+            if self._dino_cpu_resize
+            else images
+        )
+        dino_batch = (
+            torch.from_numpy(np.ascontiguousarray(np.stack(_dino_src)))
+            .permute(0, 3, 1, 2)
+            .to(self.device, non_blocking=True)
+            .float()
+            .div_(255.0)
+        )
+        dino_input = (
+            self._dino_normalize(dino_batch)
+            if self._dino_cpu_resize
+            else self.dinov2_transform(dino_batch)
+        )
 
         # 2. Prepare Local Tensor
         prep_images = [self.preprocessor.preprocess(img) for img in images]
-        local_tensors = []
-        for p_img in prep_images:
-            rgb = torch.tensor(p_img, pin_memory=True).float().div_(255.0)
-            local_tensors.append(rgb.permute(2, 0, 1))
-        local_batch = torch.stack(local_tensors).to(self.device, non_blocking=True)
+        local_batch = (
+            torch.from_numpy(np.ascontiguousarray(np.stack(prep_images)))
+            .permute(0, 3, 1, 2)
+            .to(self.device, non_blocking=True)
+            .float()
+            .div_(255.0)
+        )
 
         # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
         max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
@@ -371,6 +465,20 @@ class FeatureExtractor:
         aliked_out = None
 
         # PARALLEL EXECUTION
+        # Аудит §2.4: dino_input і local_batch створюються на DEFAULT-стрімі, а
+        # споживаються на бічних. Без wait_stream ядра бічного стріму можуть
+        # стартувати ДО завершення підготовки — гонка, що проявляється рідким
+        # NaN/сміттям, а не падінням. record_stream нижче не дає кешуючому
+        # алокатору переюзати ці блоки, поки бічні стріми з них читають.
+        if self.device == "cuda":
+            current = torch.cuda.current_stream()
+            for s in (stream_global, stream_local):
+                if s is not None:
+                    s.wait_stream(current)
+            for t, s in ((dino_input, stream_global), (local_batch, stream_local)):
+                if s is not None:
+                    t.record_stream(s)
+
         context_global = (
             torch.cuda.stream(stream_global) if stream_global else contextlib.nullcontext()
         )
@@ -442,8 +550,12 @@ class FeatureExtractor:
                     kp = kp[valid]
                     desc = desc[valid]
                 else:
+                    # ВИПРАВЛЕНО: розмірність дескриптора беремо з самого масиву,
+                    # а не з хардкоду 128 (ALIKED=128, XFeat=64, RDD=256) —
+                    # інакше порожній результат мав чужу ширину.
+                    desc_dim = desc.shape[1] if desc.ndim == 2 else 128
                     kp = np.empty((0, 2), dtype=np.float32)
-                    desc = np.empty((0, 128), dtype=np.float32)
+                    desc = np.empty((0, desc_dim), dtype=np.float32)
 
             results.append({
                 "keypoints": kp, "descriptors": desc, "coords_2d": kp.copy(), "global_desc": gd,

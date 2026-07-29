@@ -30,6 +30,14 @@ class RotationResult:
     candidates: list
     source_id: str | None
     best_scale: float = 1.0
+    # Аудит §2.2: кадр, ПОВЕРНУТИЙ і нормалізований під (angle, best_scale) —
+    # той самий, на якому рахувався глобальний дескриптор. Раніше він тут
+    # створювався і викидався, а Localizer._prepare_and_extract одразу робив
+    # rot90().copy() + normalize() ще раз (на 1080p це ~6 МБ memcpy + resize
+    # на кожен keyframe, на 4K ~25 МБ). Тепер повертаємо його разом із
+    # crop_info, щоб викликач міг перевикористати.
+    frame: Any | None = None
+    crop_info: Any | None = None
 
 
 class RotationSelector:
@@ -50,6 +58,9 @@ class RotationSelector:
         best_global_candidates = []
         best_source_id_per_angle: str | None = None
         best_scale: float = 1.0
+        # §2.2: кадр і crop_info переможної (кут, масштаб) пари — віддаємо назовні
+        best_frame: Any | None = None
+        best_crop: Any | None = None
 
         rescan_min = get_cfg(self.config, "localization.rotation_rescan_min_score", 0.70)
         use_cascade = get_cfg(self.config, "localization.recovery_cascade", False)
@@ -69,9 +80,9 @@ class RotationSelector:
             # We try the prior angle with each scale candidate (usually 1).
             prior_scales = scale_candidates if len(scale_candidates) == 1 else [scale_candidates[0]]
             for sc in prior_scales:
-                rotated_frame = np.ascontiguousarray(np.rot90(query_frame, k=prior_angle // 90))
-                if scale_manager is not None and abs(sc - 1.0) > 0.15:
-                    rotated_frame, _ = scale_manager.normalize(rotated_frame, sc)
+                rotated_frame, crop_info = self._prepare_frame(
+                    query_frame, prior_angle, sc, scale_manager
+                )
                 global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
                 with Telemetry.profile("retrieval"):
                     src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
@@ -82,6 +93,7 @@ class RotationSelector:
                         best_global_candidates = candidates
                         best_source_id_per_angle = src_id
                         best_scale = sc
+                        best_frame, best_crop = rotated_frame, crop_info
                 else:
                     logger.debug(
                         f"Prior angle {prior_angle}° scale {sc:.2f} score too low "
@@ -101,10 +113,11 @@ class RotationSelector:
                 # кожну (кут, масштаб) пару замість одного разу на кут
                 # (на 4K це десятки МБ memcpy на кожну зайву копію).
                 rot_cache: dict[int, Any] = {}
-                frames = [
+                prepared = [
                     self._prepare_frame(query_frame, a, sc, scale_manager, rot_cache)
                     for a, sc in stage_combos
                 ]
+                frames = [p[0] for p in prepared]
 
                 # Batch extraction
                 if len(frames) > 1 and hasattr(
@@ -114,7 +127,9 @@ class RotationSelector:
                 else:
                     descs = [self.feature_extractor.extract_global_descriptor(f) for f in frames]
 
-                for (angle, sc), global_desc in zip(stage_combos, descs):
+                for (angle, sc), global_desc, (frm, crop) in zip(
+                    stage_combos, descs, prepared
+                ):
                     with Telemetry.profile("retrieval"):
                         src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
 
@@ -126,6 +141,7 @@ class RotationSelector:
                             best_global_candidates = candidates
                             best_source_id_per_angle = src_id
                             best_scale = sc
+                            best_frame, best_crop = frm, crop
 
                 # Етап 1 дав достатньо впевнений збіг — решту піраміди
                 # (16 із 20 форвардів у типовій конфігурації) не рахуємо.
@@ -141,6 +157,8 @@ class RotationSelector:
             candidates=best_global_candidates,
             source_id=best_source_id_per_angle,
             best_scale=best_scale,
+            frame=best_frame,
+            crop_info=best_crop,
         )
 
     # ── ADDENDUM 2.1: планування етапів recovery ─────────────────────────────
@@ -192,11 +210,16 @@ class RotationSelector:
         sc: float,
         scale_manager: Any,
         rot_cache: dict[int, Any] | None = None,
-    ) -> Any:
-        """Кадр, повернутий на ``angle`` і нормалізований до масштабу ``sc``.
+    ) -> tuple[Any, Any]:
+        """``(кадр, crop_info)``: повернутий на ``angle``, нормалізований до ``sc``.
 
         ``rot_cache`` — спільний на етап словник {кут: повернутий кадр}:
         повороти дорогі (копія повного кадру), а масштабів на кут кілька.
+
+        §2.2: ``crop_info`` більше не викидається — його повертає переможна пара
+        в ``RotationResult``, щоб Localizer не перераховував ротацію й resize.
+        Умова ``> 0.15`` і виклик ``normalize`` мають ЗБІГАТИСЯ з
+        ``Localizer._prepare_and_extract``, інакше кадри розійдуться.
         """
         if rot_cache is not None and angle in rot_cache:
             rotated = rot_cache[angle]
@@ -205,6 +228,5 @@ class RotationSelector:
             if rot_cache is not None:
                 rot_cache[angle] = rotated
         if scale_manager is not None and abs(sc - 1.0) > 0.15:
-            scaled, _ = scale_manager.normalize(rotated, sc)
-            return scaled
-        return rotated
+            return scale_manager.normalize(rotated, sc)
+        return rotated, None

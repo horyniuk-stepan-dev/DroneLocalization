@@ -99,7 +99,7 @@ class HardwareProfile:
     os_name: str = "unknown"
 
     @classmethod
-    def detect(cls) -> "HardwareProfile":
+    def detect(cls) -> HardwareProfile:
         """Probe the current system and return a populated HardwareProfile."""
         profile = cls()
         profile.os_name = platform.system()

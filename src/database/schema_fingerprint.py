@@ -35,6 +35,10 @@ SCHEMA_FIELDS: tuple[str, ...] = (
     "frame_step",
     "store_sift_features",
     "sift_max_keypoints",
+    # Аудит §2.1: CPU-resize перед входом DINO використовує cv2.INTER_AREA
+    # замість torchvision Resize(antialias) — інший фільтр, отже інші значення
+    # дескрипторів. Бази з різним значенням цього ключа НЕ взаємозамінні.
+    "dino_cpu_resize",
 )
 
 
@@ -82,6 +86,7 @@ def build_components(
         "frame_step": int(g("database.frame_step", 30)),
         "store_sift_features": bool(g("database.store_sift_features", False)),
         "sift_max_keypoints": int(g("database.sift_max_keypoints", 2048)),
+        "dino_cpu_resize": bool(g("models.performance.dino_cpu_resize", False)),
     }
 
 

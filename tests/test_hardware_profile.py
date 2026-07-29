@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from src.utils.hardware_profile import (
     CPUInfo,
@@ -12,7 +10,6 @@ from src.utils.hardware_profile import (
     HardwareProfile,
     _classify_tier,
 )
-
 
 # ── Tier classification ──────────────────────────────────────────────────────
 

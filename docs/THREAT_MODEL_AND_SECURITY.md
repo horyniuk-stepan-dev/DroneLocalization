@@ -278,23 +278,36 @@ reliability + latency.
 The feature is complete and verified in both the GUI and headless. What remains
 is small, and none of it blocks field use of an encrypted copy.
 
-### Needs a decision
+### Done — `--supervise --headless` on an encrypted project
 
-| Item | Detail |
-|---|---|
-| `--supervise --headless` on an encrypted project | The supervised child inherits the parent's stdin, so from a terminal it re-prompts on **every restart**, and with no TTY it fails closed on the first start. Unattended supervised operation on an encrypted project does not work today. Fix is a stdin pipe (supervisor prompts once, feeds each child via `subprocess.run(..., input=...)`, plus a non-TTY branch in `get_passphrase`) — **never** a new environment variable. |
+Solved with the stdin pipe. The supervisor prompts and verifies **once**, then
+feeds the passphrase to every child launch via `subprocess.run(..., input=...)`;
+the child's `get_passphrase` takes a non-TTY branch and reads one line. A pipe is
+invisible in process listings, not inherited by grandchildren, absent from crash
+dumps, and consumed once — the properties an environment variable lacks. A wrong
+passphrase stops the supervisor before any child starts; plaintext projects pass
+`input=None` and keep inheriting the terminal exactly as before.
 
-### Undeclared dependencies (venv has them, `pyproject.toml` does not)
+Also hardened while doing it: `stdin_is_tty()` swallows `OSError`/`ValueError`
+from `isatty()` itself, which raises on a closed or detached stream — a real
+state for a service or a frozen build, and it must never be the thing that
+crashes a decrypt.
 
-| Package | Used by | Effect if missing |
+**Still to verify on real hardware:** one supervised run against an encrypted
+project, killing the child once to confirm the restart needs no second prompt.
+
+### Dependencies
+
+| Package | Used by | Status |
 |---|---|---|
-| `psutil` | `sweep_stale_lance_tempdirs` (owner-PID liveness), `hardware_profile` | The startup sweep degrades to "cannot tell" and never deletes — safe, but stale decrypted indexes accumulate |
-| `triton-windows` (3.7.1.post27) | `torch.compile` / inductor on Windows | `_is_torch_compile_supported` returns False and compilation is silently disabled. Third-party community build, not from the PyTorch project — pin the exact version if declared. Verified working with torch 2.12.0.dev20260329+cu128 (inductor compiles on CUDA, values match eager) |
+| `psutil>=5.9.0` | `sweep_stale_lance_tempdirs` (owner-PID liveness), `hardware_profile` | **Declared.** Was a silent venv-only dependency; without it the startup sweep degrades to "cannot tell" and never deletes — safe, but stale decrypted indexes accumulate |
+| ~~`triton-windows`~~ — **do not install** | `torch.compile` / inductor on Windows | Tried (3.7.1.post27) and **rolled back**. It makes `import triton` succeed, which flips compilation on, and inductor then fails two independent ways with torch 2.12.0.dev20260329+cu128: `AttributeError: 'TensorReferenceAnalysis' has no attribute 'python_mod'` inside torch's own `_sympy/interp.py`, and `RuntimeError: Compiler: cl is not found` (inductor needs MSVC on Windows). Database building broke; the whole suite failed. A trivial compile smoke test passes and proves nothing — the real models hit both paths. `torch.compile` stays effectively unavailable here, which is exactly what `_is_torch_compile_supported` was written to enforce |
 
 Note: `_is_torch_compile_supported` gates on `import triton` alone, so **any**
-importable Triton enables compilation — including a version incompatible with the
-installed torch, which is the crash the guard was written to prevent. Re-run the
-compile smoke test after any torch upgrade.
+importable Triton enables compilation — including one that cannot actually
+compile this project's models, which is precisely what happened above. If Triton
+is ever revisited, validate by building a real database (`tests/test_db_*`), not
+by compiling a toy function, and expect MSVC (`cl.exe`) to be a hard requirement.
 
 ### Operator housekeeping
 

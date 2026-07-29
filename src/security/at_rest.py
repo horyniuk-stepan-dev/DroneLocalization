@@ -146,29 +146,62 @@ def wipe_file(path: str) -> None:
     p.unlink(missing_ok=True)
 
 
+def stdin_is_tty() -> bool:
+    """True if stdin is an interactive terminal we may prompt on.
+
+    ``isatty()`` itself raises on a closed or detached stream — a real state for
+    a Windows service or a frozen GUI build — so probing it must never be the
+    thing that crashes a decrypt. Anything unreadable counts as "not a terminal",
+    which routes the caller to the pipe and then to fail-closed."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def read_passphrase_from_stdin() -> str:
+    """Read one line of passphrase from a non-TTY stdin, or "" if unavailable.
+
+    The supervised-child channel: the parent prompts once and pipes the
+    passphrase to each restarted child (see ``main.py::_run_supervised``). A pipe
+    is invisible in process listings, is not inherited by grandchildren, does not
+    reach crash dumps, and is consumed once — the properties an environment
+    variable lacks.
+
+    Never blocks a normal run: it is only reached when stdin is *not* a terminal,
+    and an empty or unreadable stdin returns "" so the caller fails closed."""
+    if stdin_is_tty():
+        return ""
+    try:
+        return sys.stdin.readline().strip()
+    except (OSError, ValueError, AttributeError):
+        # Closed, detached, or a capturing test runner — treat as "no passphrase".
+        return ""
+
+
 def get_passphrase() -> str:
     """Resolve the map passphrase: the process-wide cache (filled by the GUI
-    dialog via :func:`set_passphrase`), else an interactive prompt on a TTY.
-    Fail-closed if neither is available.
+    dialog via :func:`set_passphrase`), an interactive prompt on a TTY, or one
+    line piped in on a non-TTY stdin. Fail-closed if none of those yields one.
 
     There is deliberately **no environment-variable channel**. An env var is
     readable by any process running as the same user (Process Explorer,
     ``Win32_Process``, ``/proc/<pid>/environ``), is inherited by every child
     process, and can surface in crash dumps — for a passphrase whose whole
     purpose is that it is never stored on the device, that is the wrong trade.
-    A future non-TTY deployment should pipe the passphrase over stdin rather
-    than reintroduce one."""
+    The stdin pipe above covers the non-interactive case instead."""
     global _CACHED_PASSPHRASE
     if _CACHED_PASSPHRASE is not None:
         return _CACHED_PASSPHRASE
 
-    pw = ""
-    if sys.stdin is not None and sys.stdin.isatty():
+    if stdin_is_tty():
         pw = getpass.getpass("Enter map decryption passphrase: ")
+    else:
+        pw = read_passphrase_from_stdin()
     if not pw:
         raise EncryptionError(
             "encrypted artifact found but no passphrase available — "
-            "run interactively, or enter it in the application"
+            "run interactively, pipe it on stdin, or enter it in the application"
         )
 
     _CACHED_PASSPHRASE = pw
@@ -184,10 +217,17 @@ def prompt_and_verify_passphrase(artifact_path: str, *, attempts: int = 3) -> bo
     the cache to break every later load.
 
     Returns True once the passphrase is cached, False if the operator gave up,
-    exhausted the attempts, or there is no TTY to prompt on."""
+    exhausted the attempts, or no passphrase could be obtained at all."""
     if _CACHED_PASSPHRASE is not None:
         return True
-    if sys.stdin is None or not sys.stdin.isatty():
+
+    if not stdin_is_tty():
+        # Supervised child: a single line piped in by the parent. No retries —
+        # there is no operator on the other end, only a pipe that closes once.
+        pw = read_passphrase_from_stdin()
+        if pw and verify_passphrase(artifact_path, pw):
+            set_passphrase(pw)
+            return True
         return False
 
     for remaining in range(attempts, 0, -1):

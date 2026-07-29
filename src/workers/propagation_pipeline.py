@@ -248,6 +248,19 @@ class PropagationPipeline:
         # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
         self._report_progress(0, "Передзавантаження фіч у RAM...")
         all_features = self._prefetch_features(num_frames)
+        if not all_features:
+            # Два випадки: (а) битий/нечитабельний файл — _prefetch_features уже
+            # викликав _report_error із деталями; (б) у базі просто немає жодного
+            # кадру з фічами — тоді рапортуємо тут. Далі йти немає сенсу:
+            # порожній граф однаково не дасть калібрації, а Phase 3 упав би на
+            # тій самій умові, спаливши до того матчинг і loop closure.
+            logger.error("Prefetch не повернув жодного кадру з фічами — пропагацію зупинено")
+            if not self._prefetch_reported_error:
+                self._report_error(
+                    "У базі даних немає жодного кадру з локальними фічами. "
+                    "Найімовірніше базу побудовано не до кінця — перебудуйте її."
+                )
+            return
 
         optimizer = PoseGraphOptimizer(self.frame_w, self.frame_h)
         for i in range(num_frames):
@@ -496,22 +509,76 @@ class PropagationPipeline:
 
     # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
 
+    # Частка НЕОЧІКУВАНИХ помилок читання, вище якої база вважається битою.
+    # Порожні слоти (ValueError) сюди не входять — це нормальний стан.
+    _PREFETCH_MAX_ERROR_FRAC = 0.01
+    # Чи вже відрапортував _prefetch_features помилку користувачу (щоб
+    # викликач не дублював повідомлення). Клас-рівневий дефолт — страховка
+    # на випадок читання до першого виклику.
+    _prefetch_reported_error = False
+
     def _prefetch_features(self, num_frames: int) -> dict:
-        """Завантажує всі фічі в RAM."""
-        features = {}
+        """Завантажує всі фічі в RAM.
+
+        Раніше тут стояв голий ``except Exception: pass`` без логування: биту
+        HDF5, брак прав і «у цьому слоті немає keyframe» було не відрізнити,
+        пропагація мовчки будувала граф на менший набір вузлів і рапортувала
+        успіх. Тепер два класи розділені:
+
+        * ``ValueError`` / ``KeyError`` — слот порожній або відсутній. Штатно
+          для keyframe-селекції, рахуємо й не шумимо.
+        * будь-що інше (OSError на битому файлі, MemoryError…) — реальна
+          проблема: логуємо з деталями і, якщо таких понад
+          ``_PREFETCH_MAX_ERROR_FRAC``, зупиняємо пропагацію замість тихої
+          видачі неправильної калібрації.
+        """
+        features: dict = {}
+        n_empty = 0
+        n_error = 0
+        first_errors: list[str] = []
+        self._prefetch_reported_error = False
+
         for i in range(num_frames):
             if not self._is_running:
                 return features
             try:
                 features[i] = self.database.get_local_features(i)
-            except Exception:
-                pass
+            except (ValueError, KeyError):
+                # Порожній/відсутній слот — очікувано.
+                n_empty += 1
+            except Exception as e:  # noqa: BLE001 — класифікуємо і рапортуємо нижче
+                n_error += 1
+                if len(first_errors) < 5:
+                    first_errors.append(f"кадр {i}: {type(e).__name__}: {e}")
             if i % 500 == 0:
                 self._report_progress(
                     int(i / num_frames * 8),
                     f"Prefetch: {i}/{num_frames}",
                 )
-        logger.info(f"Prefetched features for {len(features)} frames")
+
+        logger.info(
+            f"Prefetched features for {len(features)}/{num_frames} frames "
+            f"(порожніх слотів: {n_empty}, помилок читання: {n_error})"
+        )
+        if first_errors:
+            logger.error(
+                "Помилки читання фіч із бази (перші %d):\n  %s",
+                len(first_errors),
+                "\n  ".join(first_errors),
+            )
+
+        max_errors = max(1, int(num_frames * self._PREFETCH_MAX_ERROR_FRAC))
+        if n_error > max_errors:
+            self._prefetch_reported_error = True
+            self._report_error(
+                f"Не вдалося прочитати фічі для {n_error} із {num_frames} кадрів "
+                f"(поріг {max_errors}). Найімовірніше база пошкоджена або "
+                f"недоступна для читання. Пропагацію зупинено, щоб не видати "
+                f"неправильну калібрацію.\nПерша помилка: "
+                f"{first_errors[0] if first_errors else 'н/д'}"
+            )
+            return {}
+
         return features
 
     def _build_temporal_edges(

@@ -108,6 +108,23 @@ class PerformanceConfig(BaseModel):
     # 0 = без ліміту (ПОТОЧНА поведінка). На 4 GB VRAM безпечно 4-6.
     # Впливає лише на пік памʼяті; дескриптори побітово ті самі.
     global_batch_max: int = 0
+
+    # ── Аудит §2.1 (повна форма): зменшувати кадр до входу DINO на CPU ───────
+    # Зараз кадр цілком їде на GPU, щоб там же зменшитись до (S, S) — для
+    # DINOv3 це 224. На 1080p це ~6.2 МБ uint8 замість ~0.15 МБ, тобто ~40×
+    # зайвого PCIe-трафіку на КОЖЕН форвард; при скані 4 кутів × 5 масштабів
+    # різниця набігає в сотні мегабайт на keyframe.
+    #
+    # УВАГА: cv2.INTER_AREA і torchvision Resize(antialias) — РІЗНІ фільтри,
+    # тож значення дескрипторів зміщуються. Тому ключ входить у
+    # SCHEMA_FIELDS (src/database/schema_fingerprint.py): база, збудована з
+    # іншим значенням, детектується як несумісна замість тихого псування
+    # матчів. З цієї ж причини його НЕМАЄ в hardware_profile.TUNABLE_KEYS —
+    # auto_tune не має права робити бази машинозалежними.
+    #
+    # Дефолт False = ПОТОЧНА поведінка (resize на GPU).
+    dino_cpu_resize: bool = False
+
     torch_compile: bool = False
     use_tensorrt_for_yolo: bool = False  # portable across GPUs; TRT engines are hardware-specific
     log_level: str = "INFO"

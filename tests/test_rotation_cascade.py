@@ -203,13 +203,19 @@ class TestSelectCost:
         assert res_casc.score == pytest.approx(0.4)
 
     def test_rotation_cached_per_angle(self):
-        """rot90 не повторюється на кожен масштаб — інакше зайві копії кадру."""
+        """rot90 не повторюється на кожен масштаб — інакше зайві копії кадру.
+
+        Аудит §2.2: _prepare_frame тепер повертає (frame, crop_info) — crop_info
+        потрібен викликачу, щоб не робити resize вдруге.
+        """
         cache: dict[int, object] = {}
         sm = FakeScaleManager()
         frame = _frame()
-        f1 = RotationSelector._prepare_frame(frame, 90, 1.0, sm, cache)
-        f2 = RotationSelector._prepare_frame(frame, 90, 1.0, sm, cache)
+        f1, c1 = RotationSelector._prepare_frame(frame, 90, 1.0, sm, cache)
+        f2, c2 = RotationSelector._prepare_frame(frame, 90, 1.0, sm, cache)
         assert f1 is f2
+        # scale == 1.0 → GSD-нормалізації не було, отже crop_info відсутній
+        assert c1 is None and c2 is None
         assert list(cache.keys()) == [90]
 
     def test_no_scale_manager_is_single_stage(self):

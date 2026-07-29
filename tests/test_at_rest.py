@@ -7,6 +7,7 @@ depends on `cryptography`); no torch/Qt.
 
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 from pathlib import Path
@@ -81,21 +82,49 @@ def test_get_passphrase_reads_the_injected_cache(monkeypatch):
     assert at_rest.get_passphrase() == "injected"
 
 
+def _piped_stdin(monkeypatch, text: str):
+    """Replace stdin with a non-TTY stream, as a supervised child sees it."""
+    monkeypatch.setattr(at_rest.sys, "stdin", io.StringIO(text))
+
+
 def test_get_passphrase_ignores_the_environment(monkeypatch):
     """No env-var channel: it is readable by any same-user process, inherited by
     every child, and can land in a crash dump."""
     monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
     monkeypatch.setenv("DRONELOC_PASSPHRASE", "from-env")
-    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    _piped_stdin(monkeypatch, "")
     with pytest.raises(at_rest.EncryptionError):
         at_rest.get_passphrase()
 
 
 def test_get_passphrase_raises_when_unset_and_no_tty(monkeypatch):
     monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
-    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    _piped_stdin(monkeypatch, "")
     with pytest.raises(at_rest.EncryptionError):
         at_rest.get_passphrase()
+
+
+# --- stdin pipe (supervised child) -------------------------------------------
+
+
+def test_get_passphrase_reads_a_piped_line(monkeypatch):
+    """The supervisor pipes the passphrase to each restarted child."""
+    monkeypatch.setattr(at_rest, "_CACHED_PASSPHRASE", None, raising=False)
+    _piped_stdin(monkeypatch, "piped-secret\n")
+    assert at_rest.get_passphrase() == "piped-secret"
+
+
+def test_read_passphrase_from_stdin_is_empty_on_a_tty(monkeypatch):
+    """On a terminal the caller must prompt, not silently consume input."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    assert at_rest.read_passphrase_from_stdin() == ""
+
+
+def test_read_passphrase_from_stdin_survives_a_closed_stream(monkeypatch):
+    stream = io.StringIO("x")
+    stream.close()
+    monkeypatch.setattr(at_rest.sys, "stdin", stream)
+    assert at_rest.read_passphrase_from_stdin() == ""  # fail-closed, no raise
 
 
 # --- file-level helpers (copy builder + SP3 temp-decrypt) --------------------
@@ -197,3 +226,20 @@ def test_prompt_is_a_noop_when_already_cached(encrypted_artifact, monkeypatch):
         at_rest.getpass, "getpass", lambda *a, **k: pytest.fail("prompted despite cache")
     )
     assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is True
+
+
+def test_prompt_accepts_a_piped_passphrase(encrypted_artifact, monkeypatch):
+    """Supervised child: verified in one shot, no prompt, no retries."""
+    monkeypatch.setattr(at_rest.sys, "stdin", io.StringIO("right\n"))
+    monkeypatch.setattr(
+        at_rest.getpass, "getpass", lambda *a, **k: pytest.fail("prompted on a pipe")
+    )
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is True
+    assert at_rest._CACHED_PASSPHRASE == "right"
+
+
+def test_prompt_rejects_a_wrong_piped_passphrase(encrypted_artifact, monkeypatch):
+    """No operator on the other end of a pipe — one shot, then fail closed."""
+    monkeypatch.setattr(at_rest.sys, "stdin", io.StringIO("wrong\n"))
+    assert at_rest.prompt_and_verify_passphrase(encrypted_artifact) is False
+    assert at_rest._CACHED_PASSPHRASE is None

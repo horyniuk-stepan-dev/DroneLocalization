@@ -114,12 +114,21 @@ class GeometryTransforms:
             return False
 
     @staticmethod
+    def reprojection_errors(
+        src_pts: np.ndarray, dst_pts: np.ndarray, H: np.ndarray
+    ) -> np.ndarray:
+        """Помилки репроєкції ``|H·src − dst|`` для кожної відповідності, (N,)."""
+        pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
+        return np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
+
+    @staticmethod
     def compute_mad_threshold(
         src_pts: np.ndarray,
         dst_pts: np.ndarray,
         H: np.ndarray,
         k: float = 2.5,
         min_threshold: float = 1.0,
+        inlier_mask: np.ndarray | None = None,
     ) -> float:
         """MAD-RANSAC: адаптивний поріг на основі медіанного абсолютного відхилення помилок репроєкції.
 
@@ -128,23 +137,86 @@ class GeometryTransforms:
 
         Це робить RANSAC стійким до зміни GSD (висота польоту) та крос-роздільних пар.
 
+        ВАЖЛИВО (виправлення): поріг рахується ТІЛЬКИ по ``inlier_mask`` — набору,
+        який RANSAC уже визнав інлаєрами. Якщо рахувати по ВСІХ відповідностях,
+        аутлаєри входять у median і MAD: при їх переважанні поріг злітає до сотень
+        пікселів і «інлаєром» оголошується весь набір. Заміряно на синтетиці
+        (k=2.5): 20 справжніх інлаєрів із 60 матчів → поріг 661 px → 60 «інлаєрів».
+        Роздутий лічильник далі керує вибором кандидата, early-stop і confidence,
+        тож хибний кадр може обійти правильний.
+
         Args:
             src_pts: Точки джерела (N, 2)
             dst_pts: Точки призначення (N, 2)
             H: Попередньо обчислена гомографія (3x3)
             k: Коефіцієнт чутливості (вищий → м'якший поріг)
             min_threshold: Мінімальний поріг (px)
+            inlier_mask: Булева маска (N,) інлаєрів RANSAC. ``None`` — усі точки
+                (стара поведінка; лишена для зворотної сумісності виклику).
 
         Returns:
             Адаптивний поріг репроєкції (px)
         """
-        pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
-        errors = np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
+        errors = GeometryTransforms.reprojection_errors(src_pts, dst_pts, H)
+        if inlier_mask is not None:
+            sel = np.asarray(inlier_mask).ravel().astype(bool)
+            if sel.any():
+                errors = errors[sel]
         median_err = np.median(errors)
         mad = np.median(np.abs(errors - median_err))
         # 1.4826 — константа нормалізації MAD для нормального розподілу
         threshold = median_err + k * 1.4826 * mad
         return max(threshold, min_threshold)
+
+    # Мінімум точок для гомографії — нижче цього уточнення маски безглузде.
+    _MIN_HOMOGRAPHY_PTS = 4
+
+    @staticmethod
+    def _refine_mask_mad(
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        H: np.ndarray,
+        mask: np.ndarray | None,
+        k: float,
+        ransac_threshold: float,
+    ) -> np.ndarray | None:
+        """Звужує inlier-маску адаптивним MAD-порогом.
+
+        Ключова властивість: маска може лише ЗМЕНШИТИСЬ. MAD-поріг не має права
+        повернути в інлаєри точку, яку RANSAC відкинув — саме це роздувало
+        лічильник у попередній реалізації (див. ``compute_mad_threshold``).
+
+        Повертає нову маску (N, 1) uint8 або вхідну без змін, якщо уточнення
+        неможливе чи залишило б менше ``_MIN_HOMOGRAPHY_PTS`` точок.
+        """
+        if mask is None or H is None:
+            return mask
+
+        base = np.asarray(mask).ravel().astype(bool)
+        n_base = int(base.sum())
+        if n_base < GeometryTransforms._MIN_HOMOGRAPHY_PTS:
+            return mask
+
+        mad_threshold = GeometryTransforms.compute_mad_threshold(
+            src_pts, dst_pts, H, k=k, inlier_mask=base
+        )
+        errors = GeometryTransforms.reprojection_errors(src_pts, dst_pts, H)
+        refined = base & (errors < mad_threshold)
+        n_ref = int(refined.sum())
+
+        if n_ref < GeometryTransforms._MIN_HOMOGRAPHY_PTS:
+            logger.debug(
+                f"MAD-RANSAC: уточнення лишило {n_ref} точок "
+                f"(< {GeometryTransforms._MIN_HOMOGRAPHY_PTS}) — тримаємо маску RANSAC"
+            )
+            return mask
+
+        logger.debug(
+            f"MAD-RANSAC: initial_thresh={ransac_threshold:.1f} -> "
+            f"adaptive_thresh={mad_threshold:.2f} px, "
+            f"inliers={n_ref}/{n_base} (з {len(base)} матчів)"
+        )
+        return refined.astype(np.uint8).reshape(-1, 1)
 
     @staticmethod
     def estimate_homography(
@@ -177,6 +249,13 @@ class GeometryTransforms:
                 src_pts, dst_pts, ransac_threshold, max_iters, confidence
             )
             if GeometryTransforms.is_matrix_valid(H, is_homography=True):
+                # Виправлення: раніше цей return стояв ПЕРЕД MAD-блоком, тож при
+                # backend="poselib" прапорець use_mad_ransac не мав жодного
+                # ефекту — конфіг казав ON, код робив OFF.
+                if use_mad_ransac:
+                    mask = GeometryTransforms._refine_mask_mad(
+                        src_pts, dst_pts, H, mask, mad_k_factor, ransac_threshold
+                    )
                 return H, mask
             # Якщо PoseLib дав невалідну матрицю — fallback
             logger.debug("PoseLib homography invalid, falling back to OpenCV")
@@ -212,19 +291,11 @@ class GeometryTransforms:
             )
             return None, None
 
-        # MAD-RANSAC: адаптивне уточнення inlier mask
+        # MAD-RANSAC: адаптивне уточнення inlier mask (тільки звужує — див.
+        # _refine_mask_mad)
         if use_mad_ransac and H is not None:
-            mad_threshold = GeometryTransforms.compute_mad_threshold(
-                src_pts, dst_pts, H, k=mad_k_factor
-            )
-            # Перерахунок inlier mask з адаптивним порогом
-            pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
-            errors = np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
-            mask = (errors < mad_threshold).astype(np.uint8).reshape(-1, 1)
-            logger.debug(
-                f"MAD-RANSAC: initial_thresh={ransac_threshold:.1f} -> "
-                f"adaptive_thresh={mad_threshold:.2f} px, "
-                f"inliers={int(mask.sum())}/{len(mask)}"
+            mask = GeometryTransforms._refine_mask_mad(
+                src_pts, dst_pts, H, mask, mad_k_factor, ransac_threshold
             )
 
         return H, mask

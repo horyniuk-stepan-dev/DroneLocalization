@@ -1,7 +1,6 @@
 """Unit tests for ScaleManager — GSD-ratio estimation & frame normalization."""
 
 import numpy as np
-import pytest
 
 from src.localization.scale_manager import CropInfo, ScaleManager
 

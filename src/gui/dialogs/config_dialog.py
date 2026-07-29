@@ -1,14 +1,23 @@
-import json
-from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
-    QTabWidget, QWidget, QFormLayout, QLineEdit, QCheckBox, 
-    QDoubleSpinBox, QSpinBox, QComboBox, QScrollArea, QLabel
-)
-from PyQt6.QtCore import Qt
 from pydantic import BaseModel, ValidationError
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
-from config import APP_SETTINGS, APP_CONFIG
-
+from config import APP_CONFIG, APP_SETTINGS
 
 # Відомі варіанти вибору (домени) для специфічних полів
 COMBO_OPTIONS = {
@@ -87,17 +96,17 @@ class ConfigDialog(QDialog):
         """Створює форму для однієї групи налаштувань."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        
+
         container = QWidget()
         form_layout = QFormLayout(container)
-        
+
         # Перебір всіх полів у Pydantic моделі
         # Support for Pydantic V2 model_fields or fallback to dict
         fields = getattr(model, "model_fields", model.__dict__)
-        
+
         for field_name in fields:
             val = getattr(model, field_name)
-            
+
             # Рекурсивна підтримка вкладених моделей (наприклад models.yolo)
             if isinstance(val, BaseModel):
                 form_layout.addRow(QLabel(f"<b>{field_name.upper()}</b>"))
@@ -113,7 +122,7 @@ class ConfigDialog(QDialog):
             widget = self._create_widget(group_name, field_name, val)
             form_layout.addRow(f"{field_name}:", widget)
             self.field_widgets[(group_name, field_name)] = widget
-            
+
         scroll.setWidget(container)
         self.tabs.addTab(scroll, group_name.replace("_", " ").title())
 
@@ -122,7 +131,7 @@ class ConfigDialog(QDialog):
         # Перевірка на ComboBox (наперед задані варіанти)
         combo_options = None
         base_field = field_name.split('.')[-1]
-        
+
         if base_field in COMBO_OPTIONS:
             opts = COMBO_OPTIONS[base_field]
             if isinstance(opts, dict):
@@ -200,15 +209,15 @@ class ConfigDialog(QDialog):
         """Скидає всі поля до заводських налаштувань (визначених у коді)."""
         from config import AppConfig
         default_config = AppConfig()
-        
+
         # Оновлюємо значення в UI на основі дефолтних
         for group_name, group_model in default_config:
             if not isinstance(group_model, BaseModel):
                 continue
-            
+
             for field_name in getattr(group_model, "model_fields", group_model.__dict__):
                 val = getattr(group_model, field_name)
-                
+
                 if isinstance(val, BaseModel):
                     for sub_name in getattr(val, "model_fields", val.__dict__):
                         sub_val = getattr(val, sub_name)
@@ -225,10 +234,10 @@ class ConfigDialog(QDialog):
         for group_name, group_model in APP_SETTINGS:
             if not isinstance(group_model, BaseModel):
                 continue
-            
+
             for field_name in getattr(group_model, "model_fields", group_model.__dict__):
                 val = getattr(group_model, field_name)
-                
+
                 if isinstance(val, BaseModel):
                     for sub_name in getattr(val, "model_fields", val.__dict__):
                         sub_val = getattr(val, sub_name)
@@ -262,12 +271,12 @@ class ConfigDialog(QDialog):
             for group_name, group_model in APP_SETTINGS:
                 if not isinstance(group_model, BaseModel):
                     continue
-                
+
                 group_dict = group_model.model_dump()
-                
+
                 for field_name in getattr(group_model, "model_fields", group_model.__dict__):
                     val = getattr(group_model, field_name)
-                    
+
                     if isinstance(val, BaseModel):
                         for sub_name in getattr(val, "model_fields", val.__dict__):
                             w = self.field_widgets.get((group_name, f"{field_name}.{sub_name}"))
@@ -278,7 +287,7 @@ class ConfigDialog(QDialog):
                         w = self.field_widgets.get((group_name, field_name))
                         if w:
                             group_dict[field_name] = self._get_widget_value(w, val)
-                            
+
                 # Валідуємо і створюємо новий об'єкт групи з усіма вкладеними моделями
                 new_group_model = group_model.__class__.model_validate(group_dict)
                 setattr(APP_SETTINGS, group_name, new_group_model)
@@ -290,16 +299,16 @@ class ConfigDialog(QDialog):
             # Зберігаємо на диск
             from config import save_user_config
             save_user_config(APP_SETTINGS)
-            
+
             QMessageBox.information(
-                self, 
-                "Успіх", 
+                self,
+                "Успіх",
                 "Налаштування успішно збережено.\n\n"
                 "Деякі зміни (наприклад, завантаження моделей) "
                 "почнуть діяти лише після перезапуску програми або трекінгу."
             )
             self.accept()
-            
+
         except ValidationError as e:
             QMessageBox.warning(self, "Помилка валідації", f"Неправильні параметри:\n{e}")
         except Exception as e:

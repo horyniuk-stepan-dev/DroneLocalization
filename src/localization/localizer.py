@@ -152,6 +152,25 @@ class Localizer:
         self._spread_min = 1.0
         self._spread_sum = 0.0
 
+        # Аудит §1.2: гейт аутлаєрів на OF-шляху. Дефолт False — стара поведінка
+        # (OF взагалі не перевірявся). Вмикати разом із поверненням
+        # tracking.outlier_threshold_std / max_speed_mps до фізичних значень:
+        # при std=80 і 350 м/с гейт усе одно майже не спрацьовує.
+        self._of_outlier_gate = get_cfg(self.config, "tracking.of_outlier_gate", False)
+
+        # Обхід кінематичного гейта за силою незалежних доказів (див.
+        # config/localization.py). Кінематика — це пріор про рух платформи;
+        # інлаєри та flow_quality — прямі свідчення про саме вимірювання.
+        self._trust_strong = get_cfg(
+            self.config, "tracking.outlier_trust_strong_evidence", False
+        )
+        self._trust_min_inliers = int(
+            get_cfg(self.config, "tracking.outlier_trust_min_inliers", 100)
+        )
+        self._trust_min_flow_q = float(
+            get_cfg(self.config, "tracking.outlier_trust_min_flow_quality", 0.5)
+        )
+
         # Fix #1: Захист від нескінченного циклу при виході за межі покриття
         self._consecutive_failures = 0
         self._max_failures = get_cfg(self.config, "localization.max_consecutive_failures", 10)
@@ -505,7 +524,9 @@ class Localizer:
                 _crop_info,
                 best_query_features,
             ) = self._prepare_and_extract(
-                query_frame, static_mask, best_global_angle, best_scale, _feat_cache
+                query_frame, static_mask, best_global_angle, best_scale, _feat_cache,
+                # §2.2: селектор уже повернув і відмасштабував саме цей кадр
+                prepared=(rot.frame, rot.crop_info),
             )
 
             # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
@@ -718,7 +739,17 @@ class Localizer:
         metric_pt = np.array([mx, my], dtype=np.float64)
 
         # ── Крок 7: Фільтрація аномалій ─────────────────────────────────────
-        if self.outlier_detector.is_outlier(metric_pt, dt):
+        # Сильна геометрія б'є кінематичний пріор: фікс, підтверджений сотнями
+        # інлаєрів RANSAC, не має відкидатись через припущення про швидкість
+        # платформи. Позицію все одно дописуємо в історію, щоб вікно детектора
+        # відповідало реальності, а не відфільтрованій її версії.
+        _strong = self._trust_strong and best_inliers >= self._trust_min_inliers
+        if _strong:
+            logger.debug(
+                f"Kinematic gate bypassed: {best_inliers} inliers "
+                f">= {self._trust_min_inliers} (geometry outranks motion prior)"
+            )
+        if not _strong and self.outlier_detector.is_outlier(metric_pt, dt):
             logger.warning(
                 f"Outlier filtered | matched_frame={best_candidate_id}, "
                 f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
@@ -925,6 +956,44 @@ class Localizer:
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
+        # ── Гейт аутлаєрів на OF-шляху (аудит §1.2), flag-gated ──────────────
+        # Структурна прогалина: keyframe-шлях питає is_outlier (Крок 7), а OF —
+        # ні, він лише дописував позицію в історію. При keyframe_interval=30 це
+        # 29 із 30 позицій, що виходять назовні без жодної перевірки: зрив
+        # трекінгу LK на хмару чи водну поверхню потрапляв прямо в GPS.
+        # Дефолт False = стара поведінка побітово.
+        # Висока flow_quality — незалежне свідчення, що потік узгоджений: зсув
+        # реальний, а не зрив трекінгу. Заміряно на живому прогоні: справжні
+        # зриви LK давали 0.017–0.035, а помилково відкинуті швидкі рухи —
+        # 0.625–1.0. Кінематичний гейт їх не розрізняє, а цей поріг — так.
+        _strong_flow = (
+            self._trust_strong
+            and flow_quality is not None
+            and float(flow_quality) >= self._trust_min_flow_q
+        )
+        if _strong_flow:
+            logger.debug(
+                f"OF kinematic gate bypassed: flow_quality={float(flow_quality):.3f} "
+                f">= {self._trust_min_flow_q} (flow is self-consistent)"
+            )
+        if (
+            self._of_outlier_gate
+            and not _strong_flow
+            and self.outlier_detector.is_outlier(metric_pt, dt)
+        ):
+            logger.warning(
+                f"OF outlier filtered | metric=({mx:.1f}, {my:.1f}), dt={dt:.3f}s, "
+                f"flow_quality={flow_quality if flow_quality is None else round(flow_quality, 3)}. "
+                f"Optical flow likely lost lock (clouds, water, motion blur)."
+            )
+            self._log_failure(FAILURE_TYPES["Outlier detected"])
+            # Відхилений OF усе одно йде у вікно smoother-а як одометрія:
+            # Huber-вага арбітрує краще за бінарне відкидання (та сама логіка,
+            # що для відхилених keyframe-ів).
+            if self._smoother is not None:
+                self._smoother.note_of(metric_pt, dt=dt, quality=flow_quality)
+            return {"success": False, "error": "OF outlier — position jump filtered"}
+
         # RESEARCH 3.1: сирий OF-фікс у вікно smoother-а — відносна одометрія,
         # прив'язана до H останнього прийнятого keyframe.
         if self._smoother is not None:
@@ -970,6 +1039,7 @@ class Localizer:
         angle: int,
         scale: float,
         cache: dict,
+        prepared: tuple | None = None,
     ) -> tuple:
         """Повернути кадр на ``angle``, нормалізувати до ``scale``, витягти ALIKED.
 
@@ -977,6 +1047,12 @@ class Localizer:
         гіпотеза провалилась і повний шлях обрав ті самі (кут, масштаб),
         екстракція не повторюється. Повертає
         ``(rotated_frame, rotated_mask, crop_info, features)``.
+
+        ``prepared`` (аудит §2.2) — ``(frame, crop_info)`` від RotationSelector
+        для ТІЄЇ САМОЇ пари (кут, масштаб): він уже зробив rot90 і GSD-resize,
+        щоб порахувати глобальний дескриптор. Тоді тут лишається тільки маска
+        і ALIKED — на 1080p це мінус ~6 МБ memcpy і один resize на keyframe.
+        Маску все одно доводиться готувати окремо: селектор її не бачить.
         """
         key = (int(angle), round(float(scale), 3))
         cached = cache.get(key)
@@ -984,19 +1060,26 @@ class Localizer:
             return cached
 
         k = int(angle) // 90
-        rotated = np.rot90(query_frame, k=k).copy()
         rot_mask = np.rot90(static_mask, k=k).copy() if static_mask is not None else None
+        needs_gsd = abs(float(scale) - 1.0) > 0.15
 
-        # GSD-нормалізація: у сталому польоті scale ≈ 1.0 і це no-op.
-        crop_info = None
-        if abs(float(scale) - 1.0) > 0.15:
-            rotated, crop_info = self._scale_manager.normalize(rotated, float(scale))
-            if rot_mask is not None:
+        if prepared is not None and prepared[0] is not None:
+            # Кадр уже підготовлений селектором під ці ж (кут, масштаб).
+            rotated, crop_info = prepared
+            if needs_gsd and rot_mask is not None:
                 rot_mask, _ = self._scale_manager.normalize(rot_mask, float(scale))
-            logger.debug(
-                f"GSD-normalized frame for scale {scale:.2f}: "
-                f"{rotated.shape[1]}x{rotated.shape[0]}"
-            )
+        else:
+            rotated = np.rot90(query_frame, k=k).copy()
+            crop_info = None
+            # GSD-нормалізація: у сталому польоті scale ≈ 1.0 і це no-op.
+            if needs_gsd:
+                rotated, crop_info = self._scale_manager.normalize(rotated, float(scale))
+                if rot_mask is not None:
+                    rot_mask, _ = self._scale_manager.normalize(rot_mask, float(scale))
+                logger.debug(
+                    f"GSD-normalized frame for scale {scale:.2f}: "
+                    f"{rotated.shape[1]}x{rotated.shape[0]}"
+                )
 
         feats = self.feature_extractor.extract_local_features(
             rotated, static_mask=rot_mask
