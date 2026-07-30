@@ -1,6 +1,6 @@
 # План впровадження аддендума 2026-07 — після звірки з кодом
 
-> Дата: **2026-07-21**. Вхід: `docs/RESEARCH_ADDENDUM_2026-07.md` + `EFFICIENCY_OPTIONS.md`, `RELATED_WORK_MAP.md`, `SOTA_RESEARCH.md`, `RESEARCH_INTEGRATION_PLAN.md`, `.agents/PERFORMANCE_ACCURACY_PLAN.md`.
+> Дата: **2026-07-21**. Вхід: `docs/RESEARCH_ADDENDUM_2026-07.md` + `EFFICIENCY_OPTIONS.md`, `RELATED_WORK_MAP.md`, `SOTA_RESEARCH.md`, `RESEARCH_INTEGRATION_PLAN.md`, `docs/PERFORMANCE_ACCURACY_PLAN.md`.
 > Метод: кожен пункт шорт-листа аддендума звірено з фактичним кодом у `src/`, `config/`, `scripts/` і з фактичним `user_config.json`. Мова документа — українська, як у решти документів цієї родини (правило «docs in English» стосується коментарів і API-доків, не дослідницьких нотаток).
 > Мова цифр: усе, позначене «оцінка», — арифметика за архітектурою, не замір. Жодного бенчмарку в цьому середовищі не запускалось.
 
@@ -63,7 +63,7 @@
 
 ### 1.3. A4: закрити INT8 одним рядком — і зафіксувати два реальні блокери
 
-Правка в `.agents/PERFORMANCE_ACCURACY_PLAN.md` (пункт A4), три рядки:
+Правка в `docs/PERFORMANCE_ACCURACY_PLAN.md` (пункт A4), три рядки:
 
 1. **INT8 не робити** — LayerNorm/GELU/attention лишаються у вищій точності, reformat-и з'їдають виграш ([NVIDIA/TensorRT issue](https://github.com/NVIDIA/TensorRT/actions/runs/12362619431/job/34502302378)). Це запобіжник на майбутнє, а не скасування запланованої роботи.
 2. **Блокер, знайдений звіркою №1: скрипт компілює не ту модель.** `scripts/compile_dinov2_trt.py` робить `torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")` @336 і зберігає `dinov2_vitl14_fp16.engine`. Активний бекенд — DINOv3 sat493m @224 через HF (`user_config.json: global_descriptor.backend = "dinov3"`). Тобто A4 у поточному вигляді дає двигун для моделі, яка не використовується. Стартова точка (готові ONNX-експорти DINOv3 з HF) уже названа в `EFFICIENCY_OPTIONS.md` §2.1 — скрипт треба переписати під неї, а не «увімкнути».
@@ -189,7 +189,7 @@
 
 | Пункт | Що зроблено | Файли |
 |---|---|---|
-| 1.3 | Уточнення A4: INT8-запобіжник + два знайдені блокери (не та модель у скрипті; `execute_async_v2` проти `tensorrt-cu12>=10`) | `.agents/PERFORMANCE_ACCURACY_PLAN.md` |
+| 1.3 | Уточнення A4: INT8-запобіжник + два знайдені блокери (не та модель у скрипті; `execute_async_v2` проти `tensorrt-cu12>=10`) | `docs/PERFORMANCE_ACCURACY_PLAN.md` |
 | 1.1 | `inlier_spread` + два множники (confidence / вага ребра); live-канал у `compute_confidence` → Kalman R; offline-канал у вагу temporal- і spatial-ребер + жорсткий гейт на екстремумі. `_match_and_build_edge` тепер повертає розкид п'ятим елементом (раніше точки інлаєрів обчислювались і викидались) | `src/geometry/point_spread.py` (новий), `result_builder.py`, `localizer.py`, `propagation_pipeline.py`, `config/localization.py`, `config/graph.py` |
 | 1.2 | FB-перевірка LK із захистом «не зрізати нижче 10 треків» | `tracking_worker.py`, `config/localization.py` |
 | 2.1 | Двоетапний recovery: `_plan_stages` + кеш поворотів | `rotation_selector.py`, `config/localization.py` |
