@@ -110,6 +110,22 @@ def save_user_config(config: AppConfig) -> None:
                 pass
 
 
+def reload_settings_in_place(data: dict) -> AppConfig:
+    """Перезаливає APP_SETTINGS значеннями з ``data`` БЕЗ створення нового об'єкта.
+
+    Критично: модулі роблять ``from config import APP_SETTINGS`` на рівні
+    імпорту, тому переприв'язка ``config.APP_SETTINGS = AppConfig(...)`` лишає
+    їх на старому об'єкті. Раніше через це auto-tune не доходив до GUI/headless,
+    а ``--ws-port``/``--rest-port`` мовчки ігнорувалися. Валідуємо в тимчасовий
+    об'єкт (щоб битий dict не зіпсував робочий конфіг), потім копіюємо поля
+    в наявний екземпляр — усі імпортовані посилання бачать оновлення.
+    """
+    validated = AppConfig(**data)
+    for field_name in type(validated).model_fields:
+        setattr(APP_SETTINGS, field_name, getattr(validated, field_name))
+    return APP_SETTINGS
+
+
 def load_user_config() -> AppConfig:
     """Завантажує налаштування користувача з першого наявного кандидата.
 

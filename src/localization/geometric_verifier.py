@@ -184,8 +184,10 @@ class GeometricVerifier:
             use_torch = False
 
         ratio = 0.75
+        gpu_failed = False
 
         def _mnn_count(r: np.ndarray) -> int:
+            nonlocal use_torch, gpu_failed
             r32 = np.ascontiguousarray(r, dtype=np.float32)
             if r32.shape[0] < 2:
                 return 0
@@ -201,8 +203,17 @@ class GeometricVerifier:
                     nn21 = sim.argmax(dim=0)
                     idx = torch.arange(sim.shape[0], device=sim.device)
                     return int(((nn21[nn12] == idx) & ratio_ok).sum().item())
-                except Exception:  # noqa: BLE001 — OOM тощо → numpy
-                    pass
+                except Exception as e:  # noqa: BLE001 — OOM тощо → numpy
+                    # Тихий фолбек на numpy — це перформанс-обрив, який раніше
+                    # не було видно взагалі. Вимикаємо GPU-шлях на решту
+                    # виклику і повідомляємо один раз.
+                    if not gpu_failed:
+                        gpu_failed = True
+                        logger.warning(
+                            f"GPU MNN path failed — falling back to numpy for this "
+                            f"verification ({type(e).__name__}: {e})"
+                        )
+                    use_torch = False
             sim = q32 @ r32.T
             top2 = -np.partition(-sim, 1, axis=1)[:, :2]
             d1 = np.sqrt(np.clip(2.0 - 2.0 * top2[:, 0], 0.0, None))

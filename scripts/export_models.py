@@ -5,8 +5,8 @@
 """
 
 import sys
-import os
 from pathlib import Path
+
 import torch
 
 # Додаємо корінь проєкту до path
@@ -22,10 +22,10 @@ logger = get_logger(__name__)
 def export_all_models():
     """Експортує всі підтримувані моделі."""
     logger.info("Starting manual model export sequence...")
-    
+
     # Ініціалізуємо менеджер моделей з дефолтним конфігом
     manager = ModelManager(config=APP_SETTINGS)
-    
+
     # 1. LightGlue (ALIKED)
     logger.info("--- Exporting LightGlue (ALIKED) ---")
     try:
@@ -34,9 +34,9 @@ def export_all_models():
         original_backend = APP_SETTINGS.models.lightglue.backend
         APP_SETTINGS.models.lightglue.backend = "git"
         APP_SETTINGS.models.lightglue.auto_convert = True # Щоб спрацював _auto_export
-        
+
         manager.load_lightglue(features="aliked")
-        
+
         # Повертаємо бекенд
         APP_SETTINGS.models.lightglue.backend = original_backend
     except Exception as e:
@@ -48,9 +48,9 @@ def export_all_models():
         original_backend = APP_SETTINGS.models.lightglue_superpoint.backend
         APP_SETTINGS.models.lightglue_superpoint.backend = "git"
         APP_SETTINGS.models.lightglue_superpoint.auto_convert = True
-        
+
         manager.load_lightglue(features="superpoint")
-        
+
         APP_SETTINGS.models.lightglue_superpoint.backend = original_backend
     except Exception as e:
         logger.error(f"Failed to export LightGlue SuperPoint: {e}")

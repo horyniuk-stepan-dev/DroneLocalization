@@ -81,7 +81,15 @@ line-length = 100
 target-version = "py311"
 extend-exclude = [
     "scripts/allFiles",
+    # Вендорений код — читаємо, але НІКОЛИ не модифікуємо (див. CLAUDE.md).
+    "third_party",
+    # Одноразові скрипти, не application source (gitignored).
+    "scratch",
 ]
+# Без цього exclude ігнорується, коли файли передані аргументами явно —
+# а pre-commit робить саме так. Тобто `extend-exclude` вище без force-exclude
+# не працює під хуком, і `ruff --fix .` переписував third_party/.
+force-exclude = true
 
 [tool.ruff.lint]
 select = [

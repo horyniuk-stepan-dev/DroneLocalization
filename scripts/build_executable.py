@@ -13,7 +13,6 @@ Output:  dist/DroneLocalization/DroneLocalization.exe
 import argparse
 import os
 import shutil
-import sys
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -195,7 +194,7 @@ def build(include_models: bool = True, console: bool = False) -> None:
     # Config directory
     if CONFIG_DIR.exists():
         datas.append(f"--add-data={CONFIG_DIR / 'config.py'};config")
-        print(f"  + Config: config/config.py")
+        print("  + Config: config/config.py")
 
     # Neural network model weights (models/ directory)
     if include_models and MODELS_DIR.exists():
@@ -361,7 +360,7 @@ def build(include_models: bool = True, console: bool = False) -> None:
     # ---- Run PyInstaller ---- #
     print()
     print(f"  Running PyInstaller with {len(args)} arguments...")
-    print(f"  This may take 10-20 minutes for PyTorch projects.")
+    print("  This may take 10-20 minutes for PyTorch projects.")
     print()
 
     import PyInstaller.__main__
@@ -394,16 +393,16 @@ def build(include_models: bool = True, console: bool = False) -> None:
     if output_exe.exists():
         # Calculate total size
         total_size = sum(f.stat().st_size for f in output_dir.rglob("*") if f.is_file())
-        print(f"  [OK] BUILD SUCCESSFUL")
+        print("  [OK] BUILD SUCCESSFUL")
         print(f"  Output: {output_dir}")
         print(f"  EXE:    {output_exe}")
         print(f"  Size:   {total_size / 1024**3:.2f} GB")
         print()
         print(f"  The bundled DINO models are in: {output_dir / '.cache'}")
-        print(f"  To distribute: zip the entire DroneLocalization/ folder.")
+        print("  To distribute: zip the entire DroneLocalization/ folder.")
     else:
         print(f"  [FAIL] BUILD FAILED -- EXE not found at {output_exe}")
-        print(f"     Check the log above for errors.")
+        print("     Check the log above for errors.")
     print("=" * 70)
 
 

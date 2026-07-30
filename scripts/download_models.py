@@ -31,7 +31,7 @@ def download_url(url: str, output_path: Path):
     """Завантаження файлу з відображенням прогресу"""
     # Створюємо папку якщо її немає
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     with DownloadProgressBar(unit="B", unit_scale=True, miniters=1, desc=output_path.name) as t:
         urllib.request.urlretrieve(url, filename=output_path, reporthook=t.update_to)
 

@@ -494,11 +494,12 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
 
 def run_video(results: dict, video_path: str, n_frames: int) -> None:
     try:
+        import torch
+
         from config import APP_CONFIG
         from src.localization.matcher import FeatureMatcher
         from src.models.model_manager import ModelManager
         from src.models.wrappers.feature_extractor import FeatureExtractor
-        import torch
     except ImportError as e:
         print(f"[video] skipped: {e}")
         return

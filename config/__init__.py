@@ -14,6 +14,7 @@ from config.access import (
     get_active_descriptor_cfg,
     get_cfg,
     load_user_config,
+    reload_settings_in_place,
     save_user_config,
 )
 from config.app import (
@@ -88,6 +89,7 @@ __all__ = [
     "get_cfg",
     "get_active_descriptor_cfg",
     "load_user_config",
+    "reload_settings_in_place",
     "save_user_config",
     "CONFIG_FILE_PATH",
     "CONFIG_LOAD_STATUS",

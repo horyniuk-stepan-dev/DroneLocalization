@@ -1,4 +1,5 @@
-import os, sys
+import os
+
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 print('Loading torch...')
 try:

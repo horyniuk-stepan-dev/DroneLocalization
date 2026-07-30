@@ -263,10 +263,12 @@ def main() -> None:
         if overrides:
             hw_profile.apply_overrides(_cfg_module.APP_CONFIG, overrides)
             hw_profile.log_overrides(overrides)
-            # Reload APP_SETTINGS from the updated dict so Pydantic models reflect changes
-            _cfg_module.APP_SETTINGS = _cfg_module.AppConfig(**_cfg_module.APP_CONFIG)
-            # Re-bind the module-level name used throughout the app
-            globals()["APP_SETTINGS"] = _cfg_module.APP_SETTINGS
+            # Перезаливаємо APP_SETTINGS У МІСЦІ. Переприв'язка (`= AppConfig(...)`)
+            # оновлювала лише config.* і main.*, а headless_runner/main_window/
+            # config_dialog лишалися на старому об'єкті — auto-tune до них не
+            # доходив, а --ws-port/--rest-port писалися в об'єкт, якого ніхто
+            # не читає.
+            _cfg_module.reload_settings_in_place(_cfg_module.APP_CONFIG)
         else:
             logger.info("Auto-tune: all settings already optimal or user-customized")
     else:

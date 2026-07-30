@@ -984,8 +984,13 @@ class PropagationPipeline:
                 )
                 for r in res:
                     candidates.append((int(r["frame_id"]), max(0.0, 1.0 - r["_distance"])))
-            except Exception:
-                pass
+            except Exception as e:
+                # Мовчазний pass тут означав: loop closures просто не знаходяться,
+                # карта деградує, у логах — жодного сліду.
+                logger.warning(
+                    f"LanceDB retrieval failed — loop-closure candidates lost "
+                    f"for this frame ({type(e).__name__}: {e})"
+                )
         else:
             q_batch = np.array([q], dtype=np.float32)
             scores, ids = faiss_index.search(q_batch, self.lc_top_k + 1)

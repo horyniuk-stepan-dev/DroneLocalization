@@ -198,13 +198,19 @@ class ResultBuilder:
                     f"Center metric: ({mx:.1f}, {my:.1f}) | "
                     f"Filtered: ({filtered_pt[0]:.1f}, {filtered_pt[1]:.1f})"
                 )
-                for cx, cy in metric_corners:
-                    try:
+                # Все-або-нічого: частковий полігон (1-3 кути) гірший за
+                # відсутній — споживачі (GUI-мапа, експорт) чекають чотирикутник.
+                try:
+                    for cx, cy in metric_corners:
                         clat, clon = converter.metric_to_gps(
                             float(cx + dx), float(cy + dy)
                         )
                         gps_corners.append((clat, clon))
-                    except Exception:
-                        pass
+                except Exception as e:
+                    logger.warning(
+                        f"FOV corner -> GPS conversion failed for frame "
+                        f"{candidate_id} ({type(e).__name__}: {e}) — polygon dropped"
+                    )
+                    gps_corners = []
 
         return gps_corners

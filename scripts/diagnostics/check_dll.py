@@ -1,4 +1,5 @@
-import sys, os, ctypes
+import ctypes
+import os
 
 print('--- DIAGNOSTIC SCRIPT START ---')
 base = r'd:\My Projects\DroneLocalization\dist\DroneLocalization\_internal'
@@ -17,7 +18,7 @@ for dep in deps:
             path = os.path.join(torch_lib, dep)
         else:
             path = dep
-        
+
         # 0x00001100 = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
         res = kernel32.LoadLibraryExW(path, None, 0x00001100)
         if res is None:
