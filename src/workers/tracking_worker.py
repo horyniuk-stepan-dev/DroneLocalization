@@ -49,6 +49,12 @@ class RealtimeTrackingWorker(QThread):
         # PIPELINE_OPTIMIZATION_PLAN §B1/§B2. Обидва дефолти = стара поведінка.
         self.of_stride = max(1, int(get_cfg(self.config, "tracking.of_stride", 1)))
         self.of_half_res = bool(get_cfg(self.config, "tracking.of_half_res", False))
+        # Локальна швидкість на OF-шляху: dt має мірятись від ПОПЕРЕДНЬОГО
+        # OF-КАДРУ, а не від останньої УСПІШНОЇ локалізації — інакше він
+        # розходиться з ref_position у детекторі (той бере попередній сирий
+        # OF-вимір). Заміряно: 4 з 20 спрацювань мали dt=0.200 при опорі,
+        # знятому 0.1 c тому, тобто перевищення 1.9-5.0x на рівному місці.
+        self.of_local_speed = bool(get_cfg(self.config, "tracking.of_local_speed", False))
 
         # ── Debug views (вікна «очима моделей») ─────────────────────────────
         # Порожній набір каналів ⇒ нуль overhead: колектор не створюється.
@@ -197,6 +203,10 @@ class RealtimeTrackingWorker(QThread):
         # відхиляються, last_localization_video_time залишається -1, і dt = 0.033s,
         # що штучно завищує швидкість у 5× (keyframe_interval=5).
         last_keyframe_video_time = -1.0
+        # Час ПОПЕРЕДНЬОГО обробленого OF-кадру (успішного чи ні) — база dt
+        # при of_local_speed. Скидається на кожному keyframe, бо LK там
+        # перезапускається і перший OF міряється саме від keyframe.
+        last_of_video_time = -1.0
 
         stream_start_time = time.time()
 
@@ -226,6 +236,7 @@ class RealtimeTrackingWorker(QThread):
             is_keyframe = frame_idx % self.keyframe_interval == 0
 
             # Розрахунок dt — різний для KF та OF
+            _is_of_frame = not (is_keyframe or prev_pts_for_of is None)
             if is_keyframe or prev_pts_for_of is None:
                 # Для ключових кадрів: dt = час від ПОПЕРЕДНЬОГО ключового кадру
                 # (навіть якщо він був відхилений як outlier)
@@ -236,13 +247,34 @@ class RealtimeTrackingWorker(QThread):
                     if calculated_dt <= 0:
                         calculated_dt = self.keyframe_interval * frame_duration_sec
             else:
-                # Для OF-кадрів: dt = час від останньої УСПІШНОЇ локалізації
-                if last_localization_video_time < 0:
+                # Для OF-кадрів: база dt має збігатися з базою ЗСУВУ.
+                # of_local_speed=True -> обидві беруться від попереднього
+                # OF-кадру. False -> стара поведінка (від успішної локалізації).
+                _dt_base = (
+                    last_of_video_time if self.of_local_speed else last_localization_video_time
+                )
+                if _dt_base < 0:
                     calculated_dt = frame_duration_sec
                 else:
-                    calculated_dt = current_video_time_sec - last_localization_video_time
+                    calculated_dt = current_video_time_sec - _dt_base
                     if calculated_dt <= 0:
                         calculated_dt = frame_duration_sec
+
+            # База для наступного OF-кроку: беремо ПІСЛЯ того, як calculated_dt
+            # уже обчислено. На keyframe теж оновлюємо — ланцюг локальних
+            # порівнянь починається заново від нього.
+            #
+            # КРИТИЧНО: тільки для кадрів, на яких OF СПРАВДІ рахується.
+            # of_stride пропускає обробку нижче (рядок ~394), тож без цієї
+            # перевірки база часу рухалась на кожному кадрі, а база ЗСУВУ —
+            # раз на of_stride кадрів. Заміряно на місії top з of_stride=5:
+            # distance 17.5 м при dt=0.033 давало 526 м/с замість реальних
+            # 105 м/с — рівно у of_stride разів більше.
+            _of_computed = _is_of_frame and (
+                self.of_stride <= 1 or (frame_idx % self.of_stride) == 0
+            )
+            if _of_computed or is_keyframe:
+                last_of_video_time = current_video_time_sec
 
             loc_result = {"success": False, "error": "Not processed"}
             start_process = time.time()

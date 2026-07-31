@@ -63,6 +63,7 @@ class Localizer:
             threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 4.0),
             max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 120.0),
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
+            zscore_enabled=get_cfg(self.config, "tracking.outlier_zscore_enabled", True),
         )
 
         # RESEARCH 3.1: ковзний віконний back-end smoother (флаг, дефолт off).
@@ -157,6 +158,13 @@ class Localizer:
         # tracking.outlier_threshold_std / max_speed_mps до фізичних значень:
         # при std=80 і 350 м/с гейт усе одно майже не спрацьовує.
         self._of_outlier_gate = get_cfg(self.config, "tracking.of_outlier_gate", False)
+        # Етап 6: перевести відстані аутлаєр-гейта у справжні наземні метри.
+        self._ground_scale_correction = get_cfg(
+            self.config, "tracking.ground_scale_correction", False
+        )
+        # Локальна (кадр-до-кадру) швидкість на OF-шляху замість накопиченої.
+        self._of_local_speed = get_cfg(self.config, "tracking.of_local_speed", False)
+        self._last_of_raw: np.ndarray | None = None
 
         # Обхід кінематичного гейта за силою незалежних доказів (див.
         # config/localization.py). Кінематика — це пріор про рух платформи;
@@ -284,6 +292,24 @@ class Localizer:
         """
         return getattr(self, "_last_state", None)
 
+    def _sync_ground_scale(self, lat: float) -> None:
+        """Оновлює множник проєкція→наземні метри в аутлаєр-детекторі.
+
+        Флаг-гейт: при вимкненому tracking.ground_scale_correction множник
+        лишається 1.0, тобто поведінка побітово стара. Широта береться зі
+        свіжого фікса; за місію cos(lat) міняється на ~1e-5, тож відставання
+        на один кадр не має значення.
+        """
+        if not self._ground_scale_correction:
+            return
+        converter = getattr(self.calibration, "converter", None)
+        if converter is None:
+            return
+        try:
+            self.outlier_detector.set_ground_scale(converter.ground_scale_factor(lat))
+        except Exception as e:  # noqa: BLE001 — корекція не має валити локалізацію
+            logger.warning(f"Ground-scale sync failed ({type(e).__name__}: {e})")
+
     def reset_session(self) -> None:
         """Скидає стан сесії трекінгу (фільтри, лічильники, кутовий prior).
 
@@ -292,6 +318,7 @@ class Localizer:
         """
         self.trajectory_filter.reset()
         self.outlier_detector.reset()
+        self._last_of_raw = None
         self._consecutive_failures = 0
         self._last_best_angle = None
         self._last_state = None
@@ -810,9 +837,15 @@ class Localizer:
                     f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m"
                 )
         self.outlier_detector.add_position(filtered_pt, dt=dt)
+        # Новий keyframe перезапускає LK, тож ланцюг локальних OF-порівнянь
+        # обривається: перший OF після keyframe має міряти зсув ВІД keyframe
+        # (ref=None -> база = щойно додана позиція у вікні), а не від OF-виміру
+        # попереднього циклу. Інакше знову розходяться бази зсуву і dt.
+        self._last_of_raw = None
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
+        self._sync_ground_scale(lat)
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
         # ── Крок 8: Розрахунок FOV ───────────────────────────────────────────
@@ -976,11 +1009,19 @@ class Localizer:
                 f"OF kinematic gate bypassed: flow_quality={float(flow_quality):.3f} "
                 f">= {self._trust_min_flow_q} (flow is self-consistent)"
             )
-        if (
+        # Опорна точка миттєвої швидкості: попередній СИРИЙ OF-вимір (навіть
+        # відкинутий). Без неї база — остання прийнята позиція, зазвичай
+        # keyframe, і швидкість накопичується разом зі зсувом LK.
+        _of_ref = self._last_of_raw if self._of_local_speed else None
+        _is_out = (
             self._of_outlier_gate
             and not _strong_flow
-            and self.outlier_detector.is_outlier(metric_pt, dt)
-        ):
+            and self.outlier_detector.is_outlier(metric_pt, dt, ref_position=_of_ref)
+        )
+        # Оновлюємо ДО раннього return: наступний кадр має порівнюватись із цим
+        # виміром незалежно від того, прийняли ми його чи ні.
+        self._last_of_raw = metric_pt.copy()
+        if _is_out:
             logger.warning(
                 f"OF outlier filtered | metric=({mx:.1f}, {my:.1f}), dt={dt:.3f}s, "
                 f"flow_quality={flow_quality if flow_quality is None else round(flow_quality, 3)}. "
@@ -1014,6 +1055,7 @@ class Localizer:
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
+        self._sync_ground_scale(lat)
 
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
 

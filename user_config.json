@@ -168,7 +168,7 @@
         "kalman_measurement_noise": 5.0,
         "outlier_window": 10,
         "outlier_threshold_std": 4.0,
-        "max_speed_mps": 120.0,
+        "max_speed_mps": 350.0,
         "max_consecutive_outliers": 3,
         "process_fps": 1.0,
         "keyframe_interval": 30,
@@ -187,11 +187,14 @@
         "of_fb_check": true,
         "of_fb_max_px": 2.0,
         "of_outlier_gate": true,
+        "of_local_speed": true,
+        "outlier_zscore_enabled": false,
         "outlier_trust_strong_evidence": true,
         "outlier_trust_min_inliers": 100,
         "outlier_trust_min_flow_quality": 0.5,
-        "of_stride": 3,
-        "of_half_res": true
+        "of_stride": 5,
+        "of_half_res": false,
+        "ground_scale_correction": true
     },
     "preprocessing": {
         "clahe_clip_limit": 3.0,
@@ -379,7 +382,7 @@
             "log_level": "INFO",
             "debug_mode": true,
             "redact_coords_in_logs": false,
-            "deterministic": false,
+            "deterministic": true,
             "log_latency_stats": true,
             "latency_log_interval": 100,
             "weight_integrity_mode": "off"
