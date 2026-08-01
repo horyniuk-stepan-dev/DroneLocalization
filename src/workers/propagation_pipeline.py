@@ -25,6 +25,7 @@ from src.geometry.affine_utils import (
     unwrap_angles,
 )
 from src.geometry.point_spread import inlier_spread, spread_weight_factor
+from src.geometry.pose_graph.model_5dof import _predict_forward, _predict_inverse
 from src.geometry.pose_graph.vo_guards import (
     check_anchor_gaps,
     downweight_gap_edges,
@@ -196,6 +197,11 @@ class PropagationPipeline:
         self.anchor_gap_check = get_cfg(self.config, go + "anchor_gap_check", False)
         self.anchor_gap_max_dev_m = get_cfg(self.config, go + "anchor_gap_max_dev_m", 150.0)
         self.anchor_gap_downweight = get_cfg(self.config, go + "anchor_gap_downweight", 0.05)
+
+        # ── Аудит 2026-08-01. Дефолти = ПОТОЧНА поведінка. ──
+        self.true_disagreement = get_cfg(self.config, go + "true_disagreement", False)
+        self.ground_scale_thresholds = get_cfg(self.config, go + "ground_scale_thresholds", False)
+        self.isotropy_weight = get_cfg(self.config, go + "isotropy_weight", 200.0)
         self.skip_bridges = get_cfg(self.config, "propagation.skip_bridges", False)
         self.mnn_fallback = get_cfg(self.config, "propagation.mnn_fallback", False)
         self._n_rotation_retry = 0
@@ -262,7 +268,9 @@ class PropagationPipeline:
                 )
             return
 
-        optimizer = PoseGraphOptimizer(self.frame_w, self.frame_h)
+        optimizer = PoseGraphOptimizer(
+            self.frame_w, self.frame_h, isotropy_weight=self.isotropy_weight
+        )
         for i in range(num_frames):
             if i in all_features:
                 optimizer.add_node(i)
@@ -339,11 +347,16 @@ class PropagationPipeline:
                 )
                 fid = nearest
             if fid in anchor_nodes:
-                logger.warning(
-                    f"Two anchors mapped to the same node {fid} after snapping; "
-                    f"keeping the first one."
+                # Раніше — лише warning, і другий якір мовчки зникав. Це той самий
+                # клас мовчазної втрати, що й якорі поза межами БД вище, тому й
+                # реакція та сама: зупинити і сказати користувачу.
+                self._report_error(
+                    f"Якорі кадрів #{anchor_nodes[fid].frame_id} і #{anchor.frame_id} "
+                    f"після снапу до найближчого keyframe потрапили в один слот БД "
+                    f"(#{fid}) — один із них був би мовчки відкинутий. Видаліть "
+                    f"зайвий якір або перенесіть його на кадр, у якому є keyframe."
                 )
-                continue
+                return
             anchor_nodes[fid] = anchor
 
         # Визначаємо локальну опорну точку для математичної стабільності (Local Center)
@@ -371,6 +384,25 @@ class PropagationPipeline:
             else:
                 optimizer.fix_node(fid, local_affine)
 
+        # ── Пороги в наземних метрах (аудит 2026-08-01) ──────────────────────
+        # WEB_MERCATOR роздуває виміряні відстані в 1/cos(lat), тож метрові
+        # КОНСТАНТИ порогів означають проєкційні, а не наземні метри. Ділимо
+        # поріг на cos(lat): саме порівняння лишається в проєкційних одиницях,
+        # а константа починає читатись як наземні метри. Самоузгоджені перевірки
+        # (odometry, dist-prefilter, auto min_gap) не чіпаємо — там обидві
+        # сторони в одних одиницях. UTM / невідома широта → no-op.
+        gap_max_dev = float(self.anchor_gap_max_dev_m)
+        loo_threshold = float(self.anchor_loo_threshold_m)
+        if self.ground_scale_thresholds:
+            k_ground = self._ground_scale_factor(anchors)
+            if k_ground > 1e-6:
+                gap_max_dev /= k_ground
+                loo_threshold /= k_ground
+                logger.info(
+                    f"Наземний масштаб cos(lat)={k_ground:.4f}: пороги в проєкційних "
+                    f"метрах — проміжок {gap_max_dev:.0f}, LOO {loo_threshold:.2f}"
+                )
+
         # ── Етап 8.2: звірка проміжків між якорями ДО оптимізації ────────────
         # Консистентний аліасинг (усі ребра проміжку брешуть однаково) невидимий
         # для резидуалів; неузгоджені проміжки глушаться, їх кадри після
@@ -382,7 +414,7 @@ class PropagationPipeline:
                 optimizer.edges,
                 optimizer.anchor_states(),
                 optimizer.sign,
-                self.anchor_gap_max_dev_m,
+                gap_max_dev,
             )
             flagged_gaps = [k for k, v in gap_report.items() if v["status"] != "ok"]
             for a, b in flagged_gaps:
@@ -446,8 +478,7 @@ class PropagationPipeline:
         # Звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших, anchor stress
         try:
             logger.info(
-                "Звіт пропагації:\n"
-                + optimizer.format_diagnostics(loo_threshold_m=self.anchor_loo_threshold_m)
+                "Звіт пропагації:\n" + optimizer.format_diagnostics(loo_threshold_m=loo_threshold)
             )
         except Exception as diag_err:
             logger.warning(f"Diagnostics report failed: {diag_err}")
@@ -465,12 +496,12 @@ class PropagationPipeline:
                 for fid, aff in results.items()
             }
             force_invalid = select_gap_fallback_frames(
-                centers, optimizer.anchor_states(), flagged_gaps, self.anchor_gap_max_dev_m
+                centers, optimizer.anchor_states(), flagged_gaps, gap_max_dev
             )
             if force_invalid:
                 logger.info(
                     f"Етап 8.2: {len(force_invalid)} кадрів перезаповнюються інтерполяцією "
-                    f"(відхилення від лінії якорів > {self.anchor_gap_max_dev_m:.0f} м): "
+                    f"(відхилення від лінії якорів > {gap_max_dev:.0f} м): "
                     f"{sorted(force_invalid)}"
                 )
 
@@ -1094,32 +1125,67 @@ class PropagationPipeline:
                 frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
                 frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
 
-        # Disagreement: для кадрів із ≥2 ребрами, порівнюємо predictions
-        # (simplified: використовуємо std відхилень у tx, ty)
-
-        # O(E) Optical optimization
-
+        # ── Disagreement ────────────────────────────────────────────────────
+        # Читається у ResultBuilder.compute_confidence (stability_score, далі R
+        # у Калмані), тож форма метрики має значення для ЖИВОЇ локалізації.
+        #
+        # Історична форма (дефолт, true_disagreement=False): std від tx сусідніх
+        # кадрів. tx = M[0,2] — метрична позиція пікселя (0,0), а не центру, тож
+        # величина змішує рух і ПОВОРОТ сусіда і сягає десятків метрів. Проти
+        # confidence.disagreement_norm_m = 5.0 вона насичується для кожного
+        # кадру з ≥2 ребрами, а кадр з одним ребром отримує рівно 0 — гірше
+        # зв'язаний кадр виглядає стабільнішим за краще зв'язаний.
+        #
+        # Нова форма (true_disagreement=True): наскільки самі ребра розходяться
+        # в тому, ДЕ цей кадр — середній розкид передбачень його центру кожним
+        # інцидентним ребром. Стани оптимізатора локальні (Local Origin ще не
+        # повернуто в них), але розкид інваріантний до трансляції, тож змішування
+        # систем координат тут неможливе.
         adj = defaultdict(list)
         for e in optimizer.edges:
             adj[e.from_id].append(e)
             adj[e.to_id].append(e)
 
-        for fid in range(num_frames):
-            if not frame_valid[fid]:
-                continue
-            edges_to_fid = adj[fid]
-            if len(edges_to_fid) >= 2:
-                predictions_tx = []
-                for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
+        if self.true_disagreement:
+            states = optimizer._current_states_full()
+            sign = optimizer.sign
+            for fid in range(num_frames):
+                if not frame_valid[fid] or fid not in results:
+                    continue
+                preds = []
+                for e in adj[fid][:5]:  # Обмежуємо для швидкодії
                     other_id = e.from_id if e.to_id == fid else e.to_id
-                    other_affine = results.get(other_id)
+                    st = states.get(other_id)
+                    if st is None:
+                        continue
+                    pred = (
+                        _predict_forward(st, e, sign)
+                        if e.from_id == other_id
+                        else _predict_inverse(st, e, sign)
+                    )
+                    preds.append(pred[:2])
+                if len(preds) >= 2:
+                    arr = np.asarray(preds, dtype=np.float64)
+                    frame_disagreement[fid] = float(
+                        np.mean(np.linalg.norm(arr - arr.mean(axis=0), axis=1))
+                    )
+        else:
+            for fid in range(num_frames):
+                if not frame_valid[fid]:
+                    continue
+                edges_to_fid = adj[fid]
+                if len(edges_to_fid) >= 2:
+                    predictions_tx = []
+                    for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
+                        other_id = e.from_id if e.to_id == fid else e.to_id
+                        other_affine = results.get(other_id)
 
-                    # Перевіряємо, чи сусідній кадр також валідний
-                    if other_affine is not None:
-                        comp = decompose_affine(other_affine)
-                        predictions_tx.append(comp[0])  # tx
-                if len(predictions_tx) >= 2:
-                    frame_disagreement[fid] = float(np.std(predictions_tx))
+                        # Перевіряємо, чи сусідній кадр також валідний
+                        if other_affine is not None:
+                            comp = decompose_affine(other_affine)
+                            predictions_tx.append(comp[0])  # tx
+                    if len(predictions_tx) >= 2:
+                        frame_disagreement[fid] = float(np.std(predictions_tx))
 
         # --- Збереження в HDF5 ---
         # Тримаємо лок БД на весь цикл close → write → reload: інакше
@@ -1211,6 +1277,28 @@ class PropagationPipeline:
         return int(np.sum(frame_valid))
 
     # ─── Допоміжні методи ────────────────────────────────────────────────────
+
+    def _ground_scale_factor(self, anchors) -> float:
+        """cos(lat) для переведення наземних метрів у проєкційні (WEB_MERCATOR).
+
+        Широта береться з GPS-точок першого якоря, який їх має, далі —
+        з reference_gps конвертера. UTM, невідома широта або будь-яка
+        помилка → 1.0 (порогів не чіпаємо).
+        """
+        converter = getattr(self.calibration, "converter", None)
+        if converter is None:
+            return 1.0
+        lat = None
+        for a in anchors:
+            pts = getattr(a, "points_gps", None)
+            if pts:
+                lat = float(pts[0][0])
+                break
+        try:
+            return float(converter.ground_scale_factor(lat))
+        except Exception as e:  # noqa: BLE001 — поріг важливіший за причину
+            logger.warning(f"Ground scale factor unavailable ({e}) — using 1.0")
+            return 1.0
 
     def _load_previous_affines(self) -> dict[int, np.ndarray]:
         """Завантажує frame_affine попереднього калібрування з HDF5 (warm start)."""

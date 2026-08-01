@@ -71,9 +71,13 @@ class MultiCalibrationManager:
             if src.source_id not in self._calibrations:
                 continue
             cal = self._calibrations[src.source_id]
-            if not cal.is_calibrated:
-                continue
             calib_path = project_dir / src.calibration_file
+            if not cal.is_calibrated and not calib_path.exists():
+                # Порожня калібрація і файлу нема — писати нічого. Але якщо файл
+                # Є, його треба перезаписати порожнім списком: інакше видалення
+                # всіх якорів лишало осиротілий calibration.json, який наступний
+                # load_all підхоплював як актуальний.
+                continue
             calib_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 cal.save(str(calib_path))

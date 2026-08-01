@@ -463,7 +463,10 @@
         "edge_spread_weight": true,
         "edge_spread_ref": 0.15,
         "edge_spread_k": 10.0,
-        "edge_gate_min_spread": 0.03
+        "edge_gate_min_spread": 0.03,
+        "true_disagreement": false,
+        "ground_scale_thresholds": false,
+        "isotropy_weight": 200.0
     },
     "propagation": {
         "max_skip_frames": 3,

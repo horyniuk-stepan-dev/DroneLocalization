@@ -99,7 +99,9 @@ class DiagnosticsMixin:
             incident.setdefault(e.to_id, []).append(res[k])
 
         stress: dict[int, float] = {}
-        for fid in self._fixed_nodes:
+        # anchor_states(): жорсткі + м'які. З _fixed_nodes при soft_anchors=True
+        # звіт anchor-stress зникав повністю (вузлів там немає).
+        for fid in self.anchor_states():
             rs = incident.get(fid, [])
             if not rs:
                 continue
@@ -204,7 +206,7 @@ class DiagnosticsMixin:
             "num_edges": len(self._edges),
             "num_temporal": sum(1 for e in self._edges if e.edge_type == "temporal"),
             "num_spatial": sum(1 for e in self._edges if e.edge_type == "spatial"),
-            "num_anchors": len(self._fixed_nodes),
+            "num_anchors": len(self.anchor_states()),
             "residual_stats": stats,
             "worst_edges": worst,
             "anchor_stress": {int(k): float(v) for k, v in stress.items()},
@@ -256,6 +258,7 @@ class DiagnosticsMixin:
         # Пер-ребровий резидуал у properties → на карті розфарбувати ребра
         # за резидуалом (погані loop closures стає ВИДНО очима).
         edge_res = self.compute_edge_residuals()
+        anchor_ids = set(self.anchor_states())  # жорсткі + м'які (soft_anchors)
 
         for fid, affine in results.items():
             pt = np.array([[cx, cy]], dtype=np.float64)
@@ -264,7 +267,7 @@ class DiagnosticsMixin:
                 lat, lon = converter.metric_to_gps(float(metric[0]) + ox, float(metric[1]) + oy)
             except Exception:
                 continue
-            is_fixed = fid in self._fixed_nodes
+            is_fixed = fid in anchor_ids
             features.append(
                 {
                     "type": "Feature",

@@ -14,12 +14,19 @@ class PruningMixin:
     """Two-stage spatial-edge pruning. Pure move from PoseGraphOptimizer."""
 
     def _anchor_reachable(self, edges: list[GraphEdge]) -> set[int]:
-        """Множина вузлів, досяжних із будь-якого якоря по заданому набору ребер."""
+        """Множина вузлів, досяжних із будь-якого якоря по заданому набору ребер.
+
+        Сідаємо з anchor_states() (жорсткі fix_node + м'які add_anchor), а не з
+        _fixed_nodes: при soft_anchors=True жорстких вузлів НЕМАЄ взагалі, обидві
+        множини досяжності виходили порожні, порівняння trial == base ставало
+        тотожно істинним — і захист «ніколи не роз'єднаємо вузол від якорів»
+        тихо вимикався, дозволяючи prune відрізати цілий сегмент графа.
+        """
         adj: dict[int, list[int]] = {}
         for e in edges:
             adj.setdefault(e.from_id, []).append(e.to_id)
             adj.setdefault(e.to_id, []).append(e.from_id)
-        seen = set(self._fixed_nodes.keys())
+        seen = set(self.anchor_states())
         stack = list(seen)
         while stack:
             n = stack.pop()

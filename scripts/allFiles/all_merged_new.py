@@ -1,7 +1,1306 @@
 
 
 # ================================================================================
-# File: __init__.py
+# File: config\__init__.py
+# ================================================================================
+"""Unified application configuration (Pydantic), split into domain modules.
+
+Import names directly from ``config`` (e.g. ``from config import get_cfg,
+APP_SETTINGS``). The old ``config.config`` module remains as a deprecated
+shim for one release.
+"""
+
+from config.access import (
+    APP_CONFIG,
+    APP_SETTINGS,
+    CONFIG_FILE_PATH,
+    CONFIG_LOAD_STATUS,
+    CONFIG_LOADED_FROM,
+    get_active_descriptor_cfg,
+    get_cfg,
+    load_user_config,
+    reload_settings_in_place,
+    save_user_config,
+)
+from config.app import (
+    AppConfig,
+    DebugViewsConfig,
+    GuiConfig,
+    LiveStreamConfig,
+    NetworkApiConfig,
+    ObjectTrackingConfig,
+    PreprocessingConfig,
+)
+from config.database import DatabaseConfig
+from config.graph import GraphOptimizationConfig, ProjectionConfig, PropagationConfig
+from config.localization import (
+    ConfidenceConfig,
+    HomographyConfig,
+    LocalizationConfig,
+    TrackingConfig,
+)
+from config.models import (
+    CespConfig,
+    Dinov2ModelConfig,
+    Dinov3ModelConfig,
+    GlobalDescriptorConfig,
+    ModelsCacheConfig,
+    ModelsConfig,
+    ModelSettings,
+    PerformanceConfig,
+    VramManagementConfig,
+    YoloConfig,
+    get_default_local_extractor,
+)
+from config.paths import ensure_model_cache_env, user_config_candidates, user_data_dir
+
+# Keep torch.hub / HuggingFace downloads inside <repo>/models/.cache in dev
+# (single storage location for all model weights).
+ensure_model_cache_env()
+
+__all__ = [
+    # models
+    "Dinov2ModelConfig",
+    "Dinov3ModelConfig",
+    "GlobalDescriptorConfig",
+    "YoloConfig",
+    "ModelSettings",
+    "CespConfig",
+    "VramManagementConfig",
+    "ModelsCacheConfig",
+    "PerformanceConfig",
+    "ModelsConfig",
+    "get_default_local_extractor",
+    # database
+    "DatabaseConfig",
+    # localization
+    "ConfidenceConfig",
+    "LocalizationConfig",
+    "TrackingConfig",
+    "HomographyConfig",
+    # graph
+    "ProjectionConfig",
+    "GraphOptimizationConfig",
+    "PropagationConfig",
+    # app
+    "PreprocessingConfig",
+    "GuiConfig",
+    "DebugViewsConfig",
+    "ObjectTrackingConfig",
+    "LiveStreamConfig",
+    "NetworkApiConfig",
+    "AppConfig",
+    # access
+    "get_cfg",
+    "get_active_descriptor_cfg",
+    "load_user_config",
+    "reload_settings_in_place",
+    "save_user_config",
+    "CONFIG_FILE_PATH",
+    "CONFIG_LOAD_STATUS",
+    "CONFIG_LOADED_FROM",
+    "user_config_candidates",
+    "APP_SETTINGS",
+    "APP_CONFIG",
+    "user_data_dir",
+]
+
+
+# ================================================================================
+# File: config\access.py
+# ================================================================================
+"""Config access helpers and default singleton instances."""
+
+from typing import Any, cast
+
+from config.app import AppConfig
+from config.models import Dinov2ModelConfig, Dinov3ModelConfig
+from config.paths import models_root, user_config_candidates, user_data_dir
+
+
+def get_cfg(config: Any, path: str, default: Any = None) -> Any:
+    """Централізований доступ до конфігу з dot-path.
+    Працює як зі словниками, так і з Pydantic-моделями.
+    """
+    keys = path.split(".")
+    current = config
+
+    for key in keys:
+        if isinstance(current, dict):
+            if key not in current:
+                current = default
+                break
+            current = current[key]
+        elif hasattr(current, key):
+            current = getattr(current, key)
+        else:
+            current = default
+            break
+
+    # Resolve "models/..." values against the single models root
+    # (config.paths.models_root) at READ time only — stored config stays
+    # relative, so user_config.json never accumulates absolute paths.
+    # Dev: repo-anchored, cwd-independent. Frozen: only when the file is
+    # really bundled (preserves the old fallback behaviour).
+    import os
+    import sys
+    if isinstance(current, str) and (current.startswith("models/") or current.startswith("models\\")):
+        resolved = os.path.join(str(models_root().parent), current)
+        if not getattr(sys, "frozen", False) or os.path.exists(resolved):
+            return resolved
+
+    return current
+
+
+def get_active_descriptor_cfg(config: Any) -> "Dinov2ModelConfig | Dinov3ModelConfig":
+    """Повертає конфіг активного глобального дескриптора (DINOv2 або DINOv3).
+
+    Працює як з Pydantic-об'єктом (APP_SETTINGS), так і зі словником (APP_CONFIG).
+    Fallback: DINOv2 за замовчуванням.
+    """
+    gd = get_cfg(config, "global_descriptor")
+    if gd is None:
+        return Dinov2ModelConfig()
+
+    # Pydantic object — використовуємо метод active()
+    if hasattr(gd, "active"):
+        return cast("Dinov2ModelConfig | Dinov3ModelConfig", gd.active())
+
+    # dict — реконструюємо з вкладених словників
+    if isinstance(gd, dict):
+        backend = gd.get("backend", "dinov2")
+        if backend == "dinov3":
+            return Dinov3ModelConfig(**(gd.get("dinov3") or {}))
+        return Dinov2ModelConfig(**(gd.get("dinov2") or {}))
+
+    return Dinov2ModelConfig()
+
+
+import json
+import os
+import tempfile
+
+# Куди ПИШЕМО (save_user_config). Читання йде за списком кандидатів нижче.
+CONFIG_FILE_PATH = str(user_data_dir() / "user_config.json")
+
+# Звідки конфіг реально прочитано цього запуску (None = вбудовані дефолти) та
+# людський опис для логів. Раніше відсутній файл не давав ЖОДНОГО сигналу —
+# застосунок мовчки стартував на дефолтах, і зрозуміти це можна було лише за
+# поведінкою. main.py друкує CONFIG_LOAD_STATUS у лог одразу після setup_logging.
+CONFIG_LOADED_FROM: str | None = None
+CONFIG_LOAD_STATUS: str = "not loaded yet"
+
+
+def save_user_config(config: AppConfig) -> None:
+    """Зберігає налаштування атомарно: пишемо в тимчасовий файл поруч і
+    робимо os.replace, щоб перерваний запис не пошкодив основний конфіг."""
+    target = os.path.abspath(CONFIG_FILE_PATH)
+    directory = os.path.dirname(target)
+    tmp_path = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".user_config.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(config.model_dump_json(indent=4))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+    except Exception as e:
+        print(f"Failed to save user config to {target}: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def reload_settings_in_place(data: dict) -> AppConfig:
+    """Перезаливає APP_SETTINGS значеннями з ``data`` БЕЗ створення нового об'єкта.
+
+    Критично: модулі роблять ``from config import APP_SETTINGS`` на рівні
+    імпорту, тому переприв'язка ``config.APP_SETTINGS = AppConfig(...)`` лишає
+    їх на старому об'єкті. Раніше через це auto-tune не доходив до GUI/headless,
+    а ``--ws-port``/``--rest-port`` мовчки ігнорувалися. Валідуємо в тимчасовий
+    об'єкт (щоб битий dict не зіпсував робочий конфіг), потім копіюємо поля
+    в наявний екземпляр — усі імпортовані посилання бачать оновлення.
+    """
+    validated = AppConfig(**data)
+    for field_name in type(validated).model_fields:
+        setattr(APP_SETTINGS, field_name, getattr(validated, field_name))
+    return APP_SETTINGS
+
+
+def load_user_config() -> AppConfig:
+    """Завантажує налаштування користувача з першого наявного кандидата.
+
+    Пошкоджений конфіг НЕ підмінюється наступним кандидатом: тихо підставити
+    інший файл — це той самий клас помилки, що й тихо підставити дефолти.
+    Якщо конфіг-файлів не знайдено зовсім, автоматично створюється новий
+    user_config.json із дефолтними налаштуваннями.
+    """
+    global CONFIG_LOADED_FROM, CONFIG_LOAD_STATUS
+
+    candidates = user_config_candidates()
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = AppConfig(**data)
+            CONFIG_LOADED_FROM = str(path)
+            CONFIG_LOAD_STATUS = f"User config loaded from {path}"
+            return cfg
+        except Exception as e:
+            CONFIG_LOADED_FROM = None
+            CONFIG_LOAD_STATUS = (
+                f"User config at {path} is unreadable ({e}) — BUILT-IN DEFAULTS in use. "
+                f"Your settings are NOT active."
+            )
+            print(CONFIG_LOAD_STATUS)
+            return AppConfig()
+
+    default_cfg = AppConfig()
+    save_user_config(default_cfg)
+    CONFIG_LOADED_FROM = str(CONFIG_FILE_PATH)
+    CONFIG_LOAD_STATUS = (
+        f"No user_config.json found (looked in: {', '.join(str(p) for p in candidates)}). "
+        f"Created default user_config.json at {CONFIG_FILE_PATH}."
+    )
+    print(CONFIG_LOAD_STATUS)
+    return default_cfg
+
+# Екземпляр конфігу за замовчуванням (зчитаний з файлу або дефолтний).
+APP_SETTINGS = load_user_config()
+# Також надаємо доступ як до словника для зворотньої сумісності
+APP_CONFIG = APP_SETTINGS.model_dump()
+
+
+# ================================================================================
+# File: config\app.py
+# ================================================================================
+"""Application-level configuration and the top-level AppConfig aggregator."""
+
+from pydantic import BaseModel
+
+from config.database import DatabaseConfig
+from config.graph import GraphOptimizationConfig, ProjectionConfig, PropagationConfig
+from config.localization import HomographyConfig, LocalizationConfig, TrackingConfig
+from config.models import GlobalDescriptorConfig, ModelsConfig
+
+
+class PreprocessingConfig(BaseModel):
+    clahe_clip_limit: float = 3.0
+    clahe_tile_grid: list[int] = [8, 8]
+    # УВАГА: histogram matching ще НЕ реалізований в ImagePreprocessor
+    # (працює лише CLAHE). Прапорець вимкнено, щоб не вводити в оману.
+    histogram_matching: bool = False
+    reference_image_path: str = "config/reference_style.png"
+    masking_strategy: str = "yolo"
+
+
+class GuiConfig(BaseModel):
+    video_fps: int = 30
+    verify_display_mode: str = "center"  # "center" | "center_corners" | "full"
+    verify_label_mode: str = "number"
+
+
+class DebugViewsConfig(BaseModel):
+    """Вікна «очима моделей» у режимі локалізації (YOLO / Depth / DINO / Матчі).
+
+    Усе off за замовчуванням — нульовий overhead, поки жодне вікно не відкрите.
+    Секція round-trip-иться у user_config.json, тож show_* зберігають стан
+    видимості вікон між запусками.
+    """
+
+    max_width: int = 640  # ширина зображень у вікнах (downscale перед emit)
+    depth_every_n_keyframes: int = 1  # частота depth-інференсу (1 = кожен keyframe; окремий GPU-прохід)
+    dino_pca_enabled: bool = True  # PCA патч-токенів (інакше — лише панель retrieval)
+    # Стан видимості вікон (відновлюється при старті, зберігається при виході)
+    show_yolo: bool = False
+    show_depth: bool = False
+    show_dino: bool = False
+    show_matches: bool = False
+
+
+class ObjectTrackingConfig(BaseModel):
+    enabled: bool = True
+    track_activation_threshold: float = 0.25
+    lost_track_buffer: int = 30
+    minimum_matching_threshold: float = 0.8
+    tracked_classes: list[int] = [
+        0,
+        1,
+        2,
+        3,
+        5,
+        7,
+    ]  # COCO: person, bicycle, car, motorcycle, bus, truck
+    show_on_video: bool = True
+    show_on_map: bool = True
+    project_to_gps: bool = True
+
+
+class LiveStreamConfig(BaseModel):
+    enabled: bool = False
+    source_type: str = "file"  # "file" | "rtsp" | "usb"
+    rtsp_url: str = ""
+    usb_device: int = 0
+    reconnect_attempts: int = 5
+    reconnect_delay_sec: float = 2.0
+    buffer_size: int = 1
+
+
+class NetworkApiConfig(BaseModel):
+    enabled: bool = True
+    ws_enabled: bool = True
+    # БЕЗПЕКА: дефолт — лише локальні клієнти. Телеметрія дрона на 0.0.0.0
+    # без токена читається будь-ким у тій самій мережі. Для зовнішнього
+    # доступу задайте 0.0.0.0 явно РАЗОМ з api_token.
+    ws_host: str = "127.0.0.1"
+    ws_port: int = 8765
+    rest_enabled: bool = True
+    rest_host: str = "127.0.0.1"
+    rest_port: int = 8081
+    # Спільний токен для WS (?token=... або Authorization: Bearer) і REST
+    # (Authorization: Bearer). Порожній = без автентифікації (тільки локально!)
+    api_token: str = ""
+
+    # --- HARDENING P1-7: опційний TLS для WS/REST телеметрії ---
+    # tls_enabled=False (дефолт) = поточна поведінка (plaintext ws://, http://).
+    # Увімкнення вимагає валідних certfile+keyfile — інакше сервер НЕ стартує
+    # (fail closed, як і auth). Для закритих мереж підходить self-signed.
+    tls_enabled: bool = False
+    tls_certfile: str = ""
+    tls_keyfile: str = ""
+
+    # --- HARDENING P1-9/10: машина операційного стану + детектор зависання ---
+    # expose_operating_state=False (дефолт) = поточний вивід /api/status.
+    # Увімкнено: /api/status додає op_state (IDLE/ACQUIRING/TRACKING/DEGRADED/
+    # LOST) + вік останнього фіксу, а WS отримує періодичний heartbeat — щоб
+    # споживач довіряв чесному сигналу "LOST", а вартовий бачив завислий процес.
+    expose_operating_state: bool = False
+    # Фікс, старіший за це (сек) під час активного трекінгу => LOST (зависання).
+    fix_stale_sec: float = 3.0
+    # Період WS-heartbeat (сек), коли expose_operating_state=True.
+    heartbeat_interval_sec: float = 1.0
+    # Пороги DEGRADED; 0 вимикає перевірку (дефолт: стан лише за часом фіксу).
+    degraded_min_inliers: int = 0
+    degraded_min_confidence: float = 0.0
+    # §4a: якщо трекінг коастить на optical-flow-пропагації без свіжого
+    # keyframe-якоря довше за це (сек) => DEGRADED, навіть коли годинник фіксу
+    # свіжий (пропаговані фікси несуть застарілі inliers). 0 = вимкнено (дефолт).
+    # Задавати з запасом над спостережуваним інтервалом свіжого якоря.
+    propagation_stale_sec: float = 0.0
+
+
+class AppConfig(BaseModel):
+    live_stream: LiveStreamConfig = LiveStreamConfig()
+    network_api: NetworkApiConfig = NetworkApiConfig()
+    object_tracking: ObjectTrackingConfig = ObjectTrackingConfig()
+    global_descriptor: GlobalDescriptorConfig = GlobalDescriptorConfig()
+    database: DatabaseConfig = DatabaseConfig()
+    localization: LocalizationConfig = LocalizationConfig()
+    tracking: TrackingConfig = TrackingConfig()
+    preprocessing: PreprocessingConfig = PreprocessingConfig()
+    gui: GuiConfig = GuiConfig()
+    debug_views: DebugViewsConfig = DebugViewsConfig()
+    models: ModelsConfig = ModelsConfig()
+    projection: ProjectionConfig = ProjectionConfig()
+    homography: HomographyConfig = HomographyConfig()
+    graph_optimization: GraphOptimizationConfig = GraphOptimizationConfig()
+    propagation: PropagationConfig = PropagationConfig()
+
+
+# ================================================================================
+# File: config\config.py
+# ================================================================================
+"""Deprecated: import from ``config`` instead of ``config.config``.
+
+Kept for one release as a backward-compatibility shim. All public names are
+re-exported from the :mod:`config` package.
+"""
+
+import warnings
+
+warnings.warn(
+    "config.config is deprecated; import from `config` instead "
+    "(e.g. `from config import get_cfg`).",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+from config import *  # noqa: F401, F403
+
+
+# ================================================================================
+# File: config\database.py
+# ================================================================================
+"""Database-builder configuration."""
+
+from pydantic import BaseModel
+
+
+class DatabaseConfig(BaseModel):
+    frame_step: int = 30
+    prefetch_queue_size: int = 32
+    keypoint_video_scale: float = 0.5
+    inter_frame_min_matches: int = 15
+    inter_frame_ransac_thresh: float = 3.0
+    keyframe_min_translation_px: float = 15.0
+    keyframe_min_rotation_deg: float = 1.5
+    keyframe_always_save_first: bool = True
+    use_decord: bool = True
+    decode_batch_size: int = 32
+    # A6: Depth-Anything на кожному K-му кадрі збудови (масштаб змінюється
+    # повільно, повний інференс на кожен кадр — марна трата 20-35% часу)
+    depth_every_n: int = 10
+    use_lancedb: bool = True
+    # RESEARCH 2.2: зберігати SIFT-ознаки keyframe-ів (група sift_features у
+    # HDF5) для аварійного фолбека localization.sift_fallback. ~1 МБ/кадр f16.
+    store_sift_features: bool = False
+    sift_max_keypoints: int = 2048
+    lancedb_batch_size: int = 64
+    lancedb_index_min_frames: int = 256
+    yolo_batch_size: int = 1
+
+
+# ================================================================================
+# File: config\graph.py
+# ================================================================================
+"""Graph-optimization and projection configuration."""
+
+from pydantic import BaseModel
+
+
+class ProjectionConfig(BaseModel):
+    # UTM: справжні метри. WEB_MERCATOR розтягує відстані у 1/cos(lat)
+    # (~1.5x на широтах України), через що RMSE/пороги/GSD були неузгоджені
+    # з реальними метрами. Існуючі калібрування зберігають свою проєкцію
+    # з файлу — зміна впливає лише на нові.
+    default_mode: str = "UTM"
+    strict_projection: bool = True
+    fallback_to_webmercator: bool = True
+    anchor_rmse_threshold_m: float = 3.0
+    anchor_max_error_m: float = 5.0
+    propagation_disagreement_threshold_m: float = 2.0
+    localizer_sample_points: int = 9
+    localizer_expected_spread_m: float = 150.0
+
+
+class PropagationConfig(BaseModel):
+    """Параметри графової пропагації калібрування (воркер)."""
+
+    # Скільки слотів можна "перестрибнути" при temporal-ребрах (лог-повідомлення).
+    max_skip_frames: int = 3
+
+    # Ротаційна робастність temporal-ребер (Етап 5). off = ребро просто падає.
+    # При провалі матчу — повтор із поворотом query на кут ланцюга frame_poses,
+    # далі перебір k·90°. Для місій БЕЗ heading-hold (дуги/протилежні ноги).
+    rotation_retry: bool = False
+
+    # ── Мости через розриви temporal-ланцюга (Етап 8, сесія 2026-07-12). ──
+    # off = ПОТОЧНА поведінка (розрив → «острів»/«апендикс», інтерпольований наосліп).
+    # on: матч(last, i) упав або відсіяний гейтом → пробуємо i проти глибших
+    # сусідів (до max_skip_frames). Розрив 21→22 у lasttest robив кадри 1–21
+    # апендиксом без другого якоря → відліт траєкторії на кілометри.
+    skip_bridges: bool = False
+
+    # LightGlue віддав < min_matches → повторний матч mutual-NN (L2, детермінований).
+    # На повторюваній ріллі LightGlue місцями «сліпне» (12–28 матчів) там, де
+    # MNN по тих самих дескрипторах дає 100–800 пар (перевірено офлайн на lasttest).
+    mnn_fallback: bool = False
+
+
+class GraphOptimizationConfig(BaseModel):
+    """Конфігурація графової оптимізації пропагації координат."""
+
+    # Просторові ребра (loop closure detection)
+    loop_closure_top_k: int = 5
+    loop_closure_min_similarity: float = 0.75
+    loop_closure_min_frame_gap: int = 3
+    loop_closure_min_inliers: int = 15
+
+    # Авто min_frame_gap із геометрії місії (Етап 2.1). off = явна константа вище.
+    # gap_min = ceil(overlap_factor · frame_diag_px / median_disp_px) з temporal-ребер.
+    loop_closure_auto_min_gap: bool = False
+    loop_closure_overlap_factor: float = 1.0
+
+    # Дистанційний префільтр кандидатів (Етап 2.2). off = усі пари матчаться.
+    # Якщо прикидка |Δцентрів| (BFS temporal від якорів) > margin×діагональ_кадру_м
+    # → LightGlue не запускається (відсікає аліасинг полів ДО матчингу, пришвидшує).
+    loop_closure_dist_prefilter: bool = False
+    loop_closure_dist_margin: float = 2.0
+
+    # Odometry-consistency (PCM-lite, Етап 2.3). off = лише «сусідський» cluster-гейт.
+    # spatial-ребро, несумісне з temporal-ланцюгом (передбачення центру j через ребро
+    # vs через ланцюг, допуск росте з довжиною), отримує вагу ×factor (не викидання).
+    # Ловить аліасні МІЖ СОБОЮ узгоджені ребра (паралельні ряди), які cluster пропускає.
+    loop_closure_odometry_check: bool = False
+    odometry_consistency_margin: float = 1.5
+    odometry_drift_frac: float = 0.25
+    odometry_inconsistency_factor: float = 0.3
+
+    # Вагові коефіцієнти ребер
+    temporal_edge_base_weight: float = 1.0
+    spatial_edge_base_weight: float = 2.0
+    # (мертвий ключ anchor_weight видалено у Етапі 6 — жорсткі fix_node не мають
+    #  ваги, а м'які якорі Етапу 1.1 несуть власні anchor_base_w/anchor_sigma_floor_m)
+
+    # ── М'які якорі (Етап 1.1). Дефолт off = fix_node (жорсткий, поточна поведінка). ──
+    # Якір стає унарним фактором w_a·(state−anchor), w_a = anchor_base_w/max(σ, floor).
+    # σ береться з rmse_m якоря. GT-якорі симулятора (σ≈0) → floor → практично
+    # жорсткі (сим-бенчмарк не змінюється); реальні якорі (RMSE 5–10 м) стають
+    # м'якими й можуть бути «переголосовані» узгодженим ланцюгом temporal-ребер.
+    soft_anchors: bool = False
+    anchor_base_w: float = 200.0
+    anchor_sigma_floor_m: float = 0.05
+
+    # LOO-валідація якорів (Етап 1.2, read-only): ланцюг сусідніх якорів
+    # передбачає стан якоря; розбіжність > поріг → warning у звіті пропагації.
+    anchor_loo_threshold_m: float = 5.0
+
+    # Levenberg-Marquardt оптимізатор
+    max_iterations: int = 50
+    convergence_tolerance: float = 1e-6
+
+    # ПРИМІТКА: robust loss (soft_l1) прибрано свідомо: spatial-ребра
+    # (loop closures) мають природно великі резидуали, і robust loss
+    # пригнічував саме їх — якорі тримали свої кадри, а решта "пливла".
+    # Чистий L2 дає loop closures повний вплив і стягує граф у форму.
+
+    # BFS ініціалізація початкового наближення
+    use_bfs_initialization: bool = True
+
+    # Діагностика
+    export_geojson: bool = True
+
+    # ── Швидкість (Етап 4). Дефолти = ПОТОЧНА поведінка (2-point FD, BFS). ──
+    # Аналітичний якобіан звірено з FD (‖J_a−J_fd‖<1e-5); вмикати після бенчмарка.
+    use_analytic_jacobian: bool = False
+    warm_start: bool = False  # тепла ініціалізація з попереднього розв'язку замість BFS
+
+    # ── Гейтинг ребер ДО оптимізації (Етап 2). Майстер-прапорець off = ПОТОЧНА ──
+    # поведінка (жодне ребро не відсіюється). Дефолти гейтів м'які.
+    edge_gate_enabled: bool = False
+    edge_gate_max_rotation_deg: float = 40.0  # |dtheta| spatial-ребра
+    edge_gate_max_scale_ratio: float = 1.6  # висота не стрибає вдвічі: |log_ds|≤log(1.6)
+    edge_gate_min_inlier_ratio: float = 0.25
+    edge_gate_mutual_check: bool = True  # взаємність retrieval (j теж бачить i у top-k)
+    edge_gate_cluster_consistency: bool = True  # самотнє loop closure без підтримки → вага ×0.5
+
+    # ── Two-stage prune L2→prune→L2 (Етап 3). Дефолт off. ──
+    two_stage_prune: bool = False
+    prune_mad_k: float = 5.0  # поріг = median + k·1.4826·MAD (у класі spatial)
+    prune_max_spatial_frac: float = 0.2  # не більше 20% spatial за прохід
+
+    # ── GNC-переваження spatial (Етап 3): плавна еволюція prune. Дефолт off. ──
+    # Раунди L2 із Geman-McClure-вагами w'=w·σ²/(σ²+r²), σ=µ·(median+k·MAD) свого
+    # класу, µ від опуклого до 1. Чиста сцена (без викидів > поріг) → no-op.
+    # Взаємно виключно з two_stage_prune (gnc має пріоритет, якщо ввімкнено).
+    gnc_spatial: bool = False
+    gnc_rounds: int = 5
+    gnc_mad_k: float = 3.0
+
+    # ── Кінематичний prior (Етап 7.1). Дефолт 0.0 = вимкнено (поточна поведінка).
+    # Слабкі фактори другої різниці центрів сусідніх вузлів: центр b тягнеться до
+    # α-зваженої (за гепами слотів) лінійної інтерполяції сусідів a, c. Гасить
+    # провисання середин між якорями там, де нема loop closures; вага ефективно
+    # ~1/середній геп — на розривах keyframe selection prior слабшає сам.
+    kinematic_prior_weight: float = 0.0
+
+    # PCHIP-заповнення пропущених кадрів (Етап 4). off = посегментна лінійна.
+    # Shape-preserving 5-DoF інтерполяція над УСІМА валідними кадрами (центр-базова)
+    # прибирає «сходинки» на дугах розворотів для реальних даних.
+    pchip_gap_fill: bool = False
+
+    # Log-scale інтерполяція масштабу (RESEARCH_INTEGRATION_PLAN 1.3). off = ПОТОЧНА
+    # поведінка (лінійна по sx, sy). on = інтерполяція log(sx), log(sy) — геодезично
+    # коректна для масштабу; діє і на PCHIP, і на лінійне заповнення, і на
+    # інтерполяцію між якорями MultiAnchorCalibration.
+    log_scale_interp: bool = False
+
+    # Вага temporal-ребра × якість афінного фіту H (Етап 6.2). off = без корекції.
+    # Кадри з нахилом/рельєфом (великий залишок 5-точкового фіту) → менша довіра:
+    # w *= 1/(1 + k·residual_px).
+    temporal_weight_use_fit_quality: bool = False
+    temporal_fit_quality_k: float = 0.05
+
+    # ── Вага spatial × DINOv2-подібність (Етап 4.3). Дефолт off. w *= 0.5+0.5·sim ──
+    spatial_weight_use_similarity: bool = False
+
+    # ── Санітарний гейт temporal-ребер (Етап 8.1, сесія 2026-07-12). Дефолт off. ──
+    # Ловить дегенеративні трансформації від хибного RANSAC-консенсусу на
+    # повторюваній ріллі (масштаб 0.8, дикий зсув). Межі свідомо м'які —
+    # нормальний рух не чіпають. Відсіяне ребро = розрив → кандидат на skip-міст.
+    temporal_edge_gate: bool = False
+    temporal_gate_max_rotation_deg: float = 30.0
+    temporal_gate_max_scale_ratio: float = 1.4
+    temporal_gate_max_shift_frac: float = 1.2  # × діагональ кадру × gap
+
+    # ── Звірка проміжків між якорями (Етап 8.2, сесія 2026-07-12). Дефолт off. ──
+    # Консистентний аліасинг (усі ребра проміжку брешуть однаково) невидимий
+    # для резидуалів — єдина незалежна опора це якорі. Компонуємо temporal-ланцюг
+    # якір→якір і порівнюємо з дельтою якорів: неузгоджений проміжок глушиться
+    # (вага ×downweight) ДО оптимізації, а ПІСЛЯ неї його кадри, що відхиляються
+    # від прямої якір→якір понад поріг, перезаповнюються штатною інтерполяцією.
+    anchor_gap_check: bool = False
+    anchor_gap_max_dev_m: float = 150.0
+    anchor_gap_downweight: float = 0.05
+
+    # ── ADDENDUM 1.1: просторовий розкид інлаєрів ребра. Дефолт off. ──
+    # Ребро, всі інлаєри якого скупчені в кутку кадру, дає ill-conditioned H:
+    # трансформація екстраполюється на решту кадру, а центр кадру далі
+    # визначає позицію вузла. Ні кількість інлаєрів, ні inlier_ratio, ні
+    # RMSE цього не бачать (локальний кластер — валідний RANSAC-консенсус).
+    # Вага ×1/(1+k·max(0, ref−spread)) — та сама форма, що у fit_quality (6.2).
+    edge_spread_weight: bool = False
+    edge_spread_ref: float = 0.15
+    edge_spread_k: float = 10.0
+    # Жорсткий гейт лише на екстремумі (spatial-ребра, разом з edge_gate_enabled):
+    # 0.0 = вимкнено. 0.03 ≈ «всі точки в ~3% сторони кадру».
+    edge_gate_min_spread: float = 0.0
+
+    # ── Справжня незгода передбачень (аудит 2026-08-01). Дефолт off = ПОТОЧНА ──
+    # історична форма: frame_disagreement = std(tx сусідніх кадрів). tx — це
+    # метрична позиція пікселя (0,0), а не центру, тож величина змішує рух і
+    # ПОВОРОТ сусіда і сягає десятків метрів — вона насичує confidence.stability
+    # (disagreement_norm_m = 5.0) для КОЖНОГО кадру з ≥2 ребрами, тоді як кадр з
+    # одним ребром отримує 0. Тобто гірше зв'язаний кадр виглядає стабільнішим.
+    # on: розкид передбачень ЦЕНТРУ цього кадру кожним інцидентним ребром (м).
+    # УВАГА: після ввімкнення значення падають до <1 м і confidence зростає —
+    # потрібен ре-бенчмарк localization, перш ніж лишати ON.
+    true_disagreement: bool = False
+
+    # ── Наземні метри для метрових порогів (аудит 2026-08-01). Дефолт off. ──
+    # WEB_MERCATOR розтягує відстані в 1/cos(lat) (×~1.5 на широтах України),
+    # тож константи anchor_gap_max_dev_m / anchor_loo_threshold_m зараз означають
+    # ПРОЄКЦІЙНІ метри — на 48° це ~0.67 наземного метра за одиницю. on: поріг
+    # ділиться на cos(lat), тобто константа читається як наземні метри.
+    # Самоузгоджені перевірки (odometry, dist-prefilter, auto min_gap) не
+    # зачіпаються — там обидві сторони порівняння в одних одиницях. UTM → no-op.
+    ground_scale_thresholds: bool = False
+
+    # Вага регуляризатора ізотропії вузла: r = factor·cx·(log_sx − log_sy).
+    # Історично захардкоджено 200.0 — єдиний ваговий коефіцієнт оптимізатора
+    # без ключа. Тримає модель фактично similarity (sx≈sy); зменшення дозволяє
+    # справжню анізотропію, але робить _predict_inverse менш точним.
+    isotropy_weight: float = 200.0
+
+
+# ================================================================================
+# File: config\localization.py
+# ================================================================================
+"""Localization, tracking and homography configuration."""
+
+from pydantic import BaseModel
+
+
+class ConfidenceConfig(BaseModel):
+    inlier_weight: float = 0.7
+    stability_weight: float = 0.3
+    rmse_norm_m: float = 10.0
+    disagreement_norm_m: float = 5.0
+    confidence_max_inliers: int = 80
+
+
+class LocalizationConfig(BaseModel):
+    min_matches: int = 12
+    min_inliers_accept: int = 10
+    # 0.75 = рекомендація Lowe's ratio test; 0.85 пропускало забагато хибних
+    # збігів (конфіг перекривав фікс "БАГ 4" у matcher.py)
+    ratio_threshold: float = 0.75
+    ransac_threshold: float = 3.0
+    retrieval_top_k: int = 12
+    early_stop_inliers: int = 40
+    retrieval_only_min_score: float = 0.90
+    auto_rotation: bool = True
+    # A3: темпоральний prior кута — пробуємо лише останній вдалий кут
+    # (1 DINO-forward замість 4). Якщо retrieval-score prior-кута нижчий за цей
+    # поріг — повний батчований скан 4 кутів.
+    rotation_rescan_min_score: float = 0.70
+    enable_lightglue_fallback: bool = True
+    # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ──
+    # Одноразовий перезапуск матчингу через SIFT, коли ALIKED дав
+    # < min_matches inliers (in-plane rotation / екстремальна похилість).
+    # Вимагає БД, збудованої з database.store_sift_features=True.
+    sift_fallback: bool = False
+    sift_fallback_max_candidates: int = 3
+    fallback_extractor: str = "aliked"
+    confidence: ConfidenceConfig = ConfidenceConfig()
+    use_patchify: bool = False  # Мультимасштабний retrieval через патч-дескриптори DINOv2 (14× DINOv2 forward passes — повільно на слабких GPU)
+    patchify_grids: list[list[int]] = [[1, 1], [2, 2], [3, 3]]  # 1+4+9 = 14 патчів
+    patchify_batch_size: int = (
+        1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
+    )
+    patchify_merge_weight: float = 0.4
+    # ── Scale-invariance (ScaleManager) ──
+    # GSD-ratio pyramid for altitude-invariant localization (r = query_alt / db_alt).
+    # Scanned when no temporal prior exists (bootstrap / out-of-coverage).
+    scale_pyramid: list[float] = [0.5, 0.7, 1.0, 1.4, 2.0]
+    # Minimum retrieval score on the prior-scale level to accept it;
+    # below this → full pyramid rescan (analogous to rotation_rescan_min_score).
+    scale_rescan_min_score: float = 0.65
+    # EMA smoothing factor for the temporal scale prior (higher = faster tracking).
+    scale_prior_ema: float = 0.7
+    # Use DepthAnythingV2 depth_scales (if available in DB) to reorder the pyramid.
+    scale_use_depth_hint: bool = True
+    # How often (in keyframes) to recompute the depth-based scale hint.
+    depth_hint_every_n: int = 30
+
+    # ── ADDENDUM 1.1: просторовий розкид інлаєрів → confidence. Дефолт off. ──
+    # Інлаєрів може бути досить, але всі в одному куті кадру → гомографія
+    # ill-conditioned (OrthoTrack §3.4, «spatial collapse»). Не відкидаємо кадр
+    # (на межі покриття скупчення легітимне), а множимо confidence — далі він
+    # їде в Kalman R (B2), тож слабкий фікс отримує меншу вагу, а не бан.
+    spread_confidence_enabled: bool = False
+    # Розкид, вище якого штрафу нема. 0.15 ≈ половина рівномірного покриття
+    # (σ/L = 1/√12 ≈ 0.289 для точок, розкиданих по всьому кадру).
+    spread_ref: float = 0.15
+    # Нижня межа множника — вироджена хмара не обнуляє confidence.
+    spread_floor: float = 0.35
+
+    # ── ADDENDUM 2.1: каскадний recovery замість повного добутку. Дефолт off. ──
+    # off = ПОТОЧНА поведінка: 4 кути × 5 масштабів = 20 ViT-forward одним батчем.
+    # on: етап 1 — 4 кути на ОДНОМУ масштабі (prior → hint-найближчий → 1.0);
+    # етап 2 (лише якщо скор етапу 1 < rotation_rescan_min_score) — РЕШТА
+    # комбінацій. Найгірший випадок лишається 20, типовий стає 4.
+    recovery_cascade: bool = False
+
+    # ── ADDENDUM §1: MNN-передфільтр кандидатів перед LightGlue. Дефолт off. ──
+    # off = ПОТОЧНА поведінка: LightGlue послідовно по всіх top-K з early-stop.
+    # on: спершу дешевий mutual-NN скоринг дескрипторів КОЖНОГО кандидата
+    # (один матмул на кандидата, ~мс), потім повний LightGlue лише на
+    # prefilter_keep найкращих. Найбільший ефект на слабких GPU, де LightGlue
+    # дорогий, а поганий кадр інакше коштує top_k повних прогонів.
+    candidate_prefilter: bool = False
+    # Скільки найкращих (за MNN-парами) кандидатів іде в повний LightGlue.
+    prefilter_keep: int = 2
+
+    # ── PIPELINE_OPTIMIZATION_PLAN §A3: довга сторона кадру для локального
+    # екстрактора. Раніше жила ЛИШЕ як дефолт у get_cfg(..., 1600) і не була
+    # у pydantic — тобто ключ у user_config.json мовчки ігнорувався
+    # (APP_CONFIG = AppConfig(**data).model_dump() відкидає невідомі ключі).
+    # Менше значення = менше часу ALIKED і менший пік VRAM, ціною дрібних фіч.
+    max_local_edge: int = 1600
+
+    # ── PIPELINE_OPTIMIZATION_PLAN §A1: темпоральний prior кандидатів ────────
+    # off = ПОТОЧНА поведінка: кожен keyframe рахує глобальний дескриптор
+    # (на GTX 1650 це 470 мс із 945, тобто половина keyframe-а).
+    # on = у steady state кандидати беруться з околу останнього збігу, а
+    # DINOv3 не запускається взагалі; хибна гіпотеза відсіюється дешевим MNN.
+    temporal_candidate_prior: bool = False
+    # Півширина вікна сусідів за індексом кадру БД: id-w … id+w.
+    temporal_prior_window: int = 2
+    # Скільки найкращих за MNN сусідів іде в повний LightGlue.
+    temporal_prior_keep: int = 1
+    # Мінімум MNN-пар, щоб гіпотеза взагалі дійшла до LightGlue. Це і є
+    # «дешева проба»: одиниці мс на кандидата замість ~128 мс LightGlue, тому
+    # промах не ламає бюджет worst case.
+    temporal_prior_min_mnn: int = 20
+    # Скільки інлаєрів потрібно, щоб ПРИЙНЯТИ результат темпорального шляху.
+    # Суворіше за min_matches навмисно: помилка тут тиха і самопідтверджувана.
+    temporal_prior_accept_inliers: int = 25
+    # Кожен N-й keyframe примусово йде повним шляхом — аудит проти дрейфу.
+    # 0 = аудит вимкнено (не рекомендується).
+    temporal_prior_audit_every: int = 10
+
+
+class TrackingConfig(BaseModel):
+    kalman_process_noise: float = 2.0
+    kalman_measurement_noise: float = 5.0
+    outlier_window: int = 10
+    # ── Пороги аутлаєр-детектора. ЧИТАЙ ПЕРЕД ЗМІНОЮ ────────────────────────
+    # Виміряно на місії newzap (2026-07-31, 35 keyframe-локалізацій із 2048
+    # інлаєрами, широта 47.83°, ground_scale_correction=ON):
+    #     крейсерська швидкість  47.0 м/с (169 км/год), медіана 49.6
+    #     МАКСИМУМ платформи     83.0 м/с (299 км/год)
+    #
+    # РЕКОМЕНДОВАНІ значення:
+    #     max_speed_mps         = 180.0  (2.17x над виміряним максимумом)
+    #     outlier_threshold_std = 8.0
+    #
+    # Чому threshold_std саме 8, а не класичні 4: вікно детектора змішує
+    # keyframe-позиції (dt≈1.0 с) з OF-позиціями (dt=0.1 с) і містить
+    # майже-дублі (заміряно: keyframe і OF-семпл за 14 см один від одного).
+    # Через це mean_speed у вікні читається ~26 м/с при реальних 47 —
+    # база занижена в 1.8x, а z завищений приблизно в 1.6x. 4.0 * 1.64 ≈ 6.6,
+    # округлено до 8.0. Полагодиш вікно — повертай 4.0.
+    #
+    # ЗАСТЕРЕЖЕННЯ щодо значень ВИЩЕ рекомендованих (зараз у user_config.json
+    # стоїть 100.0 / 6000.0): це не тюнінг, а вимкнення гейта. 6000 м/с =
+    # 21600 км/год ≈ 17 Махів, тобто 72x над фізичною межею платформи. Такі
+    # пороги підігнані під конкретні відео так, щоб у лозі не було WARNING.
+    # Наслідок: OF-вимірювання зі зривом LK (flow_quality 0.017-0.035) ідуть
+    # прямо в GPS-вихід, і про це вже НЕ буде жодного сигналу в лозі.
+    # Якщо гейт треба вимкнути — чесніше зробити це через of_outlier_gate=False.
+    #
+    # Звідки 6000: місія top (FlightSimulator/flight.mp4, 571 кадр, 77 анкерів)
+    # дала максимум 5301 м/с, медіану speed-спрацювань 585 м/с і 38 спрацювань
+    # на ~50 keyframe-ів. Це НЕ поодинокі викиди — на цьому матеріалі LK не
+    # тримає лок майже ніколи. Перш ніж піднімати поріг ще вище, варто
+    # перевірити OF, а не гейт.
+    #
+    # Історія: 150.0 і 1000.0 фактично вимикали обидві гілки фільтра.
+    outlier_threshold_std: float = 4.0
+    max_speed_mps: float = 120.0
+    max_consecutive_outliers: int = 3
+    process_fps: float = 1.0
+    keyframe_interval: int = 30
+
+    # ── RESEARCH 3.1: ковзний віконний back-end smoother (дефолт: вимкнено) ──
+    # Вікно keyframe-фіксів + OF-одометрії, Huber-IRLS вага замість бінарного
+    # Z-score-відкидання; корекція KF зсувом (TrajectoryFilter.shift).
+    smoother_enabled: bool = False
+    smoother_window: int = 60
+    smoother_huber_k: float = 1.2
+    smoother_fix_sigma_base_m: float = 5.0
+    smoother_odom_sigma_base_m: float = 3.0
+    # Кламп оцінки дрейфу ПЕРЕД gain і max_step_m. Оскільки далі йде
+    # step = corr * gain, обмежений max_step_m, для будь-якого drift >= 12 м
+    # (12 * 0.25 = 3.0 = max_step_m) фактичний крок однаковий незалежно від
+    # цього ліміту — змінюється лише те, чи буде WARNING у лозі. Тобто
+    # підняття цього значення (user_config: 800.0) НЕ впливає на траєкторію,
+    # на відміну від max_speed_mps / outlier_threshold_std вище.
+    smoother_max_correction_m: float = 50.0
+    smoother_entry_prior_sigma_m: float = 15.0
+    smoother_irls_iterations: int = 4
+    # Fixed-lag servo (v2 після живого прогону): корекція по вузлу з лагом,
+    # deadband проти смикання на шумі, гейн + ліміт кроку проти телепортів.
+    smoother_correction_lag: int = 10
+    smoother_deadband_m: float = 2.0
+    smoother_gain: float = 0.25
+    smoother_max_step_m: float = 3.0
+
+    # ── ADDENDUM 1.2: forward-backward перевірка optical flow. Дефолт off. ──
+    # Зараз LK фільтрується лише за status==1; треки, що «сповзли», доживають
+    # до estimateAffinePartial2D. RANSAC там їх відкидає, тож на трансформацію
+    # вплив малий — але вони роздувають знаменник inlier_ratio і ЗАНИЖУЮТЬ
+    # flow_quality, який іде в Kalman R. Це фікс чесності метрики.
+    of_fb_check: bool = False
+    of_fb_max_px: float = 2.0
+
+    # ── Аудит §1.2: гейт аутлаєрів на OF-шляху. Дефолт off = стара поведінка. ──
+    # localize_optical_flow кликав outlier_detector.add_position, але НІКОЛИ
+    # is_outlier — на відміну від keyframe-шляху. При keyframe_interval=30 це
+    # означає, що 29 із 30 виданих позицій не проходили жодної перевірки.
+    # Вмикати варто РАЗОМ із поверненням outlier_threshold_std і max_speed_mps
+    # до фізичних значень — інакше гейт формально є, а фактично не спрацьовує.
+    of_outlier_gate: bool = False
+
+    # ── Локальна швидкість на OF-шляху (діагностика 2026-07-31) ──────────────
+    # LK трекає завжди ВІД KEYFRAME (tracking_worker.py:486 — prev_gray навмисно
+    # не оновлюється, щоб не накопичувати drift), тож зсув росте лінійно з часом
+    # від keyframe. А dt для OF рахується від останньої УСПІШНОЇ локалізації
+    # (tracking_worker.py:243) і дорівнює одному кроку OF. Бази різні, тому
+    # швидкість у гейті завищена рівно в N разів, де N — номер OF-кадру після
+    # keyframe. Через це доводилось піднімати max_speed_mps до абсурдних значень.
+    #
+    # True = миттєва швидкість рахується від ПОПЕРЕДНЬОЇ сирої OF-позиції
+    # (локально, кадр відносно кадру). Тоді max_speed_mps знову означає
+    # фізичну швидкість платформи і його можна повернути до ~2x над реальним
+    # максимумом місії. False = стара поведінка побітово.
+    of_local_speed: bool = False
+
+    # ── Z-score гілка аутлаєр-детектора ──────────────────────────────────────
+    # True = стара поведінка. False лишає ЛИШЕ фізичний max_speed_mps.
+    # Замір на місії top 2026-07-31 (of_stride=1, of_local_speed=ON, 70
+    # спрацювань): z-гілка дала 47 із них і 100% спрацювань на правильних
+    # вимірах, при цьому НЕ спіймала жодного справжнього зриву — усі 22
+    # викиди >12 м зловив max_speed. Гілки не перетинаються, тож z-score тут
+    # додає лише шум. Вимикати варто разом з of_local_speed=True: без нього
+    # швидкості накопичуються і фізичний гейт сам стає ненадійним.
+    outlier_zscore_enabled: bool = True
+
+    # ── Обхід кінематичного гейта за силою НЕЗАЛЕЖНИХ доказів ────────────────
+    # Спостереження з живого прогону: гейт відкидав keyframe-фікси з 1191–1881
+    # інлаєрами, а на OF-шляху — фікси з flow_quality 0.89–1.0. І те, й інше —
+    # незалежне від кінематики свідчення, що вимірювання добре: інлаєри дає
+    # RANSAC по геометрії, flow_quality — узгодженість самого потоку. Кінематика
+    # ж спирається на ПРИПУЩЕННЯ про рух платформи, яке на нетиповому матеріалі
+    # (відео з онлайн-карти, різкий монтаж, скрол) просто не виконується.
+    #
+    # Коли докази сильні — довіряємо вимірюванню, а не пріору. Слабкі докази
+    # (flow_quality 0.02 = зрив LK на хмарі чи воді) гейт відкидає, як і раніше.
+    # Дефолт False = поведінка без обходу.
+    outlier_trust_strong_evidence: bool = False
+    # Керуємось порогами, що вже мають сенс у системі: confidence насичується
+    # на confidence_max_inliers (80), early_stop_inliers = 40. 100 — свідомо
+    # вище обох, тобто «геометрію перевірено з великим запасом».
+    outlier_trust_min_inliers: int = 100
+    # 0.5 чисто розділяє два спостережені режими: справжній зрив LK давав
+    # 0.017–0.035, реальний швидкий рух — 0.625–1.0.
+    outlier_trust_min_flow_quality: float = 0.5
+
+    # ── PIPELINE_OPTIMIZATION_PLAN §B1: рахувати OF не на кожному кадрі ──────
+    # OF-кадри НЕЗАЛЕЖНІ один від одного: кожен трекається від keyframe-а
+    # (tracking_worker навмисно не оновлює prev_gray/prev_pts на OF-кадрах),
+    # тож пропуск не накопичує помилку — падає лише частота видачі позиції.
+    # 1 = ПОТОЧНА поведінка (кожен кадр). 3 → 30 Гц стає 10 Гц.
+    of_stride: int = 1
+    # §B2: рахувати LK на половинній роздільності (≈4× дешевше, грубіший зсув).
+    of_half_res: bool = False
+
+    # ── Етап 6: корекція проєкційних метрів у справжні наземні ───────────────
+    # WebMercator (EPSG:3857) розтягує відстані у 1/cos(lat) — ×1.49 на 47.8°.
+    # Без корекції max_speed_mps і всі метрові пороги гейтять на cos(lat) від
+    # заявленого значення, і залежать від широти місії. Заміряно на живому
+    # прогоні 2026-07-31: 28 із 71 speed-відсіювань (39%) мали справжню
+    # швидкість нижче 120 м/с — тобто були хибними суто через одиниці.
+    # False = стара поведінка побітово (множник 1.0).
+    ground_scale_correction: bool = False
+
+
+class HomographyConfig(BaseModel):
+    backend: str = "opencv"  # "poselib" | "opencv"
+    ransac_threshold: float = 3.0
+    max_iters: int = 2000
+    confidence: float = 0.99
+    use_mad_ransac: bool = True  # Адаптивне уточнення порогу через MAD
+    mad_k_factor: float = 2.5
+
+
+# ================================================================================
+# File: config\models.py
+# ================================================================================
+"""Model configuration: DINOv2/v3, YOLO, local extractors, VRAM, performance."""
+
+from pydantic import BaseModel, Field
+
+
+class Dinov2ModelConfig(BaseModel):
+    """DINOv2 ViT-L/14 — ImageNet pretrained, завантажується через torch.hub"""
+    descriptor_dim: int = 1024
+    input_size: int = 336
+    normalize_mean: list[float] = [0.485, 0.456, 0.406]
+    normalize_std: list[float] = [0.229, 0.224, 0.225]
+    hub_repo: str = "facebookresearch/dinov2"
+    hub_model: str = "dinov2_vitl14"
+    vram_required_mb: float = 1600.0
+
+
+class Dinov3ModelConfig(BaseModel):
+    """DINOv3 ViT-L/16 — pretrained на 493M супутникових знімків, HuggingFace"""
+    descriptor_dim: int = 1024
+    input_size: int = 224
+    normalize_mean: list[float] = [0.430, 0.411, 0.296]
+    normalize_std: list[float] = [0.213, 0.156, 0.143]
+    hf_model_id: str = "facebook/dinov3-vitl16-pretrain-sat493m"
+    # БЕЗПЕКА: модель вантажиться з trust_remote_code=True. Зафіксуйте commit
+    # hash репозиторію HF, щоб підміна upstream-коду не стала виконанням
+    # чужого коду на вашій машині. Порожньо = latest (з warning у лог).
+    hf_revision: str = ""
+    vram_required_mb: float = 1600.0
+
+
+class GlobalDescriptorConfig(BaseModel):
+    """Вибір глобального дескриптора: 'dinov2' або 'dinov3'"""
+    backend: str = "dinov3"  # "dinov2" | "dinov3"
+    dinov2: Dinov2ModelConfig = Dinov2ModelConfig()
+    dinov3: Dinov3ModelConfig = Dinov3ModelConfig()
+
+    def active(self) -> Dinov2ModelConfig | Dinov3ModelConfig:
+        """Повертає конфіг активної моделі."""
+        return self.dinov2 if self.backend == "dinov2" else self.dinov3
+
+
+class YoloConfig(BaseModel):
+    model_path: str = "models/yolo11n-seg.pt"
+    vram_required_mb: float = 200.0
+    description: str = "YOLOv11n-seg (Nano) for dynamic object masking"
+
+
+class ModelSettings(BaseModel):
+    hub_repo: str | None = ""
+    hub_model: str | None = ""
+    top_k: int = 2048
+    vram_required_mb: float = 500.0
+    model_path: str | None = ""
+    backend: str = "git"  # "git" | "torchscript" | "tensorrt"
+    auto_convert: bool = True
+    dtype: str = "float16"  # "float16" | "float32"
+    max_keypoints: int = 4096
+    nms_radius: int = 4
+    depth_confidence: float = -1.0
+    width_confidence: float = -1.0
+    detection_threshold: float = 0.001
+
+
+class CespConfig(BaseModel):
+    enabled: bool = False
+    weights_path: str | None = None
+    scales: list[int] = [1, 2, 4]
+
+
+class VladConfig(BaseModel):
+    """RESEARCH 2.1 (AnyLoc): ненавчена VLAD-агрегація патч-токенів DINOv3.
+
+    enabled=True вимагає vocab_path — словник, збудований
+    scripts/build_vlad_vocab.py на референсних кадрах ТОГО САМОГО домену.
+    База даних має бути перебудована з тим самим словником (розмірність
+    глобального дескриптора змінюється: 1024 → pca_dim).
+    """
+    enabled: bool = False
+    vocab_path: str | None = None
+    n_clusters: int = 32
+    pca_dim: int = 512
+    # Проміжний шар ViT для патч-токенів (None = останній, з фінальним
+    # LayerNorm). AnyLoc показує кращі результати з проміжних шарів —
+    # підбирати валідацією, значення залежить від бекбона.
+    layer: int | None = None
+    # Dustbin-сурогат (SALAD): відкинути цю частку патчів з найнижчою
+    # L2-нормою токена перед агрегацією (0.0 = вимкнено, 0.1 = 10%).
+    low_norm_fraction: float = 0.0
+
+
+class VramManagementConfig(BaseModel):
+    max_vram_ratio: float = 0.8
+    default_required_mb: float = 2000.0
+
+
+class ModelsCacheConfig(BaseModel):
+    engine_cache_dir: str = "models/engines/"
+    auto_compile: bool = False
+
+
+class PerformanceConfig(BaseModel):
+    auto_tune: bool = True  # Auto-detect hardware and tune batch sizes, threads, VRAM limits
+    auto_tune_vram_headroom: float = 0.0  # Extra VRAM (MB) to reserve beyond tier default (0 = auto)
+    propagation_max_workers: int = 4
+    fp16_enabled: bool = True
+    # ADDENDUM §3 (слабкі GPU): максимальний батч ViT-форварда в
+    # extract_global_descriptors_multi (recovery: до 20 кадрів разом).
+    # 0 = без ліміту (ПОТОЧНА поведінка). На 4 GB VRAM безпечно 4-6.
+    # Впливає лише на пік памʼяті; дескриптори побітово ті самі.
+    global_batch_max: int = 0
+
+    # ── Аудит §2.1 (повна форма): зменшувати кадр до входу DINO на CPU ───────
+    # Зараз кадр цілком їде на GPU, щоб там же зменшитись до (S, S) — для
+    # DINOv3 це 224. На 1080p це ~6.2 МБ uint8 замість ~0.15 МБ, тобто ~40×
+    # зайвого PCIe-трафіку на КОЖЕН форвард; при скані 4 кутів × 5 масштабів
+    # різниця набігає в сотні мегабайт на keyframe.
+    #
+    # УВАГА: cv2.INTER_AREA і torchvision Resize(antialias) — РІЗНІ фільтри,
+    # тож значення дескрипторів зміщуються. Тому ключ входить у
+    # SCHEMA_FIELDS (src/database/schema_fingerprint.py): база, збудована з
+    # іншим значенням, детектується як несумісна замість тихого псування
+    # матчів. З цієї ж причини його НЕМАЄ в hardware_profile.TUNABLE_KEYS —
+    # auto_tune не має права робити бази машинозалежними.
+    #
+    # Дефолт False = ПОТОЧНА поведінка (resize на GPU).
+    dino_cpu_resize: bool = False
+
+    torch_compile: bool = False
+    use_tensorrt_for_yolo: bool = False  # portable across GPUs; TRT engines are hardware-specific
+    log_level: str = "INFO"
+    debug_mode: bool = True
+    # HARDENING P0-5: коли True — сирі lat/lon та координати якорів у логах
+    # округлюються/маскуються (щоб захоплений app.log не видавав маршрут місії).
+    # Дефолт False = ПОТОЧНА поведінка (повна точність). Вмикається у
+    # user_config.json для польових збірок.
+    redact_coords_in_logs: bool = False
+
+    # HARDENING P1-8 (safe slice): детермінований режим для обмеження
+    # найгіршої латентності. True вимикає cudnn.benchmark (прибирає змінну
+    # вартість першого виклику та недетермінований вибір ядер). Дефолт
+    # False = ПОТОЧНА поведінка (benchmark=True, кращий throughput).
+    deterministic: bool = False
+    # Логувати перцентилі per-frame латентності (p50/p95/p99/max) кожні
+    # latency_log_interval кадрів. Дефолт off = поточна поведінка.
+    log_latency_stats: bool = False
+    latency_log_interval: int = 100
+
+    # HARDENING P2-12: перевірка цілісності ваг на старті проти закріпленого
+    # SHA-256 маніфесту (models/weights_manifest.json). "off" (дефолт) =
+    # поточна поведінка; "warn" = логувати розбіжності; "enforce" = аварійно
+    # завершити старт, якщо файл ваг відсутній/змінений (захист від підміни).
+    weight_integrity_mode: str = "off"
+
+
+# Canonical local feature extractor — FIXED and hardware-independent.
+# The extractor defines the CONTENT of the local-feature database: ALIKED and
+# RDD descriptors are NOT cross-matchable, so if this varied with hardware,
+# databases built on different machines would stop being interchangeable.
+# Override in user_config.json (models.local_extractor) ONLY if every database
+# is rebuilt with the same value.
+CANONICAL_LOCAL_EXTRACTOR = "aliked"
+
+
+def get_default_local_extractor() -> str:
+    """Return the fixed default local extractor (hardware-INDEPENDENT).
+
+    Historically this probed VRAM and returned "aliked" on <8 GB GPUs and "rdd"
+    otherwise — which made the database schema/content depend on the machine.
+    Removed on purpose: the choice is now a constant so every machine builds an
+    interchangeable database. See ``CANONICAL_LOCAL_EXTRACTOR``.
+    """
+    return CANONICAL_LOCAL_EXTRACTOR
+
+
+class ModelsConfig(BaseModel):
+    # Явний режим пристрою — керується конфігом, не кодом:
+    #   "auto" — CUDA якщо доступна, інакше CPU-фолбек (локалізація повільна);
+    #   "cuda" — форс GPU, чітка помилка на старті якщо CUDA недоступна;
+    #   "cpu"  — форс CPU (повний робочий фолбек лише для локалізації;
+    #            збудову/модифікацію БД усе одно робити на GPU-машині).
+    device: str = "auto"  # "auto" | "cuda" | "cpu"
+    # Legacy-аліас: use_cuda:false = device:"cpu". Лишений для сумісності зі
+    # старими user_config.json; нове — через models.device.
+    use_cuda: bool = True
+    local_extractor: str = Field(default_factory=get_default_local_extractor)  # "aliked" | "rdd" | "xfeat"
+    yolo: YoloConfig = YoloConfig()
+    xfeat: ModelSettings = ModelSettings(
+        hub_repo="verlab/accelerated_features",
+        hub_model="XFeat",
+        top_k=2048,
+        vram_required_mb=300.0,
+    )
+    aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
+    rdd: ModelSettings = ModelSettings(
+        vram_required_mb=500.0,
+        model_path="models/RDD-v2.pth",
+        max_keypoints=4096,
+    )
+    superpoint: ModelSettings = ModelSettings(
+        nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
+    )
+    lightglue: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        # git backend: official weights download into TORCH_HOME (models/.cache)
+        model_path="",
+        auto_convert=False,
+    )
+    lightglue_superpoint: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        # git backend: official weights download into TORCH_HOME (models/.cache)
+        model_path="",
+        auto_convert=False,
+    )
+    lightglue_rdd: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        model_path="models/RDD_lg-v2.pth",
+        auto_convert=False,
+    )
+    lightglue_sift: ModelSettings = ModelSettings(
+        vram_required_mb=800.0,
+        backend="git",
+        auto_convert=False,
+    )
+    cesp: CespConfig = CespConfig()
+    vlad: VladConfig = VladConfig()
+    vram_management: VramManagementConfig = VramManagementConfig()
+    performance: PerformanceConfig = PerformanceConfig()
+    engines_cache: ModelsCacheConfig = ModelsCacheConfig()
+
+
+# ================================================================================
+# File: config\paths.py
+# ================================================================================
+"""Filesystem locations for writable application data (logs, user config).
+
+In a frozen build the executable typically lives under Program Files, which is
+read-only for standard users — so writing logs/config relative to the current
+working directory fails (PermissionError) and can crash startup. When frozen we
+redirect writable data to %LOCALAPPDATA%\\DroneLocalization (always writable).
+
+**Dev — anchored to the repo, NOT to the cwd (2026-07-21).** Раніше тут був
+``Path.cwd()``, і це означало, що ``user_config.json`` читався лише тоді, коли
+застосунок запускали САМЕ з кореня репозиторію. Запуск з іншої теки (IDE з
+власним working directory, ярлик, ``python D:\\...\\main.py`` з іншого місця)
+мовчки давав вбудовані дефолти замість налаштувань користувача — а це 30+
+розбіжностей, серед них вимкнений smoother, edge-гейти й torch_compile.
+``models_root()`` нижче вже був cwd-незалежним; тепер обидва однакові.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+APP_DIR_NAME = "DroneLocalization"
+USER_CONFIG_NAME = "user_config.json"
+
+
+def repo_root() -> Path:
+    """Корінь репозиторію — прив'язка до цього файлу, не до cwd."""
+    return Path(__file__).resolve().parents[1]
+
+
+def user_data_dir() -> Path:
+    """Base directory for writable files. Creates it (only) when frozen."""
+    if getattr(sys, "frozen", False):
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        root = Path(base) if base else Path.home()
+        target = root / APP_DIR_NAME
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            target = Path.home() / APP_DIR_NAME
+            target.mkdir(parents=True, exist_ok=True)
+        return target
+    return repo_root()
+
+
+def user_config_candidates() -> list[Path]:
+    """Шляхи пошуку ``user_config.json`` у порядку пріоритету; перший наявний виграє.
+
+    Dev: корінь репозиторію, плюс cwd — щоб не зламати сценарій, де користувач
+    свідомо тримає окремий конфіг у робочій теці (якщо cwd і є коренем — один
+    шлях, без дублювання).
+
+    Frozen: %LOCALAPPDATA% (туди ж пишемо) має пріоритет як користувацький
+    override; далі — конфіг поруч із .exe. Другий шлях потрібен тому, що
+    ``DroneLocalization.spec`` НЕ пакує ``user_config.json`` у білд: без нього
+    свіжовстановлений застосунок стартував би на дефолтах, мовчки ігноруючи
+    налаштування, з якими його збирали.
+    """
+    primary = user_data_dir() / USER_CONFIG_NAME
+    if getattr(sys, "frozen", False):
+        beside_exe = Path(sys.executable).resolve().parent / USER_CONFIG_NAME
+        return [primary] if beside_exe == primary else [primary, beside_exe]
+    cwd_cfg = Path.cwd().resolve() / USER_CONFIG_NAME
+    return [primary] if cwd_cfg == primary else [primary, cwd_cfg]
+
+
+def models_root() -> Path:
+    """Single storage root for model weights and hub caches.
+
+    Dev: <repo>/models, anchored to this file (not the cwd), so scripts
+    find weights from any working directory. Frozen: <_MEIPASS>/models.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / "models"
+    return repo_root() / "models"
+
+
+def ensure_model_cache_env() -> None:
+    """Redirect torch.hub / HuggingFace caches into models/.cache (dev only).
+
+    Keeps hub-downloaded models (DINOv2/v3, LightGlue, ALIKED, SuperPoint)
+    inside the project instead of the user profile. setdefault: an explicit
+    user override always wins; in frozen builds the runtime hook already
+    points these at the bundled cache, so we do nothing.
+    """
+    if getattr(sys, "frozen", False):
+        return
+    cache = models_root() / ".cache"
+    os.environ.setdefault("TORCH_HOME", str(cache / "torch"))
+    os.environ.setdefault("HF_HOME", str(cache / "huggingface"))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(cache / "huggingface" / "hub"))
+
+
+# ================================================================================
+# File: src\__init__.py
 # ================================================================================
 """Drone Topometric Localization System"""
 
@@ -10,7 +1309,13 @@ __author__ = "Drone Localization Team"
 
 
 # ================================================================================
-# File: calibration\multi_anchor_calibration.py
+# File: src\calibration\__init__.py
+# ================================================================================
+"""Calibration module"""
+
+
+# ================================================================================
+# File: src\calibration\multi_anchor_calibration.py
 # ================================================================================
 try:
     import orjson as _json_lib
@@ -24,25 +1329,19 @@ from datetime import datetime
 from typing import Any
 
 import numpy as np
-from scipy.interpolate import PchipInterpolator
 
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
+from src.security.at_rest import decrypt_bytes, get_passphrase, is_encrypted
+from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
-# Єдине джерело — src.geometry.affine_utils (усунення дублювання)
-from src.geometry.affine_utils import (
-    compose_affine as _compose_affine,
-)
-from src.geometry.affine_utils import (
-    decompose_affine as _decompose_affine,
-)
-from src.geometry.affine_utils import (
-    unwrap_angles as _unwrap_angles,
-)
+# Єдине джерело центр-базової 5-DoF PCHIP-форми — src.geometry.affine_utils
+from src.geometry.affine_utils import build_5dof_pchip as _build_5dof_pchip
+from src.geometry.affine_utils import sample_5dof_pchip as _sample_5dof_pchip
 
 
 class AnchorCalibration:
@@ -131,101 +1430,106 @@ class AnchorCalibration:
 class MultiAnchorCalibration:
     """Менеджер декількох якорів калібрування з підтримкою версіонування та проєкцій"""
 
-    VERSION: str = "2.2"
+    VERSION: str = "2.3"
 
-    def __init__(self, converter: CoordinateConverter | None = None) -> None:
+    def __init__(
+        self,
+        converter: CoordinateConverter | None = None,
+        log_scale_interp: bool | None = None,
+    ) -> None:
         self.anchors: list[AnchorCalibration] = []
         self.converter = converter or CoordinateConverter("WEB_MERCATOR")
-        self._interp: PchipInterpolator | None = None  # кешований інтерполятор
+        # Log-scale інтерполяція масштабу між якорями (RESEARCH 1.3). None →
+        # читаємо graph_optimization.log_scale_interp з APP_CONFIG (дефолт off).
+        if log_scale_interp is None:
+            try:
+                from config import APP_CONFIG, get_cfg
+
+                log_scale_interp = bool(
+                    get_cfg(APP_CONFIG, "graph_optimization.log_scale_interp", False)
+                )
+            except Exception:
+                log_scale_interp = False
+        self._log_scale_interp = bool(log_scale_interp)
+        self._interp: Any = None  # кешований PCHIP-інтерполятор (build_5dof_pchip)
+        self._interp_sign: float = -1.0  # знак det якірних матриць (Y-flip)
+        self._interp_range: tuple[float, float] | None = None  # [перший, останній] якір
+        self._ref_px: tuple[float, float] = (0.0, 0.0)  # опорний піксель декомпозиції
+        self._frame_size: tuple[int, int] | None = None  # (width, height) кадру
+
+    def set_frame_size(self, width: int, height: int) -> None:
+        """Розмір кадру: інтерполяція параметризується навколо центру кадру."""
+        new_size = (int(width), int(height))
+        if new_size != self._frame_size and new_size[0] > 0 and new_size[1] > 0:
+            self._frame_size = new_size
+            self._rebuild_interpolators()
+
+    def _reference_pixel(self) -> tuple[float, float]:
+        """Опорний піксель для декомпозиції (центр кадру або центроїд точок)."""
+        if self._frame_size:
+            return self._frame_size[0] / 2.0, self._frame_size[1] / 2.0
+        # Fallback: центроїд точок усіх якорів — стабільна точка всередині кадру
+        pts = [p for a in self.anchors for p in (a.points_2d or [])]
+        if pts:
+            arr = np.asarray(pts, dtype=np.float64)
+            return float(arr[:, 0].mean()), float(arr[:, 1].mean())
+        return 0.0, 0.0
 
     def _rebuild_interpolators(self) -> None:
         """
-        Перебудовує PCHIP-інтерполятори на основі ДЕКОМПОЗИЦІЇ афінних матриць.
+        Перебудовує PCHIP-інтерполятор на основі 5-DoF декомпозиції якірних матриць.
 
-        Замість поелементної інтерполяції raw-компонентів матриці (що порушує
-        жорсткість обертання і призводить до артефактів зсуву/shear), кожна
-        матриця розкладається на: (tx, ty, scale, angle).  Кути розгортаються
-        через np.unwrap для уникнення стрибків через ±π.  Для кожного з 4
-        скалярних каналів будується окремий PchipInterpolator.  При запиті
-        (_get_interpolated_matrix) компоненти відновлюються назад у валідну
-        афінну матрицю через _compose_affine.
+        ВИПРАВЛЕНО (критичний баг): попередня 4-DoF декомпозиція (tx, ty, scale,
+        angle) не кодувала віддзеркалення осі Y, а якірні матриці pixel→metric
+        ЗАВЖДИ мають det < 0 (піксельна вісь Y ↓, метрична ↑). Реконструйована
+        матриця виходила з det > 0 — Y-складова дзеркалилась, і позиції між
+        якорями їхали на десятки метрів, тоді як точно на якорі результат був
+        правильним → різкі стрибки біля якорів.
+
+        Тепер: інтерполюються (rx, ry, sx, sy, angle), де (rx, ry) — метрична
+        позиція ОПОРНОГО ПІКСЕЛЯ (центр кадру), а глобальний знак det
+        зберігається окремо і відновлюється при композиції. Параметризація
+        навколо центру кадру (а не пікселя (0,0)) прибирає "гойдання" центру
+        при зміні кута між якорями.
         """
+        self._interp = None
+        self._interp_range = None
         if len(self.anchors) < 2:
-            self._interp = None
             logger.debug(f"Interpolator not built: need ≥2 anchors, have {len(self.anchors)}")
             return
 
-        ids = np.array([a.frame_id for a in self.anchors], dtype=np.float64)
-        decomposed = np.array(
-            [_decompose_affine(a.affine_matrix) for a in self.anchors],
-            dtype=np.float64,
-        )  # shape (N, 4): tx, ty, scale, angle
-
-        # ── НОВИЙ БЛОК: GPS scale normalization (Phase 1.1) ──────────────────
-        # Для кожної пари сусідніх якорів: обчислюємо реальну GPS відстань
-        # і порівнюємо з пікселевою відстанню через affine.
-        if len(self.anchors) >= 2:
-            scale_corrections = []
-            for i in range(len(self.anchors) - 1):
-                a1, a2 = self.anchors[i], self.anchors[i + 1]
-
-                # GPS точки якорів
-                pts_gps_1 = a1.points_gps
-                pts_gps_2 = a2.points_gps
-
-                if pts_gps_1 and pts_gps_2:
-                    # Реальна метрична відстань між центрами якорів через GPS
-                    m1 = self.converter.gps_to_metric(pts_gps_1[0][0], pts_gps_1[0][1])
-                    m2 = self.converter.gps_to_metric(pts_gps_2[0][0], pts_gps_2[0][1])
-                    gps_dist = np.linalg.norm(np.array(m1) - np.array(m2))
-
-                    if gps_dist > 0.5:  # мін. 0.5м між якорями для стабільного розрахунку
-                        scale_ratio = decomposed[i + 1, 2] / (decomposed[i, 2] + 1e-9)
-                        scale_corrections.append(scale_ratio)
-                        logger.debug(
-                            f"Anchor pair ({a1.frame_id}, {a2.frame_id}): "
-                            f"gps_dist={gps_dist:.1f}m, scale_ratio={scale_ratio:.4f}"
-                        )
-        # ── Кінець блоку аналізу масштабу ─────────────────────────────────────
-
-        # Розгортаємо кути для коректної інтерполяції через межу ±π
-        decomposed[:, 3] = _unwrap_angles(decomposed[:, 3])
-
-        # ── Phase 1.2: Anchor confidence weighting ────────────────────────────
-        # Обчислюємо ваги якорів на основі QA метрик
-        weights = np.array([
-            a.inliers_count / (a.rmse_m + 1e-6)
-            for a in self.anchors
-        ], dtype=np.float64)
-
-        # Нормалізуємо ваги
-        weights = weights / (weights.max() + 1e-9)
-
-        # Логування для діагностики
-        for i, (a, w) in enumerate(zip(self.anchors, weights)):
-            logger.debug(
-                f"Anchor {a.frame_id}: rmse={a.rmse_m:.3f}m, "
-                f"inliers={a.inliers_count}, weight={w:.3f}, "
-                f"quality_flag={a.quality_flag}"
+        dets = np.array(
+            [np.linalg.det(a.affine_matrix[:2, :2]) for a in self.anchors], dtype=np.float64
+        )
+        n_neg = int(np.sum(dets < 0))
+        if 0 < n_neg < len(dets):
+            logger.warning(
+                f"Anchors have MIXED determinant signs ({n_neg}/{len(dets)} negative). "
+                f"One of the anchors is likely mirrored (swapped lat/lon?). "
+                f"Interpolation may be unreliable — recheck anchor points."
             )
 
-        self._anchor_weights = weights  # зберегти для подальшого використання
-        # ──────────────────────────────────────────────────────────────────────
+        cx, cy = self._reference_pixel()
+        self._ref_px = (cx, cy)
 
-        # Один багатоколонковий PCHIP-інтерполятор для всіх 4 каналів
-        self._interp = PchipInterpolator(ids, decomposed, extrapolate=True)
+        # Спільний білдер (Етап 4): та сама центр-базова 5-DoF PCHIP-форма, що й у
+        # заповненні пропущених кадрів пропагації (src.geometry.affine_utils).
+        ids = [a.frame_id for a in self.anchors]
+        affines = [a.affine_matrix for a in self.anchors]
+        self._interp, self._interp_sign, self._interp_range = _build_5dof_pchip(
+            ids, affines, (cx, cy), log_scale=self._log_scale_interp
+        )
 
     def _get_interpolated_matrix(self, frame_id: float) -> np.ndarray | None:
         """Повертає інтерпольовану афінну матрицю 2x3 для заданого frame_id."""
-        if self._interp is None:
-            return None
-        components = self._interp(frame_id)  # (4,): tx, ty, scale, angle
-        if components is None or np.any(np.isnan(components)):
-            return None
-        tx, ty, scale, angle = components
-        # Захист від вироджених значень масштабу
-        scale = float(np.clip(scale, 1e-6, 1e6))
-        return _compose_affine(float(tx), float(ty), scale, float(angle))
+        return _sample_5dof_pchip(
+            self._interp,
+            self._interp_sign,
+            self._interp_range,
+            self._ref_px,
+            frame_id,
+            log_scale=self._log_scale_interp,
+        )
 
     @property
     def is_calibrated(self) -> bool:
@@ -265,7 +1569,9 @@ class MultiAnchorCalibration:
         """Очищає всі якорі та скидає стан калібрування."""
         self.anchors.clear()
         self._interp = None
+        self._interp_range = None
         from src.geometry.coordinates import CoordinateConverter
+
         self.converter = CoordinateConverter("WEB_MERCATOR")
         logger.info("Cleared all anchors and reset calibration state.")
 
@@ -281,7 +1587,9 @@ class MultiAnchorCalibration:
         exact_anchor = self.get_anchor(frame_id)
         if exact_anchor is not None:
             # Точне потрапляння на якір = скидаємо накопичений drift
-            logger.debug(f"Exact anchor hit at frame {frame_id} — using direct affine (drift reset)")
+            logger.debug(
+                f"Exact anchor hit at frame {frame_id} — using direct affine (drift reset)"
+            )
             return exact_anchor.pixel_to_metric(x, y)
 
         # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
@@ -307,71 +1615,47 @@ class MultiAnchorCalibration:
                 return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
         return None
 
-    def get_metric_position_with_depth(
-        self,
-        frame_id: int,
-        x: float,
-        y: float,
-        depth_scale: float = 1.0,
-    ) -> tuple[float, float] | None:
-        """Версія get_metric_position з корекцією масштабу через depth.
-
-        depth_scale — відносний масштаб з DepthEstimator.get_relative_scale().
-        При depth_scale > 1: об'єкт ближче (нижча висота) → більший pixel scale.
-        При depth_scale < 1: об'єкт далі (вища висота) → менший pixel scale.
-        """
-        result = self.get_metric_position(frame_id, x, y)
-        if result is None:
-            return None
-
-        mx, my = result
-
-        # Нормалізуємо depth_scale відносно reference (медіана всіх якорів).
-        ref_depth = getattr(self, '_reference_depth_scale', 1.0)
-        if ref_depth > 1e-6:
-            correction = depth_scale / ref_depth
-            # Обмежуємо корекцію: максимум 2x в будь-який бік
-            correction = float(np.clip(correction, 0.5, 2.0))
-
-            # TODO: У майбутньому тут можна додати зміщення відносно оптичного центру
-            # для більш точної компенсації паралаксу. Поки що — логуємо.
-            if abs(correction - 1.0) > 0.05:
-                logger.debug(
-                    f"Depth scale correction: ref={ref_depth:.3f}, "
-                    f"current={depth_scale:.3f}, ratio={correction:.3f}"
-                )
-
-        return mx, my
-
-    def set_reference_depth_scale(self, depth_scale: float) -> None:
-        """Встановлює референсний depth_scale (зі збудови БД)."""
-        self._reference_depth_scale = float(depth_scale)
-        logger.info(f"Reference depth scale set: {depth_scale:.4f}")
-
     def set_gsd_calculator(self, gsd_calculator) -> None:
-        """Встановлює калькулятор GSD для прив'язки до фізичного масштабу."""
+        """Прив'язує калькулятор GSD — ІНФОРМАЦІЙНО (аудит 2026-08-01).
+
+        Викликається з Localizer, але сам ``_gsd`` ніде не читається: масштаб
+        приходить із афінних матриць якорів. Метод лишено як точку розширення
+        і для лога фактичного GSD; якщо він знадобиться для обчислень —
+        додавати разом із тестом, що це доводить.
+
+        Разом із цим приберано ``get_metric_position_with_depth`` і
+        ``set_reference_depth_scale``: у них не було ЖОДНОГО виклику, а перший
+        до того ж рахував depth-корекцію, логував її й повертав позицію БЕЗ
+        неї — назва обіцяла те, чого метод не робив.
+        """
         self._gsd = gsd_calculator
         if self._gsd:
-            logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px*100:.2f} cm/px")
+            logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px * 100:.2f} cm/px")
 
     def save(self, path: str) -> None:
         """Збереження якорів та метаданих проєкції у JSON."""
+        assert_project_writable(path)
         data = {
             "version": self.VERSION,
             "projection": self.converter.export_metadata(),
+            "frame_size": list(self._frame_size) if self._frame_size else None,
             "anchors": [a.to_dict() for a in self.anchors],
         }
+
+        # Атомарний запис: калібрування — критичні дані, обрізаний JSON
+        # при краші/конкурентному збереженні означає втрату всіх якорів.
+        from src.utils.atomic_io import atomic_write_bytes
 
         if _USE_ORJSON:
             raw = _json_lib.dumps(
                 data,
                 option=_json_lib.OPT_INDENT_2 | getattr(_json_lib, "OPT_NON_STR_KEYS", 0),
             )
-            with open(path, "wb") as f:
-                f.write(raw)
+            atomic_write_bytes(path, raw)
         else:
-            with open(path, "w", encoding="utf-8") as f:
-                _json_lib.dump(data, f, indent=2, ensure_ascii=False)
+            atomic_write_bytes(
+                path, _json_lib.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            )
         logger.success(
             f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)"
         )
@@ -380,6 +1664,11 @@ class MultiAnchorCalibration:
         logger.info(f"Loading MultiAnchorCalibration from: {path}")
         with open(path, "rb") as f:
             content = f.read()
+
+        # HARDENING P1-6: transparently decrypt an at-rest-encrypted calibration.
+        # Auto-detected by header, so plaintext projects are unaffected.
+        if is_encrypted(content):
+            content = decrypt_bytes(content, get_passphrase())
 
         if _USE_ORJSON:
             data = _json_lib.loads(content)
@@ -415,13 +1704,18 @@ class MultiAnchorCalibration:
             for item in data["anchors"]:
                 self.anchors.append(AnchorCalibration.from_dict(item))
 
+        # Відновлення розміру кадру (для параметризації навколо центру)
+        fs = data.get("frame_size")
+        if fs and len(fs) == 2 and int(fs[0]) > 0 and int(fs[1]) > 0:
+            self._frame_size = (int(fs[0]), int(fs[1]))
+
         self.anchors.sort(key=lambda a: a.frame_id)
         self._rebuild_interpolators()
         logger.success(f"Loaded {len(self.anchors)} anchors (file version: {version})")
 
 
 # ================================================================================
-# File: calibration\multi_calibration_manager.py
+# File: src\calibration\multi_calibration_manager.py
 # ================================================================================
 """
 multi_calibration_manager.py — Менеджер множинних калібрацій.
@@ -496,9 +1790,13 @@ class MultiCalibrationManager:
             if src.source_id not in self._calibrations:
                 continue
             cal = self._calibrations[src.source_id]
-            if not cal.is_calibrated:
-                continue
             calib_path = project_dir / src.calibration_file
+            if not cal.is_calibrated and not calib_path.exists():
+                # Порожня калібрація і файлу нема — писати нічого. Але якщо файл
+                # Є, його треба перезаписати порожнім списком: інакше видалення
+                # всіх якорів лишало осиротілий calibration.json, який наступний
+                # load_all підхоплював як актуальний.
+                continue
             calib_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 cal.save(str(calib_path))
@@ -525,13 +1823,7 @@ class MultiCalibrationManager:
 
 
 # ================================================================================
-# File: calibration\__init__.py
-# ================================================================================
-"""Calibration module"""
-
-
-# ================================================================================
-# File: core\export_results.py
+# File: src\core\export_results.py
 # ================================================================================
 import csv
 from datetime import datetime
@@ -539,6 +1831,7 @@ from typing import Any
 
 import geojson
 
+from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -560,6 +1853,9 @@ class ResultExporter:
         if not results:
             logger.warning("No results to export")
             return
+        # HARDENING P1-6: the track IS the mission — never write it in plaintext
+        # into an encrypted deployment copy.
+        assert_project_writable(output_path)
 
         fieldnames = [
             "frame_id",
@@ -582,6 +1878,7 @@ class ResultExporter:
     @staticmethod
     def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
         """Експорт у GeoJSON (для GIS-систем). Додає точки та полігони FOV."""
+        assert_project_writable(output_path)
         features = []
         for r in results:
             if "lat" not in r or "lon" not in r:
@@ -634,6 +1931,7 @@ class ResultExporter:
         results: list[dict[str, Any]], output_path: str, name: str = "Drone Track"
     ) -> None:
         """Експорт у KML (для Google Earth)."""
+        assert_project_writable(output_path)
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<kml xmlns="http://www.opengis.net/kml/2.2">',
@@ -703,6 +2001,7 @@ class ResultExporter:
         """Експорт об'єктів у CSV файл."""
         if not results:
             return
+        assert_project_writable(output_path)
         fieldnames = ["track_id", "class_name", "timestamp", "lat", "lon", "confidence"]
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -716,6 +2015,7 @@ class ResultExporter:
         """Експорт об'єктів у GeoJSON."""
         if not results:
             return
+        assert_project_writable(output_path)
         features = []
         for r in results:
             if "lat" not in r or "lon" not in r:
@@ -741,15 +2041,23 @@ class ResultExporter:
 
 
 # ================================================================================
-# File: core\headless_runner.py
+# File: src\core\headless_runner.py
 # ================================================================================
+# isort: off
+# WORKAROUND FOR PYTORCH + WINDOWS WinError 1114 (mirrors main.py): torch must be
+# imported before pyproj (src.geometry.coordinates) and PoseLib
+# (src.geometry.transformations), or loading c10.dll fails. Import order here is
+# load-bearing — do not let a formatter move this line.
+import torch  # noqa: F401
+# isort: on
+
 import signal
 import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QCoreApplication
 
-from config.config import APP_CONFIG, APP_SETTINGS
+from config import APP_CONFIG, APP_SETTINGS, get_cfg
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.calibration.multi_calibration_manager import MultiCalibrationManager
 from src.core.project import ProjectManager
@@ -760,6 +2068,8 @@ from src.localization.matcher import FeatureMatcher
 from src.models.model_manager import ModelManager
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.network.coordinates_broker import CoordinatesBroker
+from src.security.at_rest import EncryptionError, prompt_and_verify_passphrase
+from src.security.project_scan import encrypted_artifacts_at
 from src.utils.logging_utils import get_logger
 from src.workers.tracking_worker import RealtimeTrackingWorker
 
@@ -793,6 +2103,17 @@ class HeadlessRunner:
         """Завантажує БД та калібрування з проекту."""
         logger.info(f"Loading project from {self.project_dir}")
 
+        # HARDENING P1-6: resolve the passphrase BEFORE loading — an encrypted copy
+        # encrypts project.json itself, so the manifest is unparseable without it.
+        # Verified up front and retried, so a typo does not abort the run and never
+        # poisons the cache. Mirrors the GUI dialog.
+        encrypted = encrypted_artifacts_at(self.project_dir)
+        if encrypted and not prompt_and_verify_passphrase(str(encrypted[0])):
+            raise EncryptionError(
+                f"'{Path(self.project_dir).name}' is encrypted and no valid passphrase "
+                f"was given — cannot load the project."
+            )
+
         # Завантажуємо проект через ProjectManager для підтримки multi-source
         pm = ProjectManager()
         if pm.load_project(str(self.project_dir)):
@@ -802,7 +2123,7 @@ class HeadlessRunner:
             if is_multi and len(sources) > 0:
                 # Мультиджерельний режим
                 self.db_manager = MultiDatabaseManager(
-                    sources, self.project_dir, config=APP_CONFIG.model_dump()
+                    sources, self.project_dir, config=APP_CONFIG
                 )
                 self.calib_manager = MultiCalibrationManager()
                 self.calib_manager.load_all(sources, self.project_dir)
@@ -819,13 +2140,25 @@ class HeadlessRunner:
                     f"sources={self.db_manager.all_source_ids}"
                 )
             else:
-                # Single-source mode
-                db_path = self.project_dir / "database.h5"
+                # Single-source mode. Resolve the DB/calibration from the paths
+                # the project actually declares (modern layout: sources/main/…),
+                # falling back to the legacy flat root so old projects still load.
+                db_path = Path(pm.database_path) if pm.database_path else self.project_dir / "database.h5"
                 if not db_path.exists():
-                    raise FileNotFoundError(f"Database not found at {db_path}")
+                    legacy_db = self.project_dir / "database.h5"
+                    if legacy_db.exists():
+                        db_path = legacy_db
+                    else:
+                        raise FileNotFoundError(f"Database not found at {db_path}")
                 self.database = DatabaseLoader(str(db_path))
 
-                calib_path = self.project_dir / "calibration.json"
+                calib_path = (
+                    Path(pm.calibration_path)
+                    if pm.calibration_path
+                    else self.project_dir / "calibration.json"
+                )
+                if not calib_path.exists():
+                    calib_path = self.project_dir / "calibration.json"
                 if calib_path.exists():
                     self.calibration.load(str(calib_path))
         else:
@@ -855,7 +2188,7 @@ class HeadlessRunner:
         nv = self.model_manager.load_dinov2()
 
         cesp = None
-        if APP_CONFIG.models.cesp.enabled:
+        if get_cfg(APP_CONFIG, "models.cesp.enabled", False):
             try:
                 cesp = self.model_manager.load_cesp()
             except Exception as e:
@@ -866,7 +2199,7 @@ class HeadlessRunner:
         )
 
         matcher = FeatureMatcher(model_manager=self.model_manager, config=APP_CONFIG)
-        localizer_config = {**APP_CONFIG.model_dump(), "_model_manager": self.model_manager}
+        localizer_config = {**APP_CONFIG, "_model_manager": self.model_manager}
 
         return Localizer(
             self.database, fe, matcher, self.calibration, config=localizer_config,
@@ -896,6 +2229,7 @@ class HeadlessRunner:
 
         # Підключаємо брокер координат
         self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
+        self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
         self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
 
         def on_tracking_finished():
@@ -926,7 +2260,7 @@ class HeadlessRunner:
 
 
 # ================================================================================
-# File: core\project.py
+# File: src\core\project.py
 # ================================================================================
 import json
 from dataclasses import asdict, dataclass, field
@@ -935,6 +2269,13 @@ from pathlib import Path
 from typing import Any
 
 from src.core.project_video_source import ProjectVideoSource
+from src.security.at_rest import (
+    EncryptionError,
+    decrypt_bytes,
+    get_passphrase,
+    is_encrypted,
+)
+from src.security.project_scan import assert_project_writable, project_is_encrypted
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -1047,6 +2388,9 @@ class ProjectManager:
     def __init__(self):
         self.project_dir: Path | None = None
         self.settings: ProjectSettings | None = None
+        # HARDENING P1-6: True when project.json itself is encrypted, i.e. this is
+        # an immutable deployment copy. Write paths must refuse to touch it.
+        self.is_encrypted: bool = False
 
     @property
     def is_loaded(self) -> bool:
@@ -1148,14 +2492,39 @@ class ProjectManager:
                 )
                 return False
 
-            with open(json_file, encoding="utf-8") as f:
-                data = json.load(f)
+            # HARDENING P1-6: an encrypted copy encrypts the manifest too, so it
+            # is decrypted here before parsing. The passphrase must already be
+            # resolved (the GUI prompts before calling this).
+            content = json_file.read_bytes()
+            manifest_encrypted = is_encrypted(content)
+            if manifest_encrypted:
+                content = decrypt_bytes(content, get_passphrase())
+            data = json.loads(content)
 
             self.settings = ProjectSettings.from_dict(data)
             self.project_dir = dir_path
+            # Must agree with assert_project_writable, which scans artifacts too:
+            # a copy built before the manifest was encrypted has a plaintext
+            # manifest but encrypted artifacts, and a manifest-only check would
+            # leave every GUI pre-check passing until a write failed mid-way.
+            self.is_encrypted = manifest_encrypted or project_is_encrypted(dir_path)
 
-            logger.info(f"Project loaded successfully: {self.settings.project_name}")
+            logger.info(
+                f"Project loaded successfully: {self.settings.project_name}"
+                + (" (encrypted, read-only)" if self.is_encrypted else "")
+            )
             return True
+
+        except EncryptionError as e:
+            # Do not blame the manifest: it is intact, we just cannot read it.
+            logger.error(
+                f"Cannot decrypt project manifest: {e} | dir={project_dir}. "
+                f"This project is encrypted — supply the correct map passphrase."
+            )
+            self.project_dir = None
+            self.settings = None
+            self.is_encrypted = False
+            return False
 
         except Exception as e:
             logger.error(
@@ -1165,6 +2534,7 @@ class ProjectManager:
             )
             self.project_dir = None
             self.settings = None
+            self.is_encrypted = False
             return False
 
     def save_project(self) -> bool:
@@ -1173,9 +2543,13 @@ class ProjectManager:
             return False
 
         try:
+            from src.utils.atomic_io import atomic_write_text
+
             json_file = self.project_dir / "project.json"
-            with open(json_file, "w", encoding="utf-8") as f:
-                json.dump(asdict(self.settings), f, indent=4, ensure_ascii=False)
+            assert_project_writable(json_file)
+            atomic_write_text(
+                str(json_file), json.dumps(asdict(self.settings), indent=4, ensure_ascii=False)
+            )
             return True
         except Exception as e:
             logger.error(
@@ -1188,7 +2562,7 @@ class ProjectManager:
 
 
 # ================================================================================
-# File: core\project_registry.py
+# File: src\core\project_registry.py
 # ================================================================================
 import json
 from datetime import datetime
@@ -1232,9 +2606,13 @@ class ProjectRegistry:
     def _save(self):
         """Зберегти реєстр на диск."""
         try:
+            from src.utils.atomic_io import atomic_write_text
+
             self._registry_dir.mkdir(parents=True, exist_ok=True)
-            with open(self._registry_path, "w", encoding="utf-8") as f:
-                json.dump({"projects": self._projects}, f, indent=2, ensure_ascii=False)
+            atomic_write_text(
+                str(self._registry_path),
+                json.dumps({"projects": self._projects}, indent=2, ensure_ascii=False),
+            )
         except Exception as e:
             logger.error(
                 f"Failed to save project registry: {e} | "
@@ -1337,7 +2715,7 @@ class ProjectRegistry:
 
 
 # ================================================================================
-# File: core\project_video_source.py
+# File: src\core\project_video_source.py
 # ================================================================================
 from __future__ import annotations
 
@@ -1384,9 +2762,16 @@ class ProjectVideoSource:
 
 
 # ================================================================================
-# File: database\database_builder.py
+# File: src\database\__init__.py
+# ================================================================================
+"""Database module"""
+
+
+# ================================================================================
+# File: src\database\database_builder.py
 # ================================================================================
 import gc
+import math
 import shutil
 import traceback
 from datetime import datetime
@@ -1401,11 +2786,12 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from config.config import get_active_descriptor_cfg, get_cfg
-from src.geometry.transformations import GeometryTransforms
-from src.localization.matcher import FeatureMatcher
+from config import get_active_descriptor_cfg, get_cfg
+from src.database import keyframe_selector, keypoint_video_writer
+from src.localization.matcher import FeatureMatcher, extract_sift_features
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
+from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger, silent_output
 from src.utils.telemetry import Telemetry
 
@@ -1416,11 +2802,33 @@ class DatabaseBuilder:
     """Builds HDF5 topometric database from reference video using XFeat & DINOv2"""
 
     def __init__(self, output_path, matcher=None, config=None):
+        # HARDENING P1-6: refuse up front — a build writes the database, the lance
+        # index and the keypoint video, all in plaintext, and an encrypted
+        # deployment copy must stay immutable.
+        assert_project_writable(output_path)
         self.output_path = output_path
         self.config = config or {}
         self.matcher = matcher
         db_cfg = self.config.get("database", {})
         self.descriptor_dim = get_active_descriptor_cfg(self.config).descriptor_dim
+        # RESEARCH 2.1: VLAD змінює розмірність глобального дескриптора —
+        # читаємо out_dim зі словника, щоб HDF5/LanceDB схема збігалася з
+        # тим, що реально видаватиме FeatureExtractor.
+        if get_cfg(self.config, "models.vlad.enabled", False):
+            _vocab = get_cfg(self.config, "models.vlad.vocab_path", None)
+            if _vocab and Path(_vocab).exists():
+                from src.models.wrappers.vlad_aggregator import VladAggregator
+
+                self.descriptor_dim = VladAggregator.load(_vocab).out_dim
+                logger.info(f"VLAD enabled: global descriptor dim = {self.descriptor_dim}")
+            else:
+                logger.warning(
+                    f"models.vlad.enabled=True but vocab not found ({_vocab!r}) — "
+                    f"building with CLS descriptors (dim={self.descriptor_dim})"
+                )
+        # RESEARCH 2.2: SIFT-ознаки для аварійного фолбека
+        self.store_sift = get_cfg(self.config, "database.store_sift_features", False)
+        self.sift_max_kps = get_cfg(self.config, "database.sift_max_keypoints", 2048)
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.db_file = None
@@ -1520,7 +2928,11 @@ class DatabaseBuilder:
         )
 
         # Зберігаємо еталонну роздільну здатність у проєкт
-        if self._project_manager and hasattr(self._project_manager, 'settings') and self._project_manager.settings:
+        if (
+            self._project_manager
+            and hasattr(self._project_manager, "settings")
+            and self._project_manager.settings
+        ):
             self._project_manager.settings.ref_frame_width = width
             self._project_manager.settings.ref_frame_height = height
             self._project_manager.save_project()
@@ -1534,6 +2946,7 @@ class DatabaseBuilder:
             try:
                 import os
                 import sys
+
                 kp_width = int(width * kp_scale)
                 kp_height = int(height * kp_scale)
                 kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
@@ -1609,11 +3022,16 @@ class DatabaseBuilder:
         patchify = None
         if use_patchify:
             from src.localization.patchify import PatchifyRetrieval
-            patchify_grids = get_cfg(self.config, "localization.patchify_grids", [[1,1],[2,2],[3,3]])
+
+            patchify_grids = get_cfg(
+                self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
+            )
             patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
             patchify = PatchifyRetrieval(
-                feature_extractor, descriptor_dim=self.descriptor_dim,
-                grids=patchify_grids, batch_size=patchify_batch,
+                feature_extractor,
+                descriptor_dim=self.descriptor_dim,
+                grids=patchify_grids,
+                batch_size=patchify_batch,
             )
             logger.info(f"Patchify ENABLED for DB build: {patchify.num_patches} patches per frame")
 
@@ -1623,6 +3041,7 @@ class DatabaseBuilder:
         if depth_backend != "none":
             try:
                 from src.depth.depth_estimator import DepthEstimator
+
                 self._depth_estimator = DepthEstimator.build(
                     backend=depth_backend, device=model_manager.device
                 )
@@ -1650,7 +3069,9 @@ class DatabaseBuilder:
                     if cesp is not None:
                         features = nv_model.forward_features(dummy_input)
                         patch_tokens = features["x_norm_patchtokens"]
-                        h_patches, w_patches = dino_size // 14, dino_size // 14
+                        # Сітка з фактичної кількості токенів (DINOv3 patch=16, не 14)
+                        side = int(math.isqrt(int(patch_tokens.shape[1])))
+                        h_patches, w_patches = side, side
                         dummy_out = cesp(patch_tokens, h_patches, w_patches)[0]
                         self.descriptor_dim = int(dummy_out.shape[0])
                     else:
@@ -1682,8 +3103,15 @@ class DatabaseBuilder:
 
         # Create empty database structure
         logger.info("Creating HDF5 database structure...")
-        self.create_hdf5_structure(num_frames, width, height, use_patchify=use_patchify,
-                                  num_patches=patchify.num_patches if patchify else 0)
+        self.create_hdf5_structure(
+            num_frames,
+            width,
+            height,
+            use_patchify=use_patchify,
+            num_patches=patchify.num_patches if patchify else 0,
+            frame_step=frame_step,
+            source_total_frames=total_frames,
+        )
 
         current_pose = np.eye(3, dtype=np.float32)
         prev_features = None
@@ -1701,13 +3129,8 @@ class DatabaseBuilder:
                 f"min_rotation={get_cfg(self.config, 'database.keyframe_min_rotation_deg', 1.5)}°)"
             )
 
-        # cuDNN benchmark conditionally (Fix 5)
-
-        if torch.cuda.is_available():
-            model_type = get_cfg(self.config, "localization.fallback_extractor", "aliked")
-            if model_type in ("xfeat", "aliked"):  # CNN-based types
-                torch.backends.cudnn.benchmark = True
-                logger.info(f"cuDNN benchmark ENABLED for {model_type}")
+        # cuDNN benchmark is now set globally at startup by HardwareProfile.apply_torch_backends()
+        # (previously was conditional on CNN model type; now all architectures benefit)
 
         # Increased prefetch queue (Fix 5)
         frame_queue = Queue(maxsize=self.prefetch_size)
@@ -1785,14 +3208,20 @@ class DatabaseBuilder:
                     features["patch_descriptors"] = patchify.compute_patch_descriptors(p_frame_rgb)
 
                 # Phase 2.2: Depth estimation for scale recovery
-                features["depth_scale"] = np.float32(1.0)
+                # A6: скаляр depth_scale змінюється повільно (висота польоту) —
+                # повний інференс Depth-Anything на КОЖНОМУ кадрі був марнотратним.
+                # Рахуємо кожен depth_every_n-й кадр, між ними реюзаємо останнє значення.
+                features["depth_scale"] = np.float32(getattr(self, "_last_depth_scale", 1.0))
                 if self._depth_estimator is not None:
-                    try:
-                        features["depth_scale"] = np.float32(
-                            self._depth_estimator.get_relative_scale(p_frame_rgb)
-                        )
-                    except Exception as e:
-                        logger.warning(f"Depth estimation failed for frame {p_idx}: {e}")
+                    depth_every = max(1, int(get_cfg(self.config, "database.depth_every_n", 10)))
+                    if p_idx % depth_every == 0 or not hasattr(self, "_last_depth_scale"):
+                        try:
+                            self._last_depth_scale = float(
+                                self._depth_estimator.get_relative_scale(p_frame_rgb)
+                            )
+                            features["depth_scale"] = np.float32(self._last_depth_scale)
+                        except Exception as e:
+                            logger.warning(f"Depth estimation failed for frame {p_idx}: {e}")
 
                 if kp_writer is not None:
                     kp_frame = self._draw_keypoints_frame(
@@ -1832,6 +3261,17 @@ class DatabaseBuilder:
                     self.db_file["global_descriptors"]["frame_poses"][p_idx] = current_pose
 
                 if save_this_frame:
+                    # RESEARCH 2.2: SIFT рахуємо лише для кадрів, що реально
+                    # зберігаються (keyframe-ів) — на пропущених це марна робота
+                    if self.store_sift:
+                        try:
+                            sift_feats = extract_sift_features(
+                                p_frame_rgb, p_static_mask, self.sift_max_kps
+                            )
+                            features["sift_keypoints"] = sift_feats["keypoints"]
+                            features["sift_descriptors"] = sift_feats["descriptors"]
+                        except Exception as e:
+                            logger.warning(f"SIFT extraction failed for frame {p_idx}: {e}")
                     frame_index_map.append(p_idx)
                     # Зберігаємо за ОРИГІНАЛЬНИМ індексом p_idx, а не послідовним
                     # Це зберігає frame_id ↔ slot identity для калібрування/пропагації
@@ -1879,7 +3319,10 @@ class DatabaseBuilder:
                             saved_count,
                             frame_index_map,
                         )
-                        if torch.cuda.is_available():
+                        # A1: empty_cache() після КОЖНОГО кадру синхронізував GPU і
+                        # змушував наступні алокації йти повільним cudaMalloc —
+                        # головний гальмівний фактор збудови. Гігієнічно чистимо рідко.
+                        if torch.cuda.is_available() and p_idx % 500 == 0 and p_idx > 0:
                             torch.cuda.empty_cache()
                     if idx == -1:
                         break
@@ -1902,7 +3345,7 @@ class DatabaseBuilder:
                     self.lance_table.create_index(
                         metric="cosine",
                         num_partitions=min(256, saved_count // 8),
-                        num_sub_vectors=32
+                        num_sub_vectors=32,
                     )
 
             # Зберігаємо frame_index_map і actual_num_frames у metadata
@@ -1941,129 +3384,58 @@ class DatabaseBuilder:
         frame_id: int,
         total_frames: int,
     ) -> np.ndarray:
-        vis = frame_bgr.copy()
-
-        if static_mask is not None:
-            dynamic_zone = static_mask == 0
-            if dynamic_zone.any():
-                overlay = vis.copy()
-                overlay[dynamic_zone] = (0, 0, 200)
-                cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
-
-        for x, y in keypoints:
-            cx, cy = int(round(x)), int(round(y))
-            cv2.circle(vis, (cx, cy), radius=3, color=(0, 255, 0), thickness=-1)
-            cv2.circle(vis, (cx, cy), radius=4, color=(0, 180, 0), thickness=1)
-
-        info_lines = [
-            f"Frame: {frame_id:05d} / {total_frames:05d}",
-            f"Keypoints: {len(keypoints)}",
-            f"Dynamic mask: {'YES' if static_mask is not None else 'NO'}",
-        ]
-        panel_h = len(info_lines) * 28 + 14
-        cv2.rectangle(vis, (0, 0), (340, panel_h), (0, 0, 0), -1)
-        cv2.rectangle(vis, (0, 0), (340, panel_h), (80, 80, 80), 1)
-
-        for idx, line in enumerate(info_lines):
-            cv2.putText(
-                vis,
-                line,
-                (8, 22 + idx * 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-
-        legend_y = vis.shape[0] - 10
-        cv2.circle(vis, (12, legend_y - 4), 5, (0, 255, 0), -1)
-        cv2.putText(
-            vis,
-            "XFeat keypoint",
-            (22, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
+        """Delegates to ``keypoint_video_writer.draw_keypoints_frame`` (pure,
+        headless-tested); kept as a thin method to avoid call-site churn."""
+        return keypoint_video_writer.draw_keypoints_frame(
+            frame_bgr, keypoints, static_mask, frame_id, total_frames
         )
-        cv2.rectangle(vis, (200, legend_y - 10), (218, legend_y + 2), (0, 0, 200), -1)
-        cv2.putText(
-            vis,
-            "YOLO dynamic zone",
-            (224, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 200),
-            1,
-            cv2.LINE_AA,
-        )
-
-        return vis
 
     def _compute_inter_frame_H(self, fa: dict, fb: dict) -> np.ndarray | None:
-        """
-        Обчислює H(fb → fa): гомографію з поточного кадру в попередній.
-        """
-        min_matches = get_cfg(self.config, "database.inter_frame_min_matches", 15)
-        ransac_thresh = get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0)
-        homography_backend = get_cfg(self.config, "homography.backend", "opencv")
-        use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
-        mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
+        """H(fb → fa): гомографія з поточного кадру в попередній.
 
+        Обчислення винесене в ``keyframe_selector.compute_inter_frame_homography``
+        (headless-тестоване); тут лишається лише лінива ініціалізація матчера.
+        """
         if self.matcher is None:
             # Спробуємо отримати model_manager з контексту, якщо він є
             mm = getattr(self, "_temp_model_manager", None)
             self.matcher = FeatureMatcher(model_manager=mm, config=self.config)
 
-        mkpts_a, mkpts_b = self.matcher.match(fa, fb)
-
-        if len(mkpts_a) < min_matches:
-            return None
-
-        H, mask = GeometryTransforms.estimate_homography(
-            mkpts_a, mkpts_b,
-            ransac_threshold=ransac_thresh,
-            backend=homography_backend,
-            use_mad_ransac=use_mad_ransac,
-            mad_k_factor=mad_k_factor,
+        return keyframe_selector.compute_inter_frame_homography(
+            self.matcher,
+            fa,
+            fb,
+            min_matches=get_cfg(self.config, "database.inter_frame_min_matches", 15),
+            ransac_thresh=get_cfg(self.config, "database.inter_frame_ransac_thresh", 3.0),
+            homography_backend=get_cfg(self.config, "homography.backend", "opencv"),
+            use_mad_ransac=get_cfg(self.config, "homography.use_mad_ransac", True),
+            mad_k_factor=get_cfg(self.config, "homography.mad_k_factor", 2.5),
         )
 
-        if H is None or int(np.sum(mask)) < min_matches:
-            return None
-
-        return H.astype(np.float64)
-
     def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:
+        """True, якщо H відповідає значному руху (вибір keyframe).
+
+        Логіка винесена в ``keyframe_selector.is_significant_motion``
+        (headless-тестована); тут лишається лише читання порогів із config.
         """
-        Повертає True якщо гомографія H відповідає значному руху.
-        H: (3,3) float32 — матриця з frame_b до frame_a.
-        """
-        min_t = get_cfg(self.config, "database.keyframe_min_translation_px", 15.0)
-        min_r = get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5)
+        return keyframe_selector.is_significant_motion(
+            H,
+            frame_w,
+            frame_h,
+            min_translation_px=get_cfg(self.config, "database.keyframe_min_translation_px", 15.0),
+            min_rotation_deg=get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5),
+        )
 
-        # Трансляція: зсув центру кадру через H
-        cx, cy = frame_w / 2.0, frame_h / 2.0
-        p_src = np.array([cx, cy, 1.0], dtype=np.float64)
-        p_dst = H.astype(np.float64) @ p_src
-        p_dst /= p_dst[2]
-        translation = np.linalg.norm(p_dst[:2] - np.array([cx, cy]))
-
-        if translation >= min_t:
-            return True
-
-        # Кут: з лінійної частини H (2×2 зліва вгорі)
-        A = H[:2, :2].astype(np.float64)
-        det = np.linalg.det(A)
-        if abs(det) < 1e-6:
-            return True  # вироджена матриця → вважаємо рухом
-        angle_rad = np.arctan2(A[1, 0], A[0, 0])
-        angle_deg = abs(np.degrees(angle_rad))
-        return angle_deg >= min_r
-
-    def create_hdf5_structure(self, num_frames: int, width: int, height: int,
-                              use_patchify: bool = False, num_patches: int = 0):
+    def create_hdf5_structure(
+        self,
+        num_frames: int,
+        width: int,
+        height: int,
+        use_patchify: bool = False,
+        num_patches: int = 0,
+        frame_step: int = 1,
+        source_total_frames: int = 0,
+    ):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
         chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
@@ -2080,10 +3452,12 @@ class DatabaseBuilder:
             if lance_path.exists():
                 shutil.rmtree(lance_path)
             db = lancedb.connect(str(lance_path))
-            schema = pa.schema([
-                pa.field("frame_id", pa.int32()),
-                pa.field("vector", pa.list_(pa.float32(), self.descriptor_dim))
-            ])
+            schema = pa.schema(
+                [
+                    pa.field("frame_id", pa.int32()),
+                    pa.field("vector", pa.list_(pa.float32(), self.descriptor_dim)),
+                ]
+            )
             self.lance_table = db.create_table("global_vectors", schema=schema, mode="create")
             self.lance_batch = []
             logger.info(f"LanceDB table created at {lance_path}")
@@ -2151,6 +3525,38 @@ class DatabaseBuilder:
             lf.attrs["frame_width"] = width
             lf.attrs["frame_height"] = height
 
+            # --- RESEARCH 2.2: SIFT-ознаки для аварійного фолбека ---
+            if self.store_sift:
+                sf = f.create_group("sift_features")
+                sf.create_dataset(
+                    "keypoints",
+                    shape=(num_frames, self.sift_max_kps, 2),
+                    maxshape=(None, self.sift_max_kps, 2),
+                    dtype="float32",
+                    compression=compression,
+                    chunks=(min(chunk_f, num_frames), self.sift_max_kps, 2),
+                    fillvalue=0.0,
+                )
+                sf.create_dataset(
+                    "descriptors",
+                    shape=(num_frames, self.sift_max_kps, 128),
+                    maxshape=(None, self.sift_max_kps, 128),
+                    dtype="float16",  # rootSIFT ∈ [0,1] — f16 безпечний
+                    compression=compression,
+                    chunks=(min(chunk_f, num_frames), self.sift_max_kps, 128),
+                    fillvalue=0.0,
+                )
+                sf.create_dataset(
+                    "kp_counts",
+                    shape=(num_frames,),
+                    maxshape=(None,),
+                    dtype="int16",
+                    compression=compression,
+                    chunks=(min(num_frames, 4096),),
+                    fillvalue=0,
+                )
+                logger.info(f"SIFT fallback group created (max {self.sift_max_kps} kps/frame)")
+
             g3 = f.create_group("metadata")
             g3.attrs["num_frames"] = num_frames
             g3.attrs["creation_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2159,6 +3565,39 @@ class DatabaseBuilder:
             g3.attrs["descriptor_dim"] = self.descriptor_dim
             g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
             g3.attrs["max_keypoints"] = max_kps
+            # Крок семплінгу відео: DB slot i = кадр відео i * frame_step.
+            # Критично для калібрування — діалог конвертує номери кадрів відео у слоти БД.
+            g3.attrs["frame_step"] = int(frame_step)
+            g3.attrs["source_total_frames"] = int(source_total_frames)
+
+            # Schema fingerprint: a stable hash of every structure/content-
+            # defining setting (models, dims, keypoint budget, scale, frame
+            # step, SIFT/VLAD policy). Lets databases built on different
+            # machines be checked for interchangeability instead of silently
+            # mixed. See src/database/schema_fingerprint.py. Never fatal.
+            try:
+                import json as _json
+
+                from src.database.schema_fingerprint import (
+                    build_components,
+                    compute_fingerprint,
+                )
+
+                _fp_components = build_components(
+                    self.config,
+                    descriptor_dim=self.descriptor_dim,
+                    local_descriptor_dim=getattr(self, "local_descriptor_dim", 128),
+                    schema_version="v2",
+                )
+                g3.attrs["schema_fingerprint"] = compute_fingerprint(_fp_components)
+                g3.attrs["schema_components"] = _json.dumps(
+                    _fp_components, sort_keys=True
+                )
+                logger.info(
+                    f"DB schema fingerprint: {g3.attrs['schema_fingerprint']}"
+                )
+            except Exception as _fp_err:  # metadata must never break a build
+                logger.warning(f"Could not write schema fingerprint: {_fp_err}")
 
             # Phase 2.2: Dataset for depth scales
             g3.create_dataset(
@@ -2183,7 +3622,9 @@ class DatabaseBuilder:
                 )
                 g3.attrs["use_patchify"] = True
                 g3.attrs["patchify_num_patches"] = num_patches
-                logger.info(f"Patchify HDF5 group created: {num_patches} patches × {self.descriptor_dim}D")
+                logger.info(
+                    f"Patchify HDF5 group created: {num_patches} patches × {self.descriptor_dim}D"
+                )
 
             # Enable SWMR mode for parallel reading while writing
             f.swmr_mode = True
@@ -2194,15 +3635,14 @@ class DatabaseBuilder:
         """Save extracted data for a single frame via slice assignment (schema v2)"""
         with Telemetry.profile("hdf5_write"):
             if self.use_lancedb:
-                self.lance_batch.append({
-                    "frame_id": frame_id,
-                    "vector": features["global_desc"]
-                })
+                self.lance_batch.append({"frame_id": frame_id, "vector": features["global_desc"]})
                 if len(self.lance_batch) >= self.lance_batch_size:
                     self.lance_table.add(self.lance_batch)
                     self.lance_batch = []
             else:
-                self.db_file["global_descriptors"]["descriptors"][frame_id] = features["global_desc"]
+                self.db_file["global_descriptors"]["descriptors"][frame_id] = features[
+                    "global_desc"
+                ]
 
             self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
@@ -2222,7 +3662,20 @@ class DatabaseBuilder:
 
             # Patchify descriptors
             if "patch_descriptors" in features and "patch_descriptors" in self.db_file:
-                self.db_file["patch_descriptors"]["descriptors"][frame_id] = features["patch_descriptors"]
+                self.db_file["patch_descriptors"]["descriptors"][frame_id] = features[
+                    "patch_descriptors"
+                ]
+
+            # RESEARCH 2.2: SIFT-ознаки
+            if "sift_keypoints" in features and "sift_features" in self.db_file:
+                sf = self.db_file["sift_features"]
+                s_kps = features["sift_keypoints"]
+                s_descs = features["sift_descriptors"]
+                sn = min(len(s_kps), sf["keypoints"].shape[1])
+                if sn > 0:
+                    sf["keypoints"][frame_id, :sn] = s_kps[:sn]
+                    sf["descriptors"][frame_id, :sn] = s_descs[:sn].astype("float16")
+                sf["kp_counts"][frame_id] = sn
 
             # Save depth scale
             if "depth_scale" in features:
@@ -2230,9 +3683,14 @@ class DatabaseBuilder:
 
 
 # ================================================================================
-# File: database\database_loader.py
+# File: src\database\database_loader.py
 # ================================================================================
+import io
 import json
+import os
+import shutil
+import tempfile
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -2242,9 +3700,152 @@ import lancedb
 import numpy as np
 
 from src.geometry.coordinates import CoordinateConverter
+from src.security.at_rest import (
+    MAGIC,
+    decrypt_bytes,
+    get_passphrase,
+    is_encrypted,
+    wipe_file,
+)
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def open_maybe_encrypted_h5(path: str) -> tuple[h5py.File, io.BytesIO | None]:
+    """Open an HDF5 database, transparently decrypting an at-rest-encrypted map.
+
+    HARDENING P1-6 SP2: h5py needs a seekable source for the whole session. A
+    plaintext DB is opened straight from the path (h5py reads lazily — no full
+    load, zero overhead). An encrypted DB (`MAGIC` header) is decrypted whole into
+    RAM and served from a ``BytesIO`` (67 MB fits comfortably); the buffer is
+    returned so the caller can keep it alive for the file handle's lifetime.
+    """
+    with open(path, "rb") as f:
+        head = f.read(len(MAGIC))
+    if head != MAGIC:
+        return h5py.File(path, "r"), None  # plaintext: unchanged lazy path
+    plaintext = decrypt_bytes(Path(path).read_bytes(), get_passphrase())
+    buf = io.BytesIO(plaintext)
+    return h5py.File(buf, "r"), buf
+
+
+_LANCE_TEMP_PREFIX = "droneloc_lance_"
+
+
+def _owner_file(tmpdir: str) -> Path:
+    """Sibling file holding the PID that owns a decrypted-index temp directory."""
+    return Path(str(tmpdir) + ".owner")
+
+
+def _pid_is_running(pid: int) -> bool | None:
+    """True/False if the PID's liveness can be determined, None if it cannot.
+
+    ``os.kill(pid, 0)`` is not usable here: on Windows it maps to TerminateProcess
+    and would kill the very process we are probing. Without psutil we return None
+    and the caller keeps the directory — never delete on a guess."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.pid_exists(pid)
+    except Exception:
+        return None
+
+
+def sweep_stale_lance_tempdirs() -> int:
+    """Wipe decrypted-index temp directories abandoned by crashed runs.
+
+    ``DatabaseLoader.close`` wipes its own directory, but a hard kill or power
+    loss skips it and leaves plaintext global descriptors on the temp disk. Called
+    once at startup. Returns the number of directories wiped.
+
+    Conservative by construction: a directory is removed only when its owner PID
+    is known to be gone. An unreadable stamp, a live PID, or no way to check
+    (psutil missing) all mean "leave it alone" — deleting a directory a
+    concurrently running instance is reading from would break that instance."""
+    wiped = 0
+    for path in Path(tempfile.gettempdir()).glob(_LANCE_TEMP_PREFIX + "*"):
+        if not path.is_dir():
+            continue  # the .owner stamps themselves
+        owner = _owner_file(str(path))
+        try:
+            pid = int(owner.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue  # no readable stamp: not ours to judge
+        if _pid_is_running(pid) is not False:
+            continue  # alive, or undeterminable
+        wipe_tree(str(path))
+        wiped += 1
+    if wiped:
+        logger.warning(
+            f"Wiped {wiped} decrypted LanceDB temp director(ies) left by a previous "
+            f"run that did not shut down cleanly"
+        )
+    return wiped
+
+
+def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None]:
+    """Return a path LanceDB can open, decrypting an at-rest-encrypted index first.
+
+    HARDENING P1-6 SP3: LanceDB opens a *filesystem directory* and manages its own
+    file handles, so there is no in-RAM route like the h5 one. A plaintext index is
+    opened in place (unchanged path, zero overhead). An encrypted index is
+    materialised into a temp directory, preserving the dataset layout.
+
+    Returns ``(path_to_open, temp_dir_or_None)``; the caller must wipe the temp
+    directory when closing. Fails closed: a failed decryption leaves no partial
+    plaintext behind.
+    """
+    files = sorted(p for p in lance_path.rglob("*") if p.is_file())
+    if not files:
+        return str(lance_path), None
+    if not is_encrypted(files[0].read_bytes()[: len(MAGIC)]):
+        return str(lance_path), None  # plaintext: unchanged path
+
+    passphrase = get_passphrase()
+    tmpdir = tempfile.mkdtemp(prefix=_LANCE_TEMP_PREFIX)
+    try:
+        # Owner stamp, kept as a SIBLING file so LanceDB never sees a stray entry
+        # in its dataset root. Lets a later run tell an abandoned directory (crash)
+        # from one a concurrently running instance is still using.
+        _owner_file(tmpdir).write_text(str(os.getpid()), encoding="utf-8")
+        for src in files:
+            target = Path(tmpdir) / src.relative_to(lance_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = src.read_bytes()
+            target.write_bytes(decrypt_bytes(data, passphrase) if is_encrypted(data) else data)
+    except Exception:
+        wipe_tree(tmpdir)
+        raise
+    logger.info(f"Decrypted LanceDB index ({len(files)} files) into a temp directory")
+    return tmpdir, tmpdir
+
+
+def wipe_tree(dir_path: str) -> None:
+    """Best-effort secure delete of a decrypted temp directory (see ``wipe_file``
+    for the SSD/CoW caveat) — overwrite every file, then drop the tree and its
+    owner stamp."""
+    root = Path(dir_path)
+    if root.exists():
+        for path in root.rglob("*"):
+            if path.is_file():
+                wipe_file(str(path))
+        shutil.rmtree(root, ignore_errors=True)
+    _owner_file(dir_path).unlink(missing_ok=True)
+
+
+def _synchronized(method):
+    """Декоратор: виконує метод під self._lock (RLock — реентерабельний)."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class DatabaseLoader:
@@ -2253,6 +3854,12 @@ class DatabaseLoader:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.db_file: h5py.File | None = None
+        # HARDENING P1-6 SP2: holds the decrypted-map RAM buffer (encrypted DBs
+        # only), kept alive for the h5py handle's lifetime; None when plaintext.
+        self._decrypted_buf: io.BytesIO | None = None
+        # HARDENING P1-6 SP3: temp directory holding the decrypted LanceDB index
+        # (encrypted projects only); wiped on close. None when plaintext.
+        self._lance_tempdir: str | None = None
         self.global_descriptors: np.ndarray | None = None
         self.lance_table = None
         self.frame_poses: np.ndarray | None = None
@@ -2265,10 +3872,18 @@ class DatabaseLoader:
         self.frame_rmse: np.ndarray | None = None  # (N,)      — RMSE кожного кадру
         self.frame_disagreement: np.ndarray | None = None  # (N,)   — Розбіжність між гілками
         self.frame_matches: np.ndarray | None = None  # (N,)      — Кількість точок (inliers)
+        self.depth_scales: np.ndarray | None = None  # (N,) — 1/median_depth per frame (GSD hint)
 
         # GPS-координати кадрів та просторовий індекс (мультиджерельна геолокалізація)
         self.frame_gps: np.ndarray | None = None  # (N, 2) — [lat, lon] per frame
         self.spatial_index = None  # SpatialIndex | None
+
+        # Потокобезпека: h5py-хендл і кеші читаються з GUI-потоку та воркерів
+        # одночасно (h5py не потокобезпечний, OrderedDict-кеш мутується).
+        # RLock — бо публічні методи викликають один одного.
+        # ЗОВНІШНІЙ код (напр. пропагація при перезаписі HDF5) може взяти
+        # self.lock на весь цикл close → write → reload.
+        self._lock = threading.RLock()
 
         # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
@@ -2280,12 +3895,18 @@ class DatabaseLoader:
         logger.info(f"Initializing DatabaseLoader | path={db_path}")
         self._load_hot_data()
 
+    @property
+    def lock(self) -> threading.RLock:
+        """Публічний лок для зовнішніх критичних секцій (напр. перезапис HDF5)."""
+        return self._lock
+
+    @_synchronized
     def _load_hot_data(self) -> None:
         """Load global descriptors (DINOv2), poses and propagation data into RAM"""
         logger.info(f"Loading hot data into RAM from: {self.db_path}")
 
         try:
-            self.db_file = h5py.File(self.db_path, "r")
+            self.db_file, self._decrypted_buf = open_maybe_encrypted_h5(self.db_path)
             logger.debug(f"HDF5 file opened | top-level groups: {list(self.db_file.keys())}")
 
             if "global_descriptors" not in self.db_file:
@@ -2298,7 +3919,8 @@ class DatabaseLoader:
             lance_path = Path(self.db_path).parent / "vectors.lance"
             if lance_path.exists():
                 logger.info(f"LanceDB index found at {lance_path}. Loading...")
-                db = lancedb.connect(str(lance_path))
+                open_path, self._lance_tempdir = materialize_maybe_encrypted_lance(lance_path)
+                db = lancedb.connect(open_path)
                 self.lance_table = db.open_table("global_vectors")
                 self.global_descriptors = None
             else:
@@ -2344,6 +3966,12 @@ class DatabaseLoader:
                 logger.info(f"Loaded patch descriptors: shape={self.patch_descriptors.shape}")
             else:
                 self.patch_descriptors = None
+
+            # Depth scales (1/median_depth per frame) — GSD hint for ScaleManager pyramid
+            if "depth_scales" in self.db_file["metadata"]:
+                self.depth_scales = self.db_file["metadata"]["depth_scales"][:]
+            else:
+                self.depth_scales = None
 
             # Завантажуємо frame_gps якщо є (мультиджерельна геолокалізація)
             if "frame_gps" in self.db_file:
@@ -2458,6 +4086,15 @@ class DatabaseLoader:
     def is_propagated(self) -> bool:
         return self.frame_affine is not None
 
+    @property
+    def median_depth_scale(self) -> float | None:
+        """Median 1/median_depth across DB frames (GSD hint for ScaleManager), or None."""
+        if self.depth_scales is None:
+            return None
+        vals = self.depth_scales[np.isfinite(self.depth_scales) & (self.depth_scales > 0)]
+        return float(np.median(vals)) if vals.size else None
+
+    @_synchronized
     def get_frame_affine(self, frame_id: int) -> np.ndarray | None:
         """Повертає афінну матрицю для конкретного кадру"""
         if not self.is_propagated or self.frame_affine is None or self.frame_valid is None:
@@ -2468,6 +4105,7 @@ class DatabaseLoader:
             return None
         return self.frame_affine[frame_id]
 
+    @_synchronized
     def get_frame_size(self, frame_id: int) -> tuple[int, int]:
         """Повертає (height, width) для вказаного кадру"""
         if frame_id in self._size_cache:
@@ -2503,6 +4141,7 @@ class DatabaseLoader:
         self._size_cache[frame_id] = res
         return res
 
+    @_synchronized
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
         """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
         if frame_id in self._feature_cache:
@@ -2546,15 +4185,56 @@ class DatabaseLoader:
         self._feature_cache[frame_id] = res
         return res
 
+    @property
+    def has_sift_features(self) -> bool:
+        """RESEARCH 2.2: чи містить БД SIFT-ознаки для аварійного фолбека."""
+        try:
+            return self.db_file is not None and "sift_features" in self.db_file
+        except Exception:
+            return False
+
+    @_synchronized
+    def get_sift_features(self, frame_id: int) -> dict[str, np.ndarray]:
+        """RESEARCH 2.2: SIFT-ознаки кадру (rootSIFT, сумісні з LightGlue-sift).
+
+        Без LRU-кешу: фолбек викликається рідко (лише при провалі ALIKED),
+        кешування лише витісняло б гарячі ALIKED-ознаки з пам'яті.
+        """
+        if self.db_file is None:
+            raise RuntimeError("Database not opened")
+        if "sift_features" not in self.db_file:
+            raise ValueError(
+                "База не містить SIFT-ознак — перебудуйте з database.store_sift_features=True"
+            )
+        sf = self.db_file["sift_features"]
+        n = int(sf["kp_counts"][frame_id])
+        if n == 0:
+            raise ValueError(f"Кадр {frame_id} не має SIFT keypoints (kp_count=0)")
+        res = {
+            "keypoints": sf["keypoints"][frame_id, :n],
+            "descriptors": sf["descriptors"][frame_id, :n].astype("float32"),
+            "image_size": np.array(self.get_frame_size(frame_id), dtype=np.int32),
+        }
+        return res
+
     def get_num_frames(self) -> int:
         """Повертає кількість кадрів у БД (pre-allocated slots для v2)."""
         return int(self.metadata.get("num_frames", 0))
 
+    @_synchronized
     def close(self) -> None:
         if self.db_file is not None:
             self.db_file.close()
             self.db_file = None
             logger.info("Database file closed")
+
+        # HARDENING P1-6 SP3: drop the LanceDB handle before wiping its files,
+        # otherwise the open dataset keeps the decrypted temp copy on disk.
+        if self._lance_tempdir is not None:
+            self.lance_table = None
+            wipe_tree(self._lance_tempdir)
+            logger.info("Decrypted LanceDB temp directory wiped")
+            self._lance_tempdir = None
 
         # Очищення кешу при закритті БД
         self._size_cache.clear()
@@ -2562,7 +4242,194 @@ class DatabaseLoader:
 
 
 # ================================================================================
-# File: database\multi_database_manager.py
+# File: src\database\keyframe_selector.py
+# ================================================================================
+"""Примітиви вибору keyframe-ів (чисті, без torch/Qt).
+
+Витягнуто дослівно з ``DatabaseBuilder`` (IMPROVEMENT_PLAN п.1.3, розбиття
+``database_builder`` на модулі). Рішення «чи це keyframe» залежить лише від
+міжкадрової гомографії H і порогів руху — тому логіка headless-тестована.
+Матчер інжектується параметром (``compute_inter_frame_homography``), а не
+береться з ``self``, тож і цей шлях піддається юніт-тесту з фейковим матчером.
+
+Семантику вибору («keyframe вибірково», на відміну від «поза завжди») цей модуль
+НЕ змінює — він лише виносить обчислення; оркестрація (коли писати pose, коли
+save_frame_data, ідентичність frame_id↔slot) лишається в ``DatabaseBuilder``.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from src.geometry.transformations import GeometryTransforms
+
+# Дефолти = поточні дефолти config (database.*), щоб виклики без порогів
+# зберігали поведінку білдера.
+DEFAULT_MIN_TRANSLATION_PX = 15.0
+DEFAULT_MIN_ROTATION_DEG = 1.5
+DEFAULT_INTER_FRAME_MIN_MATCHES = 15
+DEFAULT_INTER_FRAME_RANSAC_THRESH = 3.0
+
+
+def is_significant_motion(
+    H: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+    min_translation_px: float = DEFAULT_MIN_TRANSLATION_PX,
+    min_rotation_deg: float = DEFAULT_MIN_ROTATION_DEG,
+) -> bool:
+    """True, якщо гомографія ``H`` (frame_b → frame_a) відповідає значному руху.
+
+    Трансляція центру кадру через H ≥ ``min_translation_px`` АБО кут із лінійної
+    частини H ≥ ``min_rotation_deg``. Вироджена H (|det| < 1e-6) → True (щоб не
+    застрягнути на битій матриці). Логіка збережена 1:1 з DatabaseBuilder.
+    """
+    cx, cy = frame_w / 2.0, frame_h / 2.0
+    p_src = np.array([cx, cy, 1.0], dtype=np.float64)
+    p_dst = H.astype(np.float64) @ p_src
+    p_dst /= p_dst[2]
+    translation = np.linalg.norm(p_dst[:2] - np.array([cx, cy]))
+
+    if translation >= min_translation_px:
+        return True
+
+    A = H[:2, :2].astype(np.float64)
+    det = np.linalg.det(A)
+    if abs(det) < 1e-6:
+        return True  # вироджена матриця → вважаємо рухом
+    angle_deg = abs(np.degrees(np.arctan2(A[1, 0], A[0, 0])))
+    return bool(angle_deg >= min_rotation_deg)
+
+
+def compute_inter_frame_homography(
+    matcher,
+    fa: dict,
+    fb: dict,
+    *,
+    min_matches: int = DEFAULT_INTER_FRAME_MIN_MATCHES,
+    ransac_thresh: float = DEFAULT_INTER_FRAME_RANSAC_THRESH,
+    homography_backend: str = "opencv",
+    use_mad_ransac: bool = True,
+    mad_k_factor: float = 2.5,
+) -> np.ndarray | None:
+    """H(fb → fa) як 3×3 float64, або None.
+
+    ``matcher.match(fa, fb)`` → відповідності → RANSAC-гомографія. None, якщо
+    матчів або inlier-ів менше за ``min_matches``. Матчер інжектується (не
+    створюється тут) — лінива ініціалізація/стан лишаються у виклику білдера.
+    """
+    mkpts_a, mkpts_b = matcher.match(fa, fb)
+    if len(mkpts_a) < min_matches:
+        return None
+
+    H, mask = GeometryTransforms.estimate_homography(
+        mkpts_a,
+        mkpts_b,
+        ransac_threshold=ransac_thresh,
+        backend=homography_backend,
+        use_mad_ransac=use_mad_ransac,
+        mad_k_factor=mad_k_factor,
+    )
+
+    if H is None or int(np.sum(mask)) < min_matches:
+        return None
+
+    return H.astype(np.float64)
+
+
+# ================================================================================
+# File: src\database\keypoint_video_writer.py
+# ================================================================================
+"""Debug keypoint-overlay rendering for DB builds (pure, no torch/self state).
+
+Extracted verbatim from ``DatabaseBuilder._draw_keypoints_frame``
+(IMPROVEMENT_PLAN п.1.3, splitting ``database_builder`` into modules). The
+function draws detected keypoints, the YOLO dynamic-zone overlay, an info panel
+and a legend onto a copy of the BGR frame — it depends only on its arguments,
+so it is headless-testable and reusable by the optional keypoint-preview video.
+"""
+
+from __future__ import annotations
+
+import cv2
+import numpy as np
+
+
+def draw_keypoints_frame(
+    frame_bgr: np.ndarray,
+    keypoints: np.ndarray,
+    static_mask: np.ndarray,
+    frame_id: int,
+    total_frames: int,
+) -> np.ndarray:
+    """Return a copy of ``frame_bgr`` annotated with keypoints/mask/info panel.
+
+    The input frame is not mutated. Logic preserved 1:1 with DatabaseBuilder.
+    """
+    vis = frame_bgr.copy()
+
+    if static_mask is not None:
+        dynamic_zone = static_mask == 0
+        if dynamic_zone.any():
+            overlay = vis.copy()
+            overlay[dynamic_zone] = (0, 0, 200)
+            cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
+
+    for x, y in keypoints:
+        cx, cy = int(round(x)), int(round(y))
+        cv2.circle(vis, (cx, cy), radius=3, color=(0, 255, 0), thickness=-1)
+        cv2.circle(vis, (cx, cy), radius=4, color=(0, 180, 0), thickness=1)
+
+    info_lines = [
+        f"Frame: {frame_id:05d} / {total_frames:05d}",
+        f"Keypoints: {len(keypoints)}",
+        f"Dynamic mask: {'YES' if static_mask is not None else 'NO'}",
+    ]
+    panel_h = len(info_lines) * 28 + 14
+    cv2.rectangle(vis, (0, 0), (340, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(vis, (0, 0), (340, panel_h), (80, 80, 80), 1)
+
+    for idx, line in enumerate(info_lines):
+        cv2.putText(
+            vis,
+            line,
+            (8, 22 + idx * 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    legend_y = vis.shape[0] - 10
+    cv2.circle(vis, (12, legend_y - 4), 5, (0, 255, 0), -1)
+    cv2.putText(
+        vis,
+        "XFeat keypoint",
+        (22, legend_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.rectangle(vis, (200, legend_y - 10), (218, legend_y + 2), (0, 0, 200), -1)
+    cv2.putText(
+        vis,
+        "YOLO dynamic zone",
+        (224, legend_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 0, 200),
+        1,
+        cv2.LINE_AA,
+    )
+
+    return vis
+
+
+# ================================================================================
+# File: src\database\multi_database_manager.py
 # ================================================================================
 """
 multi_database_manager.py — Менеджер множинних баз даних.
@@ -2682,6 +4549,96 @@ class MultiDatabaseManager:
             f"MultiDatabaseManager initialized: {len(self._databases)} databases loaded, "
             f"{len(self._active_source_ids)} active"
         )
+
+        self._check_interchangeability()
+
+    def _check_interchangeability(self) -> None:
+        """Warn if loaded databases were built with incompatible schema settings.
+
+        Databases combined in one manager must be mutually queryable, which
+        requires an identical schema fingerprint (same models, dims, keypoint
+        budget, sampling scale, ...). A mismatch means a database was built with
+        different settings (e.g. a different local extractor on another machine)
+        and combined results would be silently wrong. Never raises.
+        """
+        import json as _json
+
+        fps: dict[str, str] = {}
+        comps: dict[str, dict] = {}
+        for sid, loader in self._databases.items():
+            fp = loader.metadata.get("schema_fingerprint")
+            if fp is None:
+                logger.warning(
+                    f"Source '{sid}': no schema_fingerprint (older builder) — "
+                    f"cannot verify interchangeability with the other databases."
+                )
+                continue
+            fps[sid] = str(fp)
+            raw = loader.metadata.get("schema_components")
+            if raw:
+                try:
+                    comps[sid] = _json.loads(raw)
+                except Exception:
+                    pass
+
+        distinct = set(fps.values())
+        if len(distinct) <= 1:
+            if fps:
+                logger.info(
+                    f"Interchangeability OK: {len(fps)} databases share schema "
+                    f"{next(iter(distinct))}."
+                )
+            return
+
+        from src.database.schema_fingerprint import compare
+
+        ref_sid = next(iter(fps))
+        ref = comps.get(ref_sid, {})
+        logger.error(
+            f"DATABASE MISMATCH: {len(distinct)} different schema fingerprints "
+            f"among {len(fps)} databases — they are NOT interchangeable and "
+            f"combined localization may be wrong."
+        )
+        for sid, fp in fps.items():
+            if fp != fps[ref_sid] and comps.get(sid) and ref:
+                logger.error(
+                    f"  '{sid}' ({fp}) differs from '{ref_sid}' ({fps[ref_sid]}): "
+                    f"{'; '.join(compare(ref, comps[sid]))}"
+                )
+
+    def unload_source(self, source_id: str) -> None:
+        """
+        Закриває та вивантажує джерело з пам'яті (без вимкнення).
+        ОБОВ'ЯЗКОВО викликати перед перегенерацією БД джерела, інакше
+        retriever триматиме stale handle на видалені файли vectors.lance.
+        """
+        if source_id in self._databases:
+            try:
+                self._databases[source_id].close()
+            except Exception as e:
+                logger.warning(f"Error closing database '{source_id}': {e}")
+            del self._databases[source_id]
+        self._retrievers.pop(source_id, None)
+        self._sources.pop(source_id, None)
+        self._active_source_ids.discard(source_id)
+        logger.info(f"Source '{source_id}' unloaded (e.g. pending rebuild)")
+
+    def reload_source(self, src: ProjectVideoSource) -> bool:
+        """
+        Перезавантажує джерело після перегенерації БД: закриває старі handles
+        (HDF5 + LanceDB table) і створює новий loader та retriever.
+
+        Returns:
+            True якщо джерело успішно перезавантажено.
+        """
+        self.unload_source(src.source_id)
+        self._load_sources([src])
+        ok = src.source_id in self._databases
+        if ok:
+            logger.success(f"Source '{src.source_id}' reloaded after rebuild")
+        else:
+            logger.error(f"Failed to reload source '{src.source_id}' after rebuild")
+        return ok
 
     def toggle_source(self, src: ProjectVideoSource) -> None:
         """Вмикає або вимикає джерело. Завантажує або вивантажує БД з пам'яті."""
@@ -2863,7 +4820,116 @@ class MultiDatabaseManager:
 
 
 # ================================================================================
-# File: database\spatial_index.py
+# File: src\database\schema_fingerprint.py
+# ================================================================================
+"""Database schema fingerprint — single source of truth for interchangeability.
+
+Two databases are *interchangeable* (mutually queryable / mergeable) only if they
+were built with the same structure- and content-type-defining settings: same
+global/local models, descriptor dimensions, keypoint budget, sampling scale,
+frame step, SIFT policy, VLAD settings. None of those may depend on the machine's
+compute power — see ``src/utils/hardware_profile.TUNABLE_KEYS``, whose allow-list
+deliberately excludes every field used here.
+
+This module turns that fixed set of settings into a short, stable hash that the
+builder writes into each database's metadata and the loader/manager check on
+open, so an incompatible database is detected instead of silently corrupting
+matches. Pure stdlib (hashlib, json) — safe to import anywhere.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any
+
+# Ordered, fixed list of structure/content-defining fields. The order is part of
+# the contract; appending a new field only changes the fingerprint of databases
+# built afterwards (existing databases keep the fingerprint stored in them).
+SCHEMA_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "global_backend",
+    "descriptor_dim",
+    "vlad_enabled",
+    "vlad_pca_dim",
+    "local_extractor",
+    "local_descriptor_dim",
+    "max_keypoints_stored",
+    "keypoint_video_scale",
+    "frame_step",
+    "store_sift_features",
+    "sift_max_keypoints",
+    # Аудит §2.1: CPU-resize перед входом DINO використовує cv2.INTER_AREA
+    # замість torchvision Resize(antialias) — інший фільтр, отже інші значення
+    # дескрипторів. Бази з різним значенням цього ключа НЕ взаємозамінні.
+    "dino_cpu_resize",
+)
+
+
+def compute_fingerprint(components: dict[str, Any]) -> str:
+    """Short deterministic hash of the schema-defining components (16 hex chars)."""
+    canonical = {k: components.get(k) for k in SCHEMA_FIELDS}
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def build_components(
+    config: Any,
+    *,
+    descriptor_dim: int,
+    local_descriptor_dim: int,
+    schema_version: str = "v2",
+) -> dict[str, Any]:
+    """Collect schema components from a config + the two build-time-derived dims.
+
+    ``config`` may be a Pydantic ``AppConfig`` or a plain dict; access goes
+    through ``config.get_cfg`` so both work. ``descriptor_dim`` and
+    ``local_descriptor_dim`` are passed in because they are resolved from the
+    actual loaded models at build time, not read from config.
+    """
+    from config import get_cfg
+
+    def g(path: str, default: Any) -> Any:
+        return get_cfg(config, path, default)
+
+    # global_descriptor lives at top level; fall back to models.* for safety.
+    backend = g("global_descriptor.backend", None)
+    if backend is None:
+        backend = g("models.global_descriptor.backend", "dinov3")
+
+    return {
+        "schema_version": schema_version,
+        "global_backend": backend,
+        "descriptor_dim": int(descriptor_dim),
+        "vlad_enabled": bool(g("models.vlad.enabled", False)),
+        "vlad_pca_dim": int(g("models.vlad.pca_dim", 512)),
+        "local_extractor": g("models.local_extractor", "aliked"),
+        "local_descriptor_dim": int(local_descriptor_dim),
+        "max_keypoints_stored": int(g("database.max_keypoints_stored", 2048)),
+        "keypoint_video_scale": float(g("database.keypoint_video_scale", 0.5)),
+        "frame_step": int(g("database.frame_step", 30)),
+        "store_sift_features": bool(g("database.store_sift_features", False)),
+        "sift_max_keypoints": int(g("database.sift_max_keypoints", 2048)),
+        "dino_cpu_resize": bool(g("models.performance.dino_cpu_resize", False)),
+    }
+
+
+def describe(components: dict[str, Any]) -> str:
+    """One-line human-readable rendering of the components."""
+    return ", ".join(f"{k}={components.get(k)}" for k in SCHEMA_FIELDS)
+
+
+def compare(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
+    """Human-readable list of differing fields between two component dicts."""
+    return [
+        f"{k}: {a.get(k)!r} != {b.get(k)!r}"
+        for k in SCHEMA_FIELDS
+        if a.get(k) != b.get(k)
+    ]
+
+
+# ================================================================================
+# File: src\database\spatial_index.py
 # ================================================================================
 """
 spatial_index.py — Просторовий тайловий індекс для геофільтрації кадрів.
@@ -2990,13 +5056,7 @@ class SpatialIndex:
 
 
 # ================================================================================
-# File: database\__init__.py
-# ================================================================================
-"""Database module"""
-
-
-# ================================================================================
-# File: depth\depth_estimator.py
+# File: src\depth\depth_estimator.py
 # ================================================================================
 """Lightweight depth estimation wrapper для scale recovery.
 
@@ -3106,12 +5166,17 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 "depth_anything_v2_vits.pth"
             ]
 
+            from config.paths import models_root
+
+            # Single models root: <repo>/models in dev (cwd-independent),
+            # <_MEIPASS>/models in a frozen build. Bare "models" stays as a
+            # cwd-relative fallback for unusual invocations.
+            model_dirs = [str(models_root()), "models"]
             weight_paths = []
             for name in weight_names:
-                weight_paths.extend([
-                    os.path.join("models", name),
-                    os.path.expanduser(f"~/.cache/depth_anything_v2/{name}")
-                ])
+                for d in model_dirs:
+                    weight_paths.append(os.path.join(d, name))
+                weight_paths.append(os.path.expanduser(f"~/.cache/depth_anything_v2/{name}"))
 
             for wp in weight_paths:
                 if os.path.exists(wp):
@@ -3189,7 +5254,44 @@ class _DummyDepthEstimator(DepthEstimator):
 
 
 # ================================================================================
-# File: geometry\affine_utils.py
+# File: src\exceptions.py
+# ================================================================================
+"""Domain exception hierarchy for DroneLocalization.
+
+A single base (:class:`DroneLocError`) lets callers catch any project-specific
+error, while the subclasses let optional-feature and required-path code narrow
+to the exact failure instead of a blanket ``except Exception``.
+"""
+
+
+class DroneLocError(Exception):
+    """Base class for all DroneLocalization domain errors."""
+
+
+class ModelLoadError(DroneLocError):
+    """A model (weights, TensorRT/TorchScript engine, HF repo) failed to load or init."""
+
+
+class DatabaseFormatError(DroneLocError):
+    """A features database is missing, corrupt, or has an unexpected/old schema."""
+
+
+class CalibrationError(DroneLocError):
+    """Calibration or propagation could not be computed (no anchors, singular graph, ...)."""
+
+
+class VideoDecodeError(DroneLocError):
+    """A video source could not be opened or a frame could not be decoded."""
+
+
+# ================================================================================
+# File: src\geometry\__init__.py
+# ================================================================================
+"""Geometry module"""
+
+
+# ================================================================================
+# File: src\geometry\affine_utils.py
 # ================================================================================
 """
 Утиліти декомпозиції/складання ізотропних афінних матриць.
@@ -3200,10 +5302,15 @@ class _DummyDepthEstimator(DepthEstimator):
   - src.geometry.pose_graph_optimizer
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
+from numpy.typing import NDArray
 
 
-def decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
+def decompose_affine(M: NDArray[np.float64]) -> tuple[float, float, float, float]:
     """
     Розкладає афінну матрицю 2x3 на компоненти:
     (tx, ty, scale, angle_rad).
@@ -3226,19 +5333,19 @@ def decompose_affine(M: np.ndarray) -> tuple[float, float, float, float]:
     return tx, ty, scale, angle
 
 
-def compose_affine(tx: float, ty: float, scale: float, angle: float) -> np.ndarray:
+def compose_affine(tx: float, ty: float, scale: float, angle: float) -> NDArray[np.float64]:
     """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
     c = np.cos(angle) * scale
     s = np.sin(angle) * scale
     return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float64)
 
 
-def unwrap_angles(angles: np.ndarray) -> np.ndarray:
+def unwrap_angles(angles: NDArray[np.floating[Any]]) -> NDArray[np.floating[Any]]:
     """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
     return np.unwrap(angles)
 
 
-def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, float]:
+def decompose_affine_5dof(M: NDArray[np.float64]) -> tuple[float, float, float, float, float]:
     """
     Розкладає афінну матрицю 2x3 на 5 компонентів для збереження анізотропії:
     (tx, ty, sx, sy, angle_rad).
@@ -3251,17 +5358,104 @@ def decompose_affine_5dof(M: np.ndarray) -> tuple[float, float, float, float, fl
     return tx, ty, sx, sy, angle
 
 
-def compose_affine_5dof(tx: float, ty: float, sx: float, sy: float, angle: float) -> np.ndarray:
+def compose_affine_5dof(
+    tx: float, ty: float, sx: float, sy: float, angle: float, sign: float = 1.0
+) -> NDArray[np.float64]:
     """
     Збирає афінну матрицю 2x3 з незалежними масштабами X та Y.
+    sign = -1.0 додає відображення по осі Y (необхідно для систем координат де Y-вниз мапиться на Y-вверх).
     """
     c = np.cos(angle)
     s = np.sin(angle)
-    return np.array([[c * sx, -s * sy, tx], [s * sx, c * sy, ty]], dtype=np.float64)
+    return np.array([[c * sx, -s * sign * sy, tx], [s * sx, c * sign * sy, ty]], dtype=np.float64)
+
+
+# ── Центр-базова 5-DoF PCHIP-інтерполяція (Етап 4) ───────────────────────────
+# Єдине джерело форми, яку використовують MultiAnchorCalibration (інтерполяція
+# між якорями) та CalibrationPropagationWorker (заповнення пропущених кадрів).
+# Інтерполюється (rx, ry, sx, sy, angle), де (rx, ry) — МЕТРИЧНА позиція опорного
+# пікселя (центр кадру), а знак det зберігається окремо: пряма інтерполяція
+# tx/ty при зміні кута дає «гойдання» центру, тому кодуємо саме центр.
+
+
+def build_5dof_pchip(
+    ids: Any, affines: Any, ref_px: tuple[float, float], log_scale: bool = False
+) -> tuple[Any, float, tuple[float, float] | None]:
+    """Будує shape-preserving PCHIP над (rx, ry, sx, sy, angle) валідних матриць.
+
+    Повертає (interp, sign, (lo, hi)). interp=None, якщо <2 вузлів. sign — знак det
+    більшості матриць (Y-flip), що відновлюється при композиції.
+
+    log_scale=True (RESEARCH_INTEGRATION_PLAN 1.3): інтерполюються log(sx), log(sy)
+    замість sx, sy — геодезично коректна форма для масштабу (лінійна інтерполяція
+    масштабу не є геодезичною у групі подібностей). sample_5dof_pchip МУСИТЬ бути
+    викликаний з тим самим значенням log_scale.
+    """
+    from scipy.interpolate import PchipInterpolator
+
+    ids = np.asarray(ids, dtype=np.float64)
+    affines = [np.asarray(a, dtype=np.float64) for a in affines]
+    n = len(affines)
+    if n < 2:
+        return None, -1.0, None
+
+    dets = np.array([np.linalg.det(a[:2, :2]) for a in affines], dtype=np.float64)
+    n_neg = int(np.sum(dets < 0))
+    sign = -1.0 if n_neg * 2 >= n else 1.0
+
+    cx, cy = float(ref_px[0]), float(ref_px[1])
+    comps = np.zeros((n, 5), dtype=np.float64)
+    for i, a in enumerate(affines):
+        _, _, sx, sy, angle = decompose_affine_5dof(a)
+        comps[i, 0] = a[0, 0] * cx + a[0, 1] * cy + a[0, 2]  # rx
+        comps[i, 1] = a[1, 0] * cx + a[1, 1] * cy + a[1, 2]  # ry
+        if log_scale:
+            comps[i, 2] = np.log(max(sx, 1e-12))
+            comps[i, 3] = np.log(max(sy, 1e-12))
+        else:
+            comps[i, 2] = sx
+            comps[i, 3] = sy
+        comps[i, 4] = angle
+    comps[:, 4] = unwrap_angles(comps[:, 4])
+
+    interp = PchipInterpolator(ids, comps, extrapolate=False)
+    return interp, sign, (float(ids[0]), float(ids[-1]))
+
+
+def sample_5dof_pchip(
+    interp: Any,
+    sign: float,
+    rng: tuple[float, float] | None,
+    ref_px: tuple[float, float],
+    frame_id: float,
+    log_scale: bool = False,
+) -> NDArray[np.float64] | None:
+    """Афінна 2x3 для frame_id із PCHIP (clamp за межами діапазону вузлів).
+
+    log_scale має збігатися зі значенням, переданим у build_5dof_pchip.
+    """
+    if interp is None or rng is None:
+        return None
+    fid = float(np.clip(frame_id, rng[0], rng[1]))
+    comps = interp(fid)
+    if comps is None or np.any(np.isnan(comps)):
+        return None
+    rx, ry, sx, sy, angle = comps
+    if log_scale:
+        sx = float(np.exp(np.clip(sx, np.log(1e-6), np.log(1e6))))
+        sy = float(np.exp(np.clip(sy, np.log(1e-6), np.log(1e6))))
+    else:
+        sx = float(np.clip(sx, 1e-6, 1e6))
+        sy = float(np.clip(sy, 1e-6, 1e6))
+    M = compose_affine_5dof(0.0, 0.0, sx, sy, float(angle), sign=sign)
+    cx, cy = float(ref_px[0]), float(ref_px[1])
+    M[0, 2] = float(rx) - (M[0, 0] * cx + M[0, 1] * cy)
+    M[1, 2] = float(ry) - (M[1, 0] * cx + M[1, 1] * cy)
+    return M
 
 
 # ================================================================================
-# File: geometry\coordinates.py
+# File: src\geometry\coordinates.py
 # ================================================================================
 import math
 from typing import Any
@@ -3271,6 +5465,17 @@ from pyproj import CRS, Transformer
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def mercator_scale_factor(lat: float) -> float:
+    """Множник Web-Mercator-метри → справжні наземні метри (Етап 6): cos(lat).
+
+    WebMercator (EPSG:3857) розтягує відстані у 1/cos(lat) (×~1.5 на 48°), тож
+    «метрові» цифри звітів/GSD на реальних даних систематично завищені. Множення
+    Mercator-відстані на cos(lat) дає справжні метри. Для UTM корекція = 1.0.
+    На сим-даних (усе в Mercator, порівняння відносне) не впливає на висновки.
+    """
+    return math.cos(math.radians(lat))
 
 
 class CoordinateConverter:
@@ -3299,6 +5504,25 @@ class CoordinateConverter:
     def reference_gps(self) -> tuple[float, float] | None:
         """Повертає опорні GPS-координати, використані для UTM проєкції."""
         return self._reference_gps
+
+    @property
+    def mode(self) -> str:
+        """Режим проєкції: "UTM" або "WEB_MERCATOR" (публічний доступ замість _mode)."""
+        return self._mode
+
+    def ground_scale_factor(self, lat: float | None = None) -> float:
+        """Множник «проєкційні метри → справжні наземні» (Етап 6).
+
+        UTM → 1.0 (уже справжні метри). WEB_MERCATOR → cos(lat): lat береться з
+        аргументу або з reference_gps. Якщо широта невідома — 1.0 (без корекції).
+        """
+        if self._mode != "WEB_MERCATOR":
+            return 1.0
+        if lat is None and self._reference_gps is not None:
+            lat = self._reference_gps[0]
+        if lat is None:
+            return 1.0
+        return mercator_scale_factor(lat)
 
     def _initialize_projection(self, lat: float, lon: float) -> None:
         wgs84_crs = CRS("EPSG:4326")
@@ -3394,7 +5618,7 @@ DEFAULT_CONVERTER = CoordinateConverter("WEB_MERCATOR")
 
 
 # ================================================================================
-# File: geometry\gsd_calculator.py
+# File: src\geometry\gsd_calculator.py
 # ================================================================================
 """Ground Sample Distance calculator.
 
@@ -3446,7 +5670,7 @@ class GSDCalculator:
             return 1.0
         return self.altitude_m / actual_altitude_m
 
-    def log_summary(self):
+    def log_summary(self) -> None:
         gsd = self.gsd_m_per_px
         logger.info(
             f"GSD Configuration: altitude={self.altitude_m}m, "
@@ -3460,25 +5684,474 @@ class GSDCalculator:
 
 
 # ================================================================================
-# File: geometry\pose_graph_optimizer.py
+# File: src\geometry\point_spread.py
 # ================================================================================
-"""
-Оптимізатор 5-DoF графу поз для калібрувальної пропагації координат.
-Містить незалежні масштаби для осей X та Y (вирішення проблеми анізотропії).
+"""Просторовий розкид відповідностей — обумовленість геометричної оцінки.
+
+Мотивація (OrthoTrack §3.4, `docs/RESEARCH_ADDENDUM_2026-07.md` п.1): інлаєрів
+може бути формально досить, але якщо всі вони скупчилися в одному куті кадру,
+гомографія/афінна оцінка ill-conditioned — модель екстраполюється на решту
+кадру, а саме центр кадру далі йде в координату. Кількість інлаєрів цього не
+бачить; RANSAC теж — локально узгоджений кластер є валідним консенсусом.
+
+Чисті функції (лише numpy) — тестуються в будь-якому середовищі і викликаються
+з обох сторін: live (`ResultBuilder.compute_confidence`) і offline
+(`PropagationPipeline._match_and_build_edge`).
+
+ВАЖЛИВО про семантику: низький розкид — це НЕ автоматично помилка. На межі
+покриття БД query-кадр легітимно перетинається з референсом лише кутом, і
+скупчення там правильне. Тому метрика входить у пайплайн неперервно (множник
+до confidence / до ваги ребра), а жорсткий гейт лишається тільки на екстремумі.
+
+ВАЖЛИВО про None: ``None`` означає «сигнал недоступний» (мало точок, битий
+кадр), а ``0.0`` — «розкид справді нульовий» (всі точки на одній прямій —
+найгірший можливий випадок). Плутати їх не можна: перше не має штрафуватись,
+друге має штрафуватись максимально.
 """
 
+from __future__ import annotations
+
+import numpy as np
+
+# Розкид рівномірного розподілу по стороні L: σ = L/√12 ≈ 0.2887·L.
+# Тобто здоровий надирний кадр з рівномірним покриттям дає spread ≈ 0.29.
+UNIFORM_SPREAD = float(1.0 / np.sqrt(12.0))
+
+
+def inlier_spread(points: np.ndarray, frame_w: float, frame_h: float) -> float | None:
+    """min(σx, σy) / min(W, H) — безрозмірний просторовий розкид точок.
+
+    Нормування на ``min(W, H)`` робить метрику інваріантною і до роздільності,
+    і до співвідношення сторін: для рівномірного покриття σx = 0.2887·W,
+    σy = 0.2887·H, тож min(σx, σy) = 0.2887·min(W, H) → spread ≈ 0.289 за
+    будь-якого аспекту.
+
+    Береться саме ``min`` двох осей, а не площа хмари: типовий режим відмови —
+    точки вздовж однієї борозни/лінії, де один із σ великий, а другий ≈ 0.
+    Добуток σx·σy теж це ловить, але ``min`` дає лінійну шкалу в тих самих
+    одиницях, що й сторона кадру, і легше калібрується порогами.
+
+    Args:
+        points: (N, 2) координати у пікселях кадру (query-сторона).
+        frame_w: ширина кадру в тих самих пікселях, що й ``points``.
+        frame_h: висота кадру.
+
+    Returns:
+        Розкид у [0, ~0.5], або ``None``, якщо метрику неможливо порахувати
+        (< 2 валідних точок, нульовий/нечисловий розмір кадру). Нуль — це
+        валідне значення «повністю вироджена хмара», а не відсутність сигналу.
+    """
+    if points is None:
+        return None
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] < 2:
+        return None
+
+    denom = min(float(frame_w), float(frame_h))
+    if not np.isfinite(denom) or denom <= 0.0:
+        return None
+
+    xy = pts[:, :2]
+    if not np.all(np.isfinite(xy)):
+        xy = xy[np.all(np.isfinite(xy), axis=1)]
+        if xy.shape[0] < 2:
+            return None
+
+    sigma = xy.std(axis=0)
+    return float(min(sigma[0], sigma[1]) / denom)
+
+
+def spread_confidence_factor(
+    spread: float | None, spread_ref: float = 0.15, floor: float = 0.35
+) -> float:
+    """Множник до confidence живої локалізації: clip(spread/ref, floor, 1.0).
+
+    ``spread_ref`` = 0.15 — приблизно половина рівномірного покриття (0.289):
+    вище нього штрафу нема взагалі. ``floor`` не дає confidence обнулитись —
+    скупчений фікс лишається вимірюванням із більшим R у Калмані, а не
+    відкинутим кадром (це і є різниця з жорстким порогом OrthoTrack).
+
+    ``None`` (сигнал недоступний) → 1.0, без штрафу. ``0.0`` (вироджена
+    хмара) → ``floor``, тобто максимальний штраф.
+    """
+    if spread is None or not np.isfinite(spread):
+        return 1.0
+    ref = max(float(spread_ref), 1e-6)
+    return float(np.clip(max(0.0, float(spread)) / ref, float(floor), 1.0))
+
+
+def spread_weight_factor(spread: float | None, spread_ref: float = 0.15, k: float = 10.0) -> float:
+    """Множник до ваги ребра графа: 1 / (1 + k·max(0, ref − spread)).
+
+    Та сама форма, що вже вживається для якості афінного фіту
+    (``temporal_weight_use_fit_quality``), тож ваги лишаються в одній шкалі.
+    Дефіцит розкиду обмежений зверху величиною ``ref`` (0.15), тому k має бути
+    порядку 10, щоб штраф був відчутним: spread 0.05 → ×0.50, spread 0 → ×0.40.
+
+    ``None`` (сигнал недоступний) → 1.0, без штрафу.
+    """
+    if spread is None or not np.isfinite(spread):
+        return 1.0
+    deficit = max(0.0, float(spread_ref) - max(0.0, float(spread)))
+    return float(1.0 / (1.0 + float(k) * deficit))
+
+
+# ================================================================================
+# File: src\geometry\pose_graph\__init__.py
+# ================================================================================
+"""5-DoF pose-graph optimizer, split into model / optimizer / pruning / diagnostics."""
+
+from src.geometry.pose_graph.model_5dof import (
+    GraphEdge,
+    _affine_to_state,
+    _predict_forward,
+    _predict_inverse,
+    _state_to_affine,
+)
+from src.geometry.pose_graph.optimizer import (
+    PoseGraphOptimizer,
+    homography_to_affine,
+    homography_to_similarity,
+)
+
+__all__ = [
+    "PoseGraphOptimizer",
+    "GraphEdge",
+    "homography_to_affine",
+    "homography_to_similarity",
+    "_affine_to_state",
+    "_state_to_affine",
+    "_predict_forward",
+    "_predict_inverse",
+]
+
+
+# ================================================================================
+# File: src\geometry\pose_graph\diagnostics.py
+# ================================================================================
+"""Read-only residual/anchor diagnostics and GeoJSON export mixin."""
+
+from __future__ import annotations
+
 from collections import deque
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
-from scipy.sparse import lil_matrix
+
+from src.geometry.pose_graph.model_5dof import (
+    GraphEdge,
+    _predict_forward,
+    _predict_inverse,
+    edge_residual,
+)
+
+
+class DiagnosticsMixin:
+    """Residual stats, anchor stress, reports and GeoJSON. Pure move from PoseGraphOptimizer."""
+
+    def _current_states_full(self) -> dict[int, np.ndarray]:
+        """Поточні стани всіх ІНІЦІАЛІЗОВАНИХ вузлів (fixed + досяжні free)."""
+        states: dict[int, np.ndarray] = dict(self._fixed_nodes)
+        for fid, st in self._free_nodes.items():
+            if fid in self._initialized_nodes:
+                states[fid] = st
+        return states
+
+    def _single_edge_residual(self, si: np.ndarray, sj: np.ndarray, e: GraphEdge) -> np.ndarray:
+        """Зважений 5-вектор резидуала ребра — ТА САМА формула, що в _residuals_vec."""
+        return edge_residual(
+            si,
+            sj,
+            e.dtx,
+            e.dty,
+            e.log_dsx,
+            e.log_dsy,
+            e.dtheta,
+            e.weight,
+            self.cx,
+            self._sign,
+        )
+
+    def compute_edge_residuals(self) -> np.ndarray:
+        """Норма зваженого резидуала на КОЖНЕ ребро (за поточними станами).
+
+        result.fun уже містить ці числа під час оптимізації, але викидається —
+        тут відтворюємо їх для діагностики. NaN, якщо вузол ребра недосяжний.
+        """
+        states = self._current_states_full()
+        res = np.full(len(self._edges), np.nan, dtype=np.float64)
+        for k, e in enumerate(self._edges):
+            si, sj = states.get(e.from_id), states.get(e.to_id)
+            if si is None or sj is None:
+                continue
+            res[k] = float(np.linalg.norm(self._single_edge_residual(si, sj, e)))
+        self._last_edge_residuals = res
+        return res
+
+    def edge_residual_stats(self) -> dict:
+        """Статистика резидуалів ОКРЕМО для temporal і spatial (різні масштаби!)."""
+        res = self.compute_edge_residuals()
+        out: dict[str, dict] = {}
+        for cls in ("temporal", "spatial"):
+            vals = np.array(
+                [
+                    res[k]
+                    for k, e in enumerate(self._edges)
+                    if e.edge_type == cls and not np.isnan(res[k])
+                ]
+            )
+            if vals.size:
+                out[cls] = {
+                    "count": int(vals.size),
+                    "median": float(np.median(vals)),
+                    "p95": float(np.percentile(vals, 95)),
+                    "max": float(np.max(vals)),
+                }
+            else:
+                out[cls] = {"count": 0, "median": 0.0, "p95": 0.0, "max": 0.0}
+        return out
+
+    def compute_anchor_stress(self) -> dict[int, float]:
+        """Для кожного якоря: середній резидуал інцидентних ребер / медіана графу.
+
+        Якір зі stress ≫ 1 конфліктує з графом (крива точка користувача).
+        """
+        res = self._last_edge_residuals
+        if res is None:
+            res = self.compute_edge_residuals()
+        valid = res[~np.isnan(res)]
+        med = float(np.median(valid)) if valid.size else 0.0
+
+        incident: dict[int, list[float]] = {}
+        for k, e in enumerate(self._edges):
+            if np.isnan(res[k]):
+                continue
+            incident.setdefault(e.from_id, []).append(res[k])
+            incident.setdefault(e.to_id, []).append(res[k])
+
+        stress: dict[int, float] = {}
+        # anchor_states(): жорсткі + м'які. З _fixed_nodes при soft_anchors=True
+        # звіт anchor-stress зникав повністю (вузлів там немає).
+        for fid in self.anchor_states():
+            rs = incident.get(fid, [])
+            if not rs:
+                continue
+            mean_r = float(np.mean(rs))
+            stress[fid] = mean_r / med if med > 0 else mean_r
+        return stress
+
+    def leave_one_out_anchor_check(self, threshold_m: float = 5.0) -> dict:
+        """LOO-валідація якорів (Етап 1.2, read-only).
+
+        Для кожного якоря: спрогнозувати його стан temporal-ланцюгом від
+        НАЙБЛИЖЧОГО якоря з кожного боку (менший / більший frame_id), окремо.
+        disagreement = MIN по доступних боках → якір, що конфліктує з ОБОМА
+        сусідами (крива точка), спливає, а добрий сусід кривого лишається
+        normal (бо збігається зі своїм другим, добрим боком). Той самий
+        forward/inverse-предикт, що в BFS; anchor-stress лишається як пост-фактум.
+
+        Не мутує стан оптимізатора. {fid → {reachable, disagreement_m, flag}}.
+        Працює і з жорсткими (fix_node), і з м'якими (add_anchor) якорями.
+        """
+        anchors: dict[int, np.ndarray] = dict(self._fixed_nodes)
+        for fid, (st, _w) in getattr(self, "_anchor_priors", {}).items():
+            anchors.setdefault(fid, st)
+        if len(anchors) < 2:
+            return {}
+
+        adj: dict[int, list] = {}
+        for e in self._edges:
+            adj.setdefault(e.from_id, []).append((e.to_id, e))
+            adj.setdefault(e.to_id, []).append((e.from_id, e))
+
+        def predict_from(seed: int, target: int):
+            """Чиста одометрична проєкція стану target від одного якоря seed
+            уздовж ребер (BFS, перше досягнення). None, якщо недосяжно."""
+            pred = {seed: anchors[seed]}
+            visited = {seed}
+            queue = deque([seed])
+            while queue:
+                cur = queue.popleft()
+                cur_state = pred[cur]
+                for nb, e in adj.get(cur, []):
+                    if nb in visited:
+                        continue
+                    predicted = (
+                        _predict_forward(cur_state, e, self._sign)
+                        if e.from_id == cur
+                        else _predict_inverse(cur_state, e, self._sign)
+                    )
+                    if nb == target:
+                        return predicted
+                    pred[nb] = predicted
+                    visited.add(nb)
+                    queue.append(nb)
+            return None
+
+        ids = sorted(anchors)
+        results: dict[int, dict] = {}
+        for target in anchors:
+            prevs = [a for a in ids if a < target]
+            nexts = [a for a in ids if a > target]
+            sides = ([max(prevs)] if prevs else []) + ([min(nexts)] if nexts else [])
+            diffs = []
+            for seed in sides:
+                p = predict_from(seed, target)
+                if p is not None:
+                    diffs.append(float(np.linalg.norm(p[:2] - anchors[target][:2])))
+            if not diffs:
+                results[target] = {"reachable": False}
+                continue
+            d = min(diffs)
+            results[target] = {
+                "reachable": True,
+                "disagreement_m": d,
+                "flag": "warning" if d > threshold_m else "normal",
+            }
+        return results
+
+    def diagnostics_report(self, top_n: int = 5, loo_threshold_m: float = 5.0) -> dict:
+        """Повний звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших,
+        anchor stress, LOO-валідація якорів (1.2). Read-only — нуль впливу на розв'язок."""
+        res = self.compute_edge_residuals()
+        stats = self.edge_residual_stats()
+        stress = self.compute_anchor_stress()
+        loo = self.leave_one_out_anchor_check(loo_threshold_m)
+
+        order = [k for k in np.argsort(res)[::-1] if not np.isnan(res[k])]
+        worst = []
+        for k in order[:top_n]:
+            e = self._edges[k]
+            worst.append(
+                {
+                    "from_id": e.from_id,
+                    "to_id": e.to_id,
+                    "type": e.edge_type,
+                    "residual": float(res[k]),
+                    "inliers": e.inliers,
+                    "rmse": e.rmse,
+                }
+            )
+
+        return {
+            "num_edges": len(self._edges),
+            "num_temporal": sum(1 for e in self._edges if e.edge_type == "temporal"),
+            "num_spatial": sum(1 for e in self._edges if e.edge_type == "spatial"),
+            "num_anchors": len(self.anchor_states()),
+            "residual_stats": stats,
+            "worst_edges": worst,
+            "anchor_stress": {int(k): float(v) for k, v in stress.items()},
+            "anchor_loo": {int(k): v for k, v in loo.items()},
+        }
+
+    def format_diagnostics(self, top_n: int = 5, loo_threshold_m: float = 5.0) -> str:
+        """Текстовий звіт для лога/діалогу-підсумку."""
+        r = self.diagnostics_report(top_n=top_n, loo_threshold_m=loo_threshold_m)
+        lines = [
+            f"Ребер: {r['num_edges']} ({r['num_temporal']} temporal + "
+            f"{r['num_spatial']} spatial), якорів: {r['num_anchors']}",
+        ]
+        for cls in ("temporal", "spatial"):
+            st = r["residual_stats"][cls]
+            lines.append(
+                f"  {cls}: медіана={st['median']:.1f}, p95={st['p95']:.1f}, "
+                f"max={st['max']:.1f} (n={st['count']})"
+            )
+        if r["worst_edges"]:
+            lines.append("  Топ-гірших ребер:")
+            for w in r["worst_edges"]:
+                lines.append(
+                    f"    #{w['from_id']}→#{w['to_id']} [{w['type']}] резидуал={w['residual']:.1f}"
+                )
+        hot = {k: v for k, v in r["anchor_stress"].items() if v >= 2.0}
+        if hot:
+            for fid, v in sorted(hot.items(), key=lambda kv: -kv[1]):
+                lines.append(f"  ⚠ Якір #{fid}: stress {v:.1f}× медіани — перевірте точки")
+        loo_warn = {k: v for k, v in r["anchor_loo"].items() if v.get("flag") == "warning"}
+        if loo_warn:
+            for fid, v in sorted(loo_warn.items(), key=lambda kv: -kv[1]["disagreement_m"]):
+                lines.append(
+                    f"  ⚠ Якір #{fid}: конфліктує з ланцюгом сусідніх якорів на "
+                    f"{v['disagreement_m']:.1f} м (LOO) — перевірте точки"
+                )
+        return "\n".join(lines)
+
+    def export_graph_geojson(
+        self, converter, frame_w: int, frame_h: int, origin_xy: tuple = (0.0, 0.0)
+    ) -> dict:
+        """origin_xy — Local Origin пропагації: внутрішні стани графа локальні,
+        без цього зсуву GeoJSON опинявся біля (0°, 0°) (баг, сесія 2026-07-12)."""
+        features = []
+        results = self._export_results()
+        cx, cy = frame_w / 2.0, frame_h / 2.0
+        ox, oy = float(origin_xy[0]), float(origin_xy[1])
+
+        # Пер-ребровий резидуал у properties → на карті розфарбувати ребра
+        # за резидуалом (погані loop closures стає ВИДНО очима).
+        edge_res = self.compute_edge_residuals()
+        anchor_ids = set(self.anchor_states())  # жорсткі + м'які (soft_anchors)
+
+        for fid, affine in results.items():
+            pt = np.array([[cx, cy]], dtype=np.float64)
+            metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
+            try:
+                lat, lon = converter.metric_to_gps(float(metric[0]) + ox, float(metric[1]) + oy)
+            except Exception:
+                continue
+            is_fixed = fid in anchor_ids
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                    "properties": {"frame_id": fid, "type": "anchor" if is_fixed else "frame"},
+                }
+            )
+
+        for e_idx, edge in enumerate(self._edges):
+            affine_from = results.get(edge.from_id)
+            affine_to = results.get(edge.to_id)
+            if affine_from is None or affine_to is None:
+                continue
+            try:
+                pt = np.array([[cx, cy]], dtype=np.float64).reshape(-1, 1, 2)
+                m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
+                m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
+                lat1, lon1 = converter.metric_to_gps(float(m_from[0]) + ox, float(m_from[1]) + oy)
+                lat2, lon2 = converter.metric_to_gps(float(m_to[0]) + ox, float(m_to[1]) + oy)
+            except Exception:
+                continue
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
+                    "properties": {
+                        "from_id": edge.from_id,
+                        "to_id": edge.to_id,
+                        "edge_type": edge.edge_type,
+                        "residual": (None if np.isnan(edge_res[e_idx]) else float(edge_res[e_idx])),
+                        "weight": float(edge.weight),
+                    },
+                }
+            )
+
+        return {"type": "FeatureCollection", "features": features}
+
+
+# ================================================================================
+# File: src\geometry\pose_graph\model_5dof.py
+# ================================================================================
+"""5-DoF model: edge dataclass, state<->affine, forward/inverse prediction.
+
+Single source of the pure geometric transforms used by the optimizer.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
 
 from src.geometry.affine_utils import decompose_affine_5dof
-from src.utils.logging_utils import get_logger
-
-logger = get_logger(__name__)
 
 
 @dataclass
@@ -3498,10 +6171,146 @@ class GraphEdge:
     rmse: float = 0.0
 
 
-class PoseGraphOptimizer:
+def _affine_to_state(affine_2x3: np.ndarray, cx: float, cy: float) -> np.ndarray:
+    tx, ty, sx, sy, angle = decompose_affine_5dof(affine_2x3)
+    c_x = affine_2x3[0, 0] * cx + affine_2x3[0, 1] * cy + tx
+    c_y = affine_2x3[1, 0] * cx + affine_2x3[1, 1] * cy + ty
+    return np.array(
+        [c_x, c_y, np.log(max(sx, 1e-9)), np.log(max(sy, 1e-9)), angle], dtype=np.float64
+    )
+
+
+def _state_to_affine(state: np.ndarray, cx: float, cy: float, sign: float = 1.0) -> np.ndarray:
+    c_x, c_y, log_sx, log_sy, theta = state
+    sx, sy = float(np.clip(np.exp(log_sx), 1e-6, 1e6)), float(np.clip(np.exp(log_sy), 1e-6, 1e6))
+    c, s = np.cos(theta), np.sin(theta)
+
+    M00, M01 = c * sx, -s * sign * sy
+    M10, M11 = s * sx, c * sign * sy
+    tx = c_x - (M00 * cx + M01 * cy)
+    ty = c_y - (M10 * cx + M11 * cy)
+    return np.array([[M00, M01, tx], [M10, M11, ty]], dtype=np.float64)
+
+
+def _predicted_translation(tx_i, ty_i, sx_i, sy_i, cos_i, sin_i, dtx, dty, sign):
+    """Predicted child-frame centre (tx_j, ty_j) under the 5-DoF model.
+
+    Elementwise (scalars or numpy arrays). Single source of the
+    rotate-scale-translate step shared by edge_residual and predict_forward/inverse.
+    """
+    pred_tx = tx_i + cos_i * sx_i * dtx - sign * sin_i * sy_i * dty
+    pred_ty = ty_i + sin_i * sx_i * dtx + sign * cos_i * sy_i * dty
+    return pred_tx, pred_ty
+
+
+def edge_residual(state_i, state_j, dtx, dty, log_dsx, log_dsy, dtheta, weight, cx, sign):
+    """Weighted 5-vector edge residual - THE single source of the residual formula.
+
+    Broadcasts along the last axis, so the vectorized optimizer path
+    (state_i/state_j shape (N, 5)) and the per-edge diagnostics path (shape (5,))
+    share exactly one formula. Returns shape (..., 5).
+    """
+    tx_i, ty_i = state_i[..., 0], state_i[..., 1]
+    log_sx_i, log_sy_i, theta_i = state_i[..., 2], state_i[..., 3], state_i[..., 4]
+    tx_j, ty_j = state_j[..., 0], state_j[..., 1]
+    log_sx_j, log_sy_j, theta_j = state_j[..., 2], state_j[..., 3], state_j[..., 4]
+
+    sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
+    cos_i, sin_i = np.cos(theta_i), np.sin(theta_i)
+    pred_tx, pred_ty = _predicted_translation(
+        tx_i, ty_i, sx_i, sy_i, cos_i, sin_i, dtx, dty, sign
+    )
+
+    angle_diff = theta_j - theta_i - sign * dtheta
+    r0 = (weight / sx_i) * (tx_j - pred_tx)
+    r1 = (weight / sy_i) * (ty_j - pred_ty)
+    r2 = (weight * cx) * (log_sx_j - log_sx_i - log_dsx)
+    r3 = (weight * cx) * (log_sy_j - log_sy_i - log_dsy)
+    r4 = (weight * cx) * np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
+    return np.stack([r0, r1, r2, r3, r4], axis=-1)
+
+
+def _predict_forward(state_i: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
+    tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i
+    sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
+    c_i, s_i = np.cos(theta_i), np.sin(theta_i)
+    pred_tx, pred_ty = _predicted_translation(
+        tx_i, ty_i, sx_i, sy_i, c_i, s_i, edge.dtx, edge.dty, sign
+    )
+    return np.array(
+        [
+            pred_tx,
+            pred_ty,
+            log_sx_i + edge.log_dsx,
+            log_sy_i + edge.log_dsy,
+            theta_i + sign * edge.dtheta,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _predict_inverse(state_j: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
+    tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j
+    inv_dsx, inv_dsy = 1.0 / np.exp(edge.log_dsx), 1.0 / np.exp(edge.log_dsy)
+    inv_dtheta = -edge.dtheta
+    cos_inv, sin_inv = np.cos(inv_dtheta), np.sin(inv_dtheta)
+
+    inv_dtx = inv_dsx * (cos_inv * (-edge.dtx) - sin_inv * (-edge.dty))
+    inv_dty = inv_dsy * (sin_inv * (-edge.dtx) + cos_inv * (-edge.dty))
+
+    sx_j, sy_j = np.exp(log_sx_j), np.exp(log_sy_j)
+    c_j, s_j = np.cos(theta_j), np.sin(theta_j)
+    pred_tx, pred_ty = _predicted_translation(
+        tx_j, ty_j, sx_j, sy_j, c_j, s_j, inv_dtx, inv_dty, sign
+    )
+    return np.array(
+        [
+            pred_tx,
+            pred_ty,
+            log_sx_j + np.log(inv_dsx),
+            log_sy_j + np.log(inv_dsy),
+            theta_j + sign * inv_dtheta,
+        ],
+        dtype=np.float64,
+    )
+
+
+# ================================================================================
+# File: src\geometry\pose_graph\optimizer.py
+# ================================================================================
+"""5-DoF pose-graph optimizer (Levenberg-Marquardt / TRF) with 5-DoF anisotropic model."""
+
+from __future__ import annotations
+
+from collections import deque
+
+import cv2
+import numpy as np
+from scipy.optimize import least_squares
+from scipy.sparse import coo_matrix
+
+from src.geometry.affine_utils import decompose_affine_5dof
+from src.geometry.pose_graph.diagnostics import DiagnosticsMixin
+from src.geometry.pose_graph.model_5dof import (
+    GraphEdge,
+    _affine_to_state,
+    _predict_forward,
+    _predict_inverse,
+    _state_to_affine,
+    edge_residual,
+)
+from src.geometry.pose_graph.pruning import PruningMixin
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
     """5-DoF Pose Graph Optimizer з Levenberg-Marquardt."""
 
-    def __init__(self, frame_w: int = 1920, frame_h: int = 1080) -> None:
+    def __init__(
+        self, frame_w: int = 1920, frame_h: int = 1080, isotropy_weight: float = 200.0
+    ) -> None:
         # frame_id → [center_x_metric, center_y_metric, log_sx, log_sy, θ]
         self._free_nodes: dict[int, np.ndarray] = {}
         self._fixed_nodes: dict[int, np.ndarray] = {}
@@ -3513,6 +6322,20 @@ class PoseGraphOptimizer:
 
         self.cx = frame_w / 2.0
         self.cy = frame_h / 2.0
+
+        # Вага регуляризатора ізотропії: r = isotropy_weight·cx·(log_sx − log_sy).
+        # Історично захардкоджена 200.0; винесена в конфіг без зміни дефолту.
+        self.isotropy_weight = float(isotropy_weight)
+
+        # Кеш пер-ребрових резидуалів (діагностика, Етап 1). None = ще не рахували.
+        self._last_edge_residuals: np.ndarray | None = None
+
+        # Ребра, викинуті two-stage prune (Етап 3). Порожньо = prune не спрацював.
+        self._pruned_edges: list[GraphEdge] = []
+
+        # М'які якорі (Етап 1.1): frame_id → (state_anchor 5-вектор, w_a). Порожньо
+        # = поведінка як раніше (жорсткі fix_node). Заповнюється add_anchor().
+        self._anchor_priors: dict[int, tuple[np.ndarray, float]] = {}
 
     @property
     def num_nodes(self) -> int:
@@ -3553,6 +6376,83 @@ class PoseGraphOptimizer:
         self._initialized_nodes.add(frame_id)
         self._free_nodes.pop(frame_id, None)
 
+    def add_anchor(
+        self,
+        frame_id: int,
+        affine_2x3: np.ndarray,
+        sigma_m: float,
+        base_w: float = 200.0,
+        sigma_floor: float = 0.05,
+    ) -> None:
+        """М'який якір як унарний фактор (Етап 1.1) — альтернатива fix_node.
+
+        Вузол ЛИШАЄТЬСЯ ВІЛЬНИМ, але отримує пріор w_a·(state − state_anchor),
+        де w_a = base_w / max(sigma_m, sigma_floor). σ→floor (GT-якорі симулятора,
+        rmse≈0) → величезна вага → практично жорсткий (сим-бенчмарк не змінюється).
+        Реальний якір (RMSE 5–10 м) стає м'яким: узгоджений ланцюг ребер може його
+        «переголосувати», тоді як хибний ручний якір більше не гне граф.
+
+        Вузол ініціалізується станом якоря (лишається стартом BFS), знак det
+        встановлюється як у fix_node.
+        """
+        affine_2x3 = np.asarray(affine_2x3, dtype=np.float64)
+        det = affine_2x3[0, 0] * affine_2x3[1, 1] - affine_2x3[0, 1] * affine_2x3[1, 0]
+        if det < 0:
+            self._sign = -1.0
+
+        state = _affine_to_state(affine_2x3, self.cx, self.cy)
+        w_a = float(base_w) / max(float(sigma_m), float(sigma_floor))
+        self._anchor_priors[frame_id] = (state, w_a)
+
+        self._free_nodes[frame_id] = state.copy()
+        self._node_ids.add(frame_id)
+        self._initialized_nodes.add(frame_id)
+        self._fixed_nodes.pop(frame_id, None)
+
+    @property
+    def sign(self) -> float:
+        """Знак det (−1 = дзеркальні калібрувальні матриці). Для vo_guards."""
+        return self._sign
+
+    def anchor_states(self) -> dict[int, np.ndarray]:
+        """Стани всіх якорів (жорстких fix_node і м'яких add_anchor) —
+        опора для check_anchor_gaps (vo_guards, сесія 2026-07-12)."""
+        states: dict[int, np.ndarray] = dict(self._fixed_nodes)
+        for fid, (st, _w) in self._anchor_priors.items():
+            states.setdefault(fid, st)
+        return states
+
+    def _build_graph_edge(
+        self,
+        from_id: int,
+        to_id: int,
+        relative_affine_2x3: np.ndarray,
+        weight: float,
+        edge_type: str,
+        inliers: int,
+        rmse: float,
+    ) -> GraphEdge:
+        """Будує GraphEdge із відносної афінної (спільне для add_edge та
+        odometry-consistency 2.3, який рахує ефемерні ребра без додавання в граф)."""
+        M = relative_affine_2x3
+        tx, ty, sx, sy, angle = decompose_affine_5dof(M)
+
+        c_x_local = M[0, 0] * self.cx + M[0, 1] * self.cy + tx
+        c_y_local = M[1, 0] * self.cx + M[1, 1] * self.cy + ty
+        return GraphEdge(
+            from_id=from_id,
+            to_id=to_id,
+            dtx=c_x_local - self.cx,
+            dty=c_y_local - self.cy,
+            log_dsx=np.log(max(sx, 1e-9)),
+            log_dsy=np.log(max(sy, 1e-9)),
+            dtheta=angle,
+            weight=weight,
+            edge_type=edge_type,
+            inliers=inliers,
+            rmse=rmse,
+        )
+
     def add_edge(
         self,
         from_id: int,
@@ -3563,34 +6463,17 @@ class PoseGraphOptimizer:
         inliers: int = 0,
         rmse: float = 0.0,
     ) -> None:
-        M = relative_affine_2x3
-        tx, ty, sx, sy, angle = decompose_affine_5dof(M)
-
-        c_x_local = M[0, 0] * self.cx + M[0, 1] * self.cy + tx
-        c_y_local = M[1, 0] * self.cx + M[1, 1] * self.cy + ty
-        dtx = c_x_local - self.cx
-        dty = c_y_local - self.cy
-
-        edge = GraphEdge(
-            from_id=from_id,
-            to_id=to_id,
-            dtx=dtx,
-            dty=dty,
-            log_dsx=np.log(max(sx, 1e-9)),
-            log_dsy=np.log(max(sy, 1e-9)),
-            dtheta=angle,
-            weight=weight,
-            edge_type=edge_type,
-            inliers=inliers,
-            rmse=rmse,
+        edge = self._build_graph_edge(
+            from_id, to_id, relative_affine_2x3, weight, edge_type, inliers, rmse
         )
         self._edges.append(edge)
         self._node_ids.add(from_id)
         self._node_ids.add(to_id)
 
     def initialize_from_bfs(self) -> int:
-        if not self._fixed_nodes:
-            logger.warning("No fixed nodes for BFS initialization")
+        seeds = set(self._fixed_nodes) | set(self._anchor_priors)
+        if not seeds:
+            logger.warning("No fixed/anchor nodes for BFS initialization")
             return 0
 
         adj: dict[int, list[tuple[int, GraphEdge]]] = {}
@@ -3598,7 +6481,7 @@ class PoseGraphOptimizer:
             adj.setdefault(edge.from_id, []).append((edge.to_id, edge))
             adj.setdefault(edge.to_id, []).append((edge.from_id, edge))
 
-        queue: deque[int] = deque(self._fixed_nodes.keys())
+        queue: deque[int] = deque(seeds)
         count = 0
 
         while queue:
@@ -3619,12 +6502,162 @@ class PoseGraphOptimizer:
                 queue.append(neighbor_id)
                 count += 1
 
-        logger.info(
-            f"BFS initialization: {count} nodes initialized from {len(self._fixed_nodes)} anchors"
-        )
+        logger.info(f"BFS initialization: {count} nodes initialized from {len(seeds)} seeds")
         return count
 
-    def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6) -> dict[int, np.ndarray]:
+    def warm_start_from_affines(self, affines: dict[int, np.ndarray]) -> int:
+        """Тепла ініціалізація станів із попереднього розв'язку (Етап 4.2).
+
+        Замість BFS з нуля: коли користувач додав/посунув один якір, x0 =
+        попередній розв'язок (frame_affine з HDF5 → стани). Та сама модель,
+        швидша ітерація користувача. Фіксовані вузли (якорі) не чіпаємо; BFS
+        лишається для першого запуску та як fallback для вузлів без стану.
+        """
+        count = 0
+        for fid, affine in affines.items():
+            if fid in self._fixed_nodes or fid not in self._node_ids:
+                continue
+            state = _affine_to_state(np.asarray(affine, dtype=np.float64), self.cx, self.cy)
+            self._free_nodes[fid] = state
+            self._initialized_nodes.add(fid)
+            count += 1
+        logger.info(f"Warm start: {count} nodes seeded from previous solution")
+        return count
+
+    def preliminary_states(self, seed_affines: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+        """Прикидка ПОВНИХ станів вузлів BFS-ланцюгом ЛИШЕ по temporal-ребрах від
+        заданих якірних матриць (Етапи 2.2/2.3 — ДО матчингу/оптимізації).
+
+        Відстані/пози інваріантні до Local Origin, тож беремо абсолютні матриці
+        якорів. Не мутує стан оптимізатора. Повертає {fid → state[5]}.
+        """
+        seeds = {}
+        for fid, aff in seed_affines.items():
+            if fid in self._node_ids:
+                seeds[fid] = _affine_to_state(np.asarray(aff, dtype=np.float64), self.cx, self.cy)
+        if not seeds:
+            return {}
+
+        adj: dict[int, list] = {}
+        for e in self._edges:
+            if e.edge_type != "temporal":
+                continue
+            adj.setdefault(e.from_id, []).append((e.to_id, e))
+            adj.setdefault(e.to_id, []).append((e.from_id, e))
+
+        states: dict[int, np.ndarray] = dict(seeds)
+        queue = deque(seeds)
+        while queue:
+            cur = queue.popleft()
+            cur_state = states[cur]
+            for nb, e in adj.get(cur, []):
+                if nb in states:
+                    continue
+                states[nb] = (
+                    _predict_forward(cur_state, e, self._sign)
+                    if e.from_id == cur
+                    else _predict_inverse(cur_state, e, self._sign)
+                )
+                queue.append(nb)
+        return states
+
+    def preliminary_centers(self, seed_affines: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+        """Прикидка метричних центрів (Етап 2.2, дистанційний префільтр) —
+        тонка обгортка над preliminary_states."""
+        return {fid: st[:2].copy() for fid, st in self.preliminary_states(seed_affines).items()}
+
+    def odometry_consistency_factors(
+        self,
+        specs: list,
+        prelim_states: dict[int, np.ndarray],
+        frame_w: int,
+        frame_h: int,
+        margin: float = 1.5,
+        drift_frac: float = 0.25,
+        factor: float = 0.3,
+    ) -> list:
+        """Odometry-consistency (PCM-lite, Етап 2.3): вага ×factor для spatial-ребер,
+        несумісних із temporal-ланцюгом.
+
+        Для кожного кандидата (i, j, similarity): передбачити центр j із вузла i
+        ЧЕРЕЗ РЕБРО (predict_forward на прикидці стану i) і порівняти з тим, куди
+        j ставить temporal-ланцюг (prelim center). Допуск росте з довжиною ланцюга
+        |i−j| (компенсація дрейфу). Несумісне ребро (аліас паралельних рядів посівів,
+        що узгоджені МІЖ СОБОЮ й проходять cluster-гейт) → вага ×factor. НЕ викидання.
+
+        specs — список dict із ключами 'i','j','similarity'. Повертає list факторів.
+        """
+        n = len(specs)
+        factors = [1.0] * n
+        if not prelim_states or n == 0:
+            return factors
+
+        # Медіанний метричний рух за слот (для компенсації дрейфу довгих ланцюгів).
+        ids = sorted(prelim_states)
+        consec = [
+            float(np.linalg.norm(prelim_states[b][:2] - prelim_states[a][:2])) / max(b - a, 1)
+            for a, b in zip(ids, ids[1:])
+            if b - a <= 3
+        ]
+        per_slot_disp_m = float(np.median(consec)) if consec else 0.0
+        frame_diag_px = float(np.hypot(frame_w, frame_h))
+
+        for k, spec in enumerate(specs):
+            i, j = int(spec["i"]), int(spec["j"])
+            si = prelim_states.get(i)
+            sj = prelim_states.get(j)
+            if si is None or sj is None:
+                continue  # без прикидки судити не можемо — лишаємо повну вагу
+            edge = self._build_graph_edge(i, j, spec["similarity"], 1.0, "spatial", 0, 0.0)
+            pred = _predict_forward(si, edge, self._sign)
+            inconsistency = float(np.linalg.norm(pred[:2] - sj[:2]))
+            scale_i = float(np.exp(si[2]))
+            frame_diag_m = frame_diag_px * scale_i
+            allowed = frame_diag_m * margin + per_slot_disp_m * abs(i - j) * drift_frac
+            if inconsistency > allowed:
+                factors[k] = factor
+        return factors
+
+    def estimate_min_loop_gap(
+        self, frame_w: int, frame_h: int, k_overlap: float = 1.0
+    ) -> int | None:
+        """Авто min_frame_gap для loop closure з геометрії руху (Етап 2.1).
+
+        Медіанний рух центру за слот у px беремо з temporal-ребер (dtx, dty
+        нормовані на span ребра). Мінімальний геп БЕЗ фізичного перекриття:
+        gap_min = ceil(k_overlap · frame_diag_px / median_disp_px). Нижче цього
+        гепа два кадри ще перекриваються в часі (не loop closure); вище —
+        збіг фіч означає справжній повторний прохід. None, якщо temporal-ребер
+        нема або рух вироджений (виклик тоді лишає явну константу).
+        """
+        disps = [
+            np.hypot(e.dtx, e.dty) / max(abs(e.to_id - e.from_id), 1)
+            for e in self._edges
+            if e.edge_type == "temporal"
+        ]
+        if not disps:
+            return None
+        median_disp = float(np.median(disps))
+        if median_disp < 1e-6:
+            return None
+        frame_diag = float(np.hypot(frame_w, frame_h))
+        return int(np.ceil(max(k_overlap, 1e-6) * frame_diag / median_disp))
+
+    def optimize(
+        self,
+        max_iterations: int = 50,
+        tolerance: float = 1e-6,
+        progress_callback=None,
+        use_analytic_jac: bool = False,
+        two_stage_prune: bool = False,
+        prune_mad_k: float = 5.0,
+        prune_max_spatial_frac: float = 0.2,
+        gnc_spatial: bool = False,
+        gnc_rounds: int = 5,
+        gnc_mad_k: float = 3.0,
+        kinematic_prior_weight: float = 0.0,
+    ) -> dict[int, np.ndarray]:
+
         if not self._edges:
             logger.warning("No edges — returning current states as-is")
             return self._export_results()
@@ -3655,26 +6688,141 @@ class PoseGraphOptimizer:
             return self._export_results()
 
         n_edges = len(valid_edges)
-        n_residuals = n_edges * 5 + len(free_ids)
-        jac_sp = self._build_jac_sparsity(valid_edges, id_to_var, n_residuals, n_vars, n_edges)
+
+        # М'які якорі (Етап 1.1): унарні пріори тільки для вільних анкер-вузлів.
+        # Порожньо (soft_anchors off) → n_anch=0 → усі гілки нижче — no-op.
+        anchor_var_idx: list[int] = []
+        anchor_states_list: list[np.ndarray] = []
+        anchor_w_list: list[float] = []
+        for fid, (a_state, a_w) in self._anchor_priors.items():
+            if fid in id_to_var:
+                anchor_var_idx.append(id_to_var[fid])
+                anchor_states_list.append(a_state)
+                anchor_w_list.append(a_w)
+        n_anch = len(anchor_var_idx)
+
+        # ── Кінематичний prior (Етап 7.1): фактори другої різниці центрів ──
+        # w=0 (дефолт) → n_kin=0 → блок повністю відсутній, структура резидуалів
+        # незмінна (контракт 5·E+N+5·A зберігається байт-у-байт).
+        kin_ids, kin_alpha_l, kin_w_l = self._build_kinematic_triples(
+            id_to_var, kinematic_prior_weight
+        )
+        n_kin = len(kin_ids)
+
+        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5 + 2 * n_kin
+        jac_sp = self._build_jac_sparsity(
+            valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx,
+            kin_free=[
+                (id_to_var.get(a, -1), id_to_var.get(b, -1), id_to_var.get(c, -1))
+                for a, b, c in kin_ids
+            ],
+        )
 
         logger.info(
-            f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), {n_residuals} residuals, {len(self._fixed_nodes)} anchors"
+            f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), "
+            f"{n_residuals} residuals, {len(self.anchor_states())} anchors"
         )
 
         # jac_sparsity is ignored by 'lm'. method='trf' with sparse jacobian runs 100x faster.
-        safe_tolerance = max(tolerance, 1e-15)
+        import time
+
+        self._nfev = 0
+        self._start_time = time.time()
+        self._last_cb_time = self._start_time
+
+        # Prepare vectorized data
+        total_nodes = len(self._node_ids)
+        node_id_to_idx = {nid: i for i, nid in enumerate(self._node_ids)}
+
+        X_fixed = np.zeros((total_nodes, 5), dtype=np.float64)
+        for fid, state in self._fixed_nodes.items():
+            if fid in node_id_to_idx:
+                X_fixed[node_id_to_idx[fid]] = state
+
+        free_indices_in_full = [node_id_to_idx[fid] for fid in free_ids]
+        edges_from = np.array([node_id_to_idx[e.from_id] for e in valid_edges], dtype=np.int32)
+        edges_to = np.array([node_id_to_idx[e.to_id] for e in valid_edges], dtype=np.int32)
+        # Індекс вільної змінної (−1 = фіксований вузол) — для аналітичного якобіана
+        edge_from_free = np.array(
+            [id_to_var.get(e.from_id, -1) for e in valid_edges], dtype=np.int64
+        )
+        edge_to_free = np.array([id_to_var.get(e.to_id, -1) for e in valid_edges], dtype=np.int64)
+
+        d = {
+            "X_full": X_fixed,
+            "free_indices": free_indices_in_full,
+            "edges_from": edges_from,
+            "edges_to": edges_to,
+            "dtx": np.array([e.dtx for e in valid_edges], dtype=np.float64),
+            "dty": np.array([e.dty for e in valid_edges], dtype=np.float64),
+            "log_dsx": np.array([e.log_dsx for e in valid_edges], dtype=np.float64),
+            "log_dsy": np.array([e.log_dsy for e in valid_edges], dtype=np.float64),
+            "dtheta": np.array([e.dtheta for e in valid_edges], dtype=np.float64),
+            "weights": np.array([e.weight for e in valid_edges], dtype=np.float64),
+            "cx": self.cx,
+            "w_reg": self.isotropy_weight * self.cx,
+            "sign": self._sign,
+            "n_edges": n_edges,
+            "n_free": len(free_ids),
+            "edge_from_free": edge_from_free,
+            "edge_to_free": edge_to_free,
+            "anchor_var_idx": np.array(anchor_var_idx, dtype=np.int64),
+            "anchor_states": (
+                np.array(anchor_states_list, dtype=np.float64)
+                if anchor_states_list
+                else np.zeros((0, 5), dtype=np.float64)
+            ),
+            "anchor_w": np.array(anchor_w_list, dtype=np.float64),
+            "n_anch": n_anch,
+            "kin_ia": np.array([node_id_to_idx[a] for a, _b, _c in kin_ids], dtype=np.int64),
+            "kin_ib": np.array([node_id_to_idx[b] for _a, b, _c in kin_ids], dtype=np.int64),
+            "kin_ic": np.array([node_id_to_idx[c] for _a, _b, c in kin_ids], dtype=np.int64),
+            "kin_fa": np.array([id_to_var.get(a, -1) for a, _b, _c in kin_ids], dtype=np.int64),
+            "kin_fb": np.array([id_to_var.get(b, -1) for _a, b, _c in kin_ids], dtype=np.int64),
+            "kin_fc": np.array([id_to_var.get(c, -1) for _a, _b, c in kin_ids], dtype=np.int64),
+            "kin_alpha": np.array(kin_alpha_l, dtype=np.float64),
+            "kin_w": np.array(kin_w_l, dtype=np.float64),
+            "n_kin": n_kin,
+            "callback": progress_callback,
+        }
+
+        def residual_wrapper(x, d_dict):
+            self._nfev += 1
+            now = time.time()
+            if d_dict["callback"] and (now - self._last_cb_time > 1.0):
+                elapsed = now - self._start_time
+                rate = self._nfev / elapsed if elapsed > 0 else 0
+                max_evals = max_iterations * n_vars
+                remaining = max_evals - self._nfev
+
+                if remaining < 0:
+                    msg = f"Глобальна оптимізація: фіналізація... (обчислень: {self._nfev}), швидкість {rate:.0f} it/s"
+                else:
+                    eta = remaining / rate if rate > 0 else 0
+                    m, s = divmod(int(eta), 60)
+                    eta_str = f"{m}хв {s:02d}с" if m > 0 else f"{s}с"
+                    msg = f"Глобальна оптимізація: обчислення {self._nfev}/{max_evals}, швидкість {rate:.0f} it/s, ETA: {eta_str}"
+
+                d_dict["callback"](msg)
+                self._last_cb_time = now
+            return self._residuals_vec(x, d_dict)
+
+        if use_analytic_jac:
+            # Аналітичний якобіан (Етап 4.1): точніші градієнти, 3-10× швидше.
+            jac_kwargs = {"jac": self._jacobian_vec}
+        else:
+            jac_kwargs = {"jac": "2-point", "jac_sparsity": jac_sp}
+
         result = least_squares(
-            fun=self._residuals,
+            fun=residual_wrapper,
             x0=x0,
-            args=(valid_edges, id_to_var, n_edges),
+            args=(d,),
             method="trf",
-            jac="2-point",
-            jac_sparsity=jac_sp,
             max_nfev=max_iterations * n_vars,
-            ftol=safe_tolerance,
-            xtol=safe_tolerance,
-            gtol=safe_tolerance,
+            ftol=tolerance,
+            xtol=tolerance,
+            gtol=tolerance,
+            **jac_kwargs,
         )
 
         logger.info(
@@ -3684,79 +6832,311 @@ class PoseGraphOptimizer:
         for fid, idx in id_to_var.items():
             self._free_nodes[fid] = result.x[5 * idx : 5 * idx + 5].copy()
 
+        # ── Етап 3 (GNC): плавна еволюція prune. За прапорцем, дефолт off. ──
+        # Взаємно виключно з two_stage_prune; на чистій сцені — no-op (без деградації).
+        if gnc_spatial:
+            return self._run_gnc_spatial(
+                gnc_rounds,
+                gnc_mad_k,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                progress_callback=progress_callback,
+                use_analytic_jac=use_analytic_jac,
+                kinematic_prior_weight=kinematic_prior_weight,
+            )
+
+        # ── Етап 3: two-stage L2 → prune → L2 (за прапорцем, дефолт off) ──
+        # Поріг рахується ВІДНОСНО інших spatial-резидуалів (та сама природа),
+        # а не абсолютною константою — валідні loop closures лишаються з
+        # повною L2-вагою. Warm start із розв'язку кроку 1 (self._free_nodes).
+        if two_stage_prune:
+            pruned = self._prune_bad_spatial_edges(prune_mad_k, prune_max_spatial_frac)
+            if pruned:
+                logger.info(
+                    f"Two-stage prune: викинуто {len(pruned)} spatial-ребер "
+                    f"(поза median+{prune_mad_k}·MAD), повторна L2 (warm start)"
+                )
+                return self.optimize(
+                    max_iterations=max_iterations,
+                    tolerance=tolerance,
+                    progress_callback=progress_callback,
+                    use_analytic_jac=use_analytic_jac,
+                    two_stage_prune=False,
+                    kinematic_prior_weight=kinematic_prior_weight,
+                )
+
         return self._export_results()
 
-    def _residuals(
-        self, x: np.ndarray, valid_edges: list[GraphEdge], id_to_var: dict[int, int], n_edges: int
-    ) -> np.ndarray:
-        n_free = len(id_to_var)
-        residuals = np.zeros(n_edges * 5 + n_free, dtype=np.float64)
+    def _build_kinematic_triples(
+        self, id_to_var: dict[int, int], weight: float
+    ) -> tuple[list[tuple[int, int, int]], list[float], list[float]]:
+        """Трійки (a, b, c) сусідніх вузлів для кінематичного prior (Етап 7.1).
 
-        for k, edge in enumerate(valid_edges):
-            state_i = self._read_state(x, edge.from_id, id_to_var)
-            state_j = self._read_state(x, edge.to_id, id_to_var)
+        Нееквідистантні слоти (гепи keyframe selection, мости): центр b
+        порівнюється з α·a + (1−α)·c, α = h2/(h1+h2), h1 = b−a, h2 = c−b;
+        вага масштабується 2/(h1+h2) — при кроці 1 це рівно ``weight`` і
+        відповідає (a − 2b + c)/2, далі prior слабшає пропорційно гепу.
+        Трійки з усіма трьома фіксованими вузлами пропускаються (константа).
+        """
+        if weight <= 0.0:
+            return [], [], []
+        participating = sorted(
+            fid
+            for fid in self._node_ids
+            if fid in id_to_var or fid in self._fixed_nodes
+        )
+        ids: list[tuple[int, int, int]] = []
+        alphas: list[float] = []
+        weights: list[float] = []
+        for a, b, c in zip(participating, participating[1:], participating[2:]):
+            if a not in id_to_var and b not in id_to_var and c not in id_to_var:
+                continue
+            h1 = float(b - a)
+            h2 = float(c - b)
+            denom = h1 + h2
+            if denom <= 0.0:
+                continue
+            ids.append((a, b, c))
+            alphas.append(h2 / denom)
+            weights.append(weight * 2.0 / denom)
+        return ids, alphas, weights
 
-            tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i
-            tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j
-            sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
-            w = edge.weight
+    def _residuals_vec(self, x: np.ndarray, d: dict) -> np.ndarray:
+        X_full = d["X_full"]
+        X_full[d["free_indices"]] = x.reshape(-1, 5)
 
-            c_i, s_i = np.cos(theta_i), np.sin(theta_i)
-            pred_tx_j = tx_i + c_i * sx_i * edge.dtx - self._sign * s_i * sy_i * edge.dty
-            pred_ty_j = ty_i + s_i * sx_i * edge.dtx + self._sign * c_i * sy_i * edge.dty
+        res_edges = edge_residual(
+            X_full[d["edges_from"]],
+            X_full[d["edges_to"]],
+            d["dtx"],
+            d["dty"],
+            d["log_dsx"],
+            d["log_dsy"],
+            d["dtheta"],
+            d["weights"],
+            d["cx"],
+            d["sign"],
+        )
 
-            w_trans_x = w / sx_i
-            w_trans_y = w / sy_i
-            w_scale = w * self.cx
-            w_rot = w * self.cx
+        w_reg = d["w_reg"]
+        x_reshaped = x.reshape(-1, 5)
+        res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
 
-            base = 5 * k
-            residuals[base + 0] = w_trans_x * (tx_j - pred_tx_j)
-            residuals[base + 1] = w_trans_y * (ty_j - pred_ty_j)
-            residuals[base + 2] = w_scale * (log_sx_j - log_sx_i - edge.log_dsx)
-            residuals[base + 3] = w_scale * (log_sy_j - log_sy_i - edge.log_dsy)
+        parts = [res_edges.flatten(), res_reg]
 
-            angle_diff = theta_j - theta_i - self._sign * edge.dtheta
-            residuals[base + 4] = w_rot * np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
+        if d.get("n_anch", 0) > 0:
+            # Унарний пріор якоря: w_a·(state − state_anchor), кут SO(2)-safe.
+            ap = x_reshaped[d["anchor_var_idx"]]  # (n_anch, 5)
+            diff = ap - d["anchor_states"]
+            ang = np.arctan2(np.sin(diff[:, 4]), np.cos(diff[:, 4]))
+            aw = d["anchor_w"][:, None]
+            parts.append(
+                (
+                    aw
+                    * np.column_stack(
+                        [diff[:, 0], diff[:, 1], diff[:, 2], diff[:, 3], ang]
+                    )
+                ).ravel()
+            )
 
-        # Square Pixel Constraint
-        w_reg = 200.0 * self.cx
-        for idx, fid in enumerate(id_to_var.keys()):
-            log_sx = x[5 * idx + 2]
-            log_sy = x[5 * idx + 3]
-            residuals[n_edges * 5 + idx] = w_reg * (log_sx - log_sy)
+        if d.get("n_kin", 0) > 0:
+            # Кінематичний prior (Етап 7.1): r = w·(α·a + (1−α)·c − b), центри.
+            ca = X_full[d["kin_ia"]][:, :2]
+            cb = X_full[d["kin_ib"]][:, :2]
+            cc = X_full[d["kin_ic"]][:, :2]
+            al = d["kin_alpha"][:, None]
+            wk = d["kin_w"][:, None]
+            parts.append((wk * (al * ca + (1.0 - al) * cc - cb)).ravel())
 
-        return residuals
+        return np.concatenate(parts)
 
-    def _build_jac_sparsity(self, valid_edges, id_to_var, n_residuals, n_vars, n_edges):
-        sp = lil_matrix((n_residuals, n_vars), dtype=np.int8)
+    def _jacobian_vec(self, x: np.ndarray, d: dict):
+        """Аналітичний якобіан _residuals_vec (Етап 4.1).
+
+        Похідні виписані руками для 5-DoF анізотропної моделі. Та сама модель,
+        що й FD-варіант — лише точніші градієнти та 3-10× швидша оптимізація.
+        Верифікується проти 2-point FD (див. tests/test_pose_graph_jacobian.py).
+        """
+        X_full = d["X_full"]
+        X_full[d["free_indices"]] = x.reshape(-1, 5)
+
+        si = X_full[d["edges_from"]]
+        sj = X_full[d["edges_to"]]
+        txi, tyi, lxi, lyi, thi = si.T
+        txj, tyj, lxj, lyj, thj = sj.T
+
+        w = d["weights"]
+        cx = d["cx"]
+        sign = d["sign"]
+        dtx = d["dtx"]
+        dty = d["dty"]
+
+        sxi = np.exp(lxi)
+        syi = np.exp(lyi)
+        inv_sxi = np.exp(-lxi)
+        inv_syi = np.exp(-lyi)
+        ci = np.cos(thi)
+        s_i = np.sin(thi)
+        syx = np.exp(lyi - lxi)  # syi / sxi
+        sxy = np.exp(lxi - lyi)  # sxi / syi
+
+        pred_tx = txi + ci * sxi * dtx - sign * s_i * syi * dty
+        pred_ty = tyi + s_i * sxi * dtx + sign * ci * syi * dty
+        res0 = (w * inv_sxi) * (txj - pred_tx)
+        res1 = (w * inv_syi) * (tyj - pred_ty)
+
+        # ── похідні по вузлу i (from) ──
+        j0_txi = -w * inv_sxi
+        j0_lxi = -w * ci * dtx - res0
+        j0_lyi = w * sign * s_i * dty * syx
+        j0_thi = w * s_i * dtx + w * sign * ci * dty * syx
+        j1_tyi = -w * inv_syi
+        j1_lxi = -w * s_i * dtx * sxy
+        j1_lyi = -w * sign * ci * dty - res1
+        j1_thi = -w * ci * dtx * sxy + w * sign * s_i * dty
+        jcx = w * cx  # ваги масштабу/кута (−для i, +для j)
+
+        # ── похідні по вузлу j (to) ──
+        j0_txj = w * inv_sxi
+        j1_tyj = w * inv_syi
+
+        n_edges = d["n_edges"]
+        n_free = d["n_free"]
+        n_anch = int(d.get("n_anch", 0))
+        n_kin = int(d.get("n_kin", 0))
+        ff = d["edge_from_free"]
+        ft = d["edge_to_free"]
+        base_r = 5 * np.arange(n_edges)
+
+        rows: list = []
+        cols: list = []
+        data: list = []
+
+        def add(r, c, v):
+            rows.append(np.asarray(r))
+            cols.append(np.asarray(c))
+            data.append(np.asarray(v, dtype=np.float64))
+
+        mf = ff >= 0
+        if np.any(mf):
+            bi = 5 * ff[mf]
+            br = base_r[mf]
+            add(br + 0, bi + 0, j0_txi[mf])
+            add(br + 0, bi + 2, j0_lxi[mf])
+            add(br + 0, bi + 3, j0_lyi[mf])
+            add(br + 0, bi + 4, j0_thi[mf])
+            add(br + 1, bi + 1, j1_tyi[mf])
+            add(br + 1, bi + 2, j1_lxi[mf])
+            add(br + 1, bi + 3, j1_lyi[mf])
+            add(br + 1, bi + 4, j1_thi[mf])
+            add(br + 2, bi + 2, -jcx[mf])
+            add(br + 3, bi + 3, -jcx[mf])
+            add(br + 4, bi + 4, -jcx[mf])
+        mt = ft >= 0
+        if np.any(mt):
+            bj = 5 * ft[mt]
+            br = base_r[mt]
+            add(br + 0, bj + 0, j0_txj[mt])
+            add(br + 1, bj + 1, j1_tyj[mt])
+            add(br + 2, bj + 2, jcx[mt])
+            add(br + 3, bj + 3, jcx[mt])
+            add(br + 4, bj + 4, jcx[mt])
+
+        # регуляризатор ізотропії вузла: reg_p = 200*cx*(log_sx_p - log_sy_p)
+        if n_free > 0:
+            p_idx = np.arange(n_free)
+            reg_row = 5 * n_edges + p_idx
+            w_reg = d["w_reg"]
+            add(reg_row, 5 * p_idx + 2, np.full(n_free, w_reg))
+            add(reg_row, 5 * p_idx + 3, np.full(n_free, -w_reg))
+
+        # М'які якорі (Етап 1.1): d(w_a·Δstate)/d(state) = w_a·I по 5 компонентах
+        # (похідна atan2(sin dθ, cos dθ) по θ = 1). Блок діагональний.
+        if n_anch > 0:
+            av = d["anchor_var_idx"]
+            aw = d["anchor_w"]
+            base_a = 5 * n_edges + n_free
+            a_rows = base_a + 5 * np.arange(n_anch)
+            for comp in range(5):
+                add(a_rows + comp, 5 * av + comp, aw)
+
+        # Кінематичний prior (Етап 7.1): r = w·(α·a + (1−α)·c − b), лише центри —
+        # лінійний по станах, тож входи якобіана константні.
+        if n_kin > 0:
+            fa = d["kin_fa"]
+            fb = d["kin_fb"]
+            fc = d["kin_fc"]
+            al = d["kin_alpha"]
+            wk = d["kin_w"]
+            base_k = 5 * n_edges + n_free + 5 * n_anch + 2 * np.arange(n_kin)
+            for f_idx, coef in ((fa, wk * al), (fc, wk * (1.0 - al)), (fb, -wk)):
+                m = f_idx >= 0
+                if np.any(m):
+                    add(base_k[m] + 0, 5 * f_idx[m] + 0, coef[m])
+                    add(base_k[m] + 1, 5 * f_idx[m] + 1, coef[m])
+
+        rows = np.concatenate(rows)
+        cols = np.concatenate(cols)
+        data = np.concatenate(data)
+        J = coo_matrix(
+            (data, (rows, cols)),
+            shape=(5 * n_edges + n_free + 5 * n_anch + 2 * n_kin, 5 * n_free),
+            dtype=np.float64,
+        )
+        return J.tocsr()
+
+    def _build_jac_sparsity(
+        self, valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx=None,
+        kin_free=None,
+    ):
+        # COO-конструктор (rows/cols списками) швидший за поелементний lil на
+        # великих графах. Патерн розрідженості ІДЕНТИЧНИЙ попередньому.
+        rows: list[int] = []
+        cols: list[int] = []
         for k, edge in enumerate(valid_edges):
             base_r = 5 * k
             idx_i, idx_j = id_to_var.get(edge.from_id), id_to_var.get(edge.to_id)
 
             if idx_i is not None:
-                base_i = 5 * idx_i
-                sp[base_r + 0, base_i + 0] = sp[base_r + 0, base_i + 2] = sp[
-                    base_r + 0, base_i + 3
-                ] = sp[base_r + 0, base_i + 4] = 1
-                sp[base_r + 1, base_i + 1] = sp[base_r + 1, base_i + 2] = sp[
-                    base_r + 1, base_i + 3
-                ] = sp[base_r + 1, base_i + 4] = 1
-                sp[base_r + 2, base_i + 2] = 1
-                sp[base_r + 3, base_i + 3] = 1
-                sp[base_r + 4, base_i + 4] = 1
+                bi = 5 * idx_i
+                # res0 (tx): tx_i, log_sx_i, log_sy_i, theta_i
+                rows += [base_r + 0] * 4
+                cols += [bi + 0, bi + 2, bi + 3, bi + 4]
+                # res1 (ty): ty_i, log_sx_i, log_sy_i, theta_i
+                rows += [base_r + 1] * 4
+                cols += [bi + 1, bi + 2, bi + 3, bi + 4]
+                # res2/res3/res4 (log_sx / log_sy / theta)
+                rows += [base_r + 2, base_r + 3, base_r + 4]
+                cols += [bi + 2, bi + 3, bi + 4]
             if idx_j is not None:
-                base_j = 5 * idx_j
-                sp[base_r + 0, base_j + 0] = sp[base_r + 1, base_j + 1] = sp[
-                    base_r + 2, base_j + 2
-                ] = sp[base_r + 3, base_j + 3] = sp[base_r + 4, base_j + 4] = 1
+                bj = 5 * idx_j
+                rows += [base_r + 0, base_r + 1, base_r + 2, base_r + 3, base_r + 4]
+                cols += [bj + 0, bj + 1, bj + 2, bj + 3, bj + 4]
 
-        for idx in range(len(id_to_var)):
+        n_free = len(id_to_var)
+        for idx in range(n_free):
             row = n_edges * 5 + idx
-            base_i = 5 * idx
-            sp[row, base_i + 2] = 1
-            sp[row, base_i + 3] = 1
+            bi = 5 * idx
+            rows += [row, row]
+            cols += [bi + 2, bi + 3]
 
+        # М'які якорі (Етап 1.1): 5 діагональних входів на анкер-вузол.
+        for a, v in enumerate(anchor_var_idx or []):
+            base = n_edges * 5 + n_free + 5 * a
+            for comp in range(5):
+                rows.append(base + comp)
+                cols.append(5 * v + comp)
+
+        # Кінематичний prior (Етап 7.1): 2 рядки/трійку, входи tx/ty вільних вузлів.
+        base_k = n_edges * 5 + n_free + 5 * len(anchor_var_idx or [])
+        for t, (fa, fb, fc) in enumerate(kin_free or []):
+            for f_idx in (fa, fb, fc):
+                if f_idx >= 0:
+                    rows += [base_k + 2 * t, base_k + 2 * t + 1]
+                    cols += [5 * f_idx + 0, 5 * f_idx + 1]
+
+        data = np.ones(len(rows), dtype=np.int8)
+        sp = coo_matrix((data, (rows, cols)), shape=(n_residuals, n_vars), dtype=np.int8)
         return sp.tocsr()
 
     def _get_node_state(self, frame_id: int):
@@ -3780,123 +7160,9 @@ class PoseGraphOptimizer:
                 results[fid] = _state_to_affine(state, self.cx, self.cy, self._sign)
         return results
 
-    def export_graph_geojson(self, converter, frame_w: int, frame_h: int) -> dict:
-        features = []
-        results = self._export_results()
-        cx, cy = frame_w / 2.0, frame_h / 2.0
-
-        for fid, affine in results.items():
-            pt = np.array([[cx, cy]], dtype=np.float64)
-            metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
-            try:
-                lat, lon = converter.metric_to_gps(float(metric[0]), float(metric[1]))
-            except Exception:
-                continue
-            is_fixed = fid in self._fixed_nodes
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                    "properties": {"frame_id": fid, "type": "anchor" if is_fixed else "frame"},
-                }
-            )
-
-        for edge in self._edges:
-            affine_from = results.get(edge.from_id)
-            affine_to = results.get(edge.to_id)
-            if affine_from is None or affine_to is None:
-                continue
-            try:
-                pt = np.array([[cx, cy]], dtype=np.float64).reshape(-1, 1, 2)
-                m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
-                m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
-                lat1, lon1 = converter.metric_to_gps(float(m_from[0]), float(m_from[1]))
-                lat2, lon2 = converter.metric_to_gps(float(m_to[0]), float(m_to[1]))
-            except Exception:
-                continue
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": [[lon1, lat1], [lon2, lat2]]},
-                    "properties": {
-                        "from_id": edge.from_id,
-                        "to_id": edge.to_id,
-                        "edge_type": edge.edge_type,
-                    },
-                }
-            )
-
-        return {"type": "FeatureCollection", "features": features}
-
-
-# ── Вільні утиліти (поза класом) ─────────────────────────────────────────────
-
-
-# decompose_affine_5dof is imported from src.geometry.affine_utils (single source of truth)
-
-
-def _affine_to_state(affine_2x3: np.ndarray, cx: float, cy: float) -> np.ndarray:
-    tx, ty, sx, sy, angle = decompose_affine_5dof(affine_2x3)
-    c_x = affine_2x3[0, 0] * cx + affine_2x3[0, 1] * cy + tx
-    c_y = affine_2x3[1, 0] * cx + affine_2x3[1, 1] * cy + ty
-    return np.array(
-        [c_x, c_y, np.log(max(sx, 1e-9)), np.log(max(sy, 1e-9)), angle], dtype=np.float64
-    )
-
-
-def _state_to_affine(state: np.ndarray, cx: float, cy: float, sign: float = 1.0) -> np.ndarray:
-    c_x, c_y, log_sx, log_sy, theta = state
-    sx, sy = float(np.clip(np.exp(log_sx), 1e-6, 1e6)), float(np.clip(np.exp(log_sy), 1e-6, 1e6))
-    c, s = np.cos(theta), np.sin(theta)
-
-    M00, M01 = c * sx, -s * sign * sy
-    M10, M11 = s * sx, c * sign * sy
-    tx = c_x - (M00 * cx + M01 * cy)
-    ty = c_y - (M10 * cx + M11 * cy)
-    return np.array([[M00, M01, tx], [M10, M11, ty]], dtype=np.float64)
-
-
-def _predict_forward(state_i: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
-    tx_i, ty_i, log_sx_i, log_sy_i, theta_i = state_i
-    sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
-    c_i, s_i = np.cos(theta_i), np.sin(theta_i)
-    return np.array(
-        [
-            tx_i + c_i * sx_i * edge.dtx - sign * s_i * sy_i * edge.dty,
-            ty_i + s_i * sx_i * edge.dtx + sign * c_i * sy_i * edge.dty,
-            log_sx_i + edge.log_dsx,
-            log_sy_i + edge.log_dsy,
-            theta_i + sign * edge.dtheta,
-        ],
-        dtype=np.float64,
-    )
-
-
-def _predict_inverse(state_j: np.ndarray, edge: GraphEdge, sign: float) -> np.ndarray:
-    tx_j, ty_j, log_sx_j, log_sy_j, theta_j = state_j
-    inv_dsx, inv_dsy = 1.0 / np.exp(edge.log_dsx), 1.0 / np.exp(edge.log_dsy)
-    inv_dtheta = -edge.dtheta
-    cos_inv, sin_inv = np.cos(inv_dtheta), np.sin(inv_dtheta)
-
-    inv_dtx = inv_dsx * (cos_inv * (-edge.dtx) - sin_inv * (-edge.dty))
-    inv_dty = inv_dsy * (sin_inv * (-edge.dtx) + cos_inv * (-edge.dty))
-
-    sx_j, sy_j = np.exp(log_sx_j), np.exp(log_sy_j)
-    c_j, s_j = np.cos(theta_j), np.sin(theta_j)
-    return np.array(
-        [
-            tx_j + c_j * sx_j * inv_dtx - sign * s_j * sy_j * inv_dty,
-            ty_j + s_j * sx_j * inv_dtx + sign * c_j * sy_j * inv_dty,
-            log_sx_j + np.log(inv_dsx),
-            log_sy_j + np.log(inv_dsy),
-            theta_j + sign * inv_dtheta,
-        ],
-        dtype=np.float64,
-    )
-
 
 def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
-    """Для сумісності з воркером, що використовує назву homography_to_affine (або homography_to_similarity)"""
+    """Проєктує гомографію на афінну модель через 5 опорних точок навколо центру."""
     cx, cy = frame_w / 2.0, frame_h / 2.0
     d = min(frame_w, frame_h) * 0.25
     pts = np.array(
@@ -3912,54 +7178,430 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
     return T
 
 
-# Додаємо аліас, щоб не довелося змінювати назву у worker-і, якщо там досі викликається homography_to_similarity
+def affine_fit_residual(H: np.ndarray, frame_w: int, frame_h: int) -> float | None:
+    """RMS-залишок афінного наближення гомографії H на 5 точках (Етап 6.2).
+
+    homography_to_affine відкидає цей залишок. Він великий, коли H неафінна
+    (нахил камери / рельєф) — такі temporal-кадри заслуговують меншої довіри.
+    Повертає залишок у пікселях або None. ~0 для чисто афінної H.
+    """
+    cx, cy = frame_w / 2.0, frame_h / 2.0
+    d = min(frame_w, frame_h) * 0.25
+    pts = np.array(
+        [[cx, cy], [cx - d, cy - d], [cx + d, cy - d], [cx + d, cy + d], [cx - d, cy + d]],
+        dtype=np.float64,
+    )
+    transformed = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), H.astype(np.float64))
+    if transformed is None:
+        return None
+    transformed = transformed.reshape(-1, 2).astype(np.float64)
+    T, _ = cv2.estimateAffine2D(pts, transformed, method=cv2.LMEDS)
+    if T is None:
+        return None
+    proj = (T[:, :2] @ pts.T).T + T[:, 2]
+    return float(np.sqrt(np.mean(np.sum((proj - transformed) ** 2, axis=1))))
+
+
+# Аліас для сумісності з worker-ом (використовує назву homography_to_similarity)
 homography_to_similarity = homography_to_affine
 
 
-try:
-    import gtsam
+# ================================================================================
+# File: src\geometry\pose_graph\pruning.py
+# ================================================================================
+"""Spatial loop-closure pruning (two-stage prune) mixin for PoseGraphOptimizer."""
 
-    GTSAM_AVAILABLE = True
-except ImportError:
-    GTSAM_AVAILABLE = False
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from src.geometry.pose_graph.model_5dof import GraphEdge
 
 
-class GtsamPoseGraphOptimizer(PoseGraphOptimizer):
-    """
-    GTSAM-based PoseGraphOptimizer.
+class PruningMixin:
+    """Two-stage spatial-edge pruning. Pure move from PoseGraphOptimizer."""
 
-    This optimizer aims to replace SciPy LM. However, the exact 5-DoF anisotropic model
-    requires `gtsam.CustomFactor` implemented in Python, which defeats the C++ speedup,
-    or simplifying the model to an isotropic `Similarity2` (4-DoF).
+    def _anchor_reachable(self, edges: list[GraphEdge]) -> set[int]:
+        """Множина вузлів, досяжних із будь-якого якоря по заданому набору ребер.
 
-    NOTE: In the base `PoseGraphOptimizer`, the scipy method has been switched from 'lm' to 'trf'
-    which correctly utilizes the `jac_sparsity` mapping. This switch already provides a ~100x
-    performance improvement on large graphs, often matching GTSAM's speed while preserving
-    the exact 5-DoF anisotropic mathematics.
-    """
+        Сідаємо з anchor_states() (жорсткі fix_node + м'які add_anchor), а не з
+        _fixed_nodes: при soft_anchors=True жорстких вузлів НЕМАЄ взагалі, обидві
+        множини досяжності виходили порожні, порівняння trial == base ставало
+        тотожно істинним — і захист «ніколи не роз'єднаємо вузол від якорів»
+        тихо вимикався, дозволяючи prune відрізати цілий сегмент графа.
+        """
+        adj: dict[int, list[int]] = {}
+        for e in edges:
+            adj.setdefault(e.from_id, []).append(e.to_id)
+            adj.setdefault(e.to_id, []).append(e.from_id)
+        seen = set(self.anchor_states())
+        stack = list(seen)
+        while stack:
+            n = stack.pop()
+            for m in adj.get(n, []):
+                if m not in seen:
+                    seen.add(m)
+                    stack.append(m)
+        return seen
 
-    def optimize(self, max_iterations: int = 50, tolerance: float = 1e-6) -> dict[int, np.ndarray]:
-        if not GTSAM_AVAILABLE:
-            logger.warning(
-                "GTSAM is not installed (`pip install gtsam`). Falling back to optimized SciPy TRF."
-            )
-            return super().optimize(max_iterations, tolerance)
+    def _prune_bad_spatial_edges(
+        self, mad_k: float = 5.0, max_frac: float = 0.2
+    ) -> list[GraphEdge]:
+        """Викидає spatial-викиди за MAD-порогом ВСЕРЕДИНІ класу spatial.
 
-        # NOTE: Full GTSAM implementation requires validation of the Similarity2 assumption:
-        logger.info("Initializing GTSAM nonlinear factor graph (Sim2)...")
-        graph = gtsam.NonlinearFactorGraph()
-        initial_estimates = gtsam.Values()
+        Захисні правила (Етап 3.3):
+          - викидаємо ЛИШЕ spatial (temporal-ланцюг — хребет графа);
+          - не більше max_frac від кількості spatial-ребер;
+          - ніколи, якщо це роз'єднає вузол від усіх якорів.
+        """
+        res = self.compute_edge_residuals()
+        spatial_idx = [
+            k
+            for k, e in enumerate(self._edges)
+            if e.edge_type == "spatial" and not np.isnan(res[k])
+        ]
+        if len(spatial_idx) < 3:
+            return []  # замало для оцінки MAD
 
-        # We will fallback to scipy TRF for now because scipy TRF provides the exact math
-        # much faster without requiring structural changes or dropping anisotropic scales.
-        logger.warning(
-            "GTSAM 5-DoF factor graph is currently mapped to SciPy TRF for exact anisotropic stability."
+        sres = np.array([res[k] for k in spatial_idx])
+        med = float(np.median(sres))
+        mad = float(np.median(np.abs(sres - med)))
+        thresh = med + mad_k * 1.4826 * mad
+
+        candidates = sorted(
+            [k for k in spatial_idx if res[k] > thresh],
+            key=lambda k: -res[k],
         )
-        return super().optimize(max_iterations, tolerance)
+        max_prune = int(np.floor(max_frac * len(spatial_idx)))
+        candidates = candidates[:max_prune]
+        if not candidates:
+            return []
+
+        base_reach = self._anchor_reachable(self._edges)
+        removed_idx: list[int] = []
+        for k in candidates:
+            trial = [e for j, e in enumerate(self._edges) if j != k and j not in removed_idx]
+            if self._anchor_reachable(trial) == base_reach:
+                removed_idx.append(k)  # безпечно: нічого не роз'єднали
+
+        if not removed_idx:
+            return []
+
+        removed_set = set(removed_idx)
+        pruned = [e for j, e in enumerate(self._edges) if j in removed_set]
+        self._edges = [e for j, e in enumerate(self._edges) if j not in removed_set]
+        self._pruned_edges.extend(pruned)
+        self._last_edge_residuals = None
+        return pruned
+
+    def _run_gnc_spatial(
+        self,
+        rounds: int,
+        mad_k: float,
+        *,
+        max_iterations: int,
+        tolerance: float,
+        progress_callback,
+        use_analytic_jac: bool,
+        kinematic_prior_weight: float = 0.0,
+    ) -> dict[int, np.ndarray]:
+        """GNC-переваження spatial-ребер (Етап 3) — плавна еволюція two-stage prune.
+
+        Замість бінарного викидання: раунди L2 із Geman-McClure-вагами
+        w' = w · σ²/(σ²+r²), де σ = µ·thr, thr = median + mad_k·1.4826·MAD резидуалів
+        ВЛАСНОГО (spatial) класу — той самий поріг, що й у prune (урок soft_l1:
+        temporal-ланцюг недоторканий, пороги класо-відносні). µ спадає від
+        опуклого (усі ваги≈1) до 1 (справжній GM), warm start між раундами.
+
+        ЧИСТА СЦЕНА (жоден spatial-резидуал не перевищує thr) → миттєвий вихід із
+        БАЗОВИМИ вагами → розв'язок ІДЕНТИЧНИЙ чистому L2 (нуль деградації).
+        Геометричний (незалежний від ваги) резидуал = ‖residual‖ / weight.
+        """
+        spatial_idx = [k for k, e in enumerate(self._edges) if e.edge_type == "spatial"]
+        base_w = {k: float(self._edges[k].weight) for k in spatial_idx}
+        if len(base_w) < 3:
+            return self._export_results()
+
+        def _geom_residuals():
+            res = self.compute_edge_residuals()
+            geo = {}
+            for k in base_w:
+                w_cur = float(self._edges[k].weight)
+                if not np.isnan(res[k]) and w_cur > 1e-12:
+                    geo[k] = float(res[k]) / w_cur
+            return geo
+
+        # Раунд-0 діагностика на БАЗОВИХ вагах (розв'язок уже є з головного L2).
+        geo0 = _geom_residuals()
+        if len(geo0) < 3:
+            return self._export_results()
+        vals0 = np.array(list(geo0.values()))
+        med = float(np.median(vals0))
+        mad = float(np.median(np.abs(vals0 - med)))
+        thr = med + mad_k * 1.4826 * mad
+        if float(np.max(vals0)) <= thr * (1.0 + 1e-9):
+            return self._export_results()  # немає викидів → чиста сцена → no-op
+
+        opt_kw = dict(
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+            progress_callback=progress_callback,
+            use_analytic_jac=use_analytic_jac,
+            gnc_spatial=False,
+            two_stage_prune=False,
+            kinematic_prior_weight=kinematic_prior_weight,
+        )
+        mu = max(1.0, float(np.max(vals0)) / max(thr, 1e-9))
+        for _ in range(max(1, rounds)):
+            geo = _geom_residuals()
+            sigma2 = (mu * thr) ** 2
+            for k, w0 in base_w.items():
+                r = geo.get(k)
+                if r is None:
+                    continue
+                self._edges[k].weight = w0 * (sigma2 / (sigma2 + r * r))
+            self.optimize(**opt_kw)  # повторний L2, warm start із self._free_nodes
+            if mu <= 1.0:
+                break
+            mu = max(1.0, mu / 1.4)
+
+        # Відновлюємо базові ваги (розв'язок уже в self._free_nodes; ваги — лише
+        # для GNC-ітерацій, звіти мають бачити оригінальні ваги ребер).
+        for k, w0 in base_w.items():
+            self._edges[k].weight = w0
+        self._last_edge_residuals = None
+        return self._export_results()
 
 
 # ================================================================================
-# File: geometry\transformations.py
+# File: src\geometry\pose_graph\vo_guards.py
+# ================================================================================
+"""Запобіжники temporal-VO (сесія 2026-07-12).
+
+Ловлять два класи отруєних temporal-ребер, які резидуали оптимізатора
+НЕ бачать (див. docs/CALIBRATION_DEBUG_SESSION_2026-07-11.md):
+
+1. Дегенеративна H від хибного RANSAC-консенсусу (мало матчів на
+   повторюваній ріллі) → дикий зсув/масштаб/кут одного ребра —
+   ``temporal_edge_sane``.
+2. Консистентний аліасинг: цілий прогін ребер бреше ОДНАКОВО (зсув на
+   період ріллі), ланцюг внутрішньо узгоджений, тож у "апендикса" без
+   другого якоря резидуали малі, а траєкторія — на кілометри вбік.
+   Єдина незалежна опора — якорі: ``check_anchor_gaps`` компонує
+   temporal-ланцюг між сусідніми якорями і порівнює з дельтою самих
+   якорів; ``downweight_gap_edges`` глушить неузгоджені проміжки до
+   оптимізації; ``select_gap_fallback_frames`` після неї відмічає кадри
+   для перезаповнення штатною інтерполяцією (pchip/лінійною по якорях).
+
+Чисті функції без Qt/torch — тестуються в будь-якому середовищі.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from src.geometry.affine_utils import decompose_affine_5dof
+from src.geometry.pose_graph.model_5dof import (
+    GraphEdge,
+    _predict_forward,
+    _predict_inverse,
+)
+
+
+def temporal_edge_sane(
+    similarity_2x3: np.ndarray,
+    gap: int,
+    frame_w: int,
+    frame_h: int,
+    max_rotation_deg: float = 30.0,
+    max_scale_ratio: float = 1.4,
+    max_shift_frac: float = 1.2,
+) -> tuple[bool, str]:
+    """Санітарні межі ОДНОГО temporal-ребра. Повертає (ok, причина).
+
+    Межі свідомо м'які: мета — відсікти лише дегенеративні трансформації
+    (масштаб ×2, поворот 90°, зсув на кілька кадрів), а не нормальний рух.
+    """
+    M = np.asarray(similarity_2x3, dtype=np.float64)
+    _, _, sx, sy, angle = decompose_affine_5dof(M)
+
+    rot_deg = abs(float(np.degrees(angle)))
+    if rot_deg > max_rotation_deg:
+        return False, f"поворот {rot_deg:.1f}° > {max_rotation_deg:.0f}°"
+
+    max_log = float(np.log(max(max_scale_ratio, 1.0 + 1e-9)))
+    if abs(np.log(max(sx, 1e-9))) > max_log or abs(np.log(max(sy, 1e-9))) > max_log:
+        return False, f"масштаб ({sx:.3f},{sy:.3f}) поза [1/{max_scale_ratio},{max_scale_ratio}]"
+
+    cx, cy = frame_w / 2.0, frame_h / 2.0
+    dcx = M[0, 0] * cx + M[0, 1] * cy + M[0, 2] - cx
+    dcy = M[1, 0] * cx + M[1, 1] * cy + M[1, 2] - cy
+    shift = float(np.hypot(dcx, dcy))
+    diag = float(np.hypot(frame_w, frame_h))
+    limit = max_shift_frac * diag * max(int(gap), 1)
+    if shift > limit:
+        return False, f"|Δцентр| {shift:.0f}px > {limit:.0f}px (gap={gap})"
+
+    return True, ""
+
+
+def check_anchor_gaps(
+    edges: list[GraphEdge],
+    anchor_states: dict[int, np.ndarray],
+    sign: float,
+    max_dev_m: float = 150.0,
+) -> dict[tuple[int, int], dict]:
+    """Звірка temporal-ланцюга кожного проміжку між СУСІДНІМИ якорями.
+
+    Для пари якорів (a, b): стартуємо зі стану якоря a, компонуємо
+    temporal-ребра (той самий предикт, що у BFS/LOO) до b і порівнюємо
+    передбачений центр із центром якоря b.
+
+    Статуси: "ok" — розбіжність ≤ max_dev_m; "inconsistent" — ланцюг
+    повний, але бреше (консистентний аліасинг); "broken" — ланцюг
+    розірваний (нема ребра всередині проміжку).
+    """
+    ids = sorted(anchor_states)
+    report: dict[tuple[int, int], dict] = {}
+    if len(ids) < 2:
+        return report
+
+    # Для кожного вузла — temporal-ребро вперед із мінімальним стрибком
+    fwd: dict[int, GraphEdge] = {}
+    for e in edges:
+        if e.edge_type != "temporal":
+            continue
+        lo, hi = (e.from_id, e.to_id) if e.from_id < e.to_id else (e.to_id, e.from_id)
+        cur = fwd.get(lo)
+        if cur is None or hi < max(cur.from_id, cur.to_id):
+            fwd[lo] = e
+
+    for a, b in zip(ids, ids[1:]):
+        state = np.array(anchor_states[a], dtype=np.float64).copy()
+        cur, n_edges, broken = a, 0, False
+        while cur < b:
+            e = fwd.get(cur)
+            nxt = None if e is None else max(e.from_id, e.to_id)
+            if e is None or nxt is None or nxt > b:
+                broken = True
+                break
+            if e.from_id == cur:
+                state = _predict_forward(state, e, sign)
+            else:
+                state = _predict_inverse(state, e, sign)
+            cur = nxt
+            n_edges += 1
+
+        if broken:
+            report[(a, b)] = {"status": "broken", "dev_m": None, "n_edges": n_edges}
+            continue
+
+        dev = float(np.linalg.norm(state[:2] - np.asarray(anchor_states[b])[:2]))
+        report[(a, b)] = {
+            "status": "inconsistent" if dev > max_dev_m else "ok",
+            "dev_m": dev,
+            "n_edges": n_edges,
+        }
+    return report
+
+
+def downweight_gap_edges(
+    edges: list[GraphEdge],
+    gap_pairs: list[tuple[int, int]],
+    factor: float = 0.05,
+) -> int:
+    """Вага ×factor для temporal-ребер усередині зазначених проміжків.
+
+    Неузгоджений проміжок не має права торсіонити решту графа (LOO-конфлікт
+    якоря #286 на 294 м — саме цей механізм). Повертає кількість ребер.
+    """
+    if not gap_pairs:
+        return 0
+    n = 0
+    for e in edges:
+        if e.edge_type != "temporal":
+            continue
+        lo, hi = min(e.from_id, e.to_id), max(e.from_id, e.to_id)
+        for a, b in gap_pairs:
+            if lo >= a and hi <= b:
+                e.weight *= factor
+                n += 1
+                break
+    return n
+
+
+def select_gap_fallback_frames(
+    results_centers: dict[int, tuple[float, float]],
+    anchor_states: dict[int, np.ndarray],
+    flagged_gaps: list[tuple[int, int]],
+    max_dev_m: float = 150.0,
+) -> set[int]:
+    """Кадри позначених проміжків, чиї центри відхиляються від прямої
+    якір→якір понад поріг → кандидати на перезаповнення інтерполяцією.
+
+    ``results_centers`` МАЄ бути в тій самій (локальній) системі координат,
+    що й ``anchor_states``. Кадри без результату не повертаються — вони й
+    так невалідні та заповнюються інтерполяцією.
+    """
+    out: set[int] = set()
+    for a, b in flagged_gaps:
+        if a not in anchor_states or b not in anchor_states or b - a < 2:
+            continue
+        ca = np.asarray(anchor_states[a][:2], dtype=np.float64)
+        cb = np.asarray(anchor_states[b][:2], dtype=np.float64)
+        for f in range(a + 1, b):
+            c = results_centers.get(f)
+            if c is None:
+                continue
+            t = (f - a) / (b - a)
+            ref = ca + t * (cb - ca)
+            if float(np.hypot(c[0] - ref[0], c[1] - ref[1])) > max_dev_m:
+                out.add(f)
+    return out
+
+
+# ================================================================================
+# File: src\geometry\pose_graph_optimizer.py
+# ================================================================================
+"""Backward-compatible re-export.
+
+Implementation moved to the :mod:`src.geometry.pose_graph` package
+(see docs/IMPROVEMENT_PLAN.md, item 1.2). Import paths are preserved:
+``from src.geometry.pose_graph_optimizer import PoseGraphOptimizer`` still works.
+"""
+
+from src.geometry.pose_graph.model_5dof import (
+    GraphEdge,
+    _affine_to_state,
+    _predict_forward,
+    _predict_inverse,
+    _state_to_affine,
+)
+from src.geometry.pose_graph.optimizer import (
+    PoseGraphOptimizer,
+    affine_fit_residual,
+    homography_to_affine,
+    homography_to_similarity,
+)
+
+__all__ = [
+    "PoseGraphOptimizer",
+    "GraphEdge",
+    "homography_to_affine",
+    "affine_fit_residual",
+    "homography_to_similarity",
+    "_affine_to_state",
+    "_state_to_affine",
+    "_predict_forward",
+    "_predict_inverse",
+]
+
+
+# ================================================================================
+# File: src\geometry\transformations.py
 # ================================================================================
 import cv2
 import numpy as np
@@ -4013,9 +7655,9 @@ class GeometryTransforms:
                     return False
                 M = M / M[2, 2]
 
-                # Check perspective components (should be very small for top-down drone imagery)
-                # If these are large, the corners will fly off to infinity
-                if abs(M[2, 0]) > 0.005 or abs(M[2, 1]) > 0.005:
+                # Check perspective components (drone camera can tilt, so allow up to 0.02)
+                # If these are very large, the corners will fly off to infinity
+                if abs(M[2, 0]) > 0.02 or abs(M[2, 1]) > 0.02:
                     logger.debug(
                         f"Matrix invalid: Extreme perspective warp ({M[2, 0]:.5f}, {M[2, 1]:.5f})"
                     )
@@ -4049,7 +7691,7 @@ class GeometryTransforms:
                 return False
 
             # 3. Check Aspect Ratio (should be close to 1.0 for drone imagery)
-            # 5-DoF дозволяє анізотропію, але в межах реалістичної геометрії камери (зазвичай між 0.5 та 2.0)
+            # Розширюємо межі анізотропії для швидкого польоту з нахилом камери
             aspect_ratio = scale_u / (scale_v + 1e-9)
             if not (0.5 < aspect_ratio < 2.0):
                 logger.debug(
@@ -4058,6 +7700,7 @@ class GeometryTransforms:
                 return False
 
             # 4. Check Shear (cos of angle between basis vectors)
+            # Drone mapping shouldn't have extreme shear. Reject if vectors are not ~orthogonal.
             shear = abs(np.dot(u, v) / (scale_u * scale_v + 1e-9))
             if shear > max_shear:
                 logger.debug(f"Matrix invalid: Extreme shear detected ({shear:.2f} > {max_shear})")
@@ -4076,12 +7719,21 @@ class GeometryTransforms:
             return False
 
     @staticmethod
+    def reprojection_errors(
+        src_pts: np.ndarray, dst_pts: np.ndarray, H: np.ndarray
+    ) -> np.ndarray:
+        """Помилки репроєкції ``|H·src − dst|`` для кожної відповідності, (N,)."""
+        pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
+        return np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
+
+    @staticmethod
     def compute_mad_threshold(
         src_pts: np.ndarray,
         dst_pts: np.ndarray,
         H: np.ndarray,
         k: float = 2.5,
         min_threshold: float = 1.0,
+        inlier_mask: np.ndarray | None = None,
     ) -> float:
         """MAD-RANSAC: адаптивний поріг на основі медіанного абсолютного відхилення помилок репроєкції.
 
@@ -4090,23 +7742,86 @@ class GeometryTransforms:
 
         Це робить RANSAC стійким до зміни GSD (висота польоту) та крос-роздільних пар.
 
+        ВАЖЛИВО (виправлення): поріг рахується ТІЛЬКИ по ``inlier_mask`` — набору,
+        який RANSAC уже визнав інлаєрами. Якщо рахувати по ВСІХ відповідностях,
+        аутлаєри входять у median і MAD: при їх переважанні поріг злітає до сотень
+        пікселів і «інлаєром» оголошується весь набір. Заміряно на синтетиці
+        (k=2.5): 20 справжніх інлаєрів із 60 матчів → поріг 661 px → 60 «інлаєрів».
+        Роздутий лічильник далі керує вибором кандидата, early-stop і confidence,
+        тож хибний кадр може обійти правильний.
+
         Args:
             src_pts: Точки джерела (N, 2)
             dst_pts: Точки призначення (N, 2)
             H: Попередньо обчислена гомографія (3x3)
             k: Коефіцієнт чутливості (вищий → м'якший поріг)
             min_threshold: Мінімальний поріг (px)
+            inlier_mask: Булева маска (N,) інлаєрів RANSAC. ``None`` — усі точки
+                (стара поведінка; лишена для зворотної сумісності виклику).
 
         Returns:
             Адаптивний поріг репроєкції (px)
         """
-        pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
-        errors = np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
+        errors = GeometryTransforms.reprojection_errors(src_pts, dst_pts, H)
+        if inlier_mask is not None:
+            sel = np.asarray(inlier_mask).ravel().astype(bool)
+            if sel.any():
+                errors = errors[sel]
         median_err = np.median(errors)
         mad = np.median(np.abs(errors - median_err))
         # 1.4826 — константа нормалізації MAD для нормального розподілу
         threshold = median_err + k * 1.4826 * mad
         return max(threshold, min_threshold)
+
+    # Мінімум точок для гомографії — нижче цього уточнення маски безглузде.
+    _MIN_HOMOGRAPHY_PTS = 4
+
+    @staticmethod
+    def _refine_mask_mad(
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        H: np.ndarray,
+        mask: np.ndarray | None,
+        k: float,
+        ransac_threshold: float,
+    ) -> np.ndarray | None:
+        """Звужує inlier-маску адаптивним MAD-порогом.
+
+        Ключова властивість: маска може лише ЗМЕНШИТИСЬ. MAD-поріг не має права
+        повернути в інлаєри точку, яку RANSAC відкинув — саме це роздувало
+        лічильник у попередній реалізації (див. ``compute_mad_threshold``).
+
+        Повертає нову маску (N, 1) uint8 або вхідну без змін, якщо уточнення
+        неможливе чи залишило б менше ``_MIN_HOMOGRAPHY_PTS`` точок.
+        """
+        if mask is None or H is None:
+            return mask
+
+        base = np.asarray(mask).ravel().astype(bool)
+        n_base = int(base.sum())
+        if n_base < GeometryTransforms._MIN_HOMOGRAPHY_PTS:
+            return mask
+
+        mad_threshold = GeometryTransforms.compute_mad_threshold(
+            src_pts, dst_pts, H, k=k, inlier_mask=base
+        )
+        errors = GeometryTransforms.reprojection_errors(src_pts, dst_pts, H)
+        refined = base & (errors < mad_threshold)
+        n_ref = int(refined.sum())
+
+        if n_ref < GeometryTransforms._MIN_HOMOGRAPHY_PTS:
+            logger.debug(
+                f"MAD-RANSAC: уточнення лишило {n_ref} точок "
+                f"(< {GeometryTransforms._MIN_HOMOGRAPHY_PTS}) — тримаємо маску RANSAC"
+            )
+            return mask
+
+        logger.debug(
+            f"MAD-RANSAC: initial_thresh={ransac_threshold:.1f} -> "
+            f"adaptive_thresh={mad_threshold:.2f} px, "
+            f"inliers={n_ref}/{n_base} (з {len(base)} матчів)"
+        )
+        return refined.astype(np.uint8).reshape(-1, 1)
 
     @staticmethod
     def estimate_homography(
@@ -4139,6 +7854,13 @@ class GeometryTransforms:
                 src_pts, dst_pts, ransac_threshold, max_iters, confidence
             )
             if GeometryTransforms.is_matrix_valid(H, is_homography=True):
+                # Виправлення: раніше цей return стояв ПЕРЕД MAD-блоком, тож при
+                # backend="poselib" прапорець use_mad_ransac не мав жодного
+                # ефекту — конфіг казав ON, код робив OFF.
+                if use_mad_ransac:
+                    mask = GeometryTransforms._refine_mask_mad(
+                        src_pts, dst_pts, H, mask, mad_k_factor, ransac_threshold
+                    )
                 return H, mask
             # Якщо PoseLib дав невалідну матрицю — fallback
             logger.debug("PoseLib homography invalid, falling back to OpenCV")
@@ -4174,19 +7896,11 @@ class GeometryTransforms:
             )
             return None, None
 
-        # MAD-RANSAC: адаптивне уточнення inlier mask
+        # MAD-RANSAC: адаптивне уточнення inlier mask (тільки звужує — див.
+        # _refine_mask_mad)
         if use_mad_ransac and H is not None:
-            mad_threshold = GeometryTransforms.compute_mad_threshold(
-                src_pts, dst_pts, H, k=mad_k_factor
-            )
-            # Перерахунок inlier mask з адаптивним порогом
-            pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
-            errors = np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))
-            mask = (errors < mad_threshold).astype(np.uint8).reshape(-1, 1)
-            logger.debug(
-                f"MAD-RANSAC: initial_thresh={ransac_threshold:.1f} -> "
-                f"adaptive_thresh={mad_threshold:.2f} px, "
-                f"inliers={int(mask.sum())}/{len(mask)}"
+            mask = GeometryTransforms._refine_mask_mad(
+                src_pts, dst_pts, H, mask, mad_k_factor, ransac_threshold
             )
 
         return H, mask
@@ -4234,6 +7948,44 @@ class GeometryTransforms:
         points_cv = points.reshape(-1, 1, 2).astype(np.float64)
         transformed_pts_cv = cv2.perspectiveTransform(points_cv, H.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)
+
+    @staticmethod
+    def estimate_affine_lsq(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray | None:
+        """Детермінований least-squares фіт повної афінної матриці (6 DoF).
+
+        Використовує ВСІ точки та завжди дає той самий результат за тих самих
+        вхідних даних. Призначено для калібрувальних якорів (4–8 точок,
+        перевірених користувачем), де RANSAC недоречний: він недетермінований
+        (різні матриці між запусками) і його поріг інтерпретується в одиницях
+        призначення (метрах), через що валідні точки випадково відкидалися.
+        """
+        if src_pts is None or len(src_pts) < 3:
+            logger.debug(
+                f"Cannot LSQ-fit affine: need ≥3 points, got "
+                f"{0 if src_pts is None else len(src_pts)}"
+            )
+            return None
+
+        src = np.asarray(src_pts, dtype=np.float64).reshape(-1, 2)
+        dst = np.asarray(dst_pts, dtype=np.float64).reshape(-1, 2)
+        n = len(src)
+
+        A = np.zeros((2 * n, 6), dtype=np.float64)
+        b = np.zeros(2 * n, dtype=np.float64)
+        A[0::2, 0] = src[:, 0]
+        A[0::2, 1] = src[:, 1]
+        A[0::2, 2] = 1.0
+        A[1::2, 3] = src[:, 0]
+        A[1::2, 4] = src[:, 1]
+        A[1::2, 5] = 1.0
+        b[0::2] = dst[:, 0]
+        b[1::2] = dst[:, 1]
+
+        sol, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
+        if rank < 6:
+            logger.debug("LSQ affine fit degenerate (points nearly collinear?)")
+            return None
+        return sol.reshape(2, 3)
 
     @staticmethod
     def estimate_affine(src_pts: np.ndarray, dst_pts: np.ndarray, ransac_threshold: float = 3.0):
@@ -4295,172 +8047,19 @@ class GeometryTransforms:
 
 
 # ================================================================================
-# File: geometry\__init__.py
-# ================================================================================
-"""Geometry module"""
-
-
-# ================================================================================
-# File: gui\main_window.py
-# ================================================================================
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QDockWidget, QMainWindow, QStatusBar
-
-from config.config import APP_CONFIG, APP_SETTINGS
-from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
-from src.core.project import ProjectManager
-from src.database.database_loader import DatabaseLoader
-from src.gui.mixins import CalibrationMixin, DatabaseMixin, PanoramaMixin, TrackingMixin
-from src.gui.widgets.control_panel import ControlPanel
-from src.gui.widgets.map_widget import MapWidget
-from src.gui.widgets.video_widget import VideoWidget
-from src.models.model_manager import ModelManager
-from src.network.coordinates_broker import CoordinatesBroker
-from src.utils.logging_utils import get_logger
-
-logger = get_logger(__name__)
-
-
-class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Drone Topometric Localizer")
-        self.setGeometry(100, 100, 1600, 900)
-
-        self.config = APP_CONFIG
-        self.model_manager = ModelManager(config=APP_CONFIG)
-        self.project_manager = ProjectManager()
-        self.database: DatabaseLoader | None = None
-        self.calibration = MultiAnchorCalibration()
-
-        self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
-
-        # Workers
-        self.db_worker = None
-        self.tracking_worker = None
-        self.propagation_worker = None
-        self.pano_worker = None
-        self._propagation_dialog = None
-
-        self._init_ui()
-
-    def _init_ui(self):
-        self.video_widget = VideoWidget(self)
-        self.setCentralWidget(self.video_widget)
-
-        self.control_dock = QDockWidget("Панель управління", self)
-        self.control_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
-        self.control_panel = ControlPanel(self.control_dock)
-        self.control_dock.setWidget(self.control_panel)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.control_dock)
-
-        self.map_dock = QDockWidget("Інтерактивна карта", self)
-        self.map_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
-        self.map_widget = MapWidget(self.map_dock)
-        self.map_dock.setWidget(self.map_widget)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.map_dock)
-
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-
-        self._create_menu_bar()
-        self._connect_signals()
-
-    def _create_menu_bar(self):
-        menubar = self.menuBar()
-
-        file_menu = menubar.addMenu("Файл")
-        file_menu.addAction("Налаштування...", self.on_open_config)
-        file_menu.addSeparator()
-        file_menu.addAction("Вихід", self.close)
-
-        calib_menu = menubar.addMenu("Калібрування")
-        calib_menu.addAction("Додати якір...", self.on_calibrate)
-        calib_menu.addAction("Завантажити калібрування...", self.on_load_calibration)
-        calib_menu.addAction("Зберегти калібрування...", self.on_save_calibration)
-        calib_menu.addSeparator()
-        calib_menu.addAction("Запустити пропагацію вручну", self.on_run_propagation)
-        calib_menu.addAction("Перевірити пропагацію на карті", self.on_verify_propagation)
-
-        view_menu = menubar.addMenu("Вигляд")
-        view_menu.addAction(self.control_dock.toggleViewAction())
-        view_menu.addAction(self.map_dock.toggleViewAction())
-        view_menu.addSeparator()
-
-        sections_menu = view_menu.addMenu("Секції панелі управління")
-        cp = self.control_panel
-        sections = [
-            ("Управління проєктом", cp.db_group),
-            ("Калібрування GPS", cp.calib_group),
-            ("Локалізація", cp.track_group),
-            ("Результати", cp.export_group),
-            ("Інформація про проєкт", cp.info_group),
-            ("Статус системи", cp.status_group),
-            ("Відеоджерела", cp.sources_group),
-        ]
-
-        from PyQt6.QtWidgets import QCheckBox, QHBoxLayout, QWidget, QWidgetAction
-
-        for name, widget in sections:
-            action = QWidgetAction(sections_menu)
-            container = QWidget()
-            # Make background transparent to match menu styling
-            container.setStyleSheet("background: transparent;")
-            layout = QHBoxLayout(container)
-            layout.setContentsMargins(30, 4, 10, 4)
-
-            checkbox = QCheckBox(name)
-            checkbox.setChecked(not widget.isHidden())
-            # When checkbox is toggled, update widget visibility
-            checkbox.toggled.connect(widget.setVisible)
-
-            layout.addWidget(checkbox)
-            action.setDefaultWidget(container)
-            sections_menu.addAction(action)
-
-    def _connect_signals(self):
-        cp = self.control_panel
-        cp.new_mission_clicked.connect(self.on_new_mission)
-        cp.load_database_clicked.connect(self.on_load_database)
-        cp.rebuild_database_clicked.connect(self.on_rebuild_database)
-        cp.start_tracking_clicked.connect(self.on_start_tracking)
-        cp.start_live_tracking_clicked.connect(self.on_start_live_tracking)
-        cp.stop_tracking_clicked.connect(self.on_stop_tracking)
-        cp.calibrate_clicked.connect(self.on_calibrate)
-        cp.load_calibration_clicked.connect(self.on_load_calibration)
-        cp.generate_panorama_clicked.connect(self.on_generate_panorama)
-        cp.show_panorama_clicked.connect(self.on_show_panorama)
-        cp.localize_image_clicked.connect(self.on_localize_image)
-        cp.verify_propagation_clicked.connect(self.on_verify_propagation)
-        cp.clear_map_clicked.connect(self.map_widget.clear_trajectory)
-        cp.export_results_clicked.connect(self.on_export_results)
-        cp.toggle_objects_clicked.connect(self.on_toggle_objects)
-        cp.add_source_clicked.connect(self.on_add_video_source)
-        cp.source_action.connect(self.on_source_action)
-        cp.active_source_changed.connect(self.on_active_source_changed)
-        self.map_widget.mapClicked.connect(self._on_map_clicked)
-
-    def _on_map_clicked(self, lat: float, lon: float):
-        """Handle map click by showing coordinates in the status bar."""
-        msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
-        self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
-        logger.info(f"Map click: {lat=}, {lon=}")
-
-    def on_open_config(self):
-        """Open the configuration editor dialog."""
-        from src.gui.dialogs.config_dialog import ConfigDialog
-        dialog = ConfigDialog(self)
-        dialog.exec()
-
-
-# ================================================================================
-# File: gui\__init__.py
+# File: src\gui\__init__.py
 # ================================================================================
 """GUI module - PyQt6 interface"""
 
 
 # ================================================================================
-# File: gui\dialogs\add_video_source_dialog.py
+# File: src\gui\dialogs\__init__.py
+# ================================================================================
+"""Dialogs module"""
+
+
+# ================================================================================
+# File: src\gui\dialogs\add_video_source_dialog.py
 # ================================================================================
 """
 add_video_source_dialog.py — Діалог додавання нового відеоджерела до проєкту.
@@ -4716,16 +8315,18 @@ class AddVideoSourceDialog(QDialog):
 
 
 # ================================================================================
-# File: gui\dialogs\calibration_dialog.py
+# File: src\gui\dialogs\calibration_dialog.py
 # ================================================================================
 import re
 from collections import OrderedDict
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
@@ -4735,6 +8336,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -4767,15 +8369,33 @@ class CalibrationDialog(QDialog):
     anchor_confirmed = pyqtSignal(int)  # frame_id actually saved (from MainWindow)
     calibration_complete = pyqtSignal()
 
-    def __init__(self, database_path: str, existing_anchors=None, source_id: str = "main", parent=None):
+    def __init__(
+        self,
+        database_path: str,
+        existing_anchors=None,
+        source_id: str = "main",
+        parent=None,
+        db_num_frames: int | None = None,
+        frame_step: int = 1,
+        keypoints_video_path: str | None = None,
+    ):
         super().__init__(parent)
         self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
         self.source_id = source_id
 
+        # Відповідність кадрів відео ↔ слотів БД.
+        # БД індексується як video_frame // frame_step, тому діалог МУСИТЬ
+        # конвертувати номери кадрів, інакше якорі прив'язуються до чужих кадрів.
+        self.db_num_frames = int(db_num_frames) if db_num_frames else None
+        self.frame_step = max(1, int(frame_step))
+        self.keypoints_video_path = keypoints_video_path
+        self._index_mode = "db"  # "db" | "video" | "unknown"
+
         self.points_2d = []
         self.points_gps = []
         self.current_2d_point = None
+        self.editing_point_index = None
         self.last_slider_value = 0
         self._is_video = False
 
@@ -4796,6 +8416,11 @@ class CalibrationDialog(QDialog):
         self.resize(1200, 800)
         self._init_ui()
         self._refresh_anchors_list()
+
+        # Автозавантаження keypoints-відео: воно має 1 кадр = 1 слот БД,
+        # тож нумерація збігається без конвертації.
+        if self.keypoints_video_path and Path(self.keypoints_video_path).exists():
+            self._load_video(self.keypoints_video_path)
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
@@ -4871,7 +8496,8 @@ class CalibrationDialog(QDialog):
         frame_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         fg = QHBoxLayout(frame_group)
         self.spinbox_frame_id = QSpinBox()
-        self.spinbox_frame_id.setRange(0, _UNKNOWN_FRAME_COUNT)
+        max_id = (self.db_num_frames - 1) if self.db_num_frames else _UNKNOWN_FRAME_COUNT
+        self.spinbox_frame_id.setRange(0, max_id)
         self.spinbox_frame_id.setValue(0)
         self.spinbox_frame_id.setToolTip(
             "При роботі з відео — заповнюється автоматично зі слайдера."
@@ -4910,12 +8536,26 @@ class CalibrationDialog(QDialog):
         coords_row.addWidget(QLabel("Lon:"))
         coords_row.addWidget(self.input_lon)
 
-        self.btn_add_point = QPushButton("➕  Додати точку")
+        self.btn_add_point = QPushButton("Додати точку")
         self.btn_add_point.clicked.connect(self.add_point_pair)
+
+        self.btn_cancel_edit = QPushButton("Скасувати")
+        self.btn_cancel_edit.setVisible(False)
+        self.btn_cancel_edit.clicked.connect(self.cancel_point_edit)
+
+        btn_add_row = QHBoxLayout()
+        btn_add_row.addWidget(self.btn_add_point)
+        btn_add_row.addWidget(self.btn_cancel_edit)
 
         self.points_list = QListWidget()
         self.points_list.setMaximumHeight(110)
         self.points_list.setStyleSheet("font-size: 11px;")
+        self.points_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.points_list.customContextMenuRequested.connect(self.on_points_right_clicked)
+        self.points_list.itemClicked.connect(self.on_point_item_clicked)
+        self.points_list.setToolTip(
+            "Клікніть на точку для редагування, або правою кнопкою для меню"
+        )
 
         self.btn_clear_points = QPushButton("🗑  Очистити поточні точки")
         self.btn_clear_points.setStyleSheet("color: #b71c1c; font-size: 11px;")
@@ -4924,7 +8564,7 @@ class CalibrationDialog(QDialog):
         pts.addWidget(self.lbl_selected_px)
         pts.addLayout(combined_row)
         pts.addLayout(coords_row)
-        pts.addWidget(self.btn_add_point)
+        pts.addLayout(btn_add_row)
         pts.addWidget(self.points_list)
         pts.addWidget(self.btn_clear_points)
 
@@ -4932,7 +8572,7 @@ class CalibrationDialog(QDialog):
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color: #ccc;")
 
-        self.btn_add_anchor = QPushButton("⚓  Додати якір для цього кадру")
+        self.btn_add_anchor = QPushButton("Додати якір для цього кадру")
         self.btn_add_anchor.setStyleSheet(
             "background:#1565C0; color:white; font-weight:bold; padding:11px; font-size:13px;"
         )
@@ -4943,7 +8583,7 @@ class CalibrationDialog(QDialog):
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setWordWrap(True)
 
-        self.btn_done = QPushButton("✅  Готово — запустити пропагацію по всій базі")
+        self.btn_done = QPushButton("Готово — запустити пропагацію по всій базі")
         self.btn_done.setStyleSheet(
             "background:#2e7d32; color:white; font-weight:bold; padding:11px; font-size:13px;"
         )
@@ -4992,7 +8632,7 @@ class CalibrationDialog(QDialog):
                 rmse = anchor.get("qa_data", {}).get("rmse_m", 0.0)
 
                 label = f"⚓ Кадр {fid} | {n_pts} точок"
-                if n_pts > 0:
+                if n_pts > 0 and rmse > 0:
                     label += f" | RMSE: {rmse:.2f}м"
 
                 item = QListWidgetItem(label)
@@ -5035,12 +8675,13 @@ class CalibrationDialog(QDialog):
 
         self.btn_delete_anchor.setEnabled(True)
 
-        # Перехід на кадр
+        # Перехід на кадр (frame_id якоря — це ID слота БД)
         if self._is_video:
+            video_fid = self._from_db_frame_id(frame_id)
             self.slider.blockSignals(True)
-            self.slider.setValue(frame_id)
+            self.slider.setValue(video_fid)
             self.slider.blockSignals(False)
-            self.video_worker.seek(frame_id)
+            self.video_worker.seek(video_fid)
 
         # Завантаження точок
         self.clear_current_points()
@@ -5051,10 +8692,7 @@ class CalibrationDialog(QDialog):
         if pts_2d and pts_gps:
             self.points_2d = [tuple(p) for p in pts_2d]
             self.points_gps = [tuple(p) for p in pts_gps]
-            for i, (p2d, pgps) in enumerate(zip(self.points_2d, self.points_gps)):
-                self.points_list.addItem(
-                    f"  {i + 1}. ({p2d[0]:.1f}, {p2d[1]:.1f}) → {pgps[0]:.5f}, {pgps[1]:.5f}"
-                )
+            self._refresh_points_list()
             self._redraw_points()
         else:
             self.lbl_status.setText(f"⚠ У кадру {frame_id} немає точок для редагування.")
@@ -5088,28 +8726,25 @@ class CalibrationDialog(QDialog):
 
     # _jump_to_frame замінено сигналами від VideoDecodeWorker
 
-    def on_anchor_confirmed(self, frame_id: int):
-        """Called by MainWindow after affine matrix is successfully computed."""
-        # Отримуємо оновлені дані з MainWindow (опціонально, але MainWindow і так оновлює calibration в пам'яті)
-        # У MIXIN ми вже додали якір в self.calibration. Тут ми просто хочемо оновити UI діалогу.
+    def on_anchor_confirmed(self, frame_id: int, anchor_dict: dict | None = None):
+        """Called by MainWindow after affine matrix is successfully computed.
 
-        # Перевіримо, чи це оновлення існуючого
+        anchor_dict — повний AnchorCalibration.to_dict() з реальними QA-метриками
+        (RMSE тощо). Якщо не переданий — fallback на локальні точки діалогу.
+        """
         existing = next((a for a in self.existing_anchors if a.get("frame_id") == frame_id), None)
 
-        # Оскільки діалог не має прямого доступу до об'єкта calibration з MainWindow,
-        # нам треба або передати сюди новий dict, абоMainWindow сам оновить список при наступному відкритті.
-        # Але ми хочемо оновити список ЗАРАЗ.
-
-        # ХАК: оскільки ми щойно додали/оновили якір, але діалог не знає НОВІ точки (він знає лише ті, що в self.points_2d),
-        # ми можемо "імітувати" оновлення об'єкта в списку діалогу.
-        new_data = {
-            "frame_id": frame_id,
-            "qa_data": {
-                "points_2d": list(self.points_2d),
-                "points_gps": list(self.points_gps),
-                "rmse_m": 0.0,  # Буде оновлено при наступному відкритті або якщо MainWindow надішле повний об'єкт
-            },
-        }
+        if anchor_dict is not None:
+            new_data = anchor_dict
+        else:
+            # Fallback без QA-метрик (RMSE невідомий діалогу)
+            new_data = {
+                "frame_id": frame_id,
+                "qa_data": {
+                    "points_2d": list(self.points_2d),
+                    "points_gps": list(self.points_gps),
+                },
+            }
 
         if existing:
             idx = self.existing_anchors.index(existing)
@@ -5159,6 +8794,8 @@ class CalibrationDialog(QDialog):
         if total <= 0:
             total = _UNKNOWN_FRAME_COUNT
 
+        self._detect_index_mode(total)
+
         self.slider.blockSignals(True)
         self.slider.setEnabled(True)
         self.slider.setRange(0, total - 1)
@@ -5168,11 +8805,61 @@ class CalibrationDialog(QDialog):
         for btn in [self.btn_play, self.btn_step_back, self.btn_step]:
             btn.setEnabled(True)
 
-        self.spinbox_frame_id.setMaximum(total - 1)
+        # Спінбокс завжди показує ID слота БД (не кадр відео!)
+        max_id = (self.db_num_frames - 1) if self.db_num_frames else (total - 1)
+        self.spinbox_frame_id.setMaximum(max_id)
         self.spinbox_frame_id.setValue(0)
-        self.lbl_frame_id_warning.setText("")
         self.last_slider_value = 0
         self.video_worker.seek(0)
+
+    # ── Frame index mapping (video ↔ DB slots) ───────────────────────────────
+
+    def _detect_index_mode(self, total_video_frames: int):
+        """Визначає відповідність кадрів завантаженого відео слотам БД."""
+        n_db = self.db_num_frames
+        step = self.frame_step
+
+        if not n_db or total_video_frames >= _UNKNOWN_FRAME_COUNT:
+            self._index_mode = "unknown"
+            self.lbl_frame_id_warning.setText(
+                "⚠ Невідома кількість кадрів БД/відео — перевірте ID кадру вручну."
+            )
+            return
+
+        if total_video_frames == n_db:
+            # keypoints-відео: кадр = слот БД
+            self._index_mode = "db"
+            self.lbl_frame_id_warning.setText("")
+            return
+
+        expected_slots = (total_video_frames + step - 1) // step
+        if step > 1 and abs(expected_slots - n_db) <= 2:
+            # Оригінальне відео польоту — конвертуємо N → N//step
+            self._index_mode = "video"
+            self.lbl_frame_id_warning.setText(
+                f"ℹ Оригінальне відео: кадр N відео → слот БД N//{step}. "
+                f"Поле «Кадр №» показує вже конвертований ID слота БД."
+            )
+            return
+
+        self._index_mode = "unknown"
+        self.lbl_frame_id_warning.setText(
+            f"⚠ Кадри відео ({total_video_frames}) не відповідають БД "
+            f"({n_db} слотів, крок {step}). Якорі можуть прив'язатися до "
+            f"неправильних кадрів! Рекомендовано відкрити файл *_keypoints.mp4."
+        )
+
+    def _to_db_frame_id(self, video_frame: int) -> int:
+        """Кадр завантаженого відео → ID слота БД."""
+        if self._index_mode == "video":
+            return video_frame // self.frame_step
+        return video_frame
+
+    def _from_db_frame_id(self, db_frame_id: int) -> int:
+        """ID слота БД → кадр завантаженого відео (для переходу по якорях)."""
+        if self._index_mode == "video":
+            return db_frame_id * self.frame_step
+        return db_frame_id
 
     def _load_image(self, path: str):
         self._is_video = False
@@ -5252,7 +8939,7 @@ class CalibrationDialog(QDialog):
             self.slider.setValue(frame_id)
             self.slider.blockSignals(False)
 
-            self.spinbox_frame_id.setValue(frame_id)
+            self.spinbox_frame_id.setValue(self._to_db_frame_id(frame_id))
             self.video_widget.display_frame(pixmap)
             self.lbl_frame_info.setText(f"Кадр: {frame_id} / {self.slider.maximum()}")
 
@@ -5269,7 +8956,7 @@ class CalibrationDialog(QDialog):
         if value in self._frame_cache:
             self._display_cached_frame(value)
         else:
-            self.spinbox_frame_id.setValue(value)
+            self.spinbox_frame_id.setValue(self._to_db_frame_id(value))
             self.lbl_frame_info.setText(f"Кадр: {value} / {self.slider.maximum()}")
 
     def on_slider_released(self):
@@ -5320,25 +9007,35 @@ class CalibrationDialog(QDialog):
             QMessageBox.warning(self, "Помилка", "Введіть числові координати.")
             return
 
-        self.points_2d.append(self.current_2d_point)
-        self.points_gps.append((lat, lon))
-        n = len(self.points_2d)
-        self.points_list.addItem(
-            f"  {n}. ({self.current_2d_point[0]:.1f}, {self.current_2d_point[1]:.1f})"
-            f"  →  {lat:.5f}, {lon:.5f}"
-        )
+        if hasattr(self, "editing_point_index") and self.editing_point_index is not None:
+            self.points_2d[self.editing_point_index] = self.current_2d_point
+            self.points_gps[self.editing_point_index] = (lat, lon)
+            self.editing_point_index = None
+            self.btn_add_point.setText("Додати точку")
+            self.btn_cancel_edit.setVisible(False)
+            self.points_list.clearSelection()
+        else:
+            self.points_2d.append(self.current_2d_point)
+            self.points_gps.append((lat, lon))
+
         self.current_2d_point = None
         self.lbl_selected_px.setText("Клікніть на наступний орієнтир")
         self.input_combined.clear()
         self.input_lat.clear()
         self.input_lon.clear()
+        self._refresh_points_list()
         self._redraw_points()
 
     def clear_current_points(self):
         self.points_2d.clear()
         self.points_gps.clear()
         self.current_2d_point = None
-        self.points_list.clear()
+        self.editing_point_index = None
+        if hasattr(self, "btn_add_point"):
+            self.btn_add_point.setText("Додати точку")
+        if hasattr(self, "btn_cancel_edit"):
+            self.btn_cancel_edit.setVisible(False)
+        self._refresh_points_list()
         self.input_combined.clear()
         self.video_widget.clear_overlays()
         self.lbl_selected_px.setText("Клікніть на орієнтир у відео ↖")
@@ -5351,6 +9048,71 @@ class CalibrationDialog(QDialog):
             self.video_widget.draw_numbered_point(
                 self.current_2d_point[0], self.current_2d_point[1], "?", QColor(255, 80, 0)
             )
+
+    def _refresh_points_list(self):
+        self.points_list.clear()
+        for i, (p2d, pgps) in enumerate(zip(self.points_2d, self.points_gps)):
+            self.points_list.addItem(
+                f"  {i + 1}. ({p2d[0]:.1f}, {p2d[1]:.1f})  →  {pgps[0]:.5f}, {pgps[1]:.5f}"
+            )
+
+    def on_points_right_clicked(self, pos):
+        item = self.points_list.itemAt(pos)
+        if item is not None:
+            menu = QMenu(self)
+            copy_action = menu.addAction("Копіювати координати")
+            delete_action = menu.addAction("Видалити точку")
+
+            global_pos = self.points_list.mapToGlobal(pos)
+            action = menu.exec(global_pos)
+
+            if action == delete_action:
+                row = self.points_list.row(item)
+                if getattr(self, "editing_point_index", None) == row:
+                    self.editing_point_index = None
+                    self.btn_add_point.setText("Додати точку")
+                    self.btn_cancel_edit.setVisible(False)
+                elif getattr(self, "editing_point_index", None) is not None and row < self.editing_point_index:
+                    self.editing_point_index -= 1
+                self.points_2d.pop(row)
+                self.points_gps.pop(row)
+                self._refresh_points_list()
+                self._redraw_points()
+            elif action == copy_action:
+                row = self.points_list.row(item)
+                lat, lon = self.points_gps[row]
+                QApplication.clipboard().setText(f"{lat}, {lon}")
+
+    def on_point_item_clicked(self, item):
+        row = self.points_list.row(item)
+        if row < 0 or row >= len(self.points_gps):
+            return
+
+        lat, lon = self.points_gps[row]
+        self.input_lat.setText(str(lat))
+        self.input_lon.setText(str(lon))
+        self.input_combined.setText(f"{lat}, {lon}")
+
+        self.current_2d_point = self.points_2d[row]
+        self.editing_point_index = row
+        self.btn_add_point.setText("Оновити точку")
+        self.btn_cancel_edit.setVisible(True)
+        self.lbl_selected_px.setText(
+            f"✔ Обрано піксель: ({self.current_2d_point[0]:.1f}, {self.current_2d_point[1]:.1f})"
+        )
+        self._redraw_points()
+
+    def cancel_point_edit(self):
+        self.editing_point_index = None
+        self.btn_add_point.setText("Додати точку")
+        self.btn_cancel_edit.setVisible(False)
+        self.points_list.clearSelection()
+        self.current_2d_point = None
+        self.lbl_selected_px.setText("Клікніть на орієнтир у відео ↖")
+        self.input_combined.clear()
+        self.input_lat.clear()
+        self.input_lon.clear()
+        self._redraw_points()
 
     # ── Add anchor ───────────────────────────────────────────────────────────
 
@@ -5365,9 +9127,22 @@ class CalibrationDialog(QDialog):
             )
             return
 
-        frame_id = self.spinbox_frame_id.value()
+        frame_id = self.spinbox_frame_id.value()  # завжди ID слота БД
 
-        if frame_id in self.existing_anchors:
+        # Валідація діапазону БД — інакше пропагація мовчки викине якір
+        if self.db_num_frames is not None and frame_id >= self.db_num_frames:
+            QMessageBox.critical(
+                self,
+                "Кадр поза межами БД",
+                f"Кадр {frame_id} виходить за межі бази даних "
+                f"({self.db_num_frames} слотів).\n\n"
+                f"Ймовірно, завантажене відео не відповідає базі даних. "
+                f"Відкрийте файл *_keypoints.mp4 поруч із базою.",
+            )
+            return
+
+        # ВИПРАВЛЕНО: existing_anchors — список dict'ів, перевірка "in" завжди була False
+        if any(a.get("frame_id") == frame_id for a in self.existing_anchors):
             reply = QMessageBox.question(
                 self,
                 "Якір існує",
@@ -5436,19 +9211,28 @@ class CalibrationDialog(QDialog):
 
 
 # ================================================================================
-# File: gui\dialogs\config_dialog.py
+# File: src\gui\dialogs\config_dialog.py
 # ================================================================================
-import json
-from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
-    QTabWidget, QWidget, QFormLayout, QLineEdit, QCheckBox, 
-    QDoubleSpinBox, QSpinBox, QComboBox, QScrollArea, QLabel
-)
-from PyQt6.QtCore import Qt
 from pydantic import BaseModel, ValidationError
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
-from config.config import APP_SETTINGS, APP_CONFIG
-
+from config import APP_CONFIG, APP_SETTINGS
 
 # Відомі варіанти вибору (домени) для специфічних полів
 COMBO_OPTIONS = {
@@ -5457,12 +9241,23 @@ COMBO_OPTIONS = {
         "homography": ["poselib", "opencv"],
         "lightglue": ["git", "torchscript", "tensorrt"],
         "lightglue_superpoint": ["git", "torchscript", "tensorrt"],
-        "lightglue_rdd": ["git", "torchscript", "tensorrt"]
+        "lightglue_rdd": ["git", "torchscript", "tensorrt"],
+        # Backend-и локальних екстракторів (раніше падали у free-text)
+        "aliked": ["git", "torchscript", "tensorrt"],
+        "xfeat": ["git", "torchscript", "tensorrt"],
+        "rdd": ["git", "torchscript", "tensorrt"],
+        "superpoint": ["git", "torchscript", "tensorrt"],
     },
+    # Пристрій інференсу: auto (CUDA→CPU фолбек) | cuda (форс) | cpu (форс)
+    "device": ["auto", "cuda", "cpu"],
     "masking_strategy": ["yolo", "none"],
     "local_extractor": ["rdd", "aliked", "superpoint", "xfeat"],
+    "fallback_extractor": ["aliked", "rdd", "superpoint", "xfeat"],
     "dtype": ["float16", "float32"],
-    "default_mode": ["WEB_MERCATOR", "WGS84"],
+    # Повний набір рівнів loguru — щоб combo не «загубив» нестандартний рівень
+    "log_level": ["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
+    # ВИПРАВЛЕНО: "WGS84" не є режимом конвертера (підтримуються UTM/WEB_MERCATOR)
+    "default_mode": ["UTM", "WEB_MERCATOR"],
     "verify_display_mode": ["center", "center_corners", "full"],
     "verify_label_mode": ["number", "number_rmse", "full"],
     "source_type": ["file", "rtsp", "usb"],
@@ -5516,17 +9311,17 @@ class ConfigDialog(QDialog):
         """Створює форму для однієї групи налаштувань."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        
+
         container = QWidget()
         form_layout = QFormLayout(container)
-        
+
         # Перебір всіх полів у Pydantic моделі
         # Support for Pydantic V2 model_fields or fallback to dict
         fields = getattr(model, "model_fields", model.__dict__)
-        
+
         for field_name in fields:
             val = getattr(model, field_name)
-            
+
             # Рекурсивна підтримка вкладених моделей (наприклад models.yolo)
             if isinstance(val, BaseModel):
                 form_layout.addRow(QLabel(f"<b>{field_name.upper()}</b>"))
@@ -5542,7 +9337,7 @@ class ConfigDialog(QDialog):
             widget = self._create_widget(group_name, field_name, val)
             form_layout.addRow(f"{field_name}:", widget)
             self.field_widgets[(group_name, field_name)] = widget
-            
+
         scroll.setWidget(container)
         self.tabs.addTab(scroll, group_name.replace("_", " ").title())
 
@@ -5551,7 +9346,7 @@ class ConfigDialog(QDialog):
         # Перевірка на ComboBox (наперед задані варіанти)
         combo_options = None
         base_field = field_name.split('.')[-1]
-        
+
         if base_field in COMBO_OPTIONS:
             opts = COMBO_OPTIONS[base_field]
             if isinstance(opts, dict):
@@ -5565,8 +9360,12 @@ class ConfigDialog(QDialog):
         if combo_options is not None:
             cb = QComboBox()
             cb.addItems(combo_options)
-            if str(value) in combo_options:
-                cb.setCurrentText(str(value))
+            # Якщо поточне значення не входить у відомий набір — не «губимо» його
+            # (інакше на збереженні combo мовчки скинув би на перший пункт), а
+            # додаємо окремим пунктом і показуємо.
+            if value is not None and str(value) not in combo_options:
+                cb.addItem(str(value))
+            cb.setCurrentText(str(value))
             return cb
 
         # Стандартні типи
@@ -5623,17 +9422,17 @@ class ConfigDialog(QDialog):
 
     def _load_defaults(self):
         """Скидає всі поля до заводських налаштувань (визначених у коді)."""
-        from config.config import AppConfig
+        from config import AppConfig
         default_config = AppConfig()
-        
+
         # Оновлюємо значення в UI на основі дефолтних
         for group_name, group_model in default_config:
             if not isinstance(group_model, BaseModel):
                 continue
-            
+
             for field_name in getattr(group_model, "model_fields", group_model.__dict__):
                 val = getattr(group_model, field_name)
-                
+
                 if isinstance(val, BaseModel):
                     for sub_name in getattr(val, "model_fields", val.__dict__):
                         sub_val = getattr(val, sub_name)
@@ -5650,10 +9449,10 @@ class ConfigDialog(QDialog):
         for group_name, group_model in APP_SETTINGS:
             if not isinstance(group_model, BaseModel):
                 continue
-            
+
             for field_name in getattr(group_model, "model_fields", group_model.__dict__):
                 val = getattr(group_model, field_name)
-                
+
                 if isinstance(val, BaseModel):
                     for sub_name in getattr(val, "model_fields", val.__dict__):
                         sub_val = getattr(val, sub_name)
@@ -5687,12 +9486,12 @@ class ConfigDialog(QDialog):
             for group_name, group_model in APP_SETTINGS:
                 if not isinstance(group_model, BaseModel):
                     continue
-                
+
                 group_dict = group_model.model_dump()
-                
+
                 for field_name in getattr(group_model, "model_fields", group_model.__dict__):
                     val = getattr(group_model, field_name)
-                    
+
                     if isinstance(val, BaseModel):
                         for sub_name in getattr(val, "model_fields", val.__dict__):
                             w = self.field_widgets.get((group_name, f"{field_name}.{sub_name}"))
@@ -5703,7 +9502,7 @@ class ConfigDialog(QDialog):
                         w = self.field_widgets.get((group_name, field_name))
                         if w:
                             group_dict[field_name] = self._get_widget_value(w, val)
-                            
+
                 # Валідуємо і створюємо новий об'єкт групи з усіма вкладеними моделями
                 new_group_model = group_model.__class__.model_validate(group_dict)
                 setattr(APP_SETTINGS, group_name, new_group_model)
@@ -5713,18 +9512,18 @@ class ConfigDialog(QDialog):
             APP_CONFIG.update(APP_SETTINGS.model_dump())
 
             # Зберігаємо на диск
-            from config.config import save_user_config
+            from config import save_user_config
             save_user_config(APP_SETTINGS)
-            
+
             QMessageBox.information(
-                self, 
-                "Успіх", 
+                self,
+                "Успіх",
                 "Налаштування успішно збережено.\n\n"
                 "Деякі зміни (наприклад, завантаження моделей) "
                 "почнуть діяти лише після перезапуску програми або трекінгу."
             )
             self.accept()
-            
+
         except ValidationError as e:
             QMessageBox.warning(self, "Помилка валідації", f"Неправильні параметри:\n{e}")
         except Exception as e:
@@ -5732,7 +9531,7 @@ class ConfigDialog(QDialog):
 
 
 # ================================================================================
-# File: gui\dialogs\new_mission_dialog.py
+# File: src\gui\dialogs\new_mission_dialog.py
 # ================================================================================
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import (
@@ -5878,7 +9677,7 @@ class NewMissionDialog(QDialog):
 
 
 # ================================================================================
-# File: gui\dialogs\open_project_dialog.py
+# File: src\gui\dialogs\open_project_dialog.py
 # ================================================================================
 from datetime import datetime
 from pathlib import Path
@@ -5900,6 +9699,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.project_registry import ProjectRegistry
+from src.security.project_scan import project_is_encrypted
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -5915,6 +9715,9 @@ class OpenProjectDialog(QDialog):
         super().__init__(parent)
         self.registry = registry
         self.selected_path: str | None = None
+        # HARDENING P1-6: encryption state per project path. The list is rebuilt
+        # on every keystroke in the search box, so the disk probe is cached.
+        self._encrypted_cache: dict[str, bool] = {}
 
         self.setWindowTitle("Відкрити проєкт")
         self.setMinimumSize(600, 450)
@@ -5983,6 +9786,18 @@ class OpenProjectDialog(QDialog):
         buttons_row.addWidget(self.btn_open)
         layout.addLayout(buttons_row)
 
+    def _is_encrypted(self, path: str) -> bool:
+        """Cached encryption probe — see ``_encrypted_cache``."""
+        if not path:
+            return False
+        if path not in self._encrypted_cache:
+            try:
+                self._encrypted_cache[path] = project_is_encrypted(path)
+            except Exception as e:  # a broken project must not break the picker
+                logger.debug(f"Encryption probe failed for {path}: {e}")
+                self._encrypted_cache[path] = False
+        return self._encrypted_cache[path]
+
     def _populate_list(self, filter_text: str = ""):
         """Заповнити список проєктів."""
         self.project_list.clear()
@@ -6012,9 +9827,12 @@ class OpenProjectDialog(QDialog):
             except (ValueError, TypeError):
                 date_str = "—"
 
-            item_text = f"{status}  {name}   [останній: {date_str}]"
+            lock = "🔒 " if self._is_encrypted(proj.get("path", "")) else ""
+            item_text = f"{status}  {lock}{name}   [останній: {date_str}]"
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, proj)
+            if lock:
+                item.setToolTip("🔒 Зашифрований проєкт — при відкритті запитає пароль карти")
 
             # Позначаємо недоступні проєкти
             if not Path(proj["path"]).is_dir():
@@ -6069,7 +9887,13 @@ class OpenProjectDialog(QDialog):
             f"<b>Відео:</b> {Path(video).name if video else '—'}<br>"
             f"<b>Створено:</b> {created}<br>"
             f"<b>База даних:</b> {'✅ ' + db_size if proj.get('has_database') else '❌ відсутня'}<br>"
-            f"<b>Калібрація:</b> {'✅ є' if proj.get('has_calibration') else '❌ відсутня'}"
+            f"<b>Калібрація:</b> {'✅ є' if proj.get('has_calibration') else '❌ відсутня'}<br>"
+            f"<b>Шифрування:</b> "
+            + (
+                "🔒 зашифровано (потрібен пароль карти)"
+                if self._is_encrypted(path)
+                else "відкритий текст"
+            )
         )
 
     def _on_double_click(self, item: QListWidgetItem):
@@ -6120,30 +9944,464 @@ class OpenProjectDialog(QDialog):
 
 
 # ================================================================================
-# File: gui\dialogs\__init__.py
+# File: src\gui\dialogs\passphrase_dialog.py
 # ================================================================================
-"""Dialogs module"""
+"""HARDENING P1-6: passphrase prompts for encryption-at-rest, GUI side.
 
+Two dialogs:
 
-# ================================================================================
-# File: gui\mixins\calibration_mixin.py
-# ================================================================================
+* ``PassphraseDialog`` — asks for the passphrase of an encrypted project at load
+  time, verifies it against a real artifact, and injects it into the at-rest
+  cache only once it is known to be correct.
+* ``NewPassphraseDialog`` — asks (twice) for the passphrase of a new encrypted
+  copy.
+
+The GUI must inject explicitly: ``at_rest.get_passphrase`` falls back to
+``getpass`` when stdin looks like a TTY, which under a GUI launch blocks the
+process on a prompt the operator cannot see.
 """
-calibration_mixin.py — ВИПРАВЛЕНА ВЕРСІЯ
 
-Ключові зміни:
-- ВИПРАВЛЕННЯ БАГ 2: Змінено логіку вибору трансформації у on_anchor_added.
-  Попередня версія: estimate_affine_partial (4-DoF) як пріоритет, estimate_affine (6-DoF)
-  лише при покращенні RMSE > 15%. Це призводило до вибору матриці з від'ємним детермінантом
-  (дзеркальне відображення pixel→UTM) лише у виняткових випадках.
+from __future__ import annotations
 
-  Нова поведінка:
-  1. При UTM-проекції: завжди використовується estimate_affine (6-DoF) якщо точок >= 4,
-     оскільки перетворення pixel→UTM ЗАВЖДИ вимагає матрицю з від'ємним детермінантом
-     (вісь Y пікселів ↓, вісь Y UTM ↑). estimate_affine_partial фізично не здатна
-     це моделювати (детермінант завжди > 0).
-  2. При WEB_MERCATOR: попередня логіка збережена (partial як пріоритет, full як fallback).
-  3. Якщо точок < 4 або estimate_affine повернула None — fallback до partial.
+from pathlib import Path
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
+)
+
+from src.security.at_rest import set_passphrase, verify_passphrase
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+MAX_ATTEMPTS = 3
+
+
+class PassphraseDialog(QDialog):
+    """Modal passphrase prompt for an encrypted project.
+
+    Verifies each attempt against ``verify_artifact`` (pass the cheapest one —
+    calibration.json, not the map database) and caches the passphrase process-wide
+    only after a successful decryption, so a typo can never poison later loads.
+    Rejects after ``MAX_ATTEMPTS`` failures; the caller must then abort the load.
+    """
+
+    def __init__(self, project_name: str, verify_artifact: Path, parent=None):
+        super().__init__(parent)
+        self.verify_artifact = Path(verify_artifact)
+        self.attempts_left = MAX_ATTEMPTS
+
+        self.setWindowTitle("Проєкт зашифровано")
+        self.setMinimumWidth(420)
+        self._init_ui(project_name)
+
+    def _init_ui(self, project_name: str):
+        layout = QVBoxLayout(self)
+
+        header = QLabel(
+            f"Проєкт «{project_name}» містить зашифровані дані карти.\n"
+            f"Введіть пароль, щоб завантажити його."
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        self.input = QLineEdit()
+        self.input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input.setPlaceholderText("Пароль карти")
+        self.input.returnPressed.connect(self._on_accept)
+        layout.addWidget(self.input)
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #c0392b;")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.input.setFocus()
+
+    def _on_accept(self):
+        pw = self.input.text()
+        if not pw:
+            self.error_label.setText("Пароль не може бути порожнім.")
+            return
+
+        # Scrypt is deliberately slow (~100 ms); show the operator we are busy.
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ok = verify_passphrase(str(self.verify_artifact), pw)
+        finally:
+            self.unsetCursor()
+
+        if ok:
+            set_passphrase(pw)
+            logger.info("Map passphrase accepted; cached for this session.")
+            self.accept()
+            return
+
+        self.attempts_left -= 1
+        self.input.clear()
+        if self.attempts_left <= 0:
+            logger.warning("Map passphrase rejected: attempts exhausted.")
+            self.reject()
+            return
+        self.error_label.setText(
+            f"Невірний пароль. Залишилось спроб: {self.attempts_left}."
+        )
+
+
+class NewPassphraseDialog(QDialog):
+    """Prompt for the passphrase of a NEW encrypted copy (entered twice).
+
+    The result is exposed via ``passphrase`` and deliberately NOT cached: the
+    session keeps working against the plaintext master after the copy is built.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.passphrase: str | None = None
+
+        self.setWindowTitle("Пароль зашифрованої копії")
+        self.setMinimumWidth(420)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        header = QLabel(
+            "Задайте пароль для зашифрованої копії проєкту.\n"
+            "Його неможливо відновити — збережіть у безпечному місці."
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        self.input = QLineEdit()
+        self.input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input.setPlaceholderText("Новий пароль")
+        layout.addWidget(self.input)
+
+        self.confirm = QLineEdit()
+        self.confirm.setEchoMode(QLineEdit.EchoMode.Password)
+        self.confirm.setPlaceholderText("Підтвердіть пароль")
+        self.confirm.returnPressed.connect(self._on_accept)
+        layout.addWidget(self.confirm)
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #c0392b;")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.input.setFocus()
+
+    def _on_accept(self):
+        pw = self.input.text()
+        if not pw:
+            self.error_label.setText("Пароль не може бути порожнім.")
+            return
+        if pw != self.confirm.text():
+            self.error_label.setText("Паролі не збігаються.")
+            self.confirm.clear()
+            return
+        self.passphrase = pw
+        self.accept()
+
+
+# ================================================================================
+# File: src\gui\main_window.py
+# ================================================================================
+import numpy as np
+from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtWidgets import QDockWidget, QMainWindow, QStatusBar
+
+from config import APP_CONFIG, APP_SETTINGS, get_cfg
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.core.project import ProjectManager
+from src.database.database_loader import DatabaseLoader
+from src.gui.mixins import CalibrationMixin, DatabaseMixin, PanoramaMixin, TrackingMixin
+from src.gui.widgets.control_panel import ControlPanel
+from src.gui.widgets.map_widget import MapWidget
+from src.gui.widgets.video_widget import VideoWidget
+from src.models.model_manager import ModelManager
+from src.network.coordinates_broker import CoordinatesBroker
+from src.utils.logging_utils import fmt_coord, get_logger
+
+logger = get_logger(__name__)
+
+
+class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Drone Topometric Localizer")
+        self.setGeometry(100, 100, 1600, 900)
+
+        self.config = APP_CONFIG
+        self.model_manager = ModelManager(config=APP_CONFIG)
+        self.project_manager = ProjectManager()
+        self.database: DatabaseLoader | None = None
+        self.calibration = MultiAnchorCalibration()
+
+        self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
+
+        # Workers
+        self.db_worker = None
+        self.tracking_worker = None
+        self.propagation_worker = None
+        self.pano_worker = None
+        self._propagation_dialog = None
+
+        self._init_ui()
+
+    def _init_ui(self):
+        self.video_widget = VideoWidget(self)
+        self.setCentralWidget(self.video_widget)
+
+        self.control_dock = QDockWidget("Панель управління", self)
+        self.control_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self.control_panel = ControlPanel(self.control_dock)
+        self.control_dock.setWidget(self.control_panel)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.control_dock)
+
+        self.map_dock = QDockWidget("Інтерактивна карта", self)
+        self.map_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self.map_widget = MapWidget(self.map_dock)
+        self.map_dock.setWidget(self.map_widget)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.map_dock)
+
+        # ── Debug-вікна «очима моделей» (приховані за замовчуванням) ─────────
+        from src.gui.widgets.debug_view import DebugViewDock
+
+        self.debug_docks: dict = {}
+        debug_specs = [
+            ("yolo", "YOLO — детекції / маска"),
+            ("depth", "Depth Anything"),
+            ("dino", "DINO — PCA / retrieval"),
+            ("matches", "Точки / матчі (ALIKED)"),
+        ]
+        prev_dock = None
+        for channel, title in debug_specs:
+            dock = DebugViewDock(channel, title, self)
+            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+            if prev_dock is not None:
+                self.tabifyDockWidget(prev_dock, dock)
+            dock.hide()
+            dock.visibilityChanged.connect(self._update_debug_channels)
+            self.debug_docks[channel] = dock
+            prev_dock = dock
+        self._restore_debug_visibility()
+
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+        self._create_menu_bar()
+        self._connect_signals()
+
+    def _create_menu_bar(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("Файл")
+        file_menu.addAction("Налаштування...", self.on_open_config)
+        file_menu.addSeparator()
+        file_menu.addAction("Створити зашифровану копію...", self.on_create_encrypted_copy)
+        file_menu.addSeparator()
+        file_menu.addAction("Вихід", self.close)
+
+        calib_menu = menubar.addMenu("Калібрування")
+        calib_menu.addAction("Додати якір...", self.on_calibrate)
+        calib_menu.addAction("Завантажити калібрування...", self.on_load_calibration)
+        calib_menu.addAction("Зберегти калібрування...", self.on_save_calibration)
+        calib_menu.addSeparator()
+        calib_menu.addAction("Запустити пропагацію вручну", self.on_run_propagation)
+        calib_menu.addAction("Перевірити пропагацію на карті", self.on_verify_propagation)
+
+        view_menu = menubar.addMenu("Вигляд")
+        view_menu.addAction(self.control_dock.toggleViewAction())
+        view_menu.addAction(self.map_dock.toggleViewAction())
+        view_menu.addSeparator()
+
+        debug_menu = view_menu.addMenu("Вікна моделей")
+        for _channel in ("yolo", "depth", "dino", "matches"):
+            debug_menu.addAction(self.debug_docks[_channel].toggleViewAction())
+
+        sections_menu = view_menu.addMenu("Секції панелі управління")
+        cp = self.control_panel
+        sections = [
+            ("Управління проєктом", cp.db_group),
+            ("Калібрування GPS", cp.calib_group),
+            ("Локалізація", cp.track_group),
+            ("Результати", cp.export_group),
+            ("Інформація про проєкт", cp.info_group),
+            ("Статус системи", cp.status_group),
+            ("Відеоджерела", cp.sources_group),
+        ]
+
+        from PyQt6.QtWidgets import QCheckBox, QHBoxLayout, QWidget, QWidgetAction
+
+        for name, widget in sections:
+            action = QWidgetAction(sections_menu)
+            container = QWidget()
+            # Make background transparent to match menu styling
+            container.setStyleSheet("background: transparent;")
+            layout = QHBoxLayout(container)
+            layout.setContentsMargins(30, 4, 10, 4)
+
+            checkbox = QCheckBox(name)
+            checkbox.setChecked(not widget.isHidden())
+            # When checkbox is toggled, update widget visibility
+            checkbox.toggled.connect(widget.setVisible)
+
+            layout.addWidget(checkbox)
+            action.setDefaultWidget(container)
+            sections_menu.addAction(action)
+
+    def _connect_signals(self):
+        cp = self.control_panel
+        cp.new_mission_clicked.connect(self.on_new_mission)
+        cp.load_database_clicked.connect(self.on_load_database)
+        cp.rebuild_database_clicked.connect(self.on_rebuild_database)
+        cp.start_tracking_clicked.connect(self.on_start_tracking)
+        cp.start_live_tracking_clicked.connect(self.on_start_live_tracking)
+        cp.stop_tracking_clicked.connect(self.on_stop_tracking)
+        cp.calibrate_clicked.connect(self.on_calibrate)
+        cp.load_calibration_clicked.connect(self.on_load_calibration)
+        cp.generate_panorama_clicked.connect(self.on_generate_panorama)
+        cp.show_panorama_clicked.connect(self.on_show_panorama)
+        cp.localize_image_clicked.connect(self.on_localize_image)
+        cp.verify_propagation_clicked.connect(self.on_verify_propagation)
+        cp.clear_map_clicked.connect(self.map_widget.clear_trajectory)
+        cp.export_results_clicked.connect(self.on_export_results)
+        cp.toggle_objects_clicked.connect(self.on_toggle_objects)
+        cp.add_source_clicked.connect(self.on_add_video_source)
+        cp.source_action.connect(self.on_source_action)
+        cp.active_source_changed.connect(self.on_active_source_changed)
+        self.map_widget.mapClicked.connect(self._on_map_clicked)
+
+    def _on_map_clicked(self, lat: float, lon: float):
+        """Handle map click by showing coordinates in the status bar."""
+        msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
+        self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
+        logger.info(f"Map click: {fmt_coord(lat, lon)}")
+
+    def on_open_config(self):
+        """Open the configuration editor dialog."""
+        from src.gui.dialogs.config_dialog import ConfigDialog
+        dialog = ConfigDialog(self)
+        dialog.exec()
+
+    # ── Debug-вікна «очима моделей» ─────────────────────────────────────────
+    def _restore_debug_visibility(self):
+        """Відновлює видимість debug-вікон із user_config.json (секція debug_views)."""
+        mapping = {
+            "yolo": "debug_views.show_yolo",
+            "depth": "debug_views.show_depth",
+            "dino": "debug_views.show_dino",
+            "matches": "debug_views.show_matches",
+        }
+        for channel, path in mapping.items():
+            if get_cfg(self.config, path, False):
+                self.debug_docks[channel].show()
+
+    def _active_debug_channels(self) -> set:
+        """Набір каналів, чиї вікна зараз реально видимі користувачу."""
+        # «Активний» = вікно відкрите (навіть якщо зараз за іншою вкладкою в tab-групі),
+        # а не лише фронтальна вкладка. isVisible() дає False для tabbed-behind дока —
+        # через це depth-вікно «замерзало», коли фронтальною ставала інша вкладка.
+        return {ch for ch, dock in self.debug_docks.items() if not dock.isHidden()}
+
+    def _update_debug_channels(self, *args):
+        """visibilityChanged будь-якого дока → оновити активний набір у worker-і."""
+        worker = getattr(self, "tracking_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.set_debug_channels(self._active_debug_channels())
+
+    @pyqtSlot(str, np.ndarray)
+    def _on_debug_view_ready(self, channel: str, frame_bgr: np.ndarray):
+        """Маршрутизація готового BGR-кадру у відповідне debug-вікно.
+
+        Після показу підтверджуємо worker-у, що кадр спожито (backpressure
+        drop-замість-черги): знімає in-flight, дозволяючи наступний кадр.
+        """
+        try:
+            dock = self.debug_docks.get(channel)
+            if dock is not None:
+                dock.update_frame(frame_bgr)
+        finally:
+            worker = getattr(self, "tracking_worker", None)
+            if worker is not None:
+                worker.mark_debug_channel_free(channel)
+
+    def closeEvent(self, event):
+        """Зберігає стан видимості debug-вікон, не чіпаючи інші налаштування."""
+        try:
+            from config import load_user_config, save_user_config
+
+            cfg = load_user_config()
+            cfg.debug_views.show_yolo = not self.debug_docks["yolo"].isHidden()
+            cfg.debug_views.show_depth = not self.debug_docks["depth"].isHidden()
+            cfg.debug_views.show_dino = not self.debug_docks["dino"].isHidden()
+            cfg.debug_views.show_matches = not self.debug_docks["matches"].isHidden()
+            save_user_config(cfg)
+        except Exception as e:
+            logger.debug(f"Failed to persist debug view visibility: {e}")
+
+        # HARDENING P1-6 SP3: closing the databases is what wipes the decrypted
+        # LanceDB temp directory. Without this a clean exit leaves the plaintext
+        # global descriptors on the temp disk until the OS cleans it up.
+        try:
+            if getattr(self, "db_manager", None) is not None:
+                self.db_manager.close_all()
+            elif getattr(self, "database", None) is not None:
+                self.database.close()
+        except Exception as e:
+            logger.warning(f"Error closing databases on exit: {e}")
+
+        super().closeEvent(event)
+
+
+# ================================================================================
+# File: src\gui\mixins\__init__.py
+# ================================================================================
+from .calibration_mixin import CalibrationMixin
+from .database_mixin import DatabaseMixin
+from .panorama_mixin import PanoramaMixin
+from .tracking_mixin import TrackingMixin
+
+__all__ = ["CalibrationMixin", "DatabaseMixin", "TrackingMixin", "PanoramaMixin"]
+
+
+# ================================================================================
+# File: src\gui\mixins\calibration_mixin.py
+# ================================================================================
+"""GUI-міксин калібрування: діалог якорів, фіт якоря, запуск пропагації.
+
+Фіт якоря — детермінований 6-DoF least squares по ВСІХ точках
+(``GeometryTransforms.estimate_affine_lsq``), без RANSAC: для 4–8 перевірених
+користувачем точок RANSAC недетермінований (різні матриці між запусками), а його
+поріг інтерпретується в одиницях призначення (метрах), через що валідні точки
+випадково відкидались.
+
+Матриця pixel→map ЗАВЖДИ має від'ємний детермінант (вісь Y пікселів ↓, вісь Y
+карти ↑), тому det > 0 — це не warning, а відмова: такий якір ламає глобальний
+знак у графовій оптимізації.
+
+(Попередня версія цього докстрінга описувала вибір між estimate_affine_partial
+і estimate_affine, якого в коді давно немає.)
 """
 
 from datetime import datetime
@@ -6153,15 +10411,33 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
-from config.config import get_cfg
+from config import get_cfg
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
 from src.localization.matcher import FeatureMatcher
-from src.utils.logging_utils import get_logger
+from src.security.at_rest import decrypt_to_tempfile, get_passphrase, is_encrypted, wipe_file
+from src.utils.logging_utils import fmt_coord, get_logger
 from src.workers.calibration_propagation_worker import CalibrationPropagationWorker
 
 logger = get_logger(__name__)
+
+
+def _materialize_keypoints_video(path: str) -> tuple[str, str | None]:
+    """Return a path the video reader can open, plus a temp file to wipe (or None).
+
+    HARDENING P1-6 SP3: a plaintext keypoint video is used in place (unchanged);
+    an encrypted one is decrypted to a temp file the caller must wipe. A missing
+    video is not an error — the dialog already handles its absence."""
+    src = Path(path)
+    if not src.is_file():
+        return path, None
+    with open(src, "rb") as f:
+        if not is_encrypted(f.read(64)):
+            return path, None  # plaintext: unchanged path
+    tmp = decrypt_to_tempfile(str(src), get_passphrase(), suffix=".mp4")
+    logger.info("Decrypted keypoint video to a temp file for calibration")
+    return tmp, tmp
 
 
 class CalibrationMixin:
@@ -6175,21 +10451,51 @@ class CalibrationMixin:
 
         anchors_data = [a.to_dict() for a in self.calibration.anchors]
 
+        # Параметри відповідності кадрів відео ↔ слотів БД.
+        # Без них діалог не може конвертувати номери кадрів і якорі
+        # прив'язуються до неправильних слотів (див. BUGREPORT №1).
+        db_num_frames = self.database.get_num_frames()
+        frame_step = int(self.database.metadata.get("frame_step", 0) or 0)
+        if frame_step < 1:
+            # Старі БД без frame_step у метаданих — беремо з конфіга (може не збігатися!)
+            frame_step = int(get_cfg(self.config, "database.frame_step", 30))
+            logger.warning(
+                f"DB metadata has no 'frame_step' — falling back to config value {frame_step}. "
+                f"If the DB was built with a different step, anchor frame ids may be wrong."
+            )
+        kp_video_path = str(Path(self.database.db_path).with_suffix("")) + "_keypoints.mp4"
+        # HARDENING P1-6 SP3: the keypoint video is opened by path (decord/cv2),
+        # so an encrypted one is decrypted to a temp file for the dialog's
+        # lifetime and wiped as soon as it closes.
+        kp_video_path, kp_tempfile = _materialize_keypoints_video(kp_video_path)
+
         self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
             existing_anchors=anchors_data,
             source_id=self._get_current_source_id(),
             parent=self,
+            db_num_frames=db_num_frames,
+            frame_step=frame_step,
+            keypoints_video_path=kp_video_path,
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
         self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)
         self._calib_dialog.calibration_complete.connect(self.on_run_propagation)
-        self._calib_dialog.exec()
-
-        self._calib_dialog = None
+        try:
+            self._calib_dialog.exec()
+        finally:
+            self._calib_dialog = None
+            if kp_tempfile:
+                wipe_file(kp_tempfile)
+                logger.info("Decrypted keypoint video wiped")
 
     @pyqtSlot(object)
     def on_anchor_added(self, anchor_data: dict):
+        # Refuse before mutating in-memory state: the save below would raise and
+        # leave the anchor list out of sync with what is on disk. Viewing an
+        # encrypted project's calibration stays allowed.
+        if self._refuse_if_encrypted_project("Додавання якоря"):
+            return
         try:
             points_2d = anchor_data.get("points_2d")
             points_gps = anchor_data.get("points_gps")
@@ -6199,11 +10505,21 @@ class CalibrationMixin:
                 QMessageBox.warning(self, "Помилка", "Потрібно мінімум 4 точки для якоря!")
                 return
 
-            # Налаштування проєкції, якщо вона ще не ініціалізована
-            if not self.calibration.converter._initialized:
-                mode = get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")
-                reference_gps = points_gps[0] if mode == "UTM" else None
+            # ВИПРАВЛЕНО: WEB_MERCATOR-конвертер за замовчуванням завжди
+            # "_initialized", тому налаштований projection.default_mode (напр. UTM)
+            # мовчки ігнорувався. Перемикаємо режим, поки якорів ще немає.
+            mode = str(get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")).upper()
+            conv = self.calibration.converter
+            if not conv.is_initialized or (not self.calibration.anchors and conv.mode != mode):
+                reference_gps = tuple(points_gps[0]) if mode == "UTM" else None
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
+                logger.info(f"Projection initialized for calibration: {mode}")
+
+            # Розмір кадру — потрібен для інтерполяції якорів навколо центру кадру
+            fw = int(self.database.metadata.get("frame_width", 0) or 0)
+            fh = int(self.database.metadata.get("frame_height", 0) or 0)
+            if fw > 0 and fh > 0 and hasattr(self.calibration, "set_frame_size"):
+                self.calibration.set_frame_size(fw, fh)
 
             pts_2d_np = np.array(points_2d, dtype=np.float64)
             pts_metric = [
@@ -6221,103 +10537,85 @@ class CalibrationMixin:
                     proj.tolist(),
                 )
 
-            # ── ВИПРАВЛЕННЯ БАГ 2: логіка вибору трансформації ─────────────────
+            # ── ВИПРАВЛЕНО: детермінований фіт якоря ────────────────────────────
             #
-            # Система координат pixel vs UTM:
-            #   - Піксельна: вісь Y спрямована ВНИЗ (0 = верх кадру)
-            #   - UTM:       вісь Y спрямована ВГОРУ (на північ)
-            # Тому правильна матриця pixel→UTM ЗАВЖДИ має від'ємний детермінант
-            # (вона містить дзеркальне відображення). estimate_affine_partial (4-DoF)
-            # генерує лише матриці вигляду [s*cos -s*sin; s*sin s*cos], детермінант = s² > 0.
-            # Вона фізично не може відобразити такий простір.
+            # Раніше: cv2.estimateAffine2D з RANSAC та порогом 3.0, який
+            # інтерпретується в одиницях ПРИЗНАЧЕННЯ (метрах!). Кліки з похибкою
+            # 1–3 м опинялися на межі порогу, і недетермінований RANSAC давав
+            # РІЗНІ матриці за тих самих точок між запусками → "нестабільний
+            # крок калібрації". Для 4–8 перевірених користувачем точок RANSAC
+            # недоречний — використовуємо least-squares по всіх точках.
             #
-            # Рішення: при UTM-проекції завжди пробуємо estimate_affine (6-DoF) першою.
-            # При WEB_MERCATOR зберігаємо стару логіку (partial як пріоритет).
+            # Система координат: піксельна вісь Y ↓, метрична (UTM/Mercator) Y ↑,
+            # тому фізично коректна матриця pixel→metric ЗАВЖДИ має det < 0.
+            best_M = GeometryTransforms.estimate_affine_lsq(pts_2d_np, pts_metric_np)
+            best_type = "affine_full_lsq"
 
-            is_utm = self.calibration.converter._mode == "UTM"
-
-            best_M = None
-            best_type = "unknown"
-            rmse_p = float("inf")
-            median_p = 0.0
-            max_p = 0.0
-            proj_p = []
-
-            if is_utm:
-                # UTM: пріоритет — повна афінна (6-DoF), яка підтримує від'ємний детермінант
-                M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
-                if M_full is not None:
-                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
-                    logger.info(f"Full affine determinant for anchor {frame_id}: {det:.6f}")
-                    if det > 0:
-                        # Від'ємний детермінант очікується; якщо позитивний — попередження
-                        logger.warning(
-                            f"Anchor {frame_id}: full affine determinant is POSITIVE ({det:.4f}). "
-                            "Pixel→UTM should have negative det (Y-axis flip). "
-                            "Check point ordering or projection setup."
-                        )
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
-                    best_M = M_full
-                    best_type = "affine_full"
-                    logger.info(
-                        f"UTM mode: using full affine for anchor {frame_id} (RMSE: {rmse_p:.2f}m, det={det:.4f})"
-                    )
-
-                # Fallback до partial якщо full не вийшла (дуже мала к-сть точок або збій)
-                if best_M is None:
-                    logger.warning(
-                        f"Anchor {frame_id}: estimate_affine failed for UTM. "
-                        "Falling back to affine_partial — metric accuracy will be degraded."
-                    )
-                    M_partial, _ = GeometryTransforms.estimate_affine_partial(
-                        pts_2d_np, pts_metric_np
-                    )
-                    if M_partial is not None:
-                        rmse_p, median_p, max_p, proj_p = calc_metrics(
-                            M_partial, pts_2d_np, pts_metric_np
-                        )
-                        best_M = M_partial
-                        best_type = "affine_partial (UTM fallback)"
-
-            else:
-                # WEB_MERCATOR: ТАКОЖ потребує від'ємного детермінанта (Y-flip)
-                # Причина: pixel Y ↓ але metric Y (EPSG:3857) ↑
-                M_full, _ = GeometryTransforms.estimate_affine(pts_2d_np, pts_metric_np)
-                if M_full is not None:
-                    det = float(M_full[0, 0] * M_full[1, 1] - M_full[0, 1] * M_full[1, 0])
-                    if det > 0:
-                        logger.warning(
-                            f"Anchor {frame_id}: full affine det is POSITIVE ({det:.4f}). "
-                            "WEB_MERCATOR pixel→metric should have negative det (Y-flip). "
-                            "Check point ordering or projection setup."
-                        )
-                    rmse_p, median_p, max_p, proj_p = calc_metrics(M_full, pts_2d_np, pts_metric_np)
-                    best_M = M_full
-                    best_type = "affine_full"
-
-                # Fallback до partial тільки якщо full не вийшла
-                if best_M is None:
-                    logger.warning(
-                        f"Anchor {frame_id}: estimate_affine failed for WEB_MERCATOR. "
-                        "Falling back to affine_partial — Y-flip will NOT be modeled correctly!"
-                    )
-                    M_partial, _ = GeometryTransforms.estimate_affine_partial(pts_2d_np, pts_metric_np)
-                    if M_partial is not None:
-                        rmse_p, median_p, max_p, proj_p = calc_metrics(M_partial, pts_2d_np, pts_metric_np)
-                        best_M = M_partial
-                        best_type = "affine_partial (WEB_MERCATOR fallback — degraded)"
-
-            if best_M is None:
+            if best_M is None or not GeometryTransforms.is_matrix_valid(best_M):
                 QMessageBox.critical(
                     self,
                     "Помилка",
-                    "Не вдалося обчислити матрицю. Спробуйте іншу комбінацію точок.",
+                    "Не вдалося обчислити коректну матрицю за цими точками.\n\n"
+                    "Найчастіша причина — точки лежать майже на одній прямій.\n"
+                    "Розставте 4–6 точок якомога ширше по всьому кадру.",
                 )
                 return
+
+            det = float(best_M[0, 0] * best_M[1, 1] - best_M[0, 1] * best_M[1, 0])
+            logger.info(f"Anchor {frame_id} affine determinant: {det:.6f}")
+            if det > 0:
+                # det > 0 фізично неможливий для pixel→map: означає дзеркально
+                # переплутані вхідні дані. Раніше тут був лише warning у лог, і
+                # такий якір ламав глобальний sign у графовій оптимізації.
+                QMessageBox.critical(
+                    self,
+                    "Помилка калібрування",
+                    f"Матриця має додатний детермінант ({det:.4f}) — це фізично "
+                    f"неможливо для переходу пікселі → карта (вісь Y має "
+                    f"віддзеркалюватися).\n\n"
+                    f"Перевірте: чи не переплутані широта/довгота у точках, "
+                    f"чи правильним орієнтирам призначені координати.",
+                )
+                return
+
+            rmse_p, median_p, max_p, proj_p = calc_metrics(best_M, pts_2d_np, pts_metric_np)
 
             # ── Перевірка порогів якості ────────────────────────────────────────
             rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
             max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
+
+            # ── B6: Leave-one-out перевірка точок ────────────────────────────────
+            # Фітимо матрицю без кожної точки по черзі й міряємо, наскільки
+            # "викинута" точка не узгоджується з рештою. Сумарний RMSE маскує
+            # одну криву точку (неправильний клік / переплутана координата) —
+            # LOO показує її явно.
+            suspicious_points: list[tuple[int, float]] = []
+            if 5 <= len(pts_2d_np) <= 12:
+                loo_errors: list[float] = []
+                all_idx = np.arange(len(pts_2d_np))
+                for j in range(len(pts_2d_np)):
+                    idx = all_idx[all_idx != j]
+                    M_loo = GeometryTransforms.estimate_affine_lsq(
+                        pts_2d_np[idx], pts_metric_np[idx]
+                    )
+                    if M_loo is None:
+                        loo_errors.append(float("nan"))
+                        continue
+                    proj_j = GeometryTransforms.apply_affine(
+                        pts_2d_np[j].reshape(1, 2), M_loo
+                    )[0]
+                    loo_errors.append(float(np.linalg.norm(proj_j - pts_metric_np[j])))
+
+                finite = [e for e in loo_errors if np.isfinite(e)]
+                if finite:
+                    med_loo = float(np.median(finite))
+                    for j, e in enumerate(loo_errors):
+                        if np.isfinite(e) and e > max(3.0 * med_loo, 2.0 * rmse_threshold):
+                            suspicious_points.append((j, e))
+                    logger.info(
+                        f"Anchor {frame_id} LOO errors (m): "
+                        + ", ".join(f"pt{j + 1}={e:.2f}" for j, e in enumerate(loo_errors))
+                    )
 
             severity_color = "green"
             if rmse_p > rmse_threshold:
@@ -6334,12 +10632,21 @@ class CalibrationMixin:
                 f"Макс. похибка: <b>{max_p:.2f} м</b> (поріг: {max_err_threshold}м)<br>"
             )
 
-            if rmse_p > rmse_threshold or max_p > max_err_threshold:
-                qa_summary += "<br><span style='color:red'>⚠ Увага: Якість прив'язки нижча за рекомендовану!</span>"
+            if suspicious_points:
+                pts_txt = ", ".join(f"№{j + 1} ({e:.1f} м)" for j, e in suspicious_points)
+                qa_summary += (
+                    f"<br><span style='color:red'>⚠ Підозрілі точки (leave-one-out): "
+                    f"{pts_txt}.<br>Ймовірно, неправильний клік або переплутана "
+                    f"координата — перевірте ці точки.</span>"
+                )
+
+            if rmse_p > rmse_threshold or max_p > max_err_threshold or suspicious_points:
+                if rmse_p > rmse_threshold or max_p > max_err_threshold:
+                    qa_summary += "<br><span style='color:red'>⚠ Увага: Якість прив'язки нижча за рекомендовану!</span>"
                 reply = QMessageBox.warning(
                     self,
                     "Якість калібрування",
-                    qa_summary + "<br><br>Зберегти цей якір попри високу похибку?",
+                    qa_summary + "<br><br>Зберегти цей якір попри зауваження?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.No:
@@ -6354,7 +10661,7 @@ class CalibrationMixin:
                 "max_err_m": max_p,
                 "inliers_count": len(pts_2d_np),
                 "transform_type": best_type,
-                "projection_mode": self.calibration.converter._mode,
+                "projection_mode": self.calibration.converter.mode,
                 "created_at": datetime.now().isoformat(),
                 "points_2d": points_2d,
                 "points_gps": points_gps,
@@ -6393,7 +10700,8 @@ class CalibrationMixin:
                         f"  Pt {j}: px={p2d} -> err={err:.3f}м ({dist_err:.3f}м по Хаверсину)"
                     )
                     logger.debug(
-                        f"    GPS Calc: ({lat_c:.7f}, {lon_c:.7f}) | Target: ({lat_t:.7f}, {lon_t:.7f})"
+                        f"    GPS Calc: {fmt_coord(lat_c, lon_c, precision=7)} | "
+                        f"Target: {fmt_coord(lat_t, lon_t, precision=7)}"
                     )
 
             logger.info(
@@ -6404,7 +10712,10 @@ class CalibrationMixin:
             self.status_bar.showMessage(f"Додано якір (кадр {frame_id}, RMSE: {rmse_p:.2f}м)")
 
             if hasattr(self, "_calib_dialog") and self._calib_dialog is not None:
-                self._calib_dialog.on_anchor_confirmed(frame_id)
+                saved_anchor = self.calibration.get_anchor(frame_id)
+                self._calib_dialog.on_anchor_confirmed(
+                    frame_id, saved_anchor.to_dict() if saved_anchor else None
+                )
 
         except Exception as e:
             logger.error(f"Failed to add anchor: {e}", exc_info=True)
@@ -6413,6 +10724,10 @@ class CalibrationMixin:
     @pyqtSlot(int)
     def on_anchor_removed(self, frame_id: int):
         """Видалення якоря та маркування пропагації застарілою."""
+        # Refuse before remove_anchor mutates memory — the save below would
+        # raise and leave the anchor list out of sync with disk.
+        if self._refuse_if_encrypted_project("Видалення якоря"):
+            return
         try:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
@@ -6435,11 +10750,21 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_run_propagation(self):
+        if self._refuse_if_encrypted_project("Пропагація калібрування"):
+            return
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Додайте хоча б один якір калібрування!")
             return
         if not self.database:
             QMessageBox.warning(self, "Увага", "База даних не завантажена!")
+            return
+        # Взаємне виключення з трекінгом: пропагація перезаписує HDF5.
+        tw = getattr(self, "tracking_worker", None)
+        if tw is not None and tw.isRunning():
+            QMessageBox.warning(
+                self, "Увага", "Зупиніть трекінг перед запуском пропагації — "
+                "вони використовують одну базу даних."
+            )
             return
 
         try:
@@ -6521,17 +10846,19 @@ class CalibrationMixin:
 
         rmse_thresh = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
 
+        # УВАГА: frame_rmse з пропагації — це ПІКСЕЛІ репроєкції матчів між
+        # кадрами, а не метри (раніше підпис "м" вводив в оману)
         report = (
             f"<b>Пропагація завершена!</b><br><br>"
             f"Валідних кадрів: <b>{valid_count} / {num_frames}</b> ({valid_count / num_frames * 100:.1f}%)<br>"
-            f"Середній RMSE (grid): <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} м</b><br>"
+            f"Середній RMSE матчингу: <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} px</b><br>"
             f"Середній матчинг: <b>{avg_matches:.1f} точок</b><br>"
         )
 
         log_msg = (
             f"Пропагація завершена. "
             f"Валідних: {valid_count}/{num_frames} ({valid_count / num_frames * 100:.1f}%), "
-            f"RMSE: {avg_rmse:.3f}м, "
+            f"RMSE: {avg_rmse:.3f}px, "
             f"Матчинг: {avg_matches:.1f} точок"
         )
         if avg_dis > 0:
@@ -6549,7 +10876,7 @@ class CalibrationMixin:
 
         QMessageBox.information(self, "Пропагація", report)
         self.status_bar.showMessage(
-            f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}м, Mat: {avg_matches:.0f}"
+            f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}px, Mat: {avg_matches:.0f}"
         )
 
         if hasattr(self, "_update_project_info_panel"):
@@ -6568,7 +10895,9 @@ class CalibrationMixin:
         try:
             self.map_widget.clear_verification_markers()
             num_frames = self.database.get_num_frames()
-            step = max(1, num_frames // 30)
+            # A8: тисячі Leaflet-маркерів одним JSON вішають QWebEngine —
+            # обмежуємо кількість точок до ~600 із рівномірним кроком
+            step = max(1, num_frames // 600)
 
             rmse_data = getattr(self.database, "frame_rmse", None)
             dis_data = getattr(self.database, "frame_disagreement", None)
@@ -6630,7 +10959,8 @@ class CalibrationMixin:
 
                     if (i // step) % 3 == 0:
                         logger.debug(
-                            f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | BOTTOM={lat_b:.6f},{lon_b:.6f} | RMSE={rmse:.2f}m"
+                            f"Verify Frame {i}: CENTER={lat_c:.6f},{lon_c:.6f} | "
+                            f"BOTTOM={lat_b:.6f},{lon_b:.6f} | RMSE={rmse:.2f}px"
                         )
 
                     color = "green"
@@ -6639,44 +10969,13 @@ class CalibrationMixin:
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    # ВИПРАВЛЕННЯ: Відмальовуємо координати повного кадру замість затиснутої рамки
-                    pts_px = [
-                        (0, 0),  # Лівий верхній кут
-                        (w, 0),  # Правий верхній кут
-                        (w, h),  # Правий нижній кут
-                        (0, h),  # Лівий нижній кут
-                    ]
-                    for idx_p, (px, py) in enumerate(pts_px):
-                        mx_p, my_p = (
-                            affine[0, 0] * px + affine[0, 1] * py + affine[0, 2],
-                            affine[1, 0] * px + affine[1, 1] * py + affine[1, 2],
-                        )
-                        lat_p, lon_p = self.calibration.converter.metric_to_gps(
-                            float(mx_p), float(my_p)
-                        )
-                        points_to_show.append(
-                            {
-                                "lat": float(lat_p),
-                                "lon": float(lon_p),
-                                "label": f"Кадр {i} Корнер {idx_p}",
-                                "color": "gray",
-                            }
-                        )
-
+                    # Відмальовуємо тільки центр кадру
                     points_to_show.append(
                         {
                             "lat": float(lat_c),
                             "lon": float(lon_c),
-                            "label": f"Кадр {i} (Центр) | RMSE:{rmse:.1f}м | Mat:{matches}",
+                            "label": str(i),
                             "color": color,
-                        }
-                    )
-                    points_to_show.append(
-                        {
-                            "lat": float(lat_b),
-                            "lon": float(lon_b),
-                            "label": f"Кадр {i} (Низ) | RMSE:{rmse:.1f}м",
-                            "color": "blue",
                         }
                     )
 
@@ -6687,7 +10986,7 @@ class CalibrationMixin:
                 valid_rmse = rmse_data[valid_mask]
                 if len(valid_rmse) > 0:
                     avg_rmse = float(np.mean(valid_rmse))
-                    self.status_bar.showMessage(f"Пропагація: Середній RMSE = {avg_rmse:.3f} м")
+                    self.status_bar.showMessage(f"Пропагація: Середній RMSE = {avg_rmse:.3f} px")
 
         except Exception as e:
             logger.error(f"Error in on_verify_propagation: {e}", exc_info=True)
@@ -6750,6 +11049,8 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_save_calibration(self):
+        if self._refuse_if_encrypted_project("Збереження калібрування"):
+            return
         if not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
@@ -6793,6 +11094,11 @@ class CalibrationMixin:
             # (навіть якщо файл завантажено з іншого місця або скопійовано вручну)
             source_cal_path = self._get_calibration_save_path()
             copied_to_source = False
+            # An encrypted copy is immutable: load into memory for viewing, but
+            # never mirror the file into the project.
+            if getattr(self.project_manager, "is_encrypted", False):
+                source_cal_path = None
+                logger.info("Encrypted project: calibration loaded for viewing, not persisted")
             if source_cal_path:
                 norm_loaded = str(Path(path).resolve())
                 norm_source = str(Path(source_cal_path).resolve())
@@ -6827,9 +11133,8 @@ class CalibrationMixin:
             QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити:\n{e}")
 
 
-
 # ================================================================================
-# File: gui\mixins\database_mixin.py
+# File: src\gui\mixins\database_mixin.py
 # ================================================================================
 from pathlib import Path
 
@@ -6845,8 +11150,16 @@ from src.database.multi_database_manager import MultiDatabaseManager
 from src.geometry.coordinates import CoordinateConverter
 from src.gui.dialogs.new_mission_dialog import NewMissionDialog
 from src.gui.dialogs.open_project_dialog import OpenProjectDialog
+from src.gui.dialogs.passphrase_dialog import NewPassphraseDialog, PassphraseDialog
+from src.security.at_rest import clear_passphrase
+from src.security.project_scan import (
+    encrypted_artifacts_at,
+    find_project_root,
+    project_is_encrypted,
+)
 from src.utils.logging_utils import get_logger
 from src.workers.database_worker import DatabaseGenerationWorker
+from src.workers.encrypt_copy_worker import EncryptCopyWorker
 
 logger = get_logger(__name__)
 
@@ -6891,7 +11204,31 @@ class DatabaseMixin:
 
     # ── Генерація бази ────────────────────────────────────────────────────────
 
+    def _find_source_id_by_db_path(self, db_path: str) -> str | None:
+        """Знаходить source_id, чий database_file відповідає db_path."""
+        if not self.project_manager.is_loaded or not self.project_manager.settings:
+            return None
+        project_dir = self.project_manager.project_dir
+        try:
+            target = Path(db_path).resolve()
+        except OSError:
+            return None
+        for src in self.project_manager.settings.video_sources or []:
+            sid = src.get("source_id") if isinstance(src, dict) else src.source_id
+            db_file = src.get("database_file") if isinstance(src, dict) else src.database_file
+            if not sid or not db_file:
+                continue
+            try:
+                if (Path(project_dir) / db_file).resolve() == target:
+                    return sid
+            except OSError:
+                continue
+        return None
+
     def _start_database_generation(self, video_path: str, save_path: str):
+        if self._refuse_if_encrypted_project("Генерація бази даних"):
+            return
+
         # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
         # UTM-конвертер буде ініціалізований автоматично після отримання першого
         # GPS-якоря у CalibrationMixin (через _on_first_gps_anchor або еквівалент),
@@ -6918,6 +11255,14 @@ class DatabaseMixin:
             except Exception as e:
                 logger.warning(f"Could not close database: {e}")
         self.database = None
+
+        # CRITICAL: Вивантажуємо це джерело і з мульти-менеджера, інакше його
+        # retriever триматиме stale handle на vectors.lance, який зараз буде
+        # перезаписано (→ "LanceDB query failed: Not found" при трекінгу).
+        if getattr(self, "db_manager", None):
+            sid = self._find_source_id_by_db_path(save_path)
+            if sid:
+                self.db_manager.unload_source(sid)
 
         self.db_worker = DatabaseGenerationWorker(
             video_path=video_path,
@@ -6958,7 +11303,23 @@ class DatabaseMixin:
             self.database.close()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.database = DatabaseLoader(db_path)
+            # У мульти-режимі перезавантажуємо джерело всередині db_manager,
+            # щоб retriever отримав СВІЖИЙ LanceDB handle (stale handle після
+            # перезапису vectors.lance ламає весь vector search).
+            reloaded = False
+            if getattr(self, "db_manager", None):
+                sid = self._find_source_id_by_db_path(db_path)
+                src = (
+                    self.project_manager.settings.get_source(sid)
+                    if sid and self.project_manager.settings
+                    else None
+                )
+                if src is not None and self.db_manager.reload_source(src):
+                    self.database = self.db_manager.get_database(sid)
+                    reloaded = True
+
+            if not reloaded:
+                self.database = DatabaseLoader(db_path)
         finally:
             QApplication.restoreOverrideCursor()
         self.control_panel.update_progress(100)
@@ -7004,8 +11365,122 @@ class DatabaseMixin:
 
         self._open_project(path)
 
+    # ── Зашифрована копія проєкту ─────────────────────────────────────────────
+
+    @pyqtSlot()
+    def on_create_encrypted_copy(self):
+        """Побудувати зашифровану копію поточного проєкту (майстер не змінюється)."""
+        if not self.project_manager.is_loaded:
+            QMessageBox.warning(self, "Увага", "Спочатку відкрийте проєкт!")
+            return
+
+        src_dir = Path(self.project_manager.project_dir)
+        parent_dir = QFileDialog.getExistingDirectory(
+            self, "Куди зберегти зашифровану копію", str(src_dir.parent)
+        )
+        if not parent_dir:
+            return
+
+        dst_dir = Path(parent_dir) / f"{src_dir.name}_encrypted"
+        if dst_dir.exists():
+            QMessageBox.critical(
+                self, "Помилка", f"Тека вже існує (перезапис заборонено):\n{dst_dir}"
+            )
+            return
+
+        dialog = NewPassphraseDialog(self)
+        if not dialog.exec() or not dialog.passphrase:
+            return
+
+        self.status_bar.showMessage(f"Створення зашифрованої копії: {dst_dir.name}...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        self._encrypt_worker = EncryptCopyWorker(str(src_dir), str(dst_dir), dialog.passphrase)
+        self._encrypt_worker.progress.connect(self.status_bar.showMessage)
+        self._encrypt_worker.completed.connect(self._on_encrypted_copy_done)
+        self._encrypt_worker.error.connect(self._on_encrypted_copy_error)
+        self._encrypt_worker.start()
+
+    @pyqtSlot(dict)
+    def _on_encrypted_copy_done(self, summary: dict):
+        QApplication.restoreOverrideCursor()
+        self.status_bar.showMessage("Зашифровану копію створено")
+        if not summary["encrypted"]:
+            QMessageBox.warning(
+                self,
+                "Увага",
+                "Копію створено, але вихідний проєкт порожній — нічого шифрувати.",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "Готово",
+            f"Зашифровано файлів: {summary['total']} (усі, без винятків)\n\n"
+            f"Оригінал проєкту не змінено. Копія незмінна: застосунок відмовиться "
+            f"писати в неї — перебудову й калібрування робіть на майстрі.\n\n"
+            f"Пароль неможливо відновити — збережіть його в безпечному місці.",
+        )
+
+    @pyqtSlot(str)
+    def _on_encrypted_copy_error(self, message: str):
+        QApplication.restoreOverrideCursor()
+        self.status_bar.showMessage("Помилка створення зашифрованої копії")
+        QMessageBox.critical(self, "Помилка", f"Не вдалося створити копію:\n{message}")
+
+    def _refuse_if_encrypted_project(self, action: str) -> bool:
+        """True (and shows why) if ``action`` would write into an encrypted copy.
+
+        The write guards in the core raise regardless — this only turns the
+        refusal into a clear message before any work starts, instead of an
+        exception surfacing from a worker thread."""
+        if not getattr(self.project_manager, "is_encrypted", False):
+            return False
+        QMessageBox.critical(
+            self,
+            "Зашифрований проєкт",
+            f"{action} неможливо: це зашифрована копія для розгортання, "
+            f"вона незмінна.\n\nВиконайте цю дію на відкритому майстер-проєкті, "
+            f"а потім зберіть із нього нову зашифровану копію.",
+        )
+        return True
+
+    def _prompt_passphrase_if_encrypted(self, path: str) -> bool:
+        """Ask for the map passphrase if the project at ``path`` is encrypted.
+
+        Runs BEFORE the project is loaded: a fully encrypted copy encrypts
+        project.json too, so ``load_project`` cannot even parse the manifest
+        without the passphrase. The project's display name is unknown at this
+        point for the same reason — the folder name is used instead.
+
+        Returns True when loading may proceed: either the project is plaintext
+        (no prompt at all — behaviour identical to before this feature) or the
+        operator supplied a passphrase that provably decrypts an artifact.
+        Returns False if the operator cancelled or exhausted their attempts, in
+        which case the caller must abort the load rather than fail deep inside
+        h5py with an opaque error."""
+        encrypted = encrypted_artifacts_at(path)
+        if not encrypted:
+            return True
+
+        dialog = PassphraseDialog(Path(path).name, encrypted[0], parent=self)
+        if dialog.exec():
+            return True
+
+        clear_passphrase()
+        self.status_bar.showMessage("Завантаження скасовано: потрібен пароль карти")
+        return False
+
     def _open_project(self, path: str):
         """Завантажити проєкт за шляхом (використовується і для recent menu)."""
+        # A passphrase belongs to one project only — never let the previous one
+        # silently decrypt (or fail against) the project being opened now.
+        clear_passphrase()
+
+        # The passphrase must be resolved BEFORE loading: an encrypted copy
+        # encrypts project.json itself, so the manifest is unparseable without it.
+        if not self._prompt_passphrase_if_encrypted(path):
+            return
+
         if not self.project_manager.load_project(path):
             QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
             return
@@ -7107,7 +11582,7 @@ class DatabaseMixin:
             # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
             if self.database and self.database.converter is not None:
                 self.calibration.converter = self.database.converter
-            elif self.calibration.converter and self.calibration.converter._initialized:
+            elif self.calibration.converter and self.calibration.converter.is_initialized:
                 pass  # конвертер вже завантажений з calibration.json
 
             if self.database.is_propagated:
@@ -7182,6 +11657,11 @@ class DatabaseMixin:
             QMessageBox.warning(self, "Увага", "Спочатку завантажте проєкт!")
             return
 
+        # Before the confirmation prompt AND before the calibration save below —
+        # that save is a write into the project and would otherwise raise.
+        if self._refuse_if_encrypted_project("Перегенерація бази даних"):
+            return
+
         video_path = self.project_manager.settings.video_path
         if not video_path or not Path(video_path).exists():
             QMessageBox.warning(
@@ -7235,6 +11715,18 @@ class DatabaseMixin:
             "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
         )
         if not path:
+            return
+
+        # The destination is operator-chosen, so it may land inside an encrypted
+        # copy — where the exported track would sit in plaintext.
+        export_root = find_project_root(path)
+        if export_root is not None and project_is_encrypted(export_root):
+            QMessageBox.critical(
+                self,
+                "Зашифрований проєкт",
+                "Експорт у зашифровану копію неможливий: трек місії потрапив би "
+                "туди у відкритому вигляді.\n\nОберіть теку поза проєктом.",
+            )
             return
 
         try:
@@ -7484,7 +11976,7 @@ class DatabaseMixin:
 
 
 # ================================================================================
-# File: gui\mixins\panorama_mixin.py
+# File: src\gui\mixins\panorama_mixin.py
 # ================================================================================
 import base64
 
@@ -7494,7 +11986,7 @@ import torch
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
-from config.config import get_cfg
+from config import get_cfg
 from src.geometry.transformations import GeometryTransforms
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
@@ -7734,14 +12226,14 @@ class PanoramaMixin:
 
 
 # ================================================================================
-# File: gui\mixins\tracking_mixin.py
+# File: src\gui\mixins\tracking_mixin.py
 # ================================================================================
 import cv2
 import numpy as np
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
-from config.config import get_cfg
+from config import get_cfg
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
@@ -7813,6 +12305,17 @@ class TrackingMixin:
     def on_start_tracking(self):
         if not self.database:
             QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
+            return
+        # Взаємне виключення з пропагацією: вона перезаписує HDF5
+        # (close→write→reload), конкурентний трекінг читав би з перехідного хендла.
+        pw = getattr(self, "propagation_worker", None)
+        if pw is not None and pw.isRunning():
+            QMessageBox.warning(
+                self,
+                "Увага",
+                "Дочекайтеся завершення пропагації калібрування — "
+                "вона перезаписує базу даних, яку використовує трекінг.",
+            )
             return
         if not self.calibration.is_calibrated and not (
             self.database and self.database.is_propagated
@@ -7888,9 +12391,11 @@ class TrackingMixin:
         self.tracking_worker.objects_detected.connect(self.on_objects_detected)
         self.tracking_worker.objects_gps_updated.connect(self.on_objects_gps_updated)
         self.tracking_worker.finished.connect(self._on_tracking_finished)
+        self.tracking_worker.debug_view_ready.connect(self._on_debug_view_ready)
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
+            self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
             self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
             self.coordinates_broker.set_tracking_active(True)
 
@@ -7907,6 +12412,10 @@ class TrackingMixin:
         src_name = _Path(str(video_source)).name if not str(video_source).startswith("rtsp") else "RTSP"
         project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
         self.setWindowTitle(f"Drone Topometric Localizer - {project_name}  🔴 {src_name}")
+
+        # Debug views: передаємо worker-у поточний стан видимості вікон
+        if hasattr(self, "_active_debug_channels"):
+            self.tracking_worker.set_debug_channels(self._active_debug_channels())
 
         self.tracking_worker.start()
         self.status_bar.showMessage(f"Відстеження: {src_name}")
@@ -8111,18 +12620,13 @@ class TrackingMixin:
 
 
 # ================================================================================
-# File: gui\mixins\__init__.py
+# File: src\gui\widgets\__init__.py
 # ================================================================================
-from .calibration_mixin import CalibrationMixin
-from .database_mixin import DatabaseMixin
-from .panorama_mixin import PanoramaMixin
-from .tracking_mixin import TrackingMixin
-
-__all__ = ["CalibrationMixin", "DatabaseMixin", "TrackingMixin", "PanoramaMixin"]
+"""Custom Qt widgets"""
 
 
 # ================================================================================
-# File: gui\widgets\control_panel.py
+# File: src\gui\widgets\control_panel.py
 # ================================================================================
 from pathlib import Path
 
@@ -8667,7 +13171,68 @@ class ControlPanel(QWidget):
 
 
 # ================================================================================
-# File: gui\widgets\map_widget.py
+# File: src\gui\widgets\debug_view.py
+# ================================================================================
+"""Вікно візуалізації одного debug-каналу («очима моделі»).
+
+QDockWidget + QLabel зі scaled pixmap. Кадри приходять від
+RealtimeTrackingWorker.debug_view_ready (готове BGR-зображення). Приховане за
+замовчуванням; overhead нульовий, поки вікно не відкрите.
+"""
+
+import numpy as np
+from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import QDockWidget, QLabel, QSizePolicy
+
+from src.utils.image_utils import opencv_to_qpixmap
+
+
+class DebugViewDock(QDockWidget):
+    """Один канал (yolo / depth / dino / matches)."""
+
+    def __init__(self, channel_name: str, title: str, parent=None):
+        super().__init__(title, parent)
+        self.channel_name = channel_name
+        self.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self.setObjectName(f"debug_dock_{channel_name}")
+
+        self._label = QLabel(self)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setMinimumSize(160, 120)
+        self._label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self._label.setStyleSheet("background: #101010; color: #808080;")
+        self._label.setText(f"{title}\n(очікування кадру…)")
+        self.setWidget(self._label)
+
+        self._pixmap: QPixmap | None = None
+
+    @pyqtSlot(np.ndarray)
+    def update_frame(self, frame_bgr: np.ndarray) -> None:
+        """Приймає готове BGR-зображення від worker-а і показує scaled."""
+        if frame_bgr is None or frame_bgr.size == 0:
+            return
+        self._pixmap = opencv_to_qpixmap(frame_bgr)
+        self._apply_scaled()
+
+    def _apply_scaled(self) -> None:
+        if self._pixmap is None or self._pixmap.isNull():
+            return
+        self._label.setPixmap(
+            self._pixmap.scaled(
+                self._label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_scaled()
+
+
+# ================================================================================
+# File: src\gui\widgets\map_widget.py
 # ================================================================================
 import json
 from pathlib import Path
@@ -8843,7 +13408,7 @@ class MapWidget(QWebEngineView):
 
 
 # ================================================================================
-# File: gui\widgets\video_widget.py
+# File: src\gui\widgets\video_widget.py
 # ================================================================================
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
@@ -8880,9 +13445,13 @@ class VideoWidget(QGraphicsView):
 
     def display_frame(self, pixmap: QPixmap):
         self._video_item.setPixmap(pixmap)
-        self._scene.setSceneRect(self._video_item.boundingRect())
-        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        logger.debug(f"Frame: {pixmap.width()}×{pixmap.height()}")
+        # A7: fitInView — лише при зміні розміру контенту. Щокадровий виклик
+        # (30 разів/с) перераховував трансформацію в'ю і навантажував GUI-потік.
+        rect = self._video_item.boundingRect()
+        if rect != getattr(self, "_last_scene_rect", None):
+            self._scene.setSceneRect(rect)
+            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+            self._last_scene_rect = rect
 
     # ── Overlays ─────────────────────────────────────────────────────────────
 
@@ -9038,13 +13607,291 @@ class VideoWidget(QGraphicsView):
 
 
 # ================================================================================
-# File: gui\widgets\__init__.py
+# File: src\interfaces.py
 # ================================================================================
-"""Custom Qt widgets"""
+"""Structural interfaces (typing.Protocol) for the pluggable collaborators of
+the localization pipeline.
+
+These formalize the duck-typed contracts that already exist between
+``Localizer`` and its collaborators. They are Protocols, not ABCs: existing
+implementations need ZERO changes — mypy verifies conformance structurally, and
+``@runtime_checkable`` enables ``isinstance()`` in tests.
+
+Concrete implementers already in the codebase:
+    * Retriever                 -> localization.matcher.FastRetrieval / LanceDBRetrieval
+    * GlobalDescriptorExtractor -> models.wrappers.feature_extractor.FeatureExtractor
+    * LocalFeatureExtractor     -> models.wrappers.feature_extractor.FeatureExtractor
+    * FrameDatabase             -> database.database_loader.DatabaseLoader
+
+Dynamic-object masking already has an ABC (models.wrappers.masking_strategy.
+MaskingStrategy), so it is intentionally not duplicated here.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Protocol, runtime_checkable
+
+from numpy.typing import NDArray
+
+
+@runtime_checkable
+class Retriever(Protocol):
+    """Top-k nearest-neighbour retrieval over global descriptors."""
+
+    def find_similar_frames(
+        self, query_desc: NDArray[Any], top_k: int = 5
+    ) -> list[tuple[int, float]]: ...
+
+    def add_descriptor(self, query_desc: NDArray[Any], frame_id: int) -> None: ...
+
+
+@runtime_checkable
+class GlobalDescriptorExtractor(Protocol):
+    """Whole-image global descriptor(s) used for retrieval."""
+
+    def extract_global_descriptor(self, image: NDArray[Any]) -> NDArray[Any]: ...
+
+    def extract_global_descriptors_multi(
+        self, images: list[NDArray[Any]]
+    ) -> NDArray[Any]: ...
+
+
+@runtime_checkable
+class LocalFeatureExtractor(Protocol):
+    """Local keypoints/descriptors used for geometric verification."""
+
+    def extract_local_features(
+        self, image: NDArray[Any], static_mask: NDArray[Any] | None = None
+    ) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class FrameDatabase(Protocol):
+    """Read access to a built keyframe database."""
+
+    def get_local_features(self, frame_id: int) -> dict[str, NDArray[Any]]: ...
+
+    def get_frame_affine(self, frame_id: int) -> NDArray[Any] | None: ...
+
+    def get_frame_size(self, frame_id: int) -> tuple[int, int]: ...
+
+    def get_num_frames(self) -> int: ...
 
 
 # ================================================================================
-# File: localization\geo_aware_retriever.py
+# File: src\localization\__init__.py
+# ================================================================================
+"""Localization module"""
+
+
+# ================================================================================
+# File: src\localization\candidate_retriever.py
+# ================================================================================
+"""Candidate retrieval + patchify expansion for localization (IMPROVEMENT_PLAN 1.1).
+
+Extracted from Localizer as a stateless collaborator: single- or multi-database
+top-k retrieval, plus optional patchify merge for the chosen rotation. Logic and
+log messages are unchanged.
+"""
+
+from __future__ import annotations
+
+from config import get_cfg
+from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
+
+logger = get_logger(__name__)
+
+
+class CandidateRetriever:
+    """Top-k retrieval (single/multi DB) with optional patch-descriptor merge."""
+
+    def __init__(self, db_manager, retriever, patchify_retrieval, config) -> None:
+        self.db_manager = db_manager
+        self.retriever = retriever
+        self.patchify_retrieval = patchify_retrieval
+        self.config = config
+
+    def retrieve(self, global_desc, top_k: int):
+        """Retrieve candidates: (source_id | None, [(frame_id, score), ...])."""
+        if self.db_manager is not None:
+            return self.db_manager.get_best_match(global_desc, top_k=top_k)
+        return None, self.retriever.find_similar_frames(global_desc, top_k=top_k)
+
+    def expand(self, rotated_frame, base_candidates, top_k: int):
+        """Patchify-expand candidates for the chosen rotation (no-op if disabled)."""
+        if self.patchify_retrieval is None:
+            return base_candidates
+        try:
+            with Telemetry.profile("patchify_retrieval"):
+                patch_descs = self.patchify_retrieval.compute_patch_descriptors(rotated_frame)
+                patch_candidates = self.patchify_retrieval.search(patch_descs, top_k=top_k)
+            if patch_candidates:
+                merged = self.merge(base_candidates, patch_candidates, max_results=top_k * 2)
+                logger.debug(
+                    f"Patchify expanded candidates: "
+                    f"{len(base_candidates)} → {len(merged)} "
+                    f"(top patchify score: {patch_candidates[0][1]:.3f})"
+                )
+                return merged
+        except Exception as e:
+            logger.warning(f"Patchify retrieval failed, using standard candidates: {e}")
+        return base_candidates
+
+    def merge(
+        self,
+        standard: list[tuple[int, float]],
+        patches: list[tuple[int, float]],
+        max_results: int | None = None,
+    ) -> list[tuple[int, float]]:
+        """Weighted-sum merge of standard + patch retrieval.
+
+        Weight from localization.patchify_merge_weight. Frame in both:
+        score = w_std*s + w_patch*p; in one only: the score as-is.
+        """
+        w_patch = get_cfg(self.config, "localization.patchify_merge_weight", 0.4)
+        w_standard = 1.0 - w_patch
+
+        standard_dict = dict(standard)
+        patch_dict = dict(patches)
+        all_fids = set(standard_dict.keys()) | set(patch_dict.keys())
+
+        merged = {}
+        for fid in all_fids:
+            s = standard_dict.get(fid, 0.0)
+            p = patch_dict.get(fid, 0.0)
+
+            if fid in standard_dict and fid in patch_dict:
+                merged[fid] = w_standard * s + w_patch * p
+            elif fid in standard_dict:
+                merged[fid] = s
+            else:
+                merged[fid] = p
+
+        sorted_results = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+
+        if max_results is not None:
+            sorted_results = sorted_results[:max_results]
+
+        return sorted_results
+
+
+# ================================================================================
+# File: src\localization\debug_collector.py
+# ================================================================================
+"""Opt-in колектор даних для вікон візуалізації моделей (debug views).
+
+`Localizer.localize_frame(collector=...)` заповнює ці поля ЛИШЕ коли колектор
+переданий (тобто відкрите хоча б одне вікно matches/dino/depth). За
+замовчуванням `collector=None` — жодного додаткового коштування у гарячому
+шляху локалізації.
+
+Поля-запити (`want_*`) ставить worker перед викликом; поля-виходи заповнює
+Localizer у міру проходження кадру. Часткове заповнення — норма: якщо кадр
+відхилено рано (немає кандидатів), `rotated_frame` лишиться None і відповідні
+вікна просто не оновляться цього keyframe.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+
+@dataclass
+class DebugCollector:
+    # ── Запити від worker-а: що саме рахувати (дороге — лише за потреби) ─────
+    want_matches: bool = False   # keypoints / inlier-матчі / RMSE
+    want_dino_pca: bool = False  # патч-токени DINO для PCA-візуалізації (окремий forward)
+    want_depth: bool = False     # depth-мапа (окремий GPU-прохід)
+
+    # ── Вихід: повернутий + GSD-нормалізований кадр (RGB) ───────────────────
+    # У просторі саме цього кадру лежать keypoints/mkpts та патч-токени.
+    rotated_frame: np.ndarray | None = None
+    query_features: dict | None = None  # {'keypoints', 'descriptors', 'image_size', ...}
+
+    # ── Вихід: точки / матчі ────────────────────────────────────────────────
+    mkpts_q_inliers: np.ndarray | None = None  # (M, 2) query-side inliers
+    mkpts_r_inliers: np.ndarray | None = None  # (M, 2) reference-side inliers
+    total_matches: int = 0
+    inliers: int = 0
+    rmse: float = 0.0
+    # ADDENDUM 1.1: просторовий розкид інлаєрів, min(σx,σy)/min(W,H).
+    # None = порахувати не вдалося. Норма ≈ 0.29, колапс у кут < 0.05.
+    spread: float | None = None
+
+    # ── Вихід: retrieval / rotation панель ──────────────────────────────────
+    candidate_id: int = -1
+    retrieval_candidates: list = field(default_factory=list)  # [(frame_id, score), ...]
+    global_angle: int = 0
+    scale: float = 1.0
+    global_score: float = 0.0
+
+    # ── Вихід: DINO PCA ─────────────────────────────────────────────────────
+    patch_tokens: np.ndarray | None = None    # (N, D) на CPU
+    patch_grid: tuple | None = None           # (h_p, w_p)
+
+    # ── Вихід: depth ────────────────────────────────────────────────────────
+    depth_map: np.ndarray | None = None       # (H, W) float32, відносна глибина
+    depth_scale: float | None = None          # відносний масштаб (1 / median depth)
+
+
+# ================================================================================
+# File: src\localization\failure_log.py
+# ================================================================================
+"""Failure logging for localization (CSV audit trail).
+
+Extracted verbatim from Localizer (IMPROVEMENT_PLAN 1.1). FAILURE_TYPES and the
+CSV format are unchanged, so existing log files and call sites keep working.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+FAILURE_TYPES = {
+    "out_of_coverage": "out_of_coverage",
+    "No candidates": "no_retrieval_candidates",
+    "Not enough valid inliers": "insufficient_inliers",
+    "No propagated calibration": "no_propagated_affine",
+    "Outlier detected": "trajectory_outlier",
+    "Coordinate transformation": "transform_error",
+}
+
+
+class FailureLogger:
+    """Appends localization failures to a CSV (default logs/localization_failures.csv)."""
+
+    def __init__(self, csv_path: str | None = None) -> None:
+        if csv_path is None:
+            from config import user_data_dir
+
+            csv_path = str(user_data_dir() / "logs" / "localization_failures.csv")
+        self.csv_path = csv_path
+
+    def log(self, error_type: str, inliers: int = 0, details: str = "") -> None:
+        try:
+            csv_path = self.csv_path
+            write_header = not os.path.exists(csv_path)
+            os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+            with open(csv_path, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write("timestamp,error_type,inliers,details\n")
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                safe_details = details.replace('"', '""')
+                f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
+        except Exception as e:
+            logger.error(f"Failed to log to localization_failures.csv: {e}")
+
+
+# ================================================================================
+# File: src\localization\geo_aware_retriever.py
 # ================================================================================
 """
 geo_aware_retriever.py — Геозалежний ретривер з фоновою перебудовою FAISS.
@@ -9235,16 +14082,296 @@ class GeoAwareRetriever:
 
 
 # ================================================================================
-# File: localization\localizer.py
+# File: src\localization\geometric_verifier.py
 # ================================================================================
-import os
-import time
+"""Geometric verification: candidate matching + RANSAC homography (IMPROVEMENT_PLAN 1.1).
+
+Extracted verbatim from Localizer.localize_frame's candidate loop. Stateless: the
+frame database is passed to ``verify`` explicitly because it is switched per-source
+in multi-database mode.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
-from config.config import get_cfg
 from src.geometry.transformations import GeometryTransforms
+from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class VerificationResult:
+    candidate_id: int
+    H_query_to_ref: np.ndarray
+    inliers: int
+    mkpts_q_in: np.ndarray
+    mkpts_r_in: np.ndarray
+    total_matches: int
+    rmse: float
+
+
+class GeometricVerifier:
+    """Match each candidate, estimate a homography, keep the best (with early stop)."""
+
+    def __init__(
+        self,
+        matcher: Any,
+        min_matches: int,
+        ransac_thresh: float,
+        homography_backend: str,
+        use_mad_ransac: bool,
+        mad_k_factor: float,
+        early_stop_inliers: int,
+        prefilter_enabled: bool = False,
+        prefilter_keep: int = 2,
+    ) -> None:
+        self.matcher = matcher
+        self.min_matches = min_matches
+        self.ransac_thresh = ransac_thresh
+        self.homography_backend = homography_backend
+        self.use_mad_ransac = use_mad_ransac
+        self.mad_k_factor = mad_k_factor
+        self.early_stop_inliers = early_stop_inliers
+        self.prefilter_enabled = prefilter_enabled
+        self.prefilter_keep = prefilter_keep
+
+    def verify(
+        self,
+        query_features: dict,
+        candidates: list,
+        database: Any,
+        ref_cache: dict | None = None,
+    ) -> VerificationResult | None:
+        best_inliers = 0
+        best_candidate_id = -1
+        best_H_query_to_ref = None
+        best_mkpts_q_inliers = None
+        best_mkpts_r_inliers = None
+        best_total_matches = 0
+        best_rmse = 999.0
+
+        early_stop = self.early_stop_inliers
+
+        # ADDENDUM §1: дешевий MNN-скоринг усіх кандидатів, LightGlue — лише
+        # на найкращих. ref_cache уникає повторного читання фіч із БД.
+        ref_cache = {} if ref_cache is None else ref_cache
+        if self.prefilter_enabled and len(candidates) > self.prefilter_keep:
+            candidates = self._prefilter(query_features, candidates, database, ref_cache)
+
+        for candidate_id, score in candidates:
+            logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
+            ref_features = ref_cache.get(candidate_id)
+            if ref_features is None:
+                ref_features = database.get_local_features(candidate_id)
+
+            with Telemetry.profile("match"):
+                mkpts_q, mkpts_r = self.matcher.match(query_features, ref_features)
+
+            if len(mkpts_q) >= self.min_matches:
+                with Telemetry.profile("ransac_homography"):
+                    H_eval, mask = GeometryTransforms.estimate_homography(
+                        mkpts_q,
+                        mkpts_r,
+                        ransac_threshold=self.ransac_thresh,
+                        backend=self.homography_backend,
+                        use_mad_ransac=self.use_mad_ransac,
+                        mad_k_factor=self.mad_k_factor,
+                    )
+
+                if H_eval is not None:
+                    inlier_mask = mask.ravel().astype(bool)
+                    inliers = int(np.sum(inlier_mask))
+                    pts_q_in = mkpts_q[inlier_mask]
+                    pts_r_in = mkpts_r[inlier_mask]
+
+                    pts_q_transformed = GeometryTransforms.apply_homography(pts_q_in, H_eval)
+                    rmse = float(
+                        np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
+                    )
+
+                    if inliers > best_inliers and inliers >= self.min_matches:
+                        best_inliers = inliers
+                        best_candidate_id = candidate_id
+                        best_H_query_to_ref = H_eval
+                        best_mkpts_q_inliers = pts_q_in
+                        best_mkpts_r_inliers = pts_r_in
+                        best_total_matches = len(mkpts_q)
+                        best_rmse = rmse
+                        logger.debug(
+                            f"Homography for {candidate_id}: {inliers} inliers, RMSE: {rmse:.2f}"
+                        )
+
+            if best_inliers >= early_stop:
+                logger.debug(
+                    f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
+                )
+                break
+
+        if (
+            best_inliers < self.min_matches
+            or best_mkpts_r_inliers is None
+            or best_H_query_to_ref is None
+        ):
+            return None
+
+        return VerificationResult(
+            candidate_id=best_candidate_id,
+            H_query_to_ref=best_H_query_to_ref,
+            inliers=best_inliers,
+            mkpts_q_in=best_mkpts_q_inliers,
+            mkpts_r_in=best_mkpts_r_inliers,
+            total_matches=best_total_matches,
+            rmse=best_rmse,
+        )
+
+    # ── ADDENDUM §1: MNN-передфільтр кандидатів ──────────────────────────
+
+    def mnn_counts(
+        self,
+        query_features: dict,
+        candidates: list,
+        database: Any,
+        ref_cache: dict | None = None,
+    ) -> list[tuple[int, int, float]] | None:
+        """Кількість mutual-NN пар (з Lowe ratio) між query і кожним кандидатом.
+
+        Повертає ``[(пар, candidate_id, score), ...]`` або ``None``, якщо
+        дескриптори query вироджені. Два споживачі:
+        передфільтр нижче (ADDENDUM §1) і темпоральний prior
+        (PIPELINE_OPTIMIZATION_PLAN §A1), для якого це дешева проба гіпотези —
+        один матмул замість повного LightGlue.
+
+        Lowe ratio обовʼязковий: голий mutual-NN рахує ~50% випадкових пар
+        між будь-якими наборами (перевірено юніт-тестом), ratio їх зрізає.
+        Той самий поріг, що і в ``_fast_numpy_match`` (L2-нормовані
+        дескриптори: d = sqrt(2-2s)). GPU-шлях (один матмул на кандидата)
+        з фолбеком на numpy.
+        """
+        q = np.asarray(query_features.get("descriptors")) if query_features else None
+        if q is None or q.ndim != 2 or len(q) == 0:
+            return None
+        q32 = np.ascontiguousarray(q, dtype=np.float32)
+
+        use_torch = False
+        q_t = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                q_t = torch.from_numpy(q32).cuda()
+                use_torch = True
+        except Exception:  # noqa: BLE001 — GPU-шлях опційний, фолбек numpy
+            use_torch = False
+
+        ratio = 0.75
+        gpu_failed = False
+
+        def _mnn_count(r: np.ndarray) -> int:
+            nonlocal use_torch, gpu_failed
+            r32 = np.ascontiguousarray(r, dtype=np.float32)
+            if r32.shape[0] < 2:
+                return 0
+            if use_torch:
+                try:
+                    r_t = torch.from_numpy(r32).cuda()
+                    sim = q_t @ r_t.T
+                    top2 = torch.topk(sim, 2, dim=1).values
+                    d1 = torch.sqrt(torch.clamp(2.0 - 2.0 * top2[:, 0], min=0.0))
+                    d2 = torch.sqrt(torch.clamp(2.0 - 2.0 * top2[:, 1], min=0.0))
+                    ratio_ok = d1 < ratio * d2
+                    nn12 = sim.argmax(dim=1)
+                    nn21 = sim.argmax(dim=0)
+                    idx = torch.arange(sim.shape[0], device=sim.device)
+                    return int(((nn21[nn12] == idx) & ratio_ok).sum().item())
+                except Exception as e:  # noqa: BLE001 — OOM тощо → numpy
+                    # Тихий фолбек на numpy — це перформанс-обрив, який раніше
+                    # не було видно взагалі. Вимикаємо GPU-шлях на решту
+                    # виклику і повідомляємо один раз.
+                    if not gpu_failed:
+                        gpu_failed = True
+                        logger.warning(
+                            f"GPU MNN path failed — falling back to numpy for this "
+                            f"verification ({type(e).__name__}: {e})"
+                        )
+                    use_torch = False
+            sim = q32 @ r32.T
+            top2 = -np.partition(-sim, 1, axis=1)[:, :2]
+            d1 = np.sqrt(np.clip(2.0 - 2.0 * top2[:, 0], 0.0, None))
+            d2 = np.sqrt(np.clip(2.0 - 2.0 * top2[:, 1], 0.0, None))
+            ratio_ok = d1 < ratio * d2
+            nn12 = sim.argmax(axis=1)
+            nn21 = sim.argmax(axis=0)
+            mutual = nn21[nn12] == np.arange(sim.shape[0])
+            return int(np.sum(mutual & ratio_ok))
+
+        scored: list[tuple[int, int, float]] = []
+        with Telemetry.profile("prefilter"):
+            for candidate_id, score in candidates:
+                ref = ref_cache.get(candidate_id) if ref_cache is not None else None
+                if ref is None:
+                    try:
+                        ref = database.get_local_features(candidate_id)
+                    except (ValueError, KeyError) as e:
+                        # Темпоральний prior пропонує сусідів за індексом —
+                        # частина з них може бути відсутня у БД. Це не помилка.
+                        logger.debug(f"MNN probe: candidate {candidate_id} unreadable ({e})")
+                        scored.append((0, candidate_id, score))
+                        continue
+                    if ref_cache is not None:
+                        ref_cache[candidate_id] = ref
+                r = np.asarray(ref.get("descriptors"))
+                if r is None or r.ndim != 2 or len(r) == 0 or r.shape[1] != q.shape[1]:
+                    scored.append((0, candidate_id, score))
+                    continue
+                scored.append((_mnn_count(r), candidate_id, score))
+        return scored
+
+    def _prefilter(
+        self, query_features: dict, candidates: list, database: Any, ref_cache: dict
+    ) -> list:
+        """Ранжує кандидатів за кількістю MNN-пар і лишає ``prefilter_keep``
+        найкращих (LightGlue далі йде лише по них).
+
+        Консервативність: якщо жоден кандидат не набрав жодної MNN-пари
+        (виродження: порожні/несумісні дескриптори) — список без змін.
+        """
+        scored = self.mnn_counts(query_features, candidates, database, ref_cache)
+        if scored is None:
+            return candidates
+        if all(s[0] == 0 for s in scored):
+            logger.debug("Prefilter: no MNN pairs on any candidate — keeping full list")
+            return candidates
+        scored.sort(key=lambda t: (-t[0], -t[2]))
+        kept = [(cid, sc) for _, cid, sc in scored[: self.prefilter_keep]]
+        logger.debug(
+            f"Prefilter kept {len(kept)}/{len(candidates)} candidates "
+            f"(mnn top: {[(c, m) for m, c, _ in scored[: self.prefilter_keep]]})"
+        )
+        return kept
+
+
+# ================================================================================
+# File: src\localization\localizer.py
+# ================================================================================
+import numpy as np
+
+from config import get_cfg
+from src.geometry.point_spread import inlier_spread
+from src.geometry.transformations import GeometryTransforms
+from src.localization.candidate_retriever import CandidateRetriever
+from src.localization.failure_log import FAILURE_TYPES, FailureLogger
+from src.localization.geometric_verifier import GeometricVerifier
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
+from src.localization.result_builder import ResultBuilder
+from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
+from src.localization.rotation_selector import RotationSelector
+from src.localization.scale_manager import ScaleManager, crop_to_affine
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
@@ -9252,33 +14379,6 @@ from src.utils.resolution_normalizer import ResolutionNormalizer
 from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
-
-FAILURE_TYPES = {
-    "out_of_coverage": "out_of_coverage",
-    "No candidates": "no_retrieval_candidates",
-    "Not enough valid inliers": "insufficient_inliers",
-    "No propagated calibration": "no_propagated_affine",
-    "Outlier detected": "trajectory_outlier",
-    "Coordinate transformation": "transform_error",
-}
-
-# Матриці обертання вектора зсуву для кожного кута повороту кадру.
-# np.rot90(frame, k=K) повертає кадр проти годинникової стрілки на K*90°.
-# Якщо трекер обчислив зсув (dx, dy) в оригінальній системі координат,
-# цей словник перераховує його в систему координат повернутого кадру,
-# де побудована гомографія H.
-#
-# Виведення:
-#   k=1 (90° CCW):  x_rot = -y_orig, y_rot = x_orig  →  (dx,dy) → (-dy, dx)
-#   k=2 (180°):     x_rot = -x_orig, y_rot = -y_orig →  (dx,dy) → (-dx,-dy)
-#   k=3 (270° CCW): x_rot = y_orig,  y_rot = -x_orig →  (dx,dy) → (dy, -dx)
-_ROTATION_VEC: dict[int, tuple[int, int, int, int]] = {
-    # angle: (a, b, c, d) → new_dx = a*dx + b*dy, new_dy = c*dx + d*dy
-    0:   ( 1,  0,  0,  1),
-    90:  ( 0, -1,  1,  0),
-    180: (-1,  0,  0, -1),
-    270: ( 0,  1, -1,  0),
-}
 
 
 class Localizer:
@@ -9299,6 +14399,7 @@ class Localizer:
         self.matcher = matcher
         self.calibration = calibration
         self.config = config or {}
+        self._failure_logger = FailureLogger()
 
         # Мультиджерельна підтримка (Phase 3 ТЗ)
         self.db_manager = db_manager        # MultiDatabaseManager | None
@@ -9320,10 +14421,44 @@ class Localizer:
         )
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
-            threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 150.0),
-            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 1000.0),
+            threshold_std=get_cfg(self.config, "tracking.outlier_threshold_std", 4.0),
+            max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 120.0),
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
+            zscore_enabled=get_cfg(self.config, "tracking.outlier_zscore_enabled", True),
         )
+
+        # RESEARCH 3.1: ковзний віконний back-end smoother (флаг, дефолт off).
+        # Синхронний 2D Huber-IRLS поверх keyframe-фіксів + OF-одометрії;
+        # корекція KF зсувом. Див. src/tracking/smoother.py.
+        self._smoother = None
+        if get_cfg(self.config, "tracking.smoother_enabled", False):
+            from src.tracking.smoother import SlidingWindowSmoother
+
+            self._smoother = SlidingWindowSmoother(
+                window=get_cfg(self.config, "tracking.smoother_window", 60),
+                huber_k=get_cfg(self.config, "tracking.smoother_huber_k", 1.2),
+                fix_sigma_base_m=get_cfg(
+                    self.config, "tracking.smoother_fix_sigma_base_m", 5.0
+                ),
+                odom_sigma_base_m=get_cfg(
+                    self.config, "tracking.smoother_odom_sigma_base_m", 3.0
+                ),
+                max_correction_m=get_cfg(
+                    self.config, "tracking.smoother_max_correction_m", 50.0
+                ),
+                entry_prior_sigma_m=get_cfg(
+                    self.config, "tracking.smoother_entry_prior_sigma_m", 15.0
+                ),
+                irls_iterations=get_cfg(
+                    self.config, "tracking.smoother_irls_iterations", 4
+                ),
+                correction_lag=get_cfg(
+                    self.config, "tracking.smoother_correction_lag", 10
+                ),
+                deadband_m=get_cfg(self.config, "tracking.smoother_deadband_m", 2.0),
+                gain=get_cfg(self.config, "tracking.smoother_gain", 0.25),
+                max_step_m=get_cfg(self.config, "tracking.smoother_max_step_m", 3.0),
+            )
 
         # Retriever: при мульти-режимі він у db_manager, тут — для single-mode
         self.retriever = None
@@ -9338,7 +14473,72 @@ class Localizer:
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
         self.min_inliers_for_accept = get_cfg(self.config, "localization.min_inliers_accept", 10)
         self.retrieval_top_k = get_cfg(self.config, "localization.retrieval_top_k", 8)
+        # RESEARCH 2.2: аварійний SIFT+LightGlue фолбек
+        self._sift_fallback = get_cfg(self.config, "localization.sift_fallback", False)
+        self._sift_fallback_max_cand = get_cfg(
+            self.config, "localization.sift_fallback_max_candidates", 3
+        )
         self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
+
+        # ── PIPELINE_OPTIMIZATION_PLAN §A1: темпоральний prior кандидатів ───
+        # У steady state глобальний дескриптор коштує половину keyframe-а
+        # (470 мс із 945 на GTX 1650), хоча відповідь — номер кадру БД — уже
+        # відома з попереднього keyframe: дрон за секунду не телепортується.
+        # Прапорець дефолтом вимкнено: поведінка без нього побітово стара.
+        self._temporal_prior = get_cfg(
+            self.config, "localization.temporal_candidate_prior", False
+        )
+        self._tp_window = int(get_cfg(self.config, "localization.temporal_prior_window", 2))
+        self._tp_keep = int(get_cfg(self.config, "localization.temporal_prior_keep", 1))
+        self._tp_min_mnn = int(get_cfg(self.config, "localization.temporal_prior_min_mnn", 20))
+        self._tp_accept = int(
+            get_cfg(self.config, "localization.temporal_prior_accept_inliers", 25)
+        )
+        self._tp_audit_every = int(
+            get_cfg(self.config, "localization.temporal_prior_audit_every", 10)
+        )
+        self._tp_counter = 0
+        self._tp_tries = 0
+        self._tp_hits = 0
+
+        # ADDENDUM 1.1: статистика розкиду інлаєрів. Без неї прогін не дає
+        # вердикту — критерій приймання сформульований саме як ЧАСТОТА
+        # спрацювання («< 1% keyframe-ів зі spread < 0.10 → пункт відкотити»).
+        # Лічильники живуть лише коли увімкнено spread_confidence_enabled.
+        self._spread_stats_enabled = get_cfg(
+            self.config, "localization.spread_confidence_enabled", False
+        )
+        self._spread_log_every = get_cfg(self.config, "localization.spread_log_every", 50)
+        self._spread_n = 0
+        self._spread_n_low = 0
+        self._spread_min = 1.0
+        self._spread_sum = 0.0
+
+        # Аудит §1.2: гейт аутлаєрів на OF-шляху. Дефолт False — стара поведінка
+        # (OF взагалі не перевірявся). Вмикати разом із поверненням
+        # tracking.outlier_threshold_std / max_speed_mps до фізичних значень:
+        # при std=80 і 350 м/с гейт усе одно майже не спрацьовує.
+        self._of_outlier_gate = get_cfg(self.config, "tracking.of_outlier_gate", False)
+        # Етап 6: перевести відстані аутлаєр-гейта у справжні наземні метри.
+        self._ground_scale_correction = get_cfg(
+            self.config, "tracking.ground_scale_correction", False
+        )
+        # Локальна (кадр-до-кадру) швидкість на OF-шляху замість накопиченої.
+        self._of_local_speed = get_cfg(self.config, "tracking.of_local_speed", False)
+        self._last_of_raw: np.ndarray | None = None
+
+        # Обхід кінематичного гейта за силою незалежних доказів (див.
+        # config/localization.py). Кінематика — це пріор про рух платформи;
+        # інлаєри та flow_quality — прямі свідчення про саме вимірювання.
+        self._trust_strong = get_cfg(
+            self.config, "tracking.outlier_trust_strong_evidence", False
+        )
+        self._trust_min_inliers = int(
+            get_cfg(self.config, "tracking.outlier_trust_min_inliers", 100)
+        )
+        self._trust_min_flow_q = float(
+            get_cfg(self.config, "tracking.outlier_trust_min_flow_quality", 0.5)
+        )
 
         # Fix #1: Захист від нескінченного циклу при виході за межі покриття
         self._consecutive_failures = 0
@@ -9347,6 +14547,27 @@ class Localizer:
         # Нормалізація роздільної здатності вхідного кадру до еталонної роздільної здатності БД
         self.normalizer = ResolutionNormalizer(ref_frame_width, ref_frame_height)
         self._last_scale = 1.0
+
+        # A3: темпоральний prior на кут повороту — кут останньої успішної
+        # локалізації; повний скан 4 кутів лише при просіданні score або невдачі
+        self._last_best_angle: int | None = None
+
+        # ── ScaleManager: GSD-ratio estimation for altitude-invariant localization ─
+        self._scale_manager = ScaleManager(self.config)
+
+        # Depth-based scale hint (soft pyramid reorder; hint only, never a hard scale).
+        self._db_depth_scale = getattr(self.database, "median_depth_scale", None)
+        self._use_depth_hint = get_cfg(self.config, "localization.scale_use_depth_hint", True)
+        self._depth_hint_every_n = get_cfg(self.config, "localization.depth_hint_every_n", 30)
+        self._depth_estimator = None
+        self._depth_hint_counter = 0
+
+        # ── Debug views: незалежний depth-інференс для вікна (окрема каденція) ─
+        self._debug_depth_every_n = get_cfg(
+            self.config, "debug_views.depth_every_n_keyframes", 1
+        )
+        self._debug_depth_estimator = None
+        self._debug_depth_counter = 0
 
         # ── Patchify: мультипатч-retrieval ────────────────────────────────────
         # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
@@ -9390,6 +14611,21 @@ class Localizer:
                     "Patchify enabled in config but database has no patch_descriptors. "
                 )
 
+        self._candidate_retriever = CandidateRetriever(
+            self.db_manager, self.retriever, self.patchify_retrieval, self.config
+        )
+        self._geometric_verifier = GeometricVerifier(
+            self.matcher, self.min_matches, self.ransac_thresh,
+            self.homography_backend, self.use_mad_ransac, self.mad_k_factor,
+            self.early_stop_inliers,
+            prefilter_enabled=get_cfg(self.config, "localization.candidate_prefilter", False),
+            prefilter_keep=get_cfg(self.config, "localization.prefilter_keep", 2),
+        )
+        self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
+        self._rotation_selector = RotationSelector(
+            self.feature_extractor, self._candidate_retriever, self.config
+        )
+
         # Phase 3.2: GSD integration
         project_manager = self.config.get("_project_manager", None)
         if project_manager and project_manager.settings:
@@ -9409,8 +14645,109 @@ class Localizer:
 
     # ─────────────────────────────────────────────────────────────────────────
 
+    @property
+    def last_state(self) -> dict | None:
+        """Останній успішний стан локалізації (H, affine, кут, source_id) або None.
+
+        Публічний доступ замість читання приватного _last_state ззовні.
+        """
+        return getattr(self, "_last_state", None)
+
+    def _sync_ground_scale(self, lat: float) -> None:
+        """Оновлює множник проєкція→наземні метри в аутлаєр-детекторі.
+
+        Флаг-гейт: при вимкненому tracking.ground_scale_correction множник
+        лишається 1.0, тобто поведінка побітово стара. Широта береться зі
+        свіжого фікса; за місію cos(lat) міняється на ~1e-5, тож відставання
+        на один кадр не має значення.
+        """
+        if not self._ground_scale_correction:
+            return
+        converter = getattr(self.calibration, "converter", None)
+        if converter is None:
+            return
+        try:
+            self.outlier_detector.set_ground_scale(converter.ground_scale_factor(lat))
+        except Exception as e:  # noqa: BLE001 — корекція не має валити локалізацію
+            logger.warning(f"Ground-scale sync failed ({type(e).__name__}: {e})")
+
+    def reset_session(self) -> None:
+        """Скидає стан сесії трекінгу (фільтри, лічильники, кутовий prior).
+
+        Викликати при старті нового відстеження, щоб уникнути хибних
+        передбачень на основі попередньої сесії.
+        """
+        self.trajectory_filter.reset()
+        self.outlier_detector.reset()
+        self._last_of_raw = None
+        self._consecutive_failures = 0
+        self._last_best_angle = None
+        self._last_state = None
+        self._scale_manager.reset()
+        self._debug_depth_counter = 0
+        self._tp_counter = 0
+        self._tp_tries = 0
+        self._tp_hits = 0
+        if self._smoother is not None:
+            self._smoother.reset()
+
+    def _maybe_set_depth_hint(self, frame: np.ndarray) -> None:
+        """Soft depth-based reorder of the scale pyramid (every N keyframes; hint only)."""
+        if not self._use_depth_hint or self._db_depth_scale is None:
+            return
+        self._depth_hint_counter += 1
+        if (self._depth_hint_counter - 1) % max(1, self._depth_hint_every_n) != 0:
+            return
+        try:
+            if self._depth_estimator is None:
+                from src.depth.depth_estimator import DepthEstimator
+
+                device = getattr(self.model_manager, "device", "cuda")
+                self._depth_estimator = DepthEstimator.build(device=device)
+            q_scale = self._depth_estimator.get_relative_scale(frame)
+            self._scale_manager.set_depth_hint(q_scale, self._db_depth_scale)
+        except Exception as e:
+            logger.debug(f"Depth hint skipped: {e}")
+
+    def _maybe_collect_depth(self, frame_rgb: np.ndarray, collector) -> None:
+        """Debug: незалежний depth-інференс для вікна (окрема каденція).
+
+        Не впливає на локалізацію — суто візуалізація «очима Depth Anything».
+        Рахується лише коли вікно depth відкрите (collector.want_depth) і не
+        частіше ніж кожен debug_views.depth_every_n_keyframes keyframe.
+        """
+        if collector is None or not collector.want_depth:
+            return
+        self._debug_depth_counter += 1
+        if (self._debug_depth_counter - 1) % max(1, self._debug_depth_every_n) != 0:
+            return
+        try:
+            if self._debug_depth_estimator is None:
+                from src.depth.depth_estimator import DepthEstimator
+
+                device = getattr(self.model_manager, "device", "cuda")
+                self._debug_depth_estimator = DepthEstimator.build(device=device)
+            depth = self._debug_depth_estimator.estimate(frame_rgb)
+            collector.depth_map = depth
+            # відносний масштаб з центру (як get_relative_scale, без 2-го інференсу)
+            h, w = depth.shape
+            cd = depth[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
+            vm = cd > 0
+            if bool(vm.any()):
+                med = float(np.median(cd[vm]))
+                collector.depth_scale = (1.0 / med) if med > 1e-6 else 1.0
+            else:
+                collector.depth_scale = 1.0
+        except Exception as e:
+            logger.debug(f"Debug depth skipped: {e}")
+
     def localize_frame(
-        self, query_frame: np.ndarray, static_mask: np.ndarray = None, dt: float = 1.0
+        self,
+        query_frame: np.ndarray,
+        static_mask: np.ndarray = None,
+        dt: float = 1.0,
+        yaw_hint_deg: float | None = None,
+        collector=None,
     ) -> dict:
         # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
         if self._consecutive_failures >= self._max_failures:
@@ -9423,6 +14760,8 @@ class Localizer:
                 f"Out-of-coverage guard triggered after {self._max_failures} consecutive failures. "
                 f"Resetting counter. The drone may be outside the database coverage area."
             )
+            self._last_best_angle = None  # наступний keyframe — повний скан кутів
+            self._scale_manager.invalidate()  # повний скан масштабів теж
             return {
                 "success": False,
                 "error": "out_of_coverage",
@@ -9437,170 +14776,231 @@ class Localizer:
             static_mask = self.normalizer.normalize_mask(static_mask)
         height, width = query_frame.shape[:2]
 
-        angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
+        # Depth hint: soft reorder of the scale pyramid toward the DB GSD (every N keyframes).
+        self._maybe_set_depth_hint(query_frame)
+        # Debug: depth-мапа для вікна (незалежно від успіху локалізації).
+        self._maybe_collect_depth(query_frame, collector)
 
-        best_global_score = -1.0
-        best_global_angle = 0
-        best_global_candidates = []
+        angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
 
         top_k = self.retrieval_top_k
 
-        # ── Крок 1: Вибір найкращого ракурсу за стандартним DINOv2 ──────────
-        # ТІЛЬКИ стандартний retrieval — patchify тут не запускається, бо:
-        #   - compute_patch_descriptors = 14 DINOv2 forward-пасів (для grids 1+4+9)
-        #   - 4 кути × 14 патчів = 56 зайвих форвард-пасів лише на вибір кута
-        #   - patchify-скор (avg cosine по 14 патчах) ≠ DINOv2 CLS-token cosine →
-        #     змішування робить порівняння між кутами некоректним
-        best_source_id_per_angle: str | None = None  # для мульти-режиму
+        # §A1: кеш (кут, масштаб) → (кадр, маска, crop, фічі) на ОДИН виклик.
+        # Якщо темпоральна гіпотеза провалилась, а повний шлях обрав ті самі
+        # кут і масштаб — ALIKED не рахується вдруге (217-339 мс на GTX 1650).
+        _feat_cache: dict = {}
 
-        for angle in angles_to_try:
-            k = angle // 90
-            rotated_frame = np.rot90(query_frame, k=k).copy()
-            global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
-
-            with Telemetry.profile("retrieval"):
-                if self.db_manager is not None:
-                    # Мульти-режим: пошук у всіх активних базах
-                    src_id, candidates = self.db_manager.get_best_match(
-                        global_desc, top_k=top_k
-                    )
-                else:
-                    # Single-mode (зворотна сумісність)
-                    candidates = self.retriever.find_similar_frames(
-                        global_desc, top_k=top_k
-                    )
-                    src_id = None
-
-            if candidates:
-                top_score = candidates[0][1]
-                if top_score > best_global_score:
-                    best_global_score = top_score
-                    best_global_angle = angle
-                    best_global_candidates = candidates
-                    best_source_id_per_angle = src_id
-
-        if not best_global_candidates:
-            self._consecutive_failures += 1
-            self._log_failure(FAILURE_TYPES["No candidates"])
-            return {
-                "success": False,
-                "error": (
-                    f"No candidates found via global descriptor (DINOv2) in any rotation. "
-                    f"Tested angles: {angles_to_try}. "
-                    f"Image {width}x{height} may not match any frame in the database."
-                ),
-            }
-
-        logger.info(
-            f"Selected best rotation {best_global_angle}° with global score {best_global_score:.3f}"
-        )
-
-        # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
-        if self.db_manager is not None and best_source_id_per_angle is not None:
-            self._active_source_id = best_source_id_per_angle
-            self.database = self.db_manager.get_database(best_source_id_per_angle)
-            if self.calib_manager is not None:
-                self.calibration = self.calib_manager.get(best_source_id_per_angle)
-            logger.debug(f"Active source switched to '{best_source_id_per_angle}'")
-
-        # ── Крок 1.5: Готуємо повернутий кадр для найкращого ракурсу ────────
-        k = best_global_angle // 90
-        best_rotated_frame = np.rot90(query_frame, k=k).copy()
-        best_rotated_mask = (
-            np.rot90(static_mask, k=k).copy() if static_mask is not None else None
-        )
-
-        # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
-        # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
-        # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
-        # (наприклад, при зміні висоти польоту).
-        if self.patchify_retrieval is not None:
-            try:
-                with Telemetry.profile("patchify_retrieval"):
-                    patch_descs = self.patchify_retrieval.compute_patch_descriptors(
-                        best_rotated_frame
-                    )
-                    patch_candidates = self.patchify_retrieval.search(
-                        patch_descs, top_k=top_k
-                    )
-                if patch_candidates:
-                    # Об'єднуємо: max_results обмежує список, щоб не збільшувати час матчінгу
-                    merged = self._merge_candidates(
-                        best_global_candidates,
-                        patch_candidates,
-                        max_results=top_k * 2,
-                    )
-                    logger.debug(
-                        f"Patchify expanded candidates: "
-                        f"{len(best_global_candidates)} → {len(merged)} "
-                        f"(top patchify score: {patch_candidates[0][1]:.3f})"
-                    )
-                    best_global_candidates = merged
-            except Exception as e:
-                logger.warning(f"Patchify retrieval failed, using standard candidates: {e}")
-
-        # ── Крок 2: Локальна екстракція (ALIKED/RDD) для найкращого ракурсу ─
-        best_query_features = self.feature_extractor.extract_local_features(
-            best_rotated_frame, static_mask=best_rotated_mask
-        )
-
-        best_inliers = 0
-        best_candidate_id = -1
-        best_H_query_to_ref = None
-        best_mkpts_q_inliers = None
-        best_mkpts_r_inliers = None
-        best_total_matches = 0
-        best_rmse = 999.0
-
-        early_stop = self.early_stop_inliers
-
-        # ── Крок 3: Локальний матчинг + RANSAC ──────────────────────────────
-        for candidate_id, score in best_global_candidates:
-            logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
-            ref_features = self.database.get_local_features(candidate_id)
-
-            with Telemetry.profile("match"):
-                mkpts_q, mkpts_r = self.matcher.match(best_query_features, ref_features)
-
-            if len(mkpts_q) >= self.min_matches:
-                with Telemetry.profile("ransac_homography"):
-                    H_eval, mask = GeometryTransforms.estimate_homography(
-                        mkpts_q,
-                        mkpts_r,
-                        ransac_threshold=self.ransac_thresh,
-                        backend=self.homography_backend,
-                        use_mad_ransac=self.use_mad_ransac,
-                        mad_k_factor=self.mad_k_factor,
+        # ── §A1: спроба локалізуватись БЕЗ глобального дескриптора ──────────
+        # yaw_hint_deg вимикає цей шлях: зовнішній курс — це нова інформація
+        # про орієнтацію, її треба відпрацювати повним ротаційним трактом.
+        _tp = None
+        if self._temporal_prior and yaw_hint_deg is None:
+            self._tp_counter += 1
+            audit = self._tp_audit_every
+            if audit <= 0 or (self._tp_counter % audit) != 0:
+                self._tp_tries += 1
+                _tp = self._try_temporal_prior(query_frame, static_mask, _feat_cache)
+                if _tp is not None:
+                    self._tp_hits += 1
+                if self._tp_tries % 50 == 0:
+                    logger.info(
+                        f"[temporal-prior] tries={self._tp_tries} "
+                        f"hits={self._tp_hits} "
+                        f"({100.0 * self._tp_hits / self._tp_tries:.0f}%)"
                     )
 
-                if H_eval is not None:
-                    inlier_mask = mask.ravel().astype(bool)
-                    inliers = int(np.sum(inlier_mask))
-                    pts_q_in = mkpts_q[inlier_mask]
-                    pts_r_in = mkpts_r[inlier_mask]
+        if _tp is not None:
+            (
+                ver,
+                best_global_angle,
+                best_scale,
+                best_rotated_frame,
+                best_rotated_mask,
+                _crop_info,
+                best_query_features,
+                best_global_candidates,
+            ) = _tp
+            # Retrieval не виконувався — глобального score не існує. -1.0
+            # свідомо не проходить retrieval_only_min_score, тож фолбек
+            # «за схожістю» на цьому шляху не спрацює; кандидати й так
+            # відібрані за наявністю пропагованої калібрації.
+            best_global_score = -1.0
+            best_source_id_per_angle = self._active_source_id
+            if collector is not None:
+                collector.global_score = best_global_score
+                collector.global_angle = int(best_global_angle)
+                collector.scale = float(best_scale)
+                collector.retrieval_candidates = [
+                    (int(cid), float(sc)) for cid, sc in best_global_candidates
+                ]
+                collector.rotated_frame = best_rotated_frame
+                collector.query_features = best_query_features
+            logger.debug(
+                f"Temporal prior HIT: frame={ver.candidate_id}, "
+                f"inliers={ver.inliers}, angle={best_global_angle} deg "
+                f"(global descriptor skipped)"
+            )
+        else:
+            # ── RESEARCH 2.3: зовнішній yaw-hint (симулятор / телеметрія) ────────
+            # yaw_hint_deg — кут CW у градусах, на який слід повернути кадр, щоб
+            # він збігся з орієнтацією БД (north-up); конвертацію з курсу дрона
+            # робить викликач. Квантуємо до 90° — весь rotation-тракт працює з
+            # k·90. Хибний hint самовиліковується: якщо retrieval-score prior-кута
+            # нижчий за rotation_rescan_min_score, RotationSelector сам виконає
+            # повний батчований скан 4 кутів.
+            prior_angle = self._last_best_angle
+            use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
+            if yaw_hint_deg is not None and self.enable_auto_rotation:
+                prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
+                use_prior = True
+                logger.debug(f"Yaw hint {yaw_hint_deg:.1f}° → prior rotation {prior_angle}°")
 
-                    pts_q_transformed = GeometryTransforms.apply_homography(pts_q_in, H_eval)
-                    rmse = float(
-                        np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
-                    )
+            rot = self._rotation_selector.select(
+                query_frame,
+                prior_angle,
+                use_prior,
+                angles_to_try,
+                top_k,
+                scale_manager=self._scale_manager,
+            )
+            if rot is None:
+                self._consecutive_failures += 1
+                self._log_failure(FAILURE_TYPES["No candidates"])
+                return {
+                    "success": False,
+                    "error": (
+                        f"No candidates found via global descriptor (DINOv2) in any rotation. "
+                        f"Tested angles: {angles_to_try}. "
+                        f"Image {width}x{height} may not match any frame in the database."
+                    ),
+                }
+            best_global_score = rot.score
+            best_global_angle = rot.angle
+            best_global_candidates = rot.candidates
+            best_source_id_per_angle = rot.source_id
+            best_scale = rot.best_scale
 
-                    if inliers > best_inliers and inliers >= self.min_matches:
-                        best_inliers = inliers
-                        best_candidate_id = candidate_id
-                        best_H_query_to_ref = H_eval
-                        best_mkpts_q_inliers = pts_q_in
-                        best_mkpts_r_inliers = pts_r_in
-                        best_total_matches = len(mkpts_q)
-                        best_rmse = rmse
-                        logger.debug(
-                            f"Homography for {candidate_id}: {inliers} inliers, RMSE: {rmse:.2f}"
+            if collector is not None:
+                collector.global_score = float(best_global_score)
+                collector.global_angle = int(best_global_angle)
+                collector.scale = float(best_scale)
+                collector.retrieval_candidates = [
+                    (int(cid), float(sc)) for cid, sc in best_global_candidates
+                ][: self.retrieval_top_k]
+
+            logger.debug(
+                f"Selected rotation {best_global_angle}° scale {best_scale:.2f} "
+                f"with global score {best_global_score:.3f}"
+            )
+
+            # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
+            if self.db_manager is not None and best_source_id_per_angle is not None:
+                self._active_source_id = best_source_id_per_angle
+                self.database = self.db_manager.get_database(best_source_id_per_angle)
+                if self.calib_manager is not None:
+                    self.calibration = self.calib_manager.get(best_source_id_per_angle)
+                logger.debug(f"Active source switched to '{best_source_id_per_angle}'")
+
+            # ── Кроки 1.5 + 1.5b + 2: поворот, GSD-нормалізація, ALIKED ─────────
+            # §A1: через _prepare_and_extract, щоб фічі, вже пораховані невдалою
+            # темпоральною гіпотезою на тих самих (кут, масштаб), не рахувались
+            # удруге. Крок 1.6 (patchify-expand) переїхав НИЖЧЕ екстракції — вони
+            # незалежні: expand читає лише кадр, а не фічі.
+            (
+                best_rotated_frame,
+                best_rotated_mask,
+                _crop_info,
+                best_query_features,
+            ) = self._prepare_and_extract(
+                query_frame, static_mask, best_global_angle, best_scale, _feat_cache,
+                # §2.2: селектор уже повернув і відмасштабував саме цей кадр
+                prepared=(rot.frame, rot.crop_info),
+            )
+
+            # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
+            # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
+            # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
+            # (наприклад, при зміні висоти польоту).
+            best_global_candidates = self._candidate_retriever.expand(
+                best_rotated_frame, best_global_candidates, top_k
+            )
+
+            if collector is not None:
+                collector.rotated_frame = best_rotated_frame
+                collector.query_features = best_query_features
+                if collector.want_dino_pca:
+                    try:
+                        tokens, h_p, w_p = self.feature_extractor.extract_patch_tokens(
+                            best_rotated_frame
                         )
+                        collector.patch_tokens = tokens
+                        collector.patch_grid = (h_p, w_p)
+                    except Exception as e:
+                        logger.debug(f"Debug DINO tokens skipped: {e}")
 
-            if best_inliers >= early_stop:
-                logger.info(
-                    f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
-                )
-                break
+            ver = self._geometric_verifier.verify(
+                best_query_features, best_global_candidates, self.database
+            )
+        if ver is not None:
+            best_inliers = ver.inliers
+            best_candidate_id = ver.candidate_id
+            best_H_query_to_ref = ver.H_query_to_ref
+            best_mkpts_q_inliers = ver.mkpts_q_in
+            best_mkpts_r_inliers = ver.mkpts_r_in
+            best_total_matches = ver.total_matches
+            best_rmse = ver.rmse
+        else:
+            best_inliers = 0
+            best_candidate_id = -1
+            best_H_query_to_ref = None
+            best_mkpts_q_inliers = None
+            best_mkpts_r_inliers = None
+            best_total_matches = 0
+            best_rmse = 999.0
+
+        if collector is not None:
+            collector.candidate_id = int(best_candidate_id)
+            collector.inliers = int(best_inliers)
+            collector.total_matches = int(best_total_matches)
+            collector.rmse = float(best_rmse)
+            collector.mkpts_q_inliers = best_mkpts_q_inliers
+            collector.mkpts_r_inliers = best_mkpts_r_inliers
+
+        # ADDENDUM 1.1: розкид інлаєрів — рахуємо ДО SIFT-фолбеку і
+        # перераховуємо після нього, бо він підміняє набір точок.
+        best_spread = self._inlier_spread(best_mkpts_q_inliers, best_query_features)
+        if collector is not None:
+            collector.spread = best_spread
+
+        # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ────────────────────
+        # ALIKED (як і SuperPoint) втрачає матчі при великому in-plane rotation
+        # та екстремальній похилості [ISPRS 2025; MDPI RS 17(22)]. Одноразовий
+        # перезапуск через ротаційно-інваріантний SIFT + LightGlue(sift) рятує
+        # кадр до того, як він піде у retrieval-only фолбек.
+        if (
+            (best_inliers < self.min_matches or best_H_query_to_ref is None)
+            and self._sift_fallback
+            and getattr(self.database, "has_sift_features", False)
+        ):
+            rescue = self._try_sift_rescue(
+                best_rotated_frame, best_rotated_mask, best_global_candidates
+            )
+            if rescue is not None:
+                (
+                    best_candidate_id,
+                    best_H_query_to_ref,
+                    best_inliers,
+                    best_mkpts_q_inliers,
+                    best_mkpts_r_inliers,
+                    best_total_matches,
+                    best_rmse,
+                ) = rescue
+                # Точки підмінені SIFT-ом — розкид більше не той, що вище.
+                best_spread = self._inlier_spread(best_mkpts_q_inliers, best_query_features)
+                if collector is not None:
+                    collector.spread = best_spread
+
+        self._record_spread(best_spread)
 
         if (
             best_inliers < self.min_matches
@@ -9666,14 +15066,39 @@ class Localizer:
             )
             return {"success": False, "error": "Failed to compute transform"}
 
-        # ── Крок 5: Зберігаємо стан для Optical Flow ────────────────────────
-        self._last_state = {
+        # ── FOV-remap (IMPLEMENTATION_PLAN, Фаза 1.2) ────────────────────────────────────
+        # H знайдена в координатах GSD-нормалізованого кадру (crop/resize).
+        # Композиція з A (rotated→normalized) переводить H у координати
+        # повернутого кадру — далі центр (Крок 6), FOV (Крок 8), OF-стан
+        # (Крок 5) і scale-prior (update_from_homography) рахуються в одній
+        # системі координат. Без цього при r < 0.85 центр зміщений на
+        # ~(1−r)/2 кадру, полігон завищений у 1/r, а prior колапсує до 1.
+        if _crop_info is not None and _crop_info.resize_scale != 1.0:
+            n_h, n_w = best_rotated_frame.shape[:2]
+            _A_norm = crop_to_affine(_crop_info, n_w, n_h)
+            M_query_to_ref = M_query_to_ref @ _A_norm
+            if best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
+                # mkpts лишаються в нормалізованих координатах лише для
+                # collector (він малює по нормалізованому кадру); для
+                # build_fov (кламп до rot_width/rot_height) переводимо в
+                # координати повернутого кадру.
+                _A_inv = crop_to_affine(_crop_info, n_w, n_h, inverse=True)
+                best_mkpts_q_inliers = GeometryTransforms.apply_homography(
+                    np.asarray(best_mkpts_q_inliers, dtype=np.float64), _A_inv
+                )
+
+        # ── Крок 5: Стан для Optical Flow (коміт — ПІСЛЯ outlier-гейту) ─────
+        pending_state = {
             "H": M_query_to_ref,
             "affine": affine_ref,
             "candidate_id": best_candidate_id,
             "inliers": best_inliers,
             "global_angle": best_global_angle,
             "source_id": self._active_source_id,
+            # Масштаб нормалізації САМЕ ЦЬОГО keyframe: OF має працювати в
+            # системі кадру, якому належить H (свіжий self._last_scale на
+            # наступних кадрах може вже відрізнятись).
+            "scale": self._last_scale,
         }
 
         # ── Крок 6: Query center → Reference → Metric → GPS ─────────────────
@@ -9702,99 +15127,92 @@ class Localizer:
         metric_pt = np.array([mx, my], dtype=np.float64)
 
         # ── Крок 7: Фільтрація аномалій ─────────────────────────────────────
-        if self.outlier_detector.is_outlier(metric_pt, dt):
+        # Сильна геометрія б'є кінематичний пріор: фікс, підтверджений сотнями
+        # інлаєрів RANSAC, не має відкидатись через припущення про швидкість
+        # платформи. Позицію все одно дописуємо в історію, щоб вікно детектора
+        # відповідало реальності, а не відфільтрованій її версії.
+        _strong = self._trust_strong and best_inliers >= self._trust_min_inliers
+        if _strong:
+            logger.debug(
+                f"Kinematic gate bypassed: {best_inliers} inliers "
+                f">= {self._trust_min_inliers} (geometry outranks motion prior)"
+            )
+        if not _strong and self.outlier_detector.is_outlier(metric_pt, dt):
             logger.warning(
                 f"Outlier filtered | matched_frame={best_candidate_id}, "
                 f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
                 f"Position jump was too large relative to recent trajectory."
             )
             self._log_failure(FAILURE_TYPES["Outlier detected"], inliers=best_inliers)
+            # RESEARCH 3.1: відхилений фікс усе одно входить у вікно
+            # smoother-а — Huber-вага арбітрує замість бінарного відкидання
+            # (страхує Z-score false positives на різких маневрах).
+            if self._smoother is not None:
+                conf_rej = self._compute_confidence(
+                    best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
+                )
+                self._smoother.add_fix(
+                    metric_pt,
+                    dt=dt,
+                    confidence=conf_rej,
+                    source_id=self._active_source_id,
+                    accepted=False,
+                )
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
+        # БАГФІКС (OF-шов): коміт стану лише ПІСЛЯ outlier-гейту. Раніше стан
+        # комітився на Кроці 5 — і для відхилених кадрів, і до
+        # homography-failure return — тож OF отримував H, неузгоджену з
+        # prev_pts воркера (він не ребейзить точки без success).
+        self._last_state = pending_state
         self._consecutive_failures = 0
 
-        filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
+        # Confidence рахуємо ДО фільтрації — B2: адаптивний шум вимірювання,
+        # слабка локалізація впливає на траєкторію менше, впевнена — більше
+        confidence = self._compute_confidence(
+            best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
+        )
+
+        filtered_pt = self.trajectory_filter.update(
+            metric_pt, dt=dt, noise_scale=1.0 / max(confidence, 0.25)
+        )
+        # RESEARCH 3.1: back-end smoother — вікно фіксів + OF-одометрії;
+        # корекція KF зсувом ДО запису в історію детектора та GPS/FOV,
+        # щоб виправлення потрапило в ЦЕЙ же кадр.
+        if self._smoother is not None:
+            corr = self._smoother.add_fix(
+                metric_pt,
+                dt=dt,
+                confidence=confidence,
+                source_id=self._active_source_id,
+                accepted=True,
+                kf_xy=filtered_pt,
+            )
+            if corr is not None:
+                self.trajectory_filter.shift(float(corr[0]), float(corr[1]))
+                filtered_pt = (
+                    float(filtered_pt[0]) + float(corr[0]),
+                    float(filtered_pt[1]) + float(corr[1]),
+                )
+                logger.debug(
+                    f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m"
+                )
         self.outlier_detector.add_position(filtered_pt, dt=dt)
+        # Новий keyframe перезапускає LK, тож ланцюг локальних OF-порівнянь
+        # обривається: перший OF після keyframe має міряти зсув ВІД keyframe
+        # (ref=None -> база = щойно додана позиція у вікні), а не від OF-виміру
+        # попереднього циклу. Інакше знову розходяться бази зсуву і dt.
+        self._last_of_raw = None
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
+        self._sync_ground_scale(lat)
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
         # ── Крок 8: Розрахунок FOV ───────────────────────────────────────────
-        corners = np.array(
-            [[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]],
-            dtype=np.float32,
-        )
-        ref_corners = GeometryTransforms.apply_homography(corners, M_query_to_ref)
-
-        is_exploded = False
-        if ref_corners is not None:
-            max_coord = np.max(np.abs(ref_corners))
-            if max_coord > 50000:
-                is_exploded = True
-
-        if is_exploded and best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
-            logger.warning(
-                f"Homography exploded the FOV (max_coord={max_coord:.0f}px > 50000px threshold). "
-                f"Cause: perspective distortion from locally-clustered ALIKED matches. "
-                f"Falling back to inliers bounding box for safe FOV estimation."
-            )
-            pts = best_mkpts_q_inliers
-            min_x, min_y = np.min(pts, axis=0)
-            max_x, max_y = np.max(pts, axis=0)
-            pad_x, pad_y = (max_x - min_x) * 0.1, (max_y - min_y) * 0.1
-            safe_corners = np.array(
-                [
-                    [max(0, min_x - pad_x), max(0, min_y - pad_y)],
-                    [min(rot_width, max_x + pad_x), max(0, min_y - pad_y)],
-                    [min(rot_width, max_x + pad_x), min(rot_height, max_y + pad_y)],
-                    [max(0, min_x - pad_x), min(rot_height, max_y + pad_y)],
-                ],
-                dtype=np.float32,
-            )
-            ref_corners = GeometryTransforms.apply_homography(safe_corners, M_query_to_ref)
-            original_poly_px = safe_corners
-        else:
-            original_poly_px = corners
-            logger.debug("FOV projected using full frame Homography matrix.")
-
-        logger.info(f"--- FOV DIAGNOSTICS FOR FRAME {best_candidate_id} ---")
-        w_px = np.linalg.norm(original_poly_px[0] - original_poly_px[1])
-        h_px = np.linalg.norm(original_poly_px[1] - original_poly_px[2])
-        logger.info(f"[1] Original FOV in Query image: {w_px:.1f} x {h_px:.1f} pixels")
-
-        if ref_corners is not None:
-            w_ref = np.linalg.norm(ref_corners[0] - ref_corners[1])
-            h_ref = np.linalg.norm(ref_corners[1] - ref_corners[2])
-            logger.info(
-                f"[2] FOV mapped to Reference via Homography: {w_ref:.1f} x {h_ref:.1f} pixels"
-            )
-
-        gps_corners = []
-        if ref_corners is not None:
-            metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
-            if metric_corners is not None:
-                fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
-                fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
-                logger.info(
-                    f"[3] FOV mapped to Web Mercator Metric space: {fov_w:.1f}m x {fov_h:.1f}m"
-                )
-                logger.debug(
-                    f"FOV dimensions: {fov_w:.1f}m x {fov_h:.1f}m | "
-                    f"Center metric: ({mx:.1f}, {my:.1f}) | "
-                    f"Filtered: ({filtered_pt[0]:.1f}, {filtered_pt[1]:.1f})"
-                )
-                for cx, cy in metric_corners:
-                    try:
-                        clat, clon = self.calibration.converter.metric_to_gps(
-                            float(cx + dx), float(cy + dy)
-                        )
-                        gps_corners.append((clat, clon))
-                    except Exception:
-                        pass
-
-        confidence = self._compute_confidence(
-            best_candidate_id, best_inliers, best_total_matches, best_rmse
+        gps_corners = self._result_builder.build_fov(
+            M_query_to_ref, affine_ref, rot_width, rot_height, best_mkpts_q_inliers,
+            self.calibration.converter, dx, dy, mx, my, filtered_pt, best_candidate_id,
         )
 
         logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
@@ -9803,6 +15221,14 @@ class Localizer:
         logger.success(
             f"Localized ({lat:.6f}, {lon:.6f}) | frame={best_candidate_id}{source_str} | "
             f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
+        )
+
+        # A3: запам'ятовуємо кут для темпорального prior наступного keyframe
+        self._last_best_angle = best_global_angle
+
+        # Scale prior: extract scale from H for the next keyframe
+        self._scale_manager.update_from_homography(
+            M_query_to_ref, rot_width, rot_height
         )
 
         return {
@@ -9820,7 +15246,14 @@ class Localizer:
     # ─────────────────────────────────────────────────────────────────────────
 
     def localize_optical_flow(
-        self, dx_px: float, dy_px: float, dt: float, rot_width: int, rot_height: int
+        self,
+        dx_px: float,
+        dy_px: float,
+        dt: float,
+        rot_width: int,
+        rot_height: int,
+        flow_affine: np.ndarray | None = None,
+        flow_quality: float | None = None,
     ) -> dict:
         """Локалізація на основі піксельного зсуву від Optical Flow.
 
@@ -9830,12 +15263,14 @@ class Localizer:
           1. Масштабування на _last_scale (нормалізація роздільної здатності).
           2. Swap width↔height при 90° / 270° обертанні.
           3. Обертання вектора зсуву (dx, dy) у систему координат повернутого кадру.
+
+        B4: flow_affine — опційна симілярність 2x3 (original px, KF→current),
+        оцінена по flow-точках. Враховує обертання/зміну масштабу між
+        keyframe-ами (чиста трансляція dx/dy дрейфує на віражах).
+        flow_quality (0..1) — чесна якість OF для адаптивного шуму Kalman.
         """
-        if (
-            not hasattr(self, "_last_state")
-            or self._last_state["H"] is None
-            or self._last_state["affine"] is None
-        ):
+        state = self.last_state
+        if state is None or state.get("H") is None or state.get("affine") is None:
             return {"success": False, "error": "No previous state to apply OF"}
 
         # Відновлюємо database/calibration для збереженого source_id (мульти-режим)
@@ -9845,7 +15280,9 @@ class Localizer:
             if self.calib_manager is not None:
                 self.calibration = self.calib_manager.get(last_source_id)
 
-        scale = self._last_scale
+        # Масштаб зі збереженого стану keyframe-а (узгоджений з його H);
+        # фолбек на _last_scale для станів, записаних до цього поля.
+        scale = self._last_state.get("scale", self._last_scale)
         angle = self._last_state.get("global_angle", 0)
 
         # ── 1. Вектор зсуву: оригінальний простір → нормалізований + повернутий ──
@@ -9870,12 +15307,35 @@ class Localizer:
             norm_rot_h = rot_height * scale
 
         # ── 3. Центр поточного кадру в системі координат попереднього ────────
-        # Якщо з моменту KF точки змістились на (dx, dy), то центр поточного
-        # дрона відповідає точці (center − displacement) у КС попереднього KF.
-        center_query_shifted = np.array(
-            [[norm_rot_w / 2.0 - rot_sdx, norm_rot_h / 2.0 - rot_sdy]],
-            dtype=np.float64,
-        )
+        center_query_shifted = None
+
+        if flow_affine is not None:
+            # B4: повна симілярність S (original px, KF→current). Точка KF-кадру,
+            # що зараз опинилась у центрі: p0 = S⁻¹ @ center. Далі p0 переводимо
+            # normalized → rotated (та сама трансформація, що й для кадру).
+            try:
+                S3 = np.vstack([np.asarray(flow_affine, dtype=np.float64), [0.0, 0.0, 1.0]])
+                S_inv = np.linalg.inv(S3)
+                cx0, cy0 = rot_width / 2.0, rot_height / 2.0
+                p0x = S_inv[0, 0] * cx0 + S_inv[0, 1] * cy0 + S_inv[0, 2]
+                p0y = S_inv[1, 0] * cx0 + S_inv[1, 1] * cy0 + S_inv[1, 2]
+                # original → normalized
+                p0x *= scale
+                p0y *= scale
+                # normalized → rotated (мапінг точки np.rot90, верифікований)
+                w_n, h_n = rot_width * scale, rot_height * scale
+                rx, ry = _rotate_point_np90(p0x, p0y, w_n, h_n, angle)
+                center_query_shifted = np.array([[rx, ry]], dtype=np.float64)
+            except np.linalg.LinAlgError:
+                center_query_shifted = None  # вироджена S → fallback на трансляцію
+
+        if center_query_shifted is None:
+            # Fallback: чиста трансляція — якщо з моменту KF точки змістились на
+            # (dx, dy), центр відповідає точці (center − displacement) у КС KF.
+            center_query_shifted = np.array(
+                [[norm_rot_w / 2.0 - rot_sdx, norm_rot_h / 2.0 - rot_sdy]],
+                dtype=np.float64,
+            )
 
         pts_in_ref = GeometryTransforms.apply_homography(
             center_query_shifted, self._last_state["H"]
@@ -9890,12 +15350,73 @@ class Localizer:
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        filtered_pt = self.trajectory_filter.update(metric_pt, dt=dt)
+        # ── Гейт аутлаєрів на OF-шляху (аудит §1.2), flag-gated ──────────────
+        # Структурна прогалина: keyframe-шлях питає is_outlier (Крок 7), а OF —
+        # ні, він лише дописував позицію в історію. При keyframe_interval=30 це
+        # 29 із 30 позицій, що виходять назовні без жодної перевірки: зрив
+        # трекінгу LK на хмару чи водну поверхню потрапляв прямо в GPS.
+        # Дефолт False = стара поведінка побітово.
+        # Висока flow_quality — незалежне свідчення, що потік узгоджений: зсув
+        # реальний, а не зрив трекінгу. Заміряно на живому прогоні: справжні
+        # зриви LK давали 0.017–0.035, а помилково відкинуті швидкі рухи —
+        # 0.625–1.0. Кінематичний гейт їх не розрізняє, а цей поріг — так.
+        _strong_flow = (
+            self._trust_strong
+            and flow_quality is not None
+            and float(flow_quality) >= self._trust_min_flow_q
+        )
+        if _strong_flow:
+            logger.debug(
+                f"OF kinematic gate bypassed: flow_quality={float(flow_quality):.3f} "
+                f">= {self._trust_min_flow_q} (flow is self-consistent)"
+            )
+        # Опорна точка миттєвої швидкості: попередній СИРИЙ OF-вимір (навіть
+        # відкинутий). Без неї база — остання прийнята позиція, зазвичай
+        # keyframe, і швидкість накопичується разом зі зсувом LK.
+        _of_ref = self._last_of_raw if self._of_local_speed else None
+        _is_out = (
+            self._of_outlier_gate
+            and not _strong_flow
+            and self.outlier_detector.is_outlier(metric_pt, dt, ref_position=_of_ref)
+        )
+        # Оновлюємо ДО раннього return: наступний кадр має порівнюватись із цим
+        # виміром незалежно від того, прийняли ми його чи ні.
+        self._last_of_raw = metric_pt.copy()
+        if _is_out:
+            logger.warning(
+                f"OF outlier filtered | metric=({mx:.1f}, {my:.1f}), dt={dt:.3f}s, "
+                f"flow_quality={flow_quality if flow_quality is None else round(flow_quality, 3)}. "
+                f"Optical flow likely lost lock (clouds, water, motion blur)."
+            )
+            self._log_failure(FAILURE_TYPES["Outlier detected"])
+            # Відхилений OF усе одно йде у вікно smoother-а як одометрія:
+            # Huber-вага арбітрує краще за бінарне відкидання (та сама логіка,
+            # що для відхилених keyframe-ів).
+            if self._smoother is not None:
+                self._smoother.note_of(metric_pt, dt=dt, quality=flow_quality)
+            return {"success": False, "error": "OF outlier — position jump filtered"}
+
+        # RESEARCH 3.1: сирий OF-фікс у вікно smoother-а — відносна одометрія,
+        # прив'язана до H останнього прийнятого keyframe.
+        if self._smoother is not None:
+            self._smoother.note_of(metric_pt, dt=dt, quality=flow_quality)
+
+        # B2: чесний confidence OF (раніше хардкод 0.8) + більший шум вимірювання
+        # для Kalman (OF — відносне вимірювання, воно дрейфує від KF)
+        if flow_quality is not None:
+            of_conf = 0.5 + 0.35 * float(np.clip(flow_quality, 0.0, 1.0))
+        else:
+            of_conf = 0.7
+
+        filtered_pt = self.trajectory_filter.update(
+            metric_pt, dt=dt, noise_scale=1.5 / max(of_conf, 0.25)
+        )
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
 
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
+        self._sync_ground_scale(lat)
 
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
 
@@ -9903,7 +15424,7 @@ class Localizer:
             "success": True,
             "lat": lat,
             "lon": lon,
-            "confidence": 0.8,
+            "confidence": round(of_conf, 3),
             "matched_frame": int(self._last_state.get("candidate_id", -1)),
             "inliers": of_inliers,
             "fov_polygon": None,
@@ -9912,136 +15433,272 @@ class Localizer:
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _merge_candidates(
+    # ── PIPELINE_OPTIMIZATION_PLAN §A1 ──────────────────────────────────────
+
+    def _prepare_and_extract(
         self,
-        standard: list[tuple[int, float]],
-        patches: list[tuple[int, float]],
-        max_results: int | None = None,
-    ) -> list[tuple[int, float]]:
-        """Об'єднує результати стандартного та патч-retrieval через зважену суму.
+        query_frame: np.ndarray,
+        static_mask: np.ndarray | None,
+        angle: int,
+        scale: float,
+        cache: dict,
+        prepared: tuple | None = None,
+    ) -> tuple:
+        """Повернути кадр на ``angle``, нормалізувати до ``scale``, витягти ALIKED.
 
-        Ваги беруться з конфігу (localization.patchify_merge_weight).
-        Якщо кадр є в обох джерелах: score = w_std * s + w_patch * p.
-        Якщо тільки в одному: беремо скор як є (не штрафуємо за відсутність в іншому).
+        ``cache`` живе рівно один виклик ``localize_frame``: якщо темпоральна
+        гіпотеза провалилась і повний шлях обрав ті самі (кут, масштаб),
+        екстракція не повторюється. Повертає
+        ``(rotated_frame, rotated_mask, crop_info, features)``.
+
+        ``prepared`` (аудит §2.2) — ``(frame, crop_info)`` від RotationSelector
+        для ТІЄЇ САМОЇ пари (кут, масштаб): він уже зробив rot90 і GSD-resize,
+        щоб порахувати глобальний дескриптор. Тоді тут лишається тільки маска
+        і ALIKED — на 1080p це мінус ~6 МБ memcpy і один resize на keyframe.
+        Маску все одно доводиться готувати окремо: селектор її не бачить.
         """
-        w_patch = get_cfg(self.config, "localization.patchify_merge_weight", 0.4)
-        w_standard = 1.0 - w_patch
+        key = (int(angle), round(float(scale), 3))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
 
-        standard_dict = dict(standard)
-        patch_dict = dict(patches)
-        all_fids = set(standard_dict.keys()) | set(patch_dict.keys())
+        k = int(angle) // 90
+        rot_mask = np.rot90(static_mask, k=k).copy() if static_mask is not None else None
+        needs_gsd = abs(float(scale) - 1.0) > 0.15
 
-        merged = {}
-        for fid in all_fids:
-            s = standard_dict.get(fid, 0.0)
-            p = patch_dict.get(fid, 0.0)
+        if prepared is not None and prepared[0] is not None:
+            # Кадр уже підготовлений селектором під ці ж (кут, масштаб).
+            rotated, crop_info = prepared
+            if needs_gsd and rot_mask is not None:
+                rot_mask, _ = self._scale_manager.normalize(rot_mask, float(scale))
+        else:
+            rotated = np.rot90(query_frame, k=k).copy()
+            crop_info = None
+            # GSD-нормалізація: у сталому польоті scale ≈ 1.0 і це no-op.
+            if needs_gsd:
+                rotated, crop_info = self._scale_manager.normalize(rotated, float(scale))
+                if rot_mask is not None:
+                    rot_mask, _ = self._scale_manager.normalize(rot_mask, float(scale))
+                logger.debug(
+                    f"GSD-normalized frame for scale {scale:.2f}: "
+                    f"{rotated.shape[1]}x{rotated.shape[0]}"
+                )
 
-            if fid in standard_dict and fid in patch_dict:
-                merged[fid] = w_standard * s + w_patch * p
-            elif fid in standard_dict:
-                merged[fid] = s
-            else:
-                merged[fid] = p
+        feats = self.feature_extractor.extract_local_features(
+            rotated, static_mask=rot_mask
+        )
+        cache[key] = (rotated, rot_mask, crop_info, feats)
+        return cache[key]
 
-        sorted_results = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+    def _tp_neighbour_ids(self) -> list[int]:
+        """Кандидати з околу останнього збігу — без жодного forward-пасу.
 
-        if max_results is not None:
-            sorted_results = sorted_results[:max_results]
+        Порядок: сам останній кадр, далі симетрично id±1, id±2 … Кадри без
+        пропагованої калібрації відкидаються одразу: без ``frame_affine``
+        локалізація по них однаково не завершиться, а перевірка — це
+        звернення до масиву.
+        """
+        st = self.last_state
+        if not st:
+            return []
+        cid = int(st.get("candidate_id", -1))
+        if cid < 0:
+            return []
+        ids: list[int] = []
+        for d in range(0, max(0, self._tp_window) + 1):
+            for c in (cid,) if d == 0 else (cid - d, cid + d):
+                if c < 0 or c in ids:
+                    continue
+                try:
+                    if self.database.get_frame_affine(c) is None:
+                        continue
+                except Exception as e:  # noqa: BLE001 — БД може не мати кадру
+                    logger.debug(f"Temporal prior: frame {c} rejected ({e})")
+                    continue
+                ids.append(c)
+        return ids
 
-        return sorted_results
+    def _try_temporal_prior(
+        self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
+    ) -> tuple | None:
+        """§A1: локалізація без глобального дескриптора.
+
+        Повертає кортеж для гілки в ``localize_frame`` або ``None`` — тоді
+        викликач іде повним шляхом (фічі вже лежать у ``cache``, тож ALIKED
+        не повториться).
+
+        Ціна промаху навмисно тримається низькою: гіпотеза спершу перевіряється
+        MNN-скорером (один матмул на кандидата), і лише пройшовши поріг
+        ``temporal_prior_min_mnn``, доходить до LightGlue.
+        """
+        angle = self._last_best_angle
+        if angle is None:
+            return None
+        ids = self._tp_neighbour_ids()
+        if not ids:
+            return None
+
+        scale = self._scale_manager.prior
+        scale = 1.0 if scale is None else float(scale)
+
+        rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
+            query_frame, static_mask, angle, scale, cache
+        )
+
+        cands = [(int(i), 0.0) for i in ids]
+        ref_cache: dict = {}
+        scored = self._geometric_verifier.mnn_counts(
+            feats, cands, self.database, ref_cache
+        )
+        if not scored:
+            return None
+        scored.sort(key=lambda t: -t[0])
+        if scored[0][0] < self._tp_min_mnn:
+            logger.debug(
+                f"Temporal prior: MNN probe too weak "
+                f"({scored[0][0]} < {self._tp_min_mnn}) — full path"
+            )
+            return None
+
+        probe = [(cid, float(m)) for m, cid, _ in scored[: max(1, self._tp_keep)]]
+        ver = self._geometric_verifier.verify(
+            feats, probe, self.database, ref_cache=ref_cache
+        )
+        if ver is None or ver.inliers < self._tp_accept:
+            got = ver.inliers if ver is not None else 0
+            logger.debug(
+                f"Temporal prior: rejected ({got} inliers < {self._tp_accept}) — full path"
+            )
+            return None
+
+        return (ver, int(angle), float(scale), rotated, rot_mask, crop_info, feats, probe)
 
     def _compute_confidence(
-        self, best_candidate_id: int, best_inliers: int, total_matches: int, rmse_val: float
+        self,
+        best_candidate_id: int,
+        best_inliers: int,
+        total_matches: int,
+        rmse_val: float,
+        spread: float | None = None,
     ) -> float:
-        """Обчислює впевненість на основі QA бази даних та кількості інлаєрів."""
-        max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
-        rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
-        diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
-        w_inlier = get_cfg(self.config, "localization.confidence.inlier_weight", 0.7)
-        w_stability = get_cfg(self.config, "localization.confidence.stability_weight", 0.3)
-
-        inlier_score = min(1.0, best_inliers / max_inliers)
-
-        rmse = (
-            self.database.frame_rmse[best_candidate_id]
-            if self.database.frame_rmse is not None
-            else 0.0
-        )
-        disagreement = (
-            self.database.frame_disagreement[best_candidate_id]
-            if self.database.frame_disagreement is not None
-            else 0.0
+        return self._result_builder.compute_confidence(
+            best_candidate_id,
+            best_inliers,
+            total_matches,
+            rmse_val,
+            self.database,
+            spread=spread,
         )
 
-        stability_score = 1.0 - (
-            min(rmse, rmse_norm) / rmse_norm * 0.5
-            + min(disagreement, diag_norm) / diag_norm * 0.5
-        )
-        stability_score = float(np.clip(stability_score, 0.0, 1.0))
+    def _record_spread(self, spread: float | None) -> None:
+        """Накопичує статистику розкиду і періодично друкує її в лог.
 
-        ratio_score = float(best_inliers / (total_matches + 1e-6))
-        rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
-        match_score = ratio_score * 0.5 + rmse_score_val * 0.5
+        LOW_SPREAD = 0.10 — поріг із критерію приймання (≈ третина рівномірного
+        покриття 0.289), а НЕ поріг штрафу (той — ``spread_ref`` = 0.15).
+        """
+        if not self._spread_stats_enabled or spread is None:
+            return
+        self._spread_n += 1
+        self._spread_sum += spread
+        self._spread_min = min(self._spread_min, spread)
+        if spread < 0.10:
+            self._spread_n_low += 1
+        if self._spread_log_every > 0 and self._spread_n % self._spread_log_every == 0:
+            pct = 100.0 * self._spread_n_low / self._spread_n
+            logger.info(
+                f"[spread] keyframes={self._spread_n} | spread<0.10: "
+                f"{self._spread_n_low} ({pct:.1f}%) | mean={self._spread_sum / self._spread_n:.3f} "
+                f"| min={self._spread_min:.3f} (норма ≈0.29; <1% → пункт 1.1 відкотити)"
+            )
 
-        final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
-        return float(np.clip(final_conf, 0.05, 1.0))
+    @staticmethod
+    def _inlier_spread(pts_q: np.ndarray | None, query_features: dict) -> float | None:
+        """ADDENDUM 1.1: розкид інлаєрів у системі координат query-кадру.
+
+        Розміри беремо з ``query_features["image_size"]`` (= [H, W] кадру, з
+        якого екстрагувались фічі), а не з ``frame.shape``: keypoints живуть
+        саме в цьому просторі — після ротації та scale-нормалізації, але вже
+        відмасштабовані назад із ``max_local_edge`` (feature_extractor:250).
+        """
+        size = query_features.get("image_size") if query_features else None
+        if size is None or len(size) < 2:
+            return None
+        return inlier_spread(pts_q, float(size[1]), float(size[0]))
+
+    def _try_sift_rescue(
+        self,
+        rotated_frame: np.ndarray,
+        rotated_mask: np.ndarray | None,
+        candidates: list,
+    ) -> tuple | None:
+        """RESEARCH 2.2: одноразовий SIFT+LightGlue перезапуск матчингу.
+
+        Повертає (candidate_id, H, inliers, mkpts_q_in, mkpts_r_in,
+        total_matches, rmse) або None. Координати SIFT-точок — у тій самій
+        системі rotated_frame, що й ALIKED, тож даунстрім-композиція гомографій
+        не змінюється.
+        """
+        from src.localization.matcher import extract_sift_features
+
+        try:
+            q_sift = extract_sift_features(
+                rotated_frame,
+                rotated_mask,
+                get_cfg(self.config, "database.sift_max_keypoints", 2048),
+            )
+        except Exception as e:
+            logger.warning(f"SIFT rescue: query extraction failed: {e}")
+            return None
+        if len(q_sift["keypoints"]) < self.min_matches:
+            return None
+
+        best: tuple | None = None
+        with Telemetry.profile("sift_rescue"):
+            for cand_id, _score in candidates[: self._sift_fallback_max_cand]:
+                try:
+                    ref_sift = self.database.get_sift_features(cand_id)
+                except (ValueError, KeyError):
+                    continue
+                mkq, mkr = self.matcher.match_sift(q_sift, ref_sift)
+                if len(mkq) < self.min_matches:
+                    continue
+                H, mask = GeometryTransforms.estimate_homography(
+                    mkq,
+                    mkr,
+                    ransac_threshold=self.ransac_thresh,
+                    backend=self.homography_backend,
+                    use_mad_ransac=self.use_mad_ransac,
+                    mad_k_factor=self.mad_k_factor,
+                )
+                if H is None:
+                    continue
+                inl_mask = mask.ravel().astype(bool)
+                inliers = int(np.sum(inl_mask))
+                if inliers < self.min_matches:
+                    continue
+                pts_q_in, pts_r_in = mkq[inl_mask], mkr[inl_mask]
+                proj = GeometryTransforms.apply_homography(pts_q_in, H)
+                rmse = float(np.sqrt(np.mean(np.sum((proj - pts_r_in) ** 2, axis=1))))
+                if best is None or inliers > best[2]:
+                    best = (cand_id, H, inliers, pts_q_in, pts_r_in, len(mkq), rmse)
+
+        if best is not None:
+            logger.info(
+                f"SIFT rescue SUCCEEDED: frame={best[0]}, inliers={best[2]}, "
+                f"rmse={best[6]:.2f} (ALIKED had failed — likely in-plane rotation "
+                f"or extreme oblique view)"
+            )
+        return best
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
-        """Приблизна локалізація за центром опорного кадру (retrieval-only fallback)."""
-        if frame_id == -1:
-            return None
+        return self._result_builder.fallback(frame_id, score, self.database, self.calibration)
 
-        threshold = get_cfg(self.config, "localization.retrieval_only_min_score", 0.90)
-        if score < threshold:
-            logger.debug(
-                f"Retrieval-only fallback rejected: score {score:.3f} < threshold {threshold:.3f} | "
-                f"frame={frame_id}"
-            )
-            return None
-
-        affine_ref = self.database.get_frame_affine(frame_id)
-        if affine_ref is None:
-            logger.debug(
-                f"Retrieval-only fallback failed: no affine matrix for frame {frame_id}. "
-                f"Frame not reached during calibration propagation."
-            )
-            return None
-
-        ref_h, ref_w = self.database.get_frame_size(frame_id)
-        center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float64)
-        metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
-
-        lat, lon = self.calibration.converter.metric_to_gps(metric_pt[0], metric_pt[1])
-
-        return {
-            "success": True,
-            "lat": lat,
-            "lon": lon,
-            "confidence": 0.3,
-            "inliers": 0,
-            "matched_frame": frame_id,
-            "fallback_mode": "retrieval_only",
-            "global_score": score,
-            "fov_polygon": None,
-        }
-
-    def _log_failure(self, error_type: str, inliers: int = 0, details: str = ""):
-        try:
-            csv_path = "logs/localization_failures.csv"
-            write_header = not os.path.exists(csv_path)
-            os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-            with open(csv_path, "a", encoding="utf-8") as f:
-                if write_header:
-                    f.write("timestamp,error_type,inliers,details\n")
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                safe_details = details.replace('"', '""')
-                f.write(f'{timestamp},{error_type},{inliers},"{safe_details}"\n')
-        except Exception as e:
-            logger.error(f"Failed to log to localization_failures.csv: {e}")
+    def _log_failure(self, error_type: str, inliers: int = 0, details: str = "") -> None:
+        self._failure_logger.log(error_type, inliers, details)
 
 
 # ================================================================================
-# File: localization\matcher.py
+# File: src\localization\matcher.py
 # ================================================================================
 """
 matcher.py — ВИПРАВЛЕНА ВЕРСІЯ
@@ -10058,10 +15715,49 @@ import faiss
 import numpy as np
 import torch
 
-from config.config import get_cfg
+from config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def extract_sift_features(
+    image: np.ndarray, static_mask: np.ndarray | None = None, max_keypoints: int = 2048
+) -> dict:
+    """RESEARCH 2.2: SIFT-ознаки у форматі, сумісному з LightGlue(features="sift").
+
+    Використовується і DatabaseBuilder-ом (offline, збереження у БД), і
+    Localizer-ом (online, аварійний фолбек) — ідентичний пайплайн гарантує
+    сумісність дескрипторів. Дескриптори — rootSIFT (L1-норм + sqrt), як в
+    екстракторі бібліотеки lightglue, на якому натреновані ваги sift-матчера.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    mask8 = None
+    if static_mask is not None:
+        mask8 = (static_mask > 128).astype(np.uint8) * 255
+
+    sift = cv2.SIFT_create(nfeatures=int(max_keypoints))
+    kps, descs = sift.detectAndCompute(gray, mask8)
+    if descs is None or len(kps) == 0:
+        return {
+            "keypoints": np.empty((0, 2), dtype=np.float32),
+            "descriptors": np.empty((0, 128), dtype=np.float32),
+            "image_size": np.array(gray.shape[:2], dtype=np.int32),
+        }
+
+    # rootSIFT: L1-нормалізація + поелементний sqrt → L2-норм ~1
+    descs = descs.astype(np.float32)
+    descs /= np.maximum(descs.sum(axis=1, keepdims=True), 1e-12)
+    descs = np.sqrt(descs)
+
+    pts = np.array([kp.pt for kp in kps], dtype=np.float32)
+    return {
+        "keypoints": pts,
+        "descriptors": descs,
+        "image_size": np.array(gray.shape[:2], dtype=np.int32),
+    }
 
 
 class FastRetrieval:
@@ -10173,6 +15869,14 @@ class FeatureMatcher:
 
         logger.info(f"FeatureMatcher ratio_threshold = {self.ratio_threshold:.2f}")
 
+        # Для warn-once логування несумісних розмірностей дескрипторів
+        self._dim_mismatch_warned: set = set()
+
+        # RESEARCH 2.2: LightGlue(sift) вантажиться ліниво — лише коли
+        # аварійний фолбек реально спрацював уперше (VRAM не витрачається дарма)
+        self._lightglue_sift = None
+        self._lightglue_sift_failed = False
+
     def match(self, query_features: dict, ref_features: dict) -> tuple:
         """
         Dynamically routes to LightGlue (for 256-dim SuperPoint)
@@ -10181,6 +15885,25 @@ class FeatureMatcher:
         desc_dim = (
             query_features["descriptors"].shape[1] if len(query_features["descriptors"]) > 0 else 0
         )
+        ref_dim = (
+            ref_features["descriptors"].shape[1] if len(ref_features["descriptors"]) > 0 else 0
+        )
+
+        # ЗАХИСТ: різні розмірності дескрипторів (напр. query=128 ALIKED,
+        # ref=256 RDD/SuperPoint зі старої бази) неможливо матчити взагалі —
+        # ні LightGlue, ні L2. База цього джерела збудована іншим екстрактором
+        # і потребує перегенерації.
+        if desc_dim and ref_dim and desc_dim != ref_dim:
+            key = (desc_dim, ref_dim)
+            if key not in self._dim_mismatch_warned:
+                self._dim_mismatch_warned.add(key)
+                logger.error(
+                    f"Descriptor dimension mismatch: query={desc_dim}, ref={ref_dim}. "
+                    f"Reference database was built with a different local extractor. "
+                    f"Rebuild that source's database with the current extractor. "
+                    f"Skipping all matches for this dim pair (logged once)."
+                )
+            return np.empty((0, 2)), np.empty((0, 2))
 
         # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED) або 256 (RDD/SuperPoint)
         if self.lightglue is not None and desc_dim in (128, 256):
@@ -10248,9 +15971,43 @@ class FeatureMatcher:
 
         return mkpts_q, mkpts_r
 
-    def _lightglue_match(self, query_features: dict, ref_features: dict) -> tuple:
+    def match_mnn(self, query_features: dict, ref_features: dict) -> tuple:
+        """Детермінований mutual-NN (L2) матчинг ПОВЗ LightGlue (Етап 8, 2026-07-12).
+
+        Фолбек для temporal-ребер пропагації: на повторюваній ріллі LightGlue
+        місцями віддає 12–28 матчів там, де MNN по тих самих дескрипторах
+        знаходить 100–800 пар (перевірено на lasttest). Викликається воркером,
+        коли LightGlue дав < min_matches."""
+        return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
+
+    def match_sift(self, query_features: dict, ref_features: dict) -> tuple:
+        """RESEARCH 2.2: матчинг SIFT-ознак через LightGlue(features="sift").
+
+        Окремий метод (не через match()): SIFT-дескриптори 128-вимірні, як
+        ALIKED, тож маршрутизація за розмірністю відправила б їх у
+        ALIKED-матчер з ловом сміттєвих збігів.
+        """
+        if self._lightglue_sift is None and not self._lightglue_sift_failed:
+            if self.model_manager is None:
+                self._lightglue_sift_failed = True
+            else:
+                try:
+                    self._lightglue_sift = self.model_manager.load_lightglue(features="sift")
+                    logger.info("LightGlue (sift) loaded for emergency fallback")
+                except Exception as e:
+                    self._lightglue_sift_failed = True
+                    logger.warning(f"Failed to load LightGlue (sift): {e} — fallback disabled")
+        if self._lightglue_sift is None:
+            return np.empty((0, 2)), np.empty((0, 2))
+        return self._lightglue_match(query_features, ref_features, model=self._lightglue_sift)
+
+    def _lightglue_match(
+        self, query_features: dict, ref_features: dict, model=None
+    ) -> tuple:
         """Matches features using Neural LightGlue Matcher"""
         try:
+            if model is None:
+                model = self.lightglue
             if len(query_features["keypoints"]) == 0 or len(ref_features["keypoints"]) == 0:
                 logger.warning(
                     f"Empty keypoints provided to LightGlue | "
@@ -10260,7 +16017,7 @@ class FeatureMatcher:
                 )
                 return np.empty((0, 2)), np.empty((0, 2))
 
-            device = next(self.lightglue.parameters()).device
+            device = next(model.parameters()).device
 
             # image_size для коректної нормалізації координат [-1, 1] у LightGlue.
             # Без цього крос-роздільні пари (4K query vs 1080p ref) дають ~0 matches.
@@ -10296,7 +16053,7 @@ class FeatureMatcher:
             data = {"image0": image0_data, "image1": image1_data}
 
             with torch.no_grad():
-                res = self.lightglue(data)
+                res = model(data)
 
             matches = res["matches"][0].cpu().numpy()
 
@@ -10325,7 +16082,7 @@ class FeatureMatcher:
 
 
 # ================================================================================
-# File: localization\patchify.py
+# File: src\localization\patchify.py
 # ================================================================================
 import numpy as np
 import torch
@@ -10556,13 +16313,908 @@ class PatchifyRetrieval:
 
 
 # ================================================================================
-# File: localization\__init__.py
+# File: src\localization\result_builder.py
 # ================================================================================
-"""Localization module"""
+"""Result assembly for localization (IMPROVEMENT_PLAN 1.1): confidence score,
+FOV -> GPS polygon (with exploded-homography guard), and the retrieval-only
+fallback.
+
+Stateless: database / calibration / converter are passed in explicitly because
+they are switched per-source in multi-database mode. Formulas and log messages
+are copied verbatim from Localizer.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+from config import get_cfg
+from src.geometry.point_spread import spread_confidence_factor
+from src.geometry.transformations import GeometryTransforms
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class ResultBuilder:
+    """Confidence, field-of-view polygon and retrieval-only fallback."""
+
+    def __init__(self, config: Any, ransac_thresh: float) -> None:
+        self.config = config
+        self.ransac_thresh = ransac_thresh
+
+    def compute_confidence(
+        self,
+        best_candidate_id: int,
+        best_inliers: int,
+        total_matches: int,
+        rmse_val: float,
+        database: Any,
+        spread: float | None = None,
+    ) -> float:
+        """Confidence from DB QA (rmse/disagreement) + inliers + match ratio/RMSE.
+
+        ``spread`` (ADDENDUM 1.1) — просторовий розкид інлаєрів у кадрі,
+        ``src.geometry.point_spread.inlier_spread``. ``None`` = сигнал
+        недоступний → множник 1.0. Застосовується лише за прапорцем
+        ``localization.spread_confidence_enabled``.
+        """
+        max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
+        rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
+        diag_norm = get_cfg(self.config, "localization.confidence.disagreement_norm_m", 5.0)
+        w_inlier = get_cfg(self.config, "localization.confidence.inlier_weight", 0.7)
+        w_stability = get_cfg(self.config, "localization.confidence.stability_weight", 0.3)
+
+        inlier_score = min(1.0, best_inliers / max_inliers)
+
+        rmse = (
+            database.frame_rmse[best_candidate_id]
+            if database.frame_rmse is not None
+            else 0.0
+        )
+        disagreement = (
+            database.frame_disagreement[best_candidate_id]
+            if database.frame_disagreement is not None
+            else 0.0
+        )
+
+        stability_score = 1.0 - (
+            min(rmse, rmse_norm) / rmse_norm * 0.5
+            + min(disagreement, diag_norm) / diag_norm * 0.5
+        )
+        stability_score = float(np.clip(stability_score, 0.0, 1.0))
+
+        ratio_score = float(best_inliers / (total_matches + 1e-6))
+        rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
+        match_score = ratio_score * 0.5 + rmse_score_val * 0.5
+
+        final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
+
+        # ADDENDUM 1.1: скупчені інлаєри → ill-conditioned H. Множник, а не
+        # відкидання: далі confidence керує R у Kalman (B2), тож слабкий фікс
+        # просто важить менше. На межі покриття скупчення легітимне.
+        if get_cfg(self.config, "localization.spread_confidence_enabled", False):
+            factor = spread_confidence_factor(
+                spread,
+                spread_ref=get_cfg(self.config, "localization.spread_ref", 0.15),
+                floor=get_cfg(self.config, "localization.spread_floor", 0.35),
+            )
+            if factor < 1.0:
+                logger.debug(f"Spatial collapse: spread={spread:.4f} → confidence ×{factor:.2f}")
+            final_conf *= factor
+
+        return float(np.clip(final_conf, 0.05, 1.0))
+
+    def fallback(self, frame_id: int, score: float, database: Any, calibration: Any) -> dict | None:
+        """Approximate localization at the reference-frame centre (retrieval-only)."""
+        if frame_id == -1:
+            return None
+
+        threshold = get_cfg(self.config, "localization.retrieval_only_min_score", 0.90)
+        if score < threshold:
+            logger.debug(
+                f"Retrieval-only fallback rejected: score {score:.3f} < threshold {threshold:.3f} | "
+                f"frame={frame_id}"
+            )
+            return None
+
+        affine_ref = database.get_frame_affine(frame_id)
+        if affine_ref is None:
+            logger.debug(
+                f"Retrieval-only fallback failed: no affine matrix for frame {frame_id}. "
+                f"Frame not reached during calibration propagation."
+            )
+            return None
+
+        ref_h, ref_w = database.get_frame_size(frame_id)
+        center_ref = np.array([[ref_w / 2, ref_h / 2]], dtype=np.float64)
+        metric_pt = GeometryTransforms.apply_affine(center_ref, affine_ref)[0]
+
+        lat, lon = calibration.converter.metric_to_gps(metric_pt[0], metric_pt[1])
+
+        return {
+            "success": True,
+            "lat": lat,
+            "lon": lon,
+            "confidence": 0.3,
+            "inliers": 0,
+            "matched_frame": frame_id,
+            "fallback_mode": "retrieval_only",
+            "global_score": score,
+            "fov_polygon": None,
+        }
+
+    def build_fov(
+        self, M_query_to_ref: Any, affine_ref: Any, rot_width: int, rot_height: int,
+        mkpts_q_inliers: Any, converter: Any, dx: float, dy: float,
+        mx: float, my: float, filtered_pt: Any, candidate_id: int,
+    ) -> list:
+        """Project the frame FOV to a GPS polygon, guarding against exploded homographies."""
+        corners = np.array(
+            [[0, 0], [rot_width, 0], [rot_width, rot_height], [0, rot_height]],
+            dtype=np.float32,
+        )
+        ref_corners = GeometryTransforms.apply_homography(corners, M_query_to_ref)
+
+        is_exploded = False
+        if ref_corners is not None:
+            max_coord = np.max(np.abs(ref_corners))
+            if max_coord > 50000:
+                is_exploded = True
+
+        if is_exploded and mkpts_q_inliers is not None and len(mkpts_q_inliers) > 0:
+            logger.warning(
+                f"Homography exploded the FOV (max_coord={max_coord:.0f}px > 50000px threshold). "
+                f"Cause: perspective distortion from locally-clustered ALIKED matches. "
+                f"Falling back to inliers bounding box for safe FOV estimation."
+            )
+            pts = mkpts_q_inliers
+            min_x, min_y = np.min(pts, axis=0)
+            max_x, max_y = np.max(pts, axis=0)
+            pad_x, pad_y = (max_x - min_x) * 0.1, (max_y - min_y) * 0.1
+            safe_corners = np.array(
+                [
+                    [max(0, min_x - pad_x), max(0, min_y - pad_y)],
+                    [min(rot_width, max_x + pad_x), max(0, min_y - pad_y)],
+                    [min(rot_width, max_x + pad_x), min(rot_height, max_y + pad_y)],
+                    [max(0, min_x - pad_x), min(rot_height, max_y + pad_y)],
+                ],
+                dtype=np.float32,
+            )
+            ref_corners = GeometryTransforms.apply_homography(safe_corners, M_query_to_ref)
+            original_poly_px = safe_corners
+        else:
+            original_poly_px = corners
+            logger.debug("FOV projected using full frame Homography matrix.")
+
+        logger.debug(f"--- FOV DIAGNOSTICS FOR FRAME {candidate_id} ---")
+        w_px = np.linalg.norm(original_poly_px[0] - original_poly_px[1])
+        h_px = np.linalg.norm(original_poly_px[1] - original_poly_px[2])
+        logger.debug(f"[1] Original FOV in Query image: {w_px:.1f} x {h_px:.1f} pixels")
+
+        if ref_corners is not None:
+            w_ref = np.linalg.norm(ref_corners[0] - ref_corners[1])
+            h_ref = np.linalg.norm(ref_corners[1] - ref_corners[2])
+            logger.debug(
+                f"[2] FOV mapped to Reference via Homography: {w_ref:.1f} x {h_ref:.1f} pixels"
+            )
+
+        gps_corners = []
+        if ref_corners is not None:
+            metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
+            if metric_corners is not None:
+                fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
+                fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
+                logger.debug(
+                    f"[3] FOV mapped to metric space: {fov_w:.1f}m x {fov_h:.1f}m"
+                )
+                logger.debug(
+                    f"FOV dimensions: {fov_w:.1f}m x {fov_h:.1f}m | "
+                    f"Center metric: ({mx:.1f}, {my:.1f}) | "
+                    f"Filtered: ({filtered_pt[0]:.1f}, {filtered_pt[1]:.1f})"
+                )
+                # Все-або-нічого: частковий полігон (1-3 кути) гірший за
+                # відсутній — споживачі (GUI-мапа, експорт) чекають чотирикутник.
+                try:
+                    for cx, cy in metric_corners:
+                        clat, clon = converter.metric_to_gps(
+                            float(cx + dx), float(cy + dy)
+                        )
+                        gps_corners.append((clat, clon))
+                except Exception as e:
+                    logger.warning(
+                        f"FOV corner -> GPS conversion failed for frame "
+                        f"{candidate_id} ({type(e).__name__}: {e}) — polygon dropped"
+                    )
+                    gps_corners = []
+
+        return gps_corners
 
 
 # ================================================================================
-# File: models\model_manager.py
+# File: src\localization\rotation_geometry.py
+# ================================================================================
+"""Frame-rotation geometry shared by localization and optical flow.
+
+np.rot90(frame, k=K) rotates the frame counter-clockwise by K*90 degrees. These
+helpers map a displacement vector / point measured in the ORIGINAL frame into the
+rotated frame's coordinate system (where the homography H was built).
+
+Values verified numerically against np.rot90 (pixel-centred convention):
+  k=1 (90):  (x,y) -> (y, W-1-x)      vector (dx,dy) -> (dy, -dx)
+  k=2 (180): (x,y) -> (W-1-x, H-1-y)  vector (dx,dy) -> (-dx, -dy)
+  k=3 (270): (x,y) -> (H-1-y, x)      vector (dx,dy) -> (-dy, dx)
+"""
+
+from __future__ import annotations
+
+# angle: (a, b, c, d) -> new_dx = a*dx + b*dy, new_dy = c*dx + d*dy
+_ROTATION_VEC: dict[int, tuple[int, int, int, int]] = {
+    0: (1, 0, 0, 1),
+    90: (0, 1, -1, 0),
+    180: (-1, 0, 0, -1),
+    270: (0, -1, 1, 0),
+}
+
+
+def _rotate_point_np90(x: float, y: float, w: float, h: float, angle: int) -> tuple[float, float]:
+    """Map point (x, y) of a w×h frame into np.rot90(frame, k=angle//90) coords."""
+    if angle == 90:
+        return y, (w - 1.0) - x
+    if angle == 180:
+        return (w - 1.0) - x, (h - 1.0) - y
+    if angle == 270:
+        return (h - 1.0) - y, x
+    return x, y
+
+
+# ── Загальна ротація фіч + одометричний кут ланцюга (Етап 5: rotation-retry) ──
+# Для temporal-матчингу без heading-hold: коли сусідні кадри сильно повернуті,
+# матч падає. Повертаємо keypoints query на кут із ланцюга frame_poses (готовий
+# одометричний пріор БД) або перебором k·90°, і повторюємо матч. Отриману
+# гомографію H_r (rotated_query→ref) компонуємо назад: H_true = H_r · R(θ).
+
+import numpy as np
+
+
+def rotation_homography(angle_rad: float, cx: float, cy: float) -> np.ndarray:
+    """3x3 гомографія повороту точок на angle_rad НАВКОЛО (cx, cy)."""
+    c, s = float(np.cos(angle_rad)), float(np.sin(angle_rad))
+    return np.array(
+        [
+            [c, -s, cx - c * cx + s * cy],
+            [s, c, cy - s * cx - c * cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def rotate_keypoints(kpts: np.ndarray, angle_rad: float, cx: float, cy: float) -> np.ndarray:
+    """Повертає Nx2 keypoints на angle_rad навколо (cx, cy). Дескриптори не чіпаємо."""
+    kpts = np.asarray(kpts, dtype=np.float64)
+    if kpts.size == 0:
+        return kpts.copy()
+    c, s = float(np.cos(angle_rad)), float(np.sin(angle_rad))
+    x = kpts[:, 0] - cx
+    y = kpts[:, 1] - cy
+    return np.stack([c * x - s * y + cx, s * x + c * y + cy], axis=1)
+
+
+def chain_relative_angle_deg(pose_from: np.ndarray, pose_to: np.ndarray) -> float | None:
+    """Відносний поворот (град) кадру `to` відносно `from` із кумулятивних
+    3x3 chain-поз БД (frame_poses). None, якщо поза вироджена (нулі/сингулярна).
+    Кут прикладається до query, щоб вирівняти його орієнтацію з референсом."""
+    pf = np.asarray(pose_from, dtype=np.float64)
+    pt = np.asarray(pose_to, dtype=np.float64)
+    if pf.shape != (3, 3) or pt.shape != (3, 3) or not np.any(pf) or not np.any(pt):
+        return None
+    try:
+        rel = np.linalg.inv(pf) @ pt  # H_{from→to}
+    except np.linalg.LinAlgError:
+        return None
+    return float(np.degrees(np.arctan2(rel[1, 0], rel[0, 0])))
+
+
+def temporal_retry_angles(chain_angle_deg: float | None, use_chain: bool = True) -> list[float]:
+    """Кути (град) для повторного temporal-матчу (Етап 5): кут ланцюга (якщо є),
+    далі fallback-перебір k·90°. Кут ≈0 пропускаємо (первинний матч уже пробував 0)."""
+    raw: list[float] = []
+    if use_chain and chain_angle_deg is not None:
+        raw.append(float(chain_angle_deg))
+    raw += [90.0, 180.0, 270.0]
+
+    def _norm(a: float) -> float:
+        return ((a + 180.0) % 360.0) - 180.0  # у (−180, 180]
+
+    out: list[float] = []
+    for a in raw:
+        na = _norm(a)
+        if abs(na) < 1e-6:
+            continue  # 0° уже пробували у первинному матчі
+        if not any(abs(_norm(na - b)) < 1.0 for b in out):
+            out.append(na)
+    return out
+
+
+# ================================================================================
+# File: src\localization\rotation_selector.py
+# ================================================================================
+"""Rotation + scale selection for localization (IMPROVEMENT_PLAN 1.1 + SCALE_INVARIANCE).
+
+A3 temporal-angle prior (1 global-descriptor forward pass reusing the last good
+angle) with fallback to the A2 batched 4-angle scan. Now extended with ScaleManager:
+when scale_manager provides multiple candidates, the selector generates (angle × scale)
+combinations in a single batched forward pass.
+
+In steady-state (prior angle + prior scale): 1 forward pass — same as before.
+Bootstrap / recovery: up to 20 variants (4 rotations × 5 scales), batched.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+from config import get_cfg
+from src.utils.logging_utils import get_logger
+from src.utils.telemetry import Telemetry
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class RotationResult:
+    angle: int
+    score: float
+    candidates: list
+    source_id: str | None
+    best_scale: float = 1.0
+    # Аудит §2.2: кадр, ПОВЕРНУТИЙ і нормалізований під (angle, best_scale) —
+    # той самий, на якому рахувався глобальний дескриптор. Раніше він тут
+    # створювався і викидався, а Localizer._prepare_and_extract одразу робив
+    # rot90().copy() + normalize() ще раз (на 1080p це ~6 МБ memcpy + resize
+    # на кожен keyframe, на 4K ~25 МБ). Тепер повертаємо його разом із
+    # crop_info, щоб викликач міг перевикористати.
+    frame: Any | None = None
+    crop_info: Any | None = None
+
+
+class RotationSelector:
+    """Pick the best frame rotation (and scale) via global-descriptor retrieval."""
+
+    def __init__(self, feature_extractor: Any, candidate_retriever: Any, config: Any) -> None:
+        self.feature_extractor = feature_extractor
+        self._candidate_retriever = candidate_retriever
+        self.config = config
+
+    def select(
+        self, query_frame: Any, prior_angle: int | None, use_prior: bool,
+        angles_to_try: list[int], top_k: int,
+        scale_manager: Any = None,
+    ) -> RotationResult | None:
+        best_global_score = -1.0
+        best_global_angle = 0
+        best_global_candidates = []
+        best_source_id_per_angle: str | None = None
+        best_scale: float = 1.0
+        # §2.2: кадр і crop_info переможної (кут, масштаб) пари — віддаємо назовні
+        best_frame: Any | None = None
+        best_crop: Any | None = None
+
+        rescan_min = get_cfg(self.config, "localization.rotation_rescan_min_score", 0.70)
+        use_cascade = get_cfg(self.config, "localization.recovery_cascade", False)
+
+        # Determine scale candidates
+        if scale_manager is not None:
+            scale_candidates = scale_manager.candidates()
+            scale_rescan_min = scale_manager.rescan_min_score
+        else:
+            scale_candidates = [1.0]
+            scale_rescan_min = rescan_min
+
+        # A3: reuse the last good angle (+ prior scale) first; full rescan only
+        # if its retrieval score dips below the threshold.
+        if use_prior and prior_angle is not None:
+            # In steady state, scale_candidates is [prior] — 1 element.
+            # We try the prior angle with each scale candidate (usually 1).
+            prior_scales = scale_candidates if len(scale_candidates) == 1 else [scale_candidates[0]]
+            for sc in prior_scales:
+                rotated_frame, crop_info = self._prepare_frame(
+                    query_frame, prior_angle, sc, scale_manager
+                )
+                global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
+                with Telemetry.profile("retrieval"):
+                    src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+                if candidates and candidates[0][1] >= min(rescan_min, scale_rescan_min):
+                    if candidates[0][1] > best_global_score:
+                        best_global_score = candidates[0][1]
+                        best_global_angle = prior_angle
+                        best_global_candidates = candidates
+                        best_source_id_per_angle = src_id
+                        best_scale = sc
+                        best_frame, best_crop = rotated_frame, crop_info
+                else:
+                    logger.debug(
+                        f"Prior angle {prior_angle}° scale {sc:.2f} score too low "
+                        f"({candidates[0][1] if candidates else -1:.3f} < {rescan_min}) — full rescan"
+                    )
+
+        if not best_global_candidates:
+            # A2: all rotations × all scales in ONE batched forward pass.
+            # ADDENDUM 2.1 (recovery_cascade): у два етапи — спершу лише кути
+            # на одному масштабі, повна піраміда лише за потреби.
+            stages = self._plan_stages(angles_to_try, scale_candidates, scale_manager, use_cascade)
+
+            for stage_combos in stages:
+                if not stage_combos:
+                    continue
+                # rot90 кешується per-angle: інакше кадр копіювався б на
+                # кожну (кут, масштаб) пару замість одного разу на кут
+                # (на 4K це десятки МБ memcpy на кожну зайву копію).
+                rot_cache: dict[int, Any] = {}
+                prepared = [
+                    self._prepare_frame(query_frame, a, sc, scale_manager, rot_cache)
+                    for a, sc in stage_combos
+                ]
+                frames = [p[0] for p in prepared]
+
+                # Batch extraction
+                if len(frames) > 1 and hasattr(
+                    self.feature_extractor, "extract_global_descriptors_multi"
+                ):
+                    descs = self.feature_extractor.extract_global_descriptors_multi(frames)
+                else:
+                    descs = [self.feature_extractor.extract_global_descriptor(f) for f in frames]
+
+                for (angle, sc), global_desc, (frm, crop) in zip(
+                    stage_combos, descs, prepared
+                ):
+                    with Telemetry.profile("retrieval"):
+                        src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+
+                    if candidates:
+                        top_score = candidates[0][1]
+                        if top_score > best_global_score:
+                            best_global_score = top_score
+                            best_global_angle = angle
+                            best_global_candidates = candidates
+                            best_source_id_per_angle = src_id
+                            best_scale = sc
+                            best_frame, best_crop = frm, crop
+
+                # Етап 1 дав достатньо впевнений збіг — решту піраміди
+                # (16 із 20 форвардів у типовій конфігурації) не рахуємо.
+                if best_global_score >= rescan_min:
+                    break
+
+        if not best_global_candidates:
+            return None
+
+        return RotationResult(
+            angle=best_global_angle,
+            score=best_global_score,
+            candidates=best_global_candidates,
+            source_id=best_source_id_per_angle,
+            best_scale=best_scale,
+            frame=best_frame,
+            crop_info=best_crop,
+        )
+
+    # ── ADDENDUM 2.1: планування етапів recovery ─────────────────────────────
+
+    @staticmethod
+    def _plan_stages(
+        angles_to_try: list[int],
+        scale_candidates: list[float],
+        scale_manager: Any,
+        use_cascade: bool,
+    ) -> list[list[tuple[int, float]]]:
+        """Комбінації (кут, масштаб), розбиті на етапи.
+
+        ``use_cascade=False`` → один етап із повним декартовим добутком
+        (ПОТОЧНА поведінка, побітово та сама послідовність).
+
+        ``use_cascade=True`` → етап 1: усі кути × ОДИН масштаб; етап 2: усі
+        ІНШІ комбінації. Ключова властивість — етап 2 не повторює вже
+        пораховане, тож найгірший випадок (етап 1 провалився) лишається рівно
+        стільки ж форвардів, скільки й зараз. Каскад не може бути повільнішим
+        за поточну поведінку — лише швидшим.
+
+        Опорний масштаб етапу 1: prior ScaleManager-а, якщо він є; інакше
+        перший елемент ``scale_candidates`` (``ScaleManager.candidates()`` уже
+        сортує піраміду за близькістю до depth-hint); інакше 1.0.
+        """
+        combos = [(a, sc) for a in angles_to_try for sc in scale_candidates]
+        if not use_cascade or len(scale_candidates) <= 1:
+            return [combos]
+
+        primary = None
+        prior = getattr(scale_manager, "prior", None) if scale_manager is not None else None
+        if prior is not None and prior in scale_candidates:
+            primary = prior
+        elif 1.0 in scale_candidates:
+            # Масштаб 1.0 — «як у БД»; найімовірніший, коли prior відсутній.
+            primary = 1.0
+        else:
+            primary = scale_candidates[0]
+
+        stage1 = [c for c in combos if c[1] == primary]
+        stage2 = [c for c in combos if c[1] != primary]
+        return [stage1, stage2]
+
+    @staticmethod
+    def _prepare_frame(
+        query_frame: Any,
+        angle: int,
+        sc: float,
+        scale_manager: Any,
+        rot_cache: dict[int, Any] | None = None,
+    ) -> tuple[Any, Any]:
+        """``(кадр, crop_info)``: повернутий на ``angle``, нормалізований до ``sc``.
+
+        ``rot_cache`` — спільний на етап словник {кут: повернутий кадр}:
+        повороти дорогі (копія повного кадру), а масштабів на кут кілька.
+
+        §2.2: ``crop_info`` більше не викидається — його повертає переможна пара
+        в ``RotationResult``, щоб Localizer не перераховував ротацію й resize.
+        Умова ``> 0.15`` і виклик ``normalize`` мають ЗБІГАТИСЯ з
+        ``Localizer._prepare_and_extract``, інакше кадри розійдуться.
+        """
+        if rot_cache is not None and angle in rot_cache:
+            rotated = rot_cache[angle]
+        else:
+            rotated = np.ascontiguousarray(np.rot90(query_frame, k=angle // 90))
+            if rot_cache is not None:
+                rot_cache[angle] = rotated
+        if scale_manager is not None and abs(sc - 1.0) > 0.15:
+            return scale_manager.normalize(rotated, sc)
+        return rotated, None
+
+
+# ================================================================================
+# File: src\localization\scale_manager.py
+# ================================================================================
+"""ScaleManager — GSD-ratio estimation & tracking (query altitude / DB altitude).
+
+Mirrors the angular prior logic (A2/A3 in IMPROVEMENT_PLAN) for scale:
+- **Temporal prior**: after each successful localization, extract scale from
+  the homography → EMA-smoothed → reuse on the next keyframe (1 forward pass).
+- **Pyramid scan**: when no prior exists (bootstrap, out-of-coverage, score
+  gate failure) → scan a discrete set of scales [0.5, 0.7, 1.0, 1.4, 2.0].
+- **Depth hint**: if DepthAnythingV2 scales are available for both query and
+  DB frames, use the ratio to narrow the pyramid search.
+- **Frame normalization**: r > 1 (higher than DB) → center-crop + upscale;
+  r < 1 (lower) → downscale.
+
+Reference: docs/SCALE_INVARIANCE.md §1–4.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+from config import get_cfg
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+# Default octave grid around the DB altitude — covers ~50–200 m if DB is ~100 m
+_DEFAULT_PYRAMID = (0.5, 0.7, 1.0, 1.4, 2.0)
+
+
+@dataclass
+class CropInfo:
+    """Metadata needed to reverse-map coordinates after normalize()."""
+
+    scale_r: float
+    """The GSD ratio that was applied (query_altitude / db_altitude)."""
+
+    crop_x: int
+    crop_y: int
+    """Top-left corner of the crop in the *original* (resolution-normalised) frame."""
+
+    crop_w: int
+    crop_h: int
+    """Size of the crop before upscale (0 if no crop was applied)."""
+
+    resize_scale: float
+    """The actual resize factor applied to the crop (may differ from r due to rounding)."""
+
+
+def crop_to_affine(
+    crop_info: CropInfo, norm_w: int, norm_h: int, inverse: bool = False
+) -> np.ndarray:
+    """3x3 affine mapping pre-normalize frame coords -> normalized frame coords.
+
+    ``normalize()`` applies (center-crop -> resize); for a point ``p_o`` in the
+    pre-normalize (rotated) frame the normalized coords are ``p_n = S @ (p_o - c)``
+    with ``S = diag(norm_w / crop_w, norm_h / crop_h)`` and ``c = (crop_x, crop_y)``.
+    The per-axis scales are derived from the *actual* crop/output sizes, so the
+    integer-rounding aspect drift of ``resize_scale`` is not accumulated.
+
+    Args:
+        crop_info: CropInfo returned by ``normalize()``.
+        norm_w: width of the normalized frame (``frame.shape[1]`` after normalize).
+        norm_h: height of the normalized frame.
+        inverse: if True, return the exact analytic inverse (normalized -> original).
+
+    Returns:
+        (3, 3) float64 matrix. Degenerate crop sizes (<= 0) yield the identity.
+    """
+    if crop_info.crop_w <= 0 or crop_info.crop_h <= 0:
+        return np.eye(3, dtype=np.float64)
+    sx = norm_w / crop_info.crop_w
+    sy = norm_h / crop_info.crop_h
+    if inverse:
+        return np.array(
+            [
+                [1.0 / sx, 0.0, float(crop_info.crop_x)],
+                [0.0, 1.0 / sy, float(crop_info.crop_y)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+    return np.array(
+        [
+            [sx, 0.0, -crop_info.crop_x * sx],
+            [0.0, sy, -crop_info.crop_y * sy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+class ScaleManager:
+    """GSD-ratio estimation & tracking (query altitude / DB altitude) without telemetry.
+
+    Designed as a stateless-ish collaborator (owns only the EMA prior);
+    the caller (Localizer) passes frames and receives CropInfo back.
+    """
+
+    def __init__(self, config: dict | None = None):
+        cfg = config or {}
+        self._pyramid: tuple[float, ...] = tuple(
+            get_cfg(cfg, "localization.scale_pyramid", list(_DEFAULT_PYRAMID))
+        )
+        self._ema_alpha: float = get_cfg(cfg, "localization.scale_prior_ema", 0.7)
+        self._rescan_min: float = get_cfg(
+            cfg, "localization.scale_rescan_min_score", 0.65
+        )
+        self._use_depth_hint: bool = get_cfg(
+            cfg, "localization.scale_use_depth_hint", True
+        )
+        # Clipping range for the prior (prevents runaway EMA)
+        self._min_r: float = 0.3
+        self._max_r: float = 3.5
+
+        # ── mutable state ──
+        self._prior: float | None = None
+        self._depth_hint: float | None = None  # set externally per-keyframe
+
+        logger.info(
+            f"ScaleManager initialized | pyramid={self._pyramid}, "
+            f"ema_alpha={self._ema_alpha}, rescan_min={self._rescan_min}"
+        )
+
+    # ── public API ──────────────────────────────────────────────────────────
+
+    @property
+    def prior(self) -> float | None:
+        """Current scale prior (EMA-smoothed r), or None if unknown."""
+        return self._prior
+
+    @property
+    def rescan_min_score(self) -> float:
+        return self._rescan_min
+
+    def candidates(self) -> list[float]:
+        """Scale levels to scan on the next keyframe.
+
+        If prior is valid → [prior] (1 level, combined with rotation prior
+        = 1 forward pass).  Otherwise → full pyramid (5 levels × N rotations
+        = batched forward).
+
+        When a depth hint is available and no prior, the pyramid is reordered
+        so the closest level to the hint comes first (early-stop friendly).
+        """
+        if self._prior is not None:
+            return [self._prior]
+
+        pyramid = list(self._pyramid)
+
+        if self._depth_hint is not None and self._use_depth_hint:
+            # Sort pyramid by distance to depth hint — closest first
+            hint = self._depth_hint
+            pyramid.sort(key=lambda r: abs(r - hint))
+            logger.debug(
+                f"Scale pyramid reordered by depth hint {hint:.2f}: {pyramid}"
+            )
+
+        return pyramid
+
+    def normalize(self, frame: np.ndarray, r: float) -> tuple[np.ndarray, CropInfo]:
+        """Normalize *frame* to approximate the DB's GSD given scale ratio *r*.
+
+        Args:
+            frame: (H, W, 3) uint8 — the resolution-normalised query frame.
+            r: estimated GSD ratio (query_altitude / db_altitude).
+               r > 1 → flying HIGHER than DB → crop center + upscale.
+               r < 1 → flying LOWER  than DB → downscale.
+               r ≈ 1 → no-op.
+
+        Returns:
+            (normalised_frame, CropInfo) — CropInfo allows the caller to
+            reverse-map pixel coordinates back to the original frame.
+        """
+        h, w = frame.shape[:2]
+
+        # Tolerance band — no transform needed
+        if 0.85 <= r <= 1.18:
+            return frame, CropInfo(
+                scale_r=r, crop_x=0, crop_y=0,
+                crop_w=w, crop_h=h, resize_scale=1.0,
+            )
+
+        if r > 1.0:
+            # Flying HIGHER: center-crop (side = 1/r) + upscale to original size
+            # This simulates what the camera would see at the DB altitude.
+            crop_side_ratio = 1.0 / r
+            crop_w = max(32, int(w * crop_side_ratio))
+            crop_h = max(32, int(h * crop_side_ratio))
+
+            cx, cy = w // 2, h // 2
+            x1 = max(0, cx - crop_w // 2)
+            y1 = max(0, cy - crop_h // 2)
+            x2 = min(w, x1 + crop_w)
+            y2 = min(h, y1 + crop_h)
+
+            cropped = frame[y1:y2, x1:x2]
+            # Upscale back to original resolution
+            normalised = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_CUBIC)
+            actual_scale = w / (x2 - x1)
+
+            return normalised, CropInfo(
+                scale_r=r, crop_x=x1, crop_y=y1,
+                crop_w=x2 - x1, crop_h=y2 - y1,
+                resize_scale=actual_scale,
+            )
+        else:
+            # Flying LOWER: downscale the frame to match DB's GSD
+            # The query covers a smaller area — fewer pixels is correct.
+            new_w = max(32, int(w * r))
+            new_h = max(32, int(h * r))
+            downscaled = cv2.resize(
+                frame, (new_w, new_h), interpolation=cv2.INTER_AREA
+            )
+            actual_scale = new_w / w
+
+            return downscaled, CropInfo(
+                scale_r=r, crop_x=0, crop_y=0,
+                crop_w=w, crop_h=h,
+                resize_scale=actual_scale,
+            )
+
+    def reverse_center(
+        self, center_norm: np.ndarray, crop_info: CropInfo
+    ) -> np.ndarray:
+        """Map a point from the normalised frame back to the original frame coords.
+
+        Args:
+            center_norm: (1, 2) point in the normalised (cropped/resized) frame.
+            crop_info: CropInfo from the normalize() call.
+
+        Returns:
+            (1, 2) point in the original (pre-normalize) resolution-normalised frame.
+        """
+        x, y = float(center_norm[0, 0]), float(center_norm[0, 1])
+
+        if crop_info.resize_scale == 1.0:
+            return center_norm
+
+        if crop_info.scale_r > 1.0:
+            # Undo upscale → undo crop offset
+            x_crop = x / crop_info.resize_scale
+            y_crop = y / crop_info.resize_scale
+            x_orig = x_crop + crop_info.crop_x
+            y_orig = y_crop + crop_info.crop_y
+        else:
+            # Undo downscale
+            x_orig = x / crop_info.resize_scale
+            y_orig = y / crop_info.resize_scale
+
+        return np.array([[x_orig, y_orig]], dtype=np.float64)
+
+    def update_from_homography(
+        self, H: np.ndarray, frame_w: int, frame_h: int
+    ) -> None:
+        """Extract scale from a successful homography and update the EMA prior.
+
+        Uses homography_to_affine → decompose_affine_5dof → sqrt(sx * sy).
+        """
+        try:
+            from src.geometry.affine_utils import decompose_affine_5dof
+            from src.geometry.pose_graph.optimizer import homography_to_affine
+
+            M = homography_to_affine(H, frame_w, frame_h)
+            if M is None:
+                return
+
+            _tx, _ty, sx, sy, _angle = decompose_affine_5dof(M)
+            r_measured = float(np.sqrt(abs(sx) * abs(sy)))
+
+            # Sanity check
+            if not (self._min_r <= r_measured <= self._max_r):
+                logger.debug(
+                    f"ScaleManager: measured r={r_measured:.3f} out of "
+                    f"[{self._min_r}, {self._max_r}] — ignoring"
+                )
+                return
+
+            if self._prior is None:
+                self._prior = r_measured
+            else:
+                self._prior = (
+                    self._ema_alpha * r_measured
+                    + (1.0 - self._ema_alpha) * self._prior
+                )
+                self._prior = float(
+                    np.clip(self._prior, self._min_r, self._max_r)
+                )
+
+            logger.debug(
+                f"ScaleManager: r_measured={r_measured:.3f}, "
+                f"prior={self._prior:.3f}"
+            )
+        except Exception as e:
+            logger.warning(f"ScaleManager.update_from_homography failed: {e}")
+
+    def set_depth_hint(
+        self, query_depth_scale: float, db_depth_scale: float
+    ) -> None:
+        """Set a depth-based scale hint for pyramid reordering.
+
+        Args:
+            query_depth_scale: 1/median_depth for the query frame.
+            db_depth_scale: median 1/median_depth across DB frames.
+        """
+        if db_depth_scale < 1e-8:
+            return
+        ratio = query_depth_scale / db_depth_scale
+        self._depth_hint = float(np.clip(ratio, self._min_r, self._max_r))
+        logger.debug(
+            f"ScaleManager depth hint set: query={query_depth_scale:.4f}, "
+            f"db={db_depth_scale:.4f}, ratio={self._depth_hint:.3f}"
+        )
+
+    def invalidate(self) -> None:
+        """Reset the prior (out-of-coverage, too many failures, etc.)."""
+        if self._prior is not None:
+            logger.debug(f"ScaleManager: prior invalidated (was {self._prior:.3f})")
+        self._prior = None
+        self._depth_hint = None
+
+    def reset(self) -> None:
+        """Full reset for a new tracking session."""
+        self._prior = None
+        self._depth_hint = None
+
+
+# ================================================================================
+# File: src\models\__init__.py
+# ================================================================================
+"""Neural network models module"""
+
+
+# ================================================================================
+# File: src\models\model_manager.py
 # ================================================================================
 import gc
 import os
@@ -10573,7 +17225,7 @@ from pathlib import Path
 
 import torch
 
-from config.config import get_cfg
+from config import get_cfg
 from src.utils.logging_utils import get_logger, silent_output
 
 # Lazy imports moved to top level as requested
@@ -10634,13 +17286,29 @@ class ModelManager:
     def __init__(self, config=None, device="cuda"):
         self.config = config or {}
 
-        use_cuda = get_cfg(self.config, "models.use_cuda", True)
-        if not use_cuda:
-            logger.info("CUDA force disabled in configuration")
+        # Пристрій керується конфігом (models.device), не кодом.
+        # use_cuda:false — легасі-аліас на "cpu".
+        mode = str(get_cfg(self.config, "models.device", "auto")).lower()
+        if not get_cfg(self.config, "models.use_cuda", True):
+            mode = "cpu"
+        if mode not in ("auto", "cuda", "cpu"):
+            logger.warning(f"Unknown models.device={mode!r} — using 'auto'")
+            mode = "auto"
 
-        self.device = (
-            device if (use_cuda and torch.cuda.is_available() and device == "cuda") else "cpu"
-        )
+        cuda_ok = torch.cuda.is_available()
+        if mode == "cuda":
+            if not cuda_ok:
+                raise RuntimeError(
+                    "models.device='cuda' but no CUDA GPU is available. "
+                    "Set models.device='auto' for automatic CPU fallback, "
+                    "or 'cpu' to force CPU."
+                )
+            self.device = "cuda"
+        elif mode == "cpu":
+            self.device = "cpu"
+            logger.info("models.device='cpu' — running on CPU (localization only, slow)")
+        else:  # auto: стара поведінка (respects legacy use_cuda + requested device)
+            self.device = "cuda" if (cuda_ok and device == "cuda") else "cpu"
         self.models = {}
         self.model_usage = {}
 
@@ -10752,17 +17420,22 @@ class ModelManager:
         logger.success("Centralized model prewarm complete")
 
     def load_local_extractor(self):
-        """Завантажує поточний локальний екстрактор згідно конфігу (aliked або rdd)."""
+        """Завантажує поточний локальний екстрактор згідно конфігу (aliked | rdd | xfeat)."""
         local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
         if local_extractor == "rdd":
             return self.load_rdd()
+        if local_extractor == "xfeat":
+            # XFeat-шлях (легший екстрактор + 64-dim → MNN замість LightGlue).
+            # DatabaseBuilder уже кликав load_xfeat() напряму; тепер онлайн-шлях
+            # локалізації теж отримує XFeat замість тихого фолбеку на ALIKED.
+            return self.load_xfeat()
         return self.load_aliked()
 
     def load_yolo(self):
         name = "yolo"
         with self._model_lock:
             if name not in self.models:
-                model_path = get_cfg(self.config, "models.yolo.model_path", "yolo11n-seg.pt")
+                model_path = get_cfg(self.config, "models.yolo.model_path", "models/yolo11n-seg.pt")
                 vram_req = get_cfg(self.config, "models.yolo.vram_required_mb", 1200.0)
                 use_trt = get_cfg(self.config, "models.performance.use_tensorrt_for_yolo", True)
 
@@ -10916,6 +17589,7 @@ class ModelManager:
                     "aliked": "models.lightglue",
                     "superpoint": "models.lightglue_superpoint",
                     "rdd": "models.lightglue_rdd",
+                    "sift": "models.lightglue_sift",  # RESEARCH 2.2
                 }
                 config_key = config_key_map.get(features, "models.lightglue")
                 config = get_cfg(self.config, config_key)
@@ -11029,7 +17703,9 @@ class ModelManager:
             if target_backend in ["torchscript", "tensorrt"] and not path.exists():
                 logger.info(f"Exporting LightGlue ({features}) to TorchScript: {model_path}")
                 model.eval()
-                dim = {"aliked": 128, "superpoint": 256, "rdd": 256}.get(features, 128)
+                dim = {"aliked": 128, "superpoint": 256, "rdd": 256, "sift": 128}.get(
+                    features, 128
+                )
                 dummy_data = {
                     "image0": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),
@@ -11104,7 +17780,14 @@ class ModelManager:
                             raise ImportError(
                                 "DINOv3Wrapper not available — install: pip install transformers"
                             )
-                        model = DINOv3Wrapper(model_id=hf_model_id, device=self.device)
+                        hf_revision = get_cfg(
+                            self.config, "global_descriptor.dinov3.hf_revision", ""
+                        )
+                        model = DINOv3Wrapper(
+                            model_id=hf_model_id,
+                            device=self.device,
+                            revision=hf_revision or None,
+                        )
                         self.models[name] = model
                         logger.success(f"DINOv3 loaded: {hf_model_id} on {self.device}")
                     except Exception as e:
@@ -11215,7 +17898,7 @@ class ModelManager:
         with self._model_lock:
             if name not in self.models:
                 vram_req = get_cfg(self.config, "models.rdd.vram_required_mb", 500.0)
-                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/rdd.pth")
+                weights_path = get_cfg(self.config, "models.rdd.model_path", "models/RDD-v2.pth")
                 max_keypoints = get_cfg(self.config, "models.rdd.max_keypoints", 4096)
 
                 logger.info(f"Loading RDD model (max_keypoints={max_keypoints})...")
@@ -11262,7 +17945,11 @@ class ModelManager:
                     # Завантаження pretrained ваг (якщо є)
                     weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
                     if weights_path:
-                        cesp.load_state_dict(torch.load(weights_path, map_location=self.device))
+                        cesp.load_state_dict(
+                            torch.load(
+                                weights_path, map_location=self.device, weights_only=True
+                            )
+                        )
                         logger.success(f"CESP pretrained weights loaded from {weights_path}")
                     else:
                         logger.warning("CESP initialized WITHOUT pretrained weights (random init)")
@@ -11296,13 +17983,13 @@ class ModelManager:
 
 
 # ================================================================================
-# File: models\__init__.py
+# File: src\models\wrappers\__init__.py
 # ================================================================================
-"""Neural network models module"""
+"""Model wrappers module"""
 
 
 # ================================================================================
-# File: models\wrappers\aliked_wrapper.py
+# File: src\models\wrappers\aliked_wrapper.py
 # ================================================================================
 import numpy as np
 import torch
@@ -11368,7 +18055,7 @@ class ALIKEDWrapper:
 
 
 # ================================================================================
-# File: models\wrappers\cesp_module.py
+# File: src\models\wrappers\cesp_module.py
 # ================================================================================
 import torch
 import torch.nn as nn
@@ -11437,7 +18124,7 @@ class CESP(nn.Module):
 
 
 # ================================================================================
-# File: models\wrappers\dinov3_wrapper.py
+# File: src\models\wrappers\dinov3_wrapper.py
 # ================================================================================
 """
 DINOv3 Wrapper for DroneLocalization.
@@ -11480,21 +18167,37 @@ class DINOv3Wrapper(nn.Module):
     This allows FeatureExtractor and CespModule to work without any changes.
     """
 
-    def __init__(self, model_id: str = _HF_MODEL_ID, device: str = "cuda"):
+    def __init__(
+        self, model_id: str = _HF_MODEL_ID, device: str = "cuda", revision: str | None = None
+    ):
         super().__init__()
         from transformers import AutoModel
 
-        logger.info(f"Loading DINOv3 from HuggingFace: {model_id} ...")
-        # trust_remote_code needed for custom DINOv3ViTModel architecture
-        self._model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+        logger.info(f"Loading DINOv3 from HuggingFace: {model_id} (rev={revision or 'latest'})")
+        # trust_remote_code=True виконує код із репозиторію моделі. Без
+        # зафіксованого revision підміна репозиторію = виконання чужого коду.
+        if not revision:
+            logger.warning(
+                "DINOv3 loaded with trust_remote_code=True WITHOUT pinned revision — "
+                "set models.global_descriptor.dinov3.hf_revision to a commit hash "
+                "to protect against upstream repo tampering."
+            )
+        self._model = AutoModel.from_pretrained(
+            model_id, trust_remote_code=True, revision=revision or None
+        )
         self._model = self._model.eval().to(device)
         self._device = device
 
         hidden_size = self._model.config.hidden_size
+        # DINOv3 має register-токени між CLS та патч-токенами в last_hidden_state:
+        # [CLS, reg_1..reg_n, patch_1..patch_N]. Кількість читаємо з конфігу моделі,
+        # щоб не хардкодити (RESEARCH_INTEGRATION_PLAN 1.1).
+        self._num_register_tokens = int(getattr(self._model.config, "num_register_tokens", 0) or 0)
         logger.info(
             f"DINOv3 loaded: hidden_size={hidden_size}, "
             f"image_size={self._model.config.image_size}, "
-            f"patch_size={self._model.config.patch_size}"
+            f"patch_size={self._model.config.patch_size}, "
+            f"num_register_tokens={self._num_register_tokens}"
         )
 
     @torch.no_grad()
@@ -11515,19 +18218,32 @@ class DINOv3Wrapper(nn.Module):
         return cls_token
 
     @torch.no_grad()
-    def forward_features(self, pixel_values: torch.Tensor) -> dict:
+    def forward_features(self, pixel_values: torch.Tensor, layer: int | None = None) -> dict:
         """
         Returns patch tokens and CLS token — compatible with CESP module.
 
         Returns dict with:
             'x_norm_clstoken':    (B, 1024)
-            'x_norm_patchtokens': (B, num_patches, 1024)
+            'x_norm_patchtokens': (B, num_patches, 1024) — без CLS та register-токенів
         """
-        outputs = self._model(pixel_values=pixel_values)
-        hidden = outputs.last_hidden_state  # (B, 1 + N_patches, 1024)
+        if layer is None:
+            outputs = self._model(pixel_values=pixel_values)
+            hidden_src = outputs.last_hidden_state
+        else:
+            # RESEARCH 2.1 (AnyLoc): патч-токени з проміжного шару. Увага:
+            # hidden_states[layer] БЕЗ фінального LayerNorm — узгоджено з
+            # AnyLoc, який агрегує сирі проміжні токени; словник VLAD треба
+            # будувати з ТОГО САМОГО шару.
+            outputs = self._model(pixel_values=pixel_values, output_hidden_states=True)
+            hidden_src = outputs.hidden_states[layer]
+        # (B, 1 + n_reg + N_patches, 1024): пропускаємо CLS і register-токени —
+        # register-токени не несуть просторової семантики і забруднювали б
+        # патч-агрегацію (CESP/VLAD). Раніше тут був зріз [:, 1:, :] — витік.
+        hidden = hidden_src
+        n_skip = 1 + self._num_register_tokens
         return {
             "x_norm_clstoken": hidden[:, 0, :],
-            "x_norm_patchtokens": hidden[:, 1:, :],
+            "x_norm_patchtokens": hidden[:, n_skip:, :],
         }
 
     def to(self, *args, **kwargs):
@@ -11548,15 +18264,17 @@ class DINOv3Wrapper(nn.Module):
 
 
 # ================================================================================
-# File: models\wrappers\feature_extractor.py
+# File: src\models\wrappers\feature_extractor.py
 # ================================================================================
 import contextlib
+import math
+import os
 
 import numpy as np
 import torch
 import torchvision.transforms as T
 
-from config.config import get_active_descriptor_cfg, get_cfg
+from config import get_active_descriptor_cfg, get_cfg
 from src.utils.image_preprocessor import ImagePreprocessor
 from src.utils.logging_utils import get_logger
 from src.utils.telemetry import Telemetry
@@ -11575,6 +18293,30 @@ class FeatureExtractor:
         self.preprocessor = ImagePreprocessor(config)
         self.cesp_module = cesp_module  # Опціональний CESP для покращення global descriptors
 
+        # ── RESEARCH 2.1 (AnyLoc): VLAD-агрегація патч-токенів ──────────────
+        # Вантажиться з конфігу тут (а не в місцях конструювання), щоб усі
+        # 4 точки створення FeatureExtractor отримали її автоматично.
+        self.vlad_aggregator = None
+        self._vlad_layer = None
+        if get_cfg(config, "models.vlad.enabled", False):
+            vocab_path = get_cfg(config, "models.vlad.vocab_path", None)
+            if vocab_path and os.path.exists(vocab_path):
+                from src.models.wrappers.vlad_aggregator import VladAggregator
+
+                self.vlad_aggregator = VladAggregator.load(
+                    vocab_path,
+                    low_norm_fraction=get_cfg(config, "models.vlad.low_norm_fraction", 0.0),
+                )
+                self._vlad_layer = get_cfg(config, "models.vlad.layer", None)
+                if cesp_module is not None:
+                    logger.warning("Both VLAD and CESP enabled — VLAD takes precedence")
+            else:
+                logger.warning(
+                    f"models.vlad.enabled=True but vocab_path is missing or not found "
+                    f"({vocab_path!r}) — falling back to CLS. "
+                    f"Build the vocabulary with scripts/build_vlad_vocab.py"
+                )
+
         # Параметри нормалізації та розміру входу — беремо з активного backend (dinov2 або dinov3)
         _desc_cfg = get_active_descriptor_cfg(self.config)
         dino_size = _desc_cfg.input_size
@@ -11587,6 +18329,19 @@ class FeatureExtractor:
                 T.Normalize(mean=dino_mean, std=dino_std),
             ]
         )
+        # Аудит §2.1: варіант із CPU-resize. Зменшення вже зроблено на numpy,
+        # тож лишається сама нормалізація — Resize тут був би no-op на (S, S),
+        # але зайвим ядром.
+        self._dino_normalize = T.Normalize(mean=dino_mean, std=dino_std)
+        self._dino_cpu_resize = bool(
+            get_cfg(self.config, "models.performance.dino_cpu_resize", False)
+        )
+        if self._dino_cpu_resize:
+            logger.info(
+                f"DINO input resize on CPU ENABLED (cv2 → {dino_size}x{dino_size} "
+                f"uint8 before upload). Databases built with this ON are NOT "
+                f"interchangeable with those built OFF — schema fingerprint differs."
+            )
 
         self.use_half = (
             device == "cuda"
@@ -11595,8 +18350,21 @@ class FeatureExtractor:
         )
         self.amp_dtype = torch.float16 if self.use_half else torch.float32
 
+        # CPU-фолбек локалізації: на CPU-only torch device_type="cuda" в
+        # autocast може впасти (а легасі torch.cuda.amp.autocast — тим паче).
+        # use_half на CPU завжди False, тож autocast лишається no-op — але
+        # device_type має бути коректним, інакше конструктор контексту трипить.
+        self._amp_device_type = (
+            "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+        )
+
         if self.use_half:
             logger.info("FP16 mixed precision ENABLED for inference")
+        elif device != "cuda" or not torch.cuda.is_available():
+            logger.warning(
+                "Running feature extraction on CPU (no CUDA). Localization will "
+                "work but be slow; build/modify the database on a GPU machine."
+            )
 
         cesp_status = "with CESP" if cesp_module is not None else "without CESP"
         local_name = type(local_model).__name__
@@ -11614,41 +18382,203 @@ class FeatureExtractor:
             self.stream_global = None
             self.stream_local = None
 
+    @staticmethod
+    def _patch_grid_side(n_tokens: int) -> int:
+        """Сторона квадратної сітки патчів із кількості патч-токенів.
+
+        Вхід DINO — квадрат (S, S), тож токенів має бути side². Якщо ні —
+        у токени протекли register-токени або вхід не квадратний; беремо
+        floor(sqrt) і попереджаємо, щоб CESP не отримав неузгоджену сітку.
+        """
+        side = int(math.isqrt(int(n_tokens)))
+        if side * side != int(n_tokens):
+            logger.warning(
+                f"Patch tokens count {n_tokens} is not a perfect square — "
+                f"possible register-token leak or non-square input; using side={side}"
+            )
+        return side
+
+    @property
+    def global_descriptor_dim(self) -> int:
+        """Фактична розмірність глобального дескриптора (VLAD змінює її)."""
+        if self.vlad_aggregator is not None:
+            return self.vlad_aggregator.out_dim
+        return get_active_descriptor_cfg(self.config).descriptor_dim
+
+    def _upload_chw(self, image: np.ndarray) -> torch.Tensor:
+        """(H, W, 3) uint8 → (1, 3, H, W) float32 [0..1] на self.device.
+
+        ОПТИМІЗАЦІЯ (аудит §2.1): раніше кадр конвертувався у float32 на CPU
+        і вже вчетверо більшим їхав по PCIe, щоб на GPU одразу зменшитись до
+        (S, S) — для DINOv3 це 224. На 1080p це ~25 МБ трансферу і ~25 МБ
+        CPU-алокації на КОЖЕН форвард; при скані 4 кутів × 5 масштабів —
+        до 500 МБ на keyframe.
+
+        Тепер на девайс їде uint8 (вчетверо менше), а .float()/.div_ рахуються
+        вже там. Результат ПОБІТОВО той самий: uint8→float32 точний, а ділення
+        на 255.0 — одна IEEE-754 операція з тим самим округленням на CPU і CUDA.
+        Тому дескриптори лишаються сумісними з уже збудованими базами.
+        """
+        t = torch.from_numpy(np.ascontiguousarray(image))
+        t = t.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+        return t.float().div_(255.0)
+
+    def _cpu_resize_dino(self, image: np.ndarray) -> np.ndarray:
+        """(H, W, 3) uint8 → (S, S, 3) uint8 на CPU, де S = self.dino_size.
+
+        Аудит §2.1 (повна форма). Зменшення робиться на uint8 ДО завантаження,
+        тому по PCIe їде ~S²·3 байт замість H·W·3: для 1080p → 224 це ~0.15 МБ
+        замість ~6.2 МБ, тобто ~40×.
+
+        Фільтр обирається як у ResolutionNormalizer: INTER_AREA на зменшення
+        (коректне усереднення площі), INTER_CUBIC на збільшення. Це НЕ той
+        самий фільтр, що torchvision Resize(antialias=True), тож значення
+        дескрипторів зміщуються — саме тому прапорець сидить у SCHEMA_FIELDS.
+
+        Аспект навмисно не зберігається: цільова форма квадратна, точно як у
+        ``T.Resize((S, S))``, який цей шлях заміщає. Інакше геометрія входу
+        розійшлася б із GPU-варіантом.
+        """
+        import cv2
+
+        s = int(self.dino_size)
+        h, w = image.shape[:2]
+        interp = cv2.INTER_AREA if (h > s or w > s) else cv2.INTER_CUBIC
+        return cv2.resize(np.ascontiguousarray(image), (s, s), interpolation=interp)
+
+    def _dino_input(self, image: np.ndarray) -> torch.Tensor:
+        """(H, W, 3) uint8 → (1, 3, S, S) нормалізований тензор на self.device.
+
+        Єдина точка препроцесу DINO. І онлайн-локалізація, і побудова бази
+        ходять сюди, тож query та БД не можуть розійтися препроцесом.
+        """
+        if self._dino_cpu_resize:
+            return self._dino_normalize(self._upload_chw(self._cpu_resize_dino(image)))
+        return self.dinov2_transform(self._upload_chw(image))
+
+    @torch.no_grad()
+    def _vlad_descriptors(self, dino_input: torch.Tensor) -> np.ndarray:
+        """(B, 3, S, S) → (B, out_dim) через VLAD-агрегацію патч-токенів."""
+        kwargs = {}
+        if self._vlad_layer is not None:
+            kwargs["layer"] = self._vlad_layer
+        with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+            try:
+                features = self.global_model.forward_features(dino_input, **kwargs)
+            except TypeError:
+                # DINOv2 (torch.hub) не приймає layer — беремо останній шар
+                features = self.global_model.forward_features(dino_input)
+        tokens = features["x_norm_patchtokens"].float().cpu().numpy()
+        return self.vlad_aggregator.aggregate_batch(tokens)
+
     @torch.no_grad()
     def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
         with Telemetry.profile("dinov2"):
             logger.debug("Extracting global descriptor with DINOv2...")
-            dino_tensor = torch.from_numpy(image).float().div_(255.0)
-            dino_tensor = (
-                dino_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
-            )
-            dino_input = self.dinov2_transform(dino_tensor)
+            dino_input = self._dino_input(image)
+
+        if self.vlad_aggregator is not None:
+            return self._vlad_descriptors(dino_input)[0]
 
         if self.cesp_module is not None:
             # CESP mode: отримуємо patch tokens замість CLS
-            with torch.cuda.amp.autocast(dtype=self.amp_dtype, enabled=self.use_half):
+            with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                 features = self.global_model.forward_features(dino_input)
                 patch_tokens = features["x_norm_patchtokens"].float()
 
-            h_patches = self.dino_size // 14
-            w_patches = self.dino_size // 14
+            # Сітка патчів — з фактичної кількості токенів, а не з хардкоду //14:
+            # DINOv3 має patch_size=16 (DINOv2 — 14), і після виправлення витоку
+            # register-токенів кількість токенів = (S/patch)^2 (RESEARCH 1.1).
+            h_patches = w_patches = self._patch_grid_side(patch_tokens.shape[1])
             global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
             # Стандартний mode: CLS token
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+            with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                 global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
 
         return global_desc
 
     @torch.no_grad()
+    def extract_global_descriptors_multi(self, images: list[np.ndarray]) -> np.ndarray:
+        """Глобальні дескриптори для СПИСКУ зображень одним forward-пасом.
+
+        A2: використовується для 4 ротацій кадру при auto_rotation — один
+        батчований ViT-forward замість чотирьох послідовних (~3× швидше на GPU).
+        Зображення можуть мати різні розміри (90°-ротації), тому resize
+        виконується по-кадрово, а батчується вже (B, 3, S, S).
+        """
+        if not images:
+            return np.empty((0, 0), dtype=np.float32)
+
+        with Telemetry.profile("dinov2"):
+            if self._dino_cpu_resize:
+                # §2.1: усі кадри стають (S, S) ще на numpy, тож батч
+                # збирається одним стеком і йде на девайс ОДНИМ трансфером —
+                # замість B окремих завантажень повнорозмірних кадрів.
+                stacked = np.stack([self._cpu_resize_dino(img) for img in images])
+                t = (
+                    torch.from_numpy(np.ascontiguousarray(stacked))
+                    .permute(0, 3, 1, 2)
+                    .to(self.device, non_blocking=True)
+                    .float()
+                    .div_(255.0)
+                )
+                batch = self._dino_normalize(t)  # (B, 3, S, S)
+            else:
+                prepped = [
+                    self.dinov2_transform(self._upload_chw(img))[0] for img in images
+                ]
+                batch = torch.stack(prepped)  # (B, 3, S, S)
+
+            # ADDENDUM §3: чанкування батча — кап піку VRAM на слабких GPU.
+            # global_batch_max=0 (дефолт) → один форвард, поведінка без змін.
+            max_b = int(get_cfg(self.config, "models.performance.global_batch_max", 0) or 0)
+            if max_b > 0 and batch.shape[0] > max_b:
+                chunks = torch.split(batch, max_b)
+            else:
+                chunks = (batch,)
+
+            outs = []
+            for chunk in chunks:
+                if self.vlad_aggregator is not None:
+                    outs.append(np.asarray(self._vlad_descriptors(chunk)))
+                elif self.cesp_module is not None:
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+                        features = self.global_model.forward_features(chunk)
+                    patch_tokens = features["x_norm_patchtokens"].float()
+                    h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
+                    outs.append(self.cesp_module(patch_tokens, h_p, w_p).float().cpu().numpy())
+                else:
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+                        outs.append(self.global_model(chunk).float().cpu().numpy())
+
+            return np.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
+
+    @torch.no_grad()
+    def extract_patch_tokens(self, image: np.ndarray):
+        """DINO патч-токени для PCA-візуалізації (debug view «очима DINO»).
+
+        Окремий forward саме для вікна — викликається ЛИШЕ коли вікно DINO
+        відкрите (collector.want_dino_pca). Повертає (tokens, h_p, w_p), де
+        tokens — (N, D) float32 на CPU, N = h_p * w_p. Той самий препроцес
+        (dinov2_transform) і той самий backend (DINOv2/DINOv3), що і retrieval.
+        """
+        dino_input = self._dino_input(image)
+        with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+            features = self.global_model.forward_features(dino_input)
+        tokens = features["x_norm_patchtokens"][0].float().cpu().numpy()  # (N, D)
+        side = self._patch_grid_side(tokens.shape[0])
+        return tokens, side, side
+
+    @torch.no_grad()
     def extract_local_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
-        logger.debug(f"Extracting local features (ALIKED) from image: {image.shape}")
+        logger.debug(f"Extracting local features from image: {image.shape}")
 
         enhanced_image = self.preprocessor.preprocess(image)
 
-        # Підготовка зображення для ALIKED (LightGlue format)
-        rgb_tensor = torch.from_numpy(enhanced_image).float().div_(255.0)
-        rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device, non_blocking=True)
+        # Підготовка тензора (LightGlue format для ALIKED/RDD; сирий (1,3,H,W) для XFeat).
+        # §2.1: uint8 на девайс, float/div — уже там (той самий результат, 4× менше PCIe).
+        rgb_tensor = self._upload_chw(enhanced_image)
 
         # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
         max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
@@ -11662,17 +18592,25 @@ class FeatureExtractor:
             )
             logger.debug(f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
 
-        # ALIKED очікує словник зі списком/тензором 'image'
-        input_dict = {"image": rgb_tensor}
+        # XFeat має інший інтерфейс (detectAndCompute на сирому тензорі), ніж
+        # ALIKED/RDD (виклик як {"image": tensor}). Ця гілка дзеркалить
+        # batch-шлях extract_features_batch, щоб онлайн-локалізація давала той
+        # самий формат ознак, що й БД, збудована XFeat-ом.
+        is_xfeat = "XFeat" in self.local_model.__class__.__name__
 
-        # ALIKED behaves unstably and yields NaNs inside AMP autocast. Always run it in FP32!
         with Telemetry.profile("local_extractor"):
-            with contextlib.nullcontext():
-                aliked_out = self.local_model(input_dict)
-
-        # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
-        keypoints = aliked_out["keypoints"][0].cpu().numpy()
-        descriptors = aliked_out["descriptors"][0].cpu().numpy()
+            if is_xfeat:
+                top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
+                xf = self.local_model.detectAndCompute(rgb_tensor, top_k=top_k)[0]
+                keypoints = xf["keypoints"].cpu().numpy()
+                descriptors = xf["descriptors"].cpu().numpy()
+            else:
+                # ALIKED нестабільний усередині AMP autocast (NaN) — тримаємо FP32.
+                with contextlib.nullcontext():
+                    aliked_out = self.local_model({"image": rgb_tensor})
+                # LightGlue wrapper повертає батч: (1, N, 2) та (1, N, D)
+                keypoints = aliked_out["keypoints"][0].cpu().numpy()
+                descriptors = aliked_out["descriptors"][0].cpu().numpy()
 
         if scale_factor != 1.0:
             keypoints = keypoints / scale_factor
@@ -11692,9 +18630,12 @@ class FeatureExtractor:
                 keypoints = keypoints[valid]
                 descriptors = descriptors[valid]
             else:
+                # ВИПРАВЛЕНО: тут було len(aliked_out[...]), а aliked_out існує
+                # лише в ALIKED/RDD-гілці — на XFeat це UnboundLocalError у
+                # момент, коли маска зрізала все. keypoints у скоупі завжди.
                 logger.warning(
                     f"All keypoints filtered out by YOLO mask! "
-                    f"Image {image.shape[:2]}, total_kpts={len(aliked_out['keypoints'][0])}, "
+                    f"Image {image.shape[:2]}, total_kpts={len(keypoints)}, "
                     f"mask_static_ratio={np.mean(static_mask > 128):.1%}. "
                     f"The entire image may be covered by dynamic objects (vehicles, people)."
                 )
@@ -11729,20 +18670,43 @@ class FeatureExtractor:
             return []
 
         # 1. Prepare DINOv2 Tensor
-        dino_tensors = []
-        for img in images:
-            rgb = torch.tensor(img, pin_memory=True).float().div_(255.0)
-            dino_tensors.append(rgb.permute(2, 0, 1))
-        dino_batch = torch.stack(dino_tensors).to(self.device, non_blocking=True)
-        dino_input = self.dinov2_transform(dino_batch)
+        # Аудит §2.1/§2.4: раніше кожне зображення окремо йшло через
+        # torch.tensor(..., pin_memory=True).float() — тобто (а) копія + власна
+        # pinned-алокація на КОЖЕН кадр (cudaHostAlloc синхронізує драйвер), і
+        # (б) float32 їхав по PCIe вчетверо більшим за потрібне. Тепер батч
+        # збирається як uint8 одним numpy-стеком, а .float()/.div_ рахуються
+        # на девайсі. Числовий результат той самий.
+        # §2.1: коли CPU-resize увімкнено, зменшуємо ДО стеку — тоді на девайс
+        # їде (B, 3, S, S) замість (B, 3, H, W). Це ТОЙ САМИЙ препроцес, що в
+        # _dino_input на онлайн-шляху: інакше дескриптори БД і запиту були б
+        # порахованими різними фільтрами.
+        _dino_src = (
+            [self._cpu_resize_dino(img) for img in images]
+            if self._dino_cpu_resize
+            else images
+        )
+        dino_batch = (
+            torch.from_numpy(np.ascontiguousarray(np.stack(_dino_src)))
+            .permute(0, 3, 1, 2)
+            .to(self.device, non_blocking=True)
+            .float()
+            .div_(255.0)
+        )
+        dino_input = (
+            self._dino_normalize(dino_batch)
+            if self._dino_cpu_resize
+            else self.dinov2_transform(dino_batch)
+        )
 
         # 2. Prepare Local Tensor
         prep_images = [self.preprocessor.preprocess(img) for img in images]
-        local_tensors = []
-        for p_img in prep_images:
-            rgb = torch.tensor(p_img, pin_memory=True).float().div_(255.0)
-            local_tensors.append(rgb.permute(2, 0, 1))
-        local_batch = torch.stack(local_tensors).to(self.device, non_blocking=True)
+        local_batch = (
+            torch.from_numpy(np.ascontiguousarray(np.stack(prep_images)))
+            .permute(0, 3, 1, 2)
+            .to(self.device, non_blocking=True)
+            .float()
+            .div_(255.0)
+        )
 
         # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
         max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
@@ -11769,19 +18733,36 @@ class FeatureExtractor:
         aliked_out = None
 
         # PARALLEL EXECUTION
+        # Аудит §2.4: dino_input і local_batch створюються на DEFAULT-стрімі, а
+        # споживаються на бічних. Без wait_stream ядра бічного стріму можуть
+        # стартувати ДО завершення підготовки — гонка, що проявляється рідким
+        # NaN/сміттям, а не падінням. record_stream нижче не дає кешуючому
+        # алокатору переюзати ці блоки, поки бічні стріми з них читають.
+        if self.device == "cuda":
+            current = torch.cuda.current_stream()
+            for s in (stream_global, stream_local):
+                if s is not None:
+                    s.wait_stream(current)
+            for t, s in ((dino_input, stream_global), (local_batch, stream_local)):
+                if s is not None:
+                    t.record_stream(s)
+
         context_global = (
             torch.cuda.stream(stream_global) if stream_global else contextlib.nullcontext()
         )
         with context_global:
             with Telemetry.profile("dinov2"):
-                if self.cesp_module is not None:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                if self.vlad_aggregator is not None:
+                    out_global = torch.from_numpy(self._vlad_descriptors(dino_input))
+                elif self.cesp_module is not None:
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                         features = self.global_model.forward_features(dino_input)
                     patch_tokens = features["x_norm_patchtokens"].float()
-                    h_p, w_p = self.dino_size // 14, self.dino_size // 14
+                    # RESEARCH 1.1: сітка з фактичної кількості токенів, не //14
+                    h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
                     out_global = self.cesp_module(patch_tokens, h_p, w_p)
                 else:
-                    with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
                         out_global = self.global_model(dino_input).float()
 
         out_kpts = []
@@ -11837,8 +18818,12 @@ class FeatureExtractor:
                     kp = kp[valid]
                     desc = desc[valid]
                 else:
+                    # ВИПРАВЛЕНО: розмірність дескриптора беремо з самого масиву,
+                    # а не з хардкоду 128 (ALIKED=128, XFeat=64, RDD=256) —
+                    # інакше порожній результат мав чужу ширину.
+                    desc_dim = desc.shape[1] if desc.ndim == 2 else 128
                     kp = np.empty((0, 2), dtype=np.float32)
-                    desc = np.empty((0, 128), dtype=np.float32)
+                    desc = np.empty((0, desc_dim), dtype=np.float32)
 
             results.append({
                 "keypoints": kp, "descriptors": desc, "coords_2d": kp.copy(), "global_desc": gd,
@@ -11849,7 +18834,7 @@ class FeatureExtractor:
 
 
 # ================================================================================
-# File: models\wrappers\masking_strategy.py
+# File: src\models\wrappers\masking_strategy.py
 # ================================================================================
 # src/models/wrappers/masking_strategy.py
 #
@@ -11963,7 +18948,7 @@ def create_masking_strategy(
 
 
 # ================================================================================
-# File: models\wrappers\rdd_wrapper.py
+# File: src\models\wrappers\rdd_wrapper.py
 # ================================================================================
 import sys
 from pathlib import Path
@@ -12135,7 +19120,7 @@ class RDDWrapper:
 
 
 # ================================================================================
-# File: models\wrappers\trt_dinov2_wrapper.py
+# File: src\models\wrappers\trt_dinov2_wrapper.py
 # ================================================================================
 # src/models/wrappers/trt_dinov2_wrapper.py
 #
@@ -12265,7 +19250,252 @@ class TensorRTDINOv2Wrapper:
 
 
 # ================================================================================
-# File: models\wrappers\yolo_wrapper.py
+# File: src\models\wrappers\vlad_aggregator.py
+# ================================================================================
+"""RESEARCH 2.1 (AnyLoc, arXiv:2308.00688): ненавчена VLAD-агрегація патч-токенів.
+
+Замінює CLS-токен глобального дескриптора на VLAD поверх патч-токенів
+фундаментальної моделі: словник — k-means по токенах референсних кадрів,
+дескриптор — конкатенація нормованих кластерних залишків + PCA-whitening.
+
+Модуль свідомо без torch: fit/aggregate працюють на numpy (k-means — faiss,
+якщо доступний, інакше scipy), тому юніт-тестується без GPU і вантажиться
+у DatabaseBuilder / FeatureExtractor без додаткових залежностей.
+
+Пайплайн:
+    offline (scripts/build_vlad_vocab.py):
+        tokens_per_image = DINOv3.forward_features(...)  # (N, D) кожен
+        agg = VladAggregator(n_clusters=32, pca_dim=512)
+        agg.fit(list_of_tokens)
+        agg.save("vlad_vocab.npz")
+    online (FeatureExtractor):
+        agg = VladAggregator.load("vlad_vocab.npz")
+        desc = agg.aggregate(tokens)  # (out_dim,), L2-нормований
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class VladAggregator:
+    """VLAD з жорстким призначенням + intra-нормалізація + PCA-whitening."""
+
+    def __init__(
+        self,
+        n_clusters: int = 32,
+        pca_dim: int = 512,
+        low_norm_fraction: float = 0.0,
+        seed: int = 42,
+    ) -> None:
+        self.n_clusters = int(n_clusters)
+        self.pca_dim = int(pca_dim)
+        self.low_norm_fraction = float(low_norm_fraction)
+        self.seed = int(seed)
+
+        self.centers: np.ndarray | None = None      # (K, D)
+        self.pca_mean: np.ndarray | None = None      # (K*D,)
+        self.pca_components: np.ndarray | None = None  # (pca_dim, K*D)
+        self.pca_eigvals: np.ndarray | None = None   # (pca_dim,)
+
+    # ── Властивості ──────────────────────────────────────────────────────
+
+    @property
+    def is_fitted(self) -> bool:
+        return self.centers is not None
+
+    @property
+    def out_dim(self) -> int:
+        """Розмірність фінального дескриптора."""
+        if self.centers is None:
+            raise RuntimeError("VladAggregator is not fitted")
+        if self.pca_components is not None:
+            return int(self.pca_components.shape[0])
+        return int(self.n_clusters * self.centers.shape[1])
+
+    # ── Fit ──────────────────────────────────────────────────────────────
+
+    def fit(
+        self,
+        tokens_per_image: list[np.ndarray],
+        max_kmeans_tokens: int = 200_000,
+    ) -> VladAggregator:
+        """Будує словник (k-means) і PCA-whitening по референсних кадрах.
+
+        Args:
+            tokens_per_image: список (N_i, D) патч-токенів окремих кадрів.
+            max_kmeans_tokens: стеля вибірки токенів для k-means (пам'ять).
+        """
+        if len(tokens_per_image) < 2:
+            raise ValueError("fit() needs at least 2 images of tokens")
+
+        rng = np.random.default_rng(self.seed)
+        stacked = np.concatenate(
+            [np.asarray(t, dtype=np.float32) for t in tokens_per_image], axis=0
+        )
+        if len(stacked) > max_kmeans_tokens:
+            idx = rng.choice(len(stacked), size=max_kmeans_tokens, replace=False)
+            stacked = stacked[idx]
+
+        self.centers = self._kmeans(stacked)
+        logger.info(
+            f"VLAD vocabulary: k-means done | k={self.n_clusters}, "
+            f"tokens={len(stacked)}, dim={stacked.shape[1]}"
+        )
+
+        # PCA-whitening по VLAD-векторах референсних кадрів (як в AnyLoc).
+        vlads = np.stack([self._vlad(t) for t in tokens_per_image])  # (M, K*D)
+        n_samples, full_dim = vlads.shape
+        eff_dim = min(self.pca_dim, n_samples - 1, full_dim)
+        if eff_dim < self.pca_dim:
+            logger.warning(
+                f"PCA dim reduced {self.pca_dim} → {eff_dim}: "
+                f"only {n_samples} reference images (need ≥ pca_dim+1 for full rank)"
+            )
+        if eff_dim < 2:
+            logger.warning("PCA disabled: not enough reference images")
+            self.pca_mean = None
+            self.pca_components = None
+            self.pca_eigvals = None
+            return self
+
+        self.pca_mean = vlads.mean(axis=0)
+        centered = vlads - self.pca_mean
+        # SVD економного розміру: components — праві сингулярні вектори
+        _, s, vt = np.linalg.svd(centered, full_matrices=False)
+        self.pca_components = vt[:eff_dim].astype(np.float32)
+        # Дисперсія компонент; epsilon від ділення на ~0 для хвостових компонент
+        self.pca_eigvals = (s[:eff_dim] ** 2 / max(n_samples - 1, 1)).astype(np.float32)
+        logger.info(f"VLAD PCA-whitening fitted: {full_dim} → {eff_dim}")
+        return self
+
+    def _kmeans(self, tokens: np.ndarray) -> np.ndarray:
+        """k-means: faiss (швидко, GPU-able) з фолбеком на scipy."""
+        try:
+            import faiss
+
+            km = faiss.Kmeans(
+                d=int(tokens.shape[1]),
+                k=self.n_clusters,
+                niter=25,
+                seed=self.seed,
+                verbose=False,
+            )
+            km.train(np.ascontiguousarray(tokens, dtype=np.float32))
+            return km.centroids.reshape(self.n_clusters, -1).astype(np.float32)
+        except ImportError:
+            logger.info("faiss not available — falling back to scipy kmeans2")
+            from scipy.cluster.vq import kmeans2
+
+            centers, _ = kmeans2(
+                tokens.astype(np.float64),
+                self.n_clusters,
+                minit="++",
+                seed=self.seed,
+            )
+            return centers.astype(np.float32)
+
+    # ── Aggregate ────────────────────────────────────────────────────────
+
+    def _filter_low_norm(self, tokens: np.ndarray) -> np.ndarray:
+        """Dustbin-сурогат (SALAD): відкидає частку токенів з найнижчою нормою
+        (небо, однорідні поверхні несуть мало просторової інформації)."""
+        if self.low_norm_fraction <= 0.0 or len(tokens) < 8:
+            return tokens
+        norms = np.linalg.norm(tokens, axis=1)
+        thresh = np.quantile(norms, self.low_norm_fraction)
+        kept = tokens[norms > thresh]
+        return kept if len(kept) >= 4 else tokens
+
+    def _vlad(self, tokens: np.ndarray) -> np.ndarray:
+        """VLAD-вектор без PCA: (K*D,) з intra- та глобальною L2-нормалізацією."""
+        if self.centers is None:
+            raise RuntimeError("VladAggregator is not fitted")
+        t = self._filter_low_norm(np.asarray(tokens, dtype=np.float32))
+        k, d = self.centers.shape
+
+        # Жорстке призначення до найближчого центру: argmin ||t - c||²
+        # через розклад (економія пам'яті проти повної матриці відстаней)
+        dots = t @ self.centers.T                      # (N, K)
+        c_sq = np.sum(self.centers**2, axis=1)         # (K,)
+        assign = np.argmax(dots - 0.5 * c_sq, axis=1)  # (N,)
+
+        vlad = np.zeros((k, d), dtype=np.float32)
+        for ci in range(k):
+            sel = t[assign == ci]
+            if len(sel):
+                vlad[ci] = (sel - self.centers[ci]).sum(axis=0)
+
+        # Intra-нормалізація (по кластеру) — пригнічує burstiness
+        norms = np.linalg.norm(vlad, axis=1, keepdims=True)
+        np.divide(vlad, norms, out=vlad, where=norms > 1e-12)
+
+        flat = vlad.reshape(-1)
+        n = np.linalg.norm(flat)
+        return flat / n if n > 1e-12 else flat
+
+    def aggregate(self, tokens: np.ndarray) -> np.ndarray:
+        """Патч-токени (N, D) → глобальний дескриптор (out_dim,), L2-норм."""
+        v = self._vlad(tokens)
+        if self.pca_components is not None:
+            v = (v - self.pca_mean) @ self.pca_components.T
+            v = v / np.sqrt(self.pca_eigvals + 1e-8)  # whitening
+            n = np.linalg.norm(v)
+            if n > 1e-12:
+                v = v / n
+        return v.astype(np.float32)
+
+    def aggregate_batch(self, tokens_batch: np.ndarray | list[np.ndarray]) -> np.ndarray:
+        """(B, N, D) або список (N_i, D) → (B, out_dim)."""
+        return np.stack([self.aggregate(t) for t in tokens_batch])
+
+    # ── Persistence ──────────────────────────────────────────────────────
+
+    def save(self, path: str) -> None:
+        if self.centers is None:
+            raise RuntimeError("Nothing to save: not fitted")
+        np.savez_compressed(
+            path,
+            centers=self.centers,
+            pca_mean=self.pca_mean if self.pca_mean is not None else np.empty(0),
+            pca_components=(
+                self.pca_components if self.pca_components is not None else np.empty((0, 0))
+            ),
+            pca_eigvals=self.pca_eigvals if self.pca_eigvals is not None else np.empty(0),
+            meta=np.array(
+                [self.n_clusters, self.pca_dim, self.seed], dtype=np.int64
+            ),
+            low_norm_fraction=np.float64(self.low_norm_fraction),
+        )
+        logger.info(f"VLAD vocabulary saved: {path} (out_dim={self.out_dim})")
+
+    @classmethod
+    def load(cls, path: str, low_norm_fraction: float | None = None) -> VladAggregator:
+        data = np.load(path, allow_pickle=False)
+        n_clusters, pca_dim, seed = (int(x) for x in data["meta"])
+        lnf = (
+            float(data["low_norm_fraction"])
+            if low_norm_fraction is None
+            else float(low_norm_fraction)
+        )
+        agg = cls(n_clusters=n_clusters, pca_dim=pca_dim, low_norm_fraction=lnf, seed=seed)
+        agg.centers = data["centers"].astype(np.float32)
+        if data["pca_components"].size:
+            agg.pca_mean = data["pca_mean"].astype(np.float32)
+            agg.pca_components = data["pca_components"].astype(np.float32)
+            agg.pca_eigvals = data["pca_eigvals"].astype(np.float32)
+        logger.info(
+            f"VLAD vocabulary loaded: {path} | k={n_clusters}, out_dim={agg.out_dim}"
+        )
+        return agg
+
+
+# ================================================================================
+# File: src\models\wrappers\yolo_wrapper.py
 # ================================================================================
 import cv2
 import numpy as np
@@ -12375,22 +19605,17 @@ class YOLOWrapper:
 
 
 # ================================================================================
-# File: models\wrappers\__init__.py
-# ================================================================================
-"""Model wrappers module"""
-
-
-# ================================================================================
-# File: network\coordinates_broker.py
+# File: src\network\coordinates_broker.py
 # ================================================================================
 import asyncio
+import secrets
 import threading
 import time
 from collections import deque
 
 from PyQt6.QtCore import QObject, pyqtSlot
 
-from config.config import NetworkApiConfig
+from config import NetworkApiConfig
 from src.network.rest_server import RestApiServer
 from src.network.ws_server import WebSocketServer
 from src.utils.logging_utils import get_logger
@@ -12412,6 +19637,15 @@ class CoordinatesBroker(QObject):
         self._tracking_start_time: float = 0.0
         self.is_tracking_active: bool = False
 
+        # HARDENING P1-9/10: monotonic timestamp of the last successful fix,
+        # drives the operating-state machine and stall detector. None = no fix
+        # since the current tracking session began.
+        self._last_fix_mono: float | None = None
+        # HARDENING §4a: monotonic timestamp of the last *fresh keyframe anchor*
+        # (a real re-localization, not an optical-flow-propagated fix). Drives
+        # the anchor-staleness DEGRADED branch. None = no anchor yet this session.
+        self._last_anchor_mono: float | None = None
+
         self._ws_server = None
         self._rest_server = None
 
@@ -12430,17 +19664,64 @@ class CoordinatesBroker(QObject):
     def _run_event_loop(self):
         asyncio.set_event_loop(self._loop)
 
+        token = getattr(self.config, "api_token", "") or None
+
+        # HARDENING P0-4: if any server would bind a routable host without a
+        # token, self-heal to secure rather than crash — generate one and log
+        # it so the operator can hand it to clients. Localhost stays tokenless.
+        _local = ("127.0.0.1", "localhost", "::1")
+        _remote_ws = self.config.ws_enabled and self.config.ws_host not in _local
+        _remote_rest = self.config.rest_enabled and self.config.rest_host not in _local
+        if token is None and (_remote_ws or _remote_rest):
+            token = secrets.token_urlsafe(32)
+            logger.warning(
+                "Telemetry bound to a routable host without api_token — "
+                "generated one automatically. Clients must authenticate with "
+                "this token (Authorization: Bearer <token> or ?token=<token>):\n"
+                f"    api_token = {token}\n"
+                "Set network.api_token in user_config.json to pin a fixed token."
+            )
+
+        # HARDENING P1-7: resolve optional TLS. Fail closed — if TLS is enabled
+        # but the cert/key pair is missing, do NOT silently serve plaintext.
+        certfile = keyfile = None
+        if getattr(self.config, "tls_enabled", False):
+            certfile = getattr(self.config, "tls_certfile", "") or ""
+            keyfile = getattr(self.config, "tls_keyfile", "") or ""
+            if not (certfile and keyfile):
+                raise ValueError(
+                    "network_api.tls_enabled=True but tls_certfile/tls_keyfile "
+                    "are not both set — refusing to start telemetry in plaintext."
+                )
+            logger.info("Telemetry TLS enabled (wss/https).")
+
         tasks = []
         if self.config.ws_enabled:
-            self._ws_server = WebSocketServer(host=self.config.ws_host, port=self.config.ws_port)
+            self._ws_server = WebSocketServer(
+                host=self.config.ws_host,
+                port=self.config.ws_port,
+                api_token=token,
+                certfile=certfile,
+                keyfile=keyfile,
+            )
             tasks.append(self._ws_server.start())
 
         if self.config.rest_enabled:
-            self._rest_server = RestApiServer(broker=self, host=self.config.rest_host, port=self.config.rest_port)
+            self._rest_server = RestApiServer(
+                broker=self,
+                host=self.config.rest_host,
+                port=self.config.rest_port,
+                api_token=token,
+                certfile=certfile,
+                keyfile=keyfile,
+            )
             tasks.append(self._rest_server.start())
 
         if tasks:
             self._loop.run_until_complete(asyncio.gather(*tasks))
+            # HARDENING P1-10: liveness heartbeat over WS, flag-gated.
+            if getattr(self.config, "expose_operating_state", False):
+                self._loop.create_task(self._heartbeat_loop())
             # Запускаємо безкінечний цикл для обробки підключень
             self._loop.run_forever()
 
@@ -12463,11 +19744,77 @@ class CoordinatesBroker(QObject):
         self.is_tracking_active = active
         if active:
             self._tracking_start_time = time.time()
+            # New session starts in ACQUIRING until the first fix arrives.
+            self._last_fix_mono = None
+            self._last_anchor_mono = None
 
     def get_uptime(self) -> float:
         if self.is_tracking_active:
             return time.time() - self._tracking_start_time
         return 0.0
+
+    def get_operating_state(self) -> dict:
+        """HARDENING P1-9/10: honest operating state + stall info.
+
+        IDLE       — tracking not active.
+        ACQUIRING  — tracking active, no fix yet this session.
+        LOST       — tracking active, last fix older than fix_stale_sec (stall).
+        DEGRADED   — recent fix but below configured inlier/confidence floor.
+        TRACKING   — recent, healthy fix.
+        """
+        stale_sec = getattr(self.config, "fix_stale_sec", 3.0)
+        min_inl = getattr(self.config, "degraded_min_inliers", 0)
+        min_conf = getattr(self.config, "degraded_min_confidence", 0.0)
+        prop_stale = getattr(self.config, "propagation_stale_sec", 0.0)
+
+        now = time.monotonic()
+        age = None
+        anchor_age = None if self._last_anchor_mono is None else now - self._last_anchor_mono
+
+        if not self.is_tracking_active:
+            state = "IDLE"
+        elif self._last_fix_mono is None:
+            state = "ACQUIRING"
+        else:
+            age = now - self._last_fix_mono
+            if age > stale_sec:
+                state = "LOST"
+            else:
+                last = self._last_position or {}
+                inl = last.get("inliers", 0)
+                conf = last.get("confidence", 1.0)
+                if (min_inl and inl < min_inl) or (min_conf and conf < min_conf):
+                    state = "DEGRADED"
+                elif prop_stale and (self._last_anchor_mono is None or anchor_age > prop_stale):
+                    # HARDENING §4a: tracking is coasting on optical-flow
+                    # propagation with no fresh keyframe anchor for too long —
+                    # honest DEGRADED even though the (propagated) fix clock is
+                    # still fresh. Closes the content-blind gap.
+                    state = "DEGRADED"
+                else:
+                    state = "TRACKING"
+
+        return {
+            "op_state": state,
+            "last_fix_age_sec": round(age, 3) if age is not None else None,
+            "stale_after_sec": stale_sec,
+            "anchor_age_sec": round(anchor_age, 3) if anchor_age is not None else None,
+        }
+
+    async def _heartbeat_loop(self):
+        """HARDENING P1-10: periodic liveness beacon so consumers detect a hung
+        pipeline even when no position is being produced (i.e. LOST)."""
+        interval = getattr(self.config, "heartbeat_interval_sec", 1.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if self._ws_server is None:
+                    continue
+                msg = {"type": "heartbeat", "timestamp": time.time()}
+                msg.update(self.get_operating_state())
+                await self._ws_server.broadcast(msg)
+        except asyncio.CancelledError:
+            pass
 
     def get_last_position(self) -> dict | None:
         return self._last_position
@@ -12492,8 +19839,16 @@ class CoordinatesBroker(QObject):
             "timestamp": time.time(),
         }
         self._last_position = msg
+        self._last_fix_mono = time.monotonic()  # HARDENING P1-9/10: stall clock
         self._history.append(msg)
         self._broadcast(msg)
+
+    @pyqtSlot()
+    def on_anchor_fix(self):
+        """HARDENING §4a: a fresh keyframe anchor landed (a real re-localization,
+        not an optical-flow-propagated fix). Refreshes the anchor-staleness clock
+        the DEGRADED branch watches. Wired to the worker's ``anchor_fix`` signal."""
+        self._last_anchor_mono = time.monotonic()
 
     @pyqtSlot(object)
     def on_objects_gps_updated(self, objects_gps: list):
@@ -12520,7 +19875,7 @@ class CoordinatesBroker(QObject):
 
 
 # ================================================================================
-# File: network\rest_server.py
+# File: src\network\rest_server.py
 # ================================================================================
 from aiohttp import web
 
@@ -12529,15 +19884,38 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 class RestApiServer:
-    """Легкий HTTP-сервер для REST API координат."""
+    """Легкий HTTP-сервер для REST API координат.
 
-    def __init__(self, broker, host="0.0.0.0", port=8080):
+    Безпека: дефолт — 127.0.0.1. Для доступу з мережі задайте host="0.0.0.0"
+    явно та api_token (перевіряється заголовок Authorization: Bearer <token>).
+    """
+
+    def __init__(
+        self,
+        broker,
+        host="127.0.0.1",
+        port=8080,
+        api_token: str | None = None,
+        certfile: str | None = None,
+        keyfile: str | None = None,
+    ):
         self.broker = broker
         self.host = host
         self.port = port
-        self.app = web.Application()
+        self.api_token = api_token
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.app = web.Application(middlewares=[self._auth_middleware])
         self.runner = None
         self.site = None
+
+        # HARDENING P0-4: fail closed (see WebSocketServer for rationale).
+        if host not in ("127.0.0.1", "localhost", "::1") and not api_token:
+            raise ValueError(
+                f"Refusing to start REST API server on routable host '{host}' "
+                f"without api_token — position/trajectory endpoints would be "
+                f"public on the network. Set network.api_token or bind 127.0.0.1."
+            )
 
         self.app.add_routes([
             web.get('/api/position', self.get_position),
@@ -12545,6 +19923,14 @@ class RestApiServer:
             web.get('/api/trajectory', self.get_trajectory),
             web.get('/api/status', self.get_status)
         ])
+
+    @web.middleware
+    async def _auth_middleware(self, request, handler):
+        if self.api_token:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {self.api_token}":
+                return web.json_response({"error": "Unauthorized"}, status=401)
+        return await handler(request)
 
     async def get_position(self, request):
         pos = self.broker.get_last_position()
@@ -12566,16 +19952,32 @@ class RestApiServer:
         return web.json_response(history)
 
     async def get_status(self, request):
-        return web.json_response({
+        resp = {
             "state": "tracking" if self.broker.is_tracking_active else "idle",
-            "uptime_sec": self.broker.get_uptime()
-        })
+            "uptime_sec": self.broker.get_uptime(),
+        }
+        # HARDENING P1-9/10: additive, flag-gated operating-state + stall info.
+        if getattr(self.broker.config, "expose_operating_state", False):
+            resp.update(self.broker.get_operating_state())
+        return web.json_response(resp)
+
+    def _build_ssl_context(self):
+        """HARDENING P1-7: TLS context or None (see WebSocketServer). Fail closed."""
+        if not (self.certfile and self.keyfile):
+            return None
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        return ctx
 
     async def start(self):
-        logger.info(f"Starting REST API server on {self.host}:{self.port}...")
+        ssl_ctx = self._build_ssl_context()
+        scheme = "https" if ssl_ctx else "http"
+        logger.info(f"Starting REST API server on {scheme}://{self.host}:{self.port}...")
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
-        self.site = web.TCPSite(self.runner, self.host, self.port)
+        self.site = web.TCPSite(self.runner, self.host, self.port, ssl_context=ssl_ctx)
         await self.site.start()
 
     async def stop(self):
@@ -12585,7 +19987,7 @@ class RestApiServer:
 
 
 # ================================================================================
-# File: network\ws_server.py
+# File: src\network\ws_server.py
 # ================================================================================
 import asyncio
 import json
@@ -12598,19 +20000,63 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 class WebSocketServer:
-    """Асинхронний WebSocket-сервер для розсилки координат."""
+    """Асинхронний WebSocket-сервер для розсилки координат.
 
-    def __init__(self, host="0.0.0.0", port=8765):
+    Безпека: дефолт — 127.0.0.1 (лише локальні клієнти). Для доступу з мережі
+    задайте host="0.0.0.0" явно та api_token — телеметрія дрона не має бути
+    відкритою в чужому Wi-Fi.
+    """
+
+    def __init__(
+        self,
+        host="127.0.0.1",
+        port=8765,
+        api_token: str | None = None,
+        certfile: str | None = None,
+        keyfile: str | None = None,
+    ):
         self.host = host
         self.port = port
+        self.api_token = api_token
+        self.certfile = certfile
+        self.keyfile = keyfile
         self.clients: set[WebSocketServerProtocol] = set()
         self.server = None
 
+        # HARDENING P0-4: fail closed. Binding drone telemetry to a routable
+        # host without a token would leave position readable by anyone on the
+        # network — refuse instead of merely warning. Localhost stays
+        # frictionless (no token required). Normal startup never hits this
+        # because CoordinatesBroker auto-generates a token for remote hosts;
+        # this guards direct/headless/test instantiation.
+        if host not in ("127.0.0.1", "localhost", "::1") and not api_token:
+            raise ValueError(
+                f"Refusing to start WebSocket server on routable host '{host}' "
+                f"without api_token — drone telemetry would be public on the "
+                f"network. Set network.api_token or bind 127.0.0.1."
+            )
+
     async def handler(self, websocket: WebSocketServerProtocol):
         path = getattr(websocket.request, "path", "") if hasattr(websocket, "request") else ""
-        if path and path != "/ws/coords":
+        if path and not path.startswith("/ws/coords"):
             await websocket.close()
             return
+
+        # Токен: ?token=... у query або заголовок Authorization: Bearer ...
+        if self.api_token:
+            supplied = None
+            if "token=" in path:
+                supplied = path.split("token=", 1)[1].split("&", 1)[0]
+            headers = getattr(getattr(websocket, "request", None), "headers", {}) or {}
+            auth = headers.get("Authorization", "") if hasattr(headers, "get") else ""
+            if auth.startswith("Bearer "):
+                supplied = auth[7:]
+            if supplied != self.api_token:
+                logger.warning(
+                    f"WebSocket auth failed from {websocket.remote_address} — closing"
+                )
+                await websocket.close(code=4401, reason="Unauthorized")
+                return
 
         logger.info(f"WebSocket client connected: {websocket.remote_address}")
         self.clients.add(websocket)
@@ -12624,9 +20070,27 @@ class WebSocketServer:
             self.clients.remove(websocket)
             logger.info(f"WebSocket client disconnected: {websocket.remote_address}")
 
+    def _build_ssl_context(self):
+        """HARDENING P1-7: build a TLS context, or None for plaintext.
+
+        Fail closed: if a cert/key pair is supplied it must load, otherwise we
+        refuse to start rather than silently falling back to plaintext ws://.
+        """
+        if not (self.certfile and self.keyfile):
+            return None
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        return ctx
+
     async def start(self):
-        logger.info(f"Starting WebSocket server on {self.host}:{self.port}...")
-        self.server = await websockets.serve(self.handler, self.host, self.port)
+        ssl_ctx = self._build_ssl_context()
+        scheme = "wss" if ssl_ctx else "ws"
+        logger.info(f"Starting WebSocket server on {scheme}://{self.host}:{self.port}...")
+        self.server = await websockets.serve(
+            self.handler, self.host, self.port, ssl=ssl_ctx
+        )
 
     async def stop(self):
         if self.server:
@@ -12647,7 +20111,457 @@ class WebSocketServer:
 
 
 # ================================================================================
-# File: tracking\kalman_filter.py
+# File: src\security\__init__.py
+# ================================================================================
+"""HARDENING P1-6: encryption-at-rest primitives (passphrase-derived AES-256-GCM)."""
+
+
+# ================================================================================
+# File: src\security\at_rest.py
+# ================================================================================
+"""HARDENING P1-6: passphrase-derived encryption-at-rest for map artifacts.
+
+Threat: airframe capture — an adversary who recovers the payload must not read
+the mission's operational area or map. The key is *never* stored on the device;
+it is derived from an operator passphrase at load time (Scrypt), so a captured,
+powered-off payload yields only authenticated ciphertext.
+
+Self-describing container (so a plaintext project stays byte-for-byte unchanged
+and encrypted artifacts are auto-detected on load):
+
+    MAGIC(7) | version(1) | salt(16) | nonce(12) | AES-256-GCM(ciphertext‖tag)
+
+This module is the crypto foundation reused by every encryption-at-rest
+sub-project (geo-anchors, the h5 map, the lance index). It depends only on
+`cryptography` — no torch/Qt — so it is unit-testable in the pure-Python suite.
+"""
+
+from __future__ import annotations
+
+import getpass
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+MAGIC = b"DLENC1\0"
+_VERSION = 1
+_SALT_LEN = 16
+_NONCE_LEN = 12
+_TAG_LEN = 16
+_HEADER_LEN = len(MAGIC) + 1 + _SALT_LEN + _NONCE_LEN  # 36
+
+# Scrypt work factors (memory-hard). n=2**15 → ~32 MB, ~100 ms on a modern CPU:
+# strong against offline brute force, negligible against a legitimate one-shot
+# load. Bumping n means re-encrypting existing artifacts, hence pinned here.
+_SCRYPT_N = 2**15
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_KEY_LEN = 32  # AES-256
+
+# Process-wide passphrase cache so multiple artifact loads prompt/read only once.
+_CACHED_PASSPHRASE: str | None = None
+
+
+class EncryptionError(Exception):
+    """Fail-closed error for any at-rest crypto failure (bad passphrase, tamper,
+    malformed container, or a missing passphrase). Never yields partial plaintext."""
+
+
+def derive_key(passphrase: str, salt: bytes) -> bytes:
+    """Derive a 32-byte AES-256 key from a passphrase + salt via Scrypt."""
+    kdf = Scrypt(salt=salt, length=_KEY_LEN, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P)
+    return kdf.derive(passphrase.encode("utf-8"))
+
+
+def is_encrypted(data: bytes) -> bool:
+    """True iff ``data`` is one of our containers (cheap header check)."""
+    return data[: len(MAGIC)] == MAGIC and len(data) >= len(MAGIC)
+
+
+def encrypt_bytes(plaintext: bytes, passphrase: str) -> bytes:
+    """Encrypt ``plaintext`` into a self-describing container. Fresh random salt +
+    nonce every call, so the same input never produces the same ciphertext."""
+    salt = os.urandom(_SALT_LEN)
+    nonce = os.urandom(_NONCE_LEN)
+    key = derive_key(passphrase, salt)
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)  # appends 16-byte tag
+    return MAGIC + bytes([_VERSION]) + salt + nonce + ciphertext
+
+
+def decrypt_bytes(container: bytes, passphrase: str) -> bytes:
+    """Authenticate + decrypt a container. Wrong passphrase, tampering, or a
+    malformed container all raise :class:`EncryptionError` (fail-closed)."""
+    if not is_encrypted(container):
+        raise EncryptionError("not an encrypted container (bad magic)")
+    if len(container) < _HEADER_LEN + _TAG_LEN:
+        raise EncryptionError("truncated container")
+    version = container[len(MAGIC)]
+    if version != _VERSION:
+        raise EncryptionError(f"unsupported container version {version}")
+
+    off = len(MAGIC) + 1
+    salt = container[off : off + _SALT_LEN]
+    nonce = container[off + _SALT_LEN : _HEADER_LEN]
+    ciphertext = container[_HEADER_LEN:]
+
+    key = derive_key(passphrase, salt)
+    try:
+        return AESGCM(key).decrypt(nonce, ciphertext, None)
+    except InvalidTag as e:
+        raise EncryptionError("wrong passphrase or corrupted data") from e
+
+
+def encrypt_file(src_path: str, dst_path: str, passphrase: str) -> None:
+    """Encrypt ``src_path`` into an at-rest container at ``dst_path`` (atomic
+    write). Used by the encrypted-copy builder. ``dst`` may equal ``src`` for
+    in-place, but the copy model keeps the plaintext master untouched."""
+    container = encrypt_bytes(Path(src_path).read_bytes(), passphrase)
+    dst = Path(dst_path)
+    tmp = dst.with_name(dst.name + ".enc-tmp")
+    with open(tmp, "wb") as f:
+        f.write(container)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, dst)
+
+
+def decrypt_to_tempfile(src_path: str, passphrase: str, *, suffix: str = "") -> str:
+    """Decrypt an encrypted file to a fresh temp file and return its path. For
+    artifacts a library must open by path (e.g. a video, a lance data file). The
+    caller MUST :func:`wipe_file` it when done. Fails closed (never leaves a
+    partial plaintext temp on a bad passphrase)."""
+    plaintext = decrypt_bytes(Path(src_path).read_bytes(), passphrase)
+    fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="dlmap_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(plaintext)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        wipe_file(tmp)
+        raise
+    return tmp
+
+
+def wipe_file(path: str) -> None:
+    """Best-effort secure delete: overwrite with random bytes, then unlink. Note:
+    on SSD/copy-on-write/journaling filesystems this does NOT guarantee the old
+    blocks are physically erased (that needs full-disk encryption or a device
+    secure-erase); it raises the bar against casual recovery of a decrypted temp."""
+    p = Path(path)
+    if not p.exists():
+        return
+    try:
+        size = p.stat().st_size
+        with open(p, "r+b") as f:
+            f.write(os.urandom(size))
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass  # overwrite is best-effort; still unlink below
+    p.unlink(missing_ok=True)
+
+
+def stdin_is_tty() -> bool:
+    """True if stdin is an interactive terminal we may prompt on.
+
+    ``isatty()`` itself raises on a closed or detached stream — a real state for
+    a Windows service or a frozen GUI build — so probing it must never be the
+    thing that crashes a decrypt. Anything unreadable counts as "not a terminal",
+    which routes the caller to the pipe and then to fail-closed."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def read_passphrase_from_stdin() -> str:
+    """Read one line of passphrase from a non-TTY stdin, or "" if unavailable.
+
+    The supervised-child channel: the parent prompts once and pipes the
+    passphrase to each restarted child (see ``main.py::_run_supervised``). A pipe
+    is invisible in process listings, is not inherited by grandchildren, does not
+    reach crash dumps, and is consumed once — the properties an environment
+    variable lacks.
+
+    Never blocks a normal run: it is only reached when stdin is *not* a terminal,
+    and an empty or unreadable stdin returns "" so the caller fails closed."""
+    if stdin_is_tty():
+        return ""
+    try:
+        return sys.stdin.readline().strip()
+    except (OSError, ValueError, AttributeError):
+        # Closed, detached, or a capturing test runner — treat as "no passphrase".
+        return ""
+
+
+def get_passphrase() -> str:
+    """Resolve the map passphrase: the process-wide cache (filled by the GUI
+    dialog via :func:`set_passphrase`), an interactive prompt on a TTY, or one
+    line piped in on a non-TTY stdin. Fail-closed if none of those yields one.
+
+    There is deliberately **no environment-variable channel**. An env var is
+    readable by any process running as the same user (Process Explorer,
+    ``Win32_Process``, ``/proc/<pid>/environ``), is inherited by every child
+    process, and can surface in crash dumps — for a passphrase whose whole
+    purpose is that it is never stored on the device, that is the wrong trade.
+    The stdin pipe above covers the non-interactive case instead."""
+    global _CACHED_PASSPHRASE
+    if _CACHED_PASSPHRASE is not None:
+        return _CACHED_PASSPHRASE
+
+    if stdin_is_tty():
+        pw = getpass.getpass("Enter map decryption passphrase: ")
+    else:
+        pw = read_passphrase_from_stdin()
+    if not pw:
+        raise EncryptionError(
+            "encrypted artifact found but no passphrase available — "
+            "run interactively, pipe it on stdin, or enter it in the application"
+        )
+
+    _CACHED_PASSPHRASE = pw
+    return pw
+
+
+def prompt_and_verify_passphrase(artifact_path: str, *, attempts: int = 3) -> bool:
+    """Prompt on the TTY until ``artifact_path`` decrypts, or attempts run out.
+
+    The console counterpart of the GUI passphrase dialog, with the same contract:
+    verify first, cache only on success, give the operator more than one try. A
+    typo must not abort a headless run, and must not leave a wrong passphrase in
+    the cache to break every later load.
+
+    Returns True once the passphrase is cached, False if the operator gave up,
+    exhausted the attempts, or no passphrase could be obtained at all."""
+    if _CACHED_PASSPHRASE is not None:
+        return True
+
+    if not stdin_is_tty():
+        # Supervised child: a single line piped in by the parent. No retries —
+        # there is no operator on the other end, only a pipe that closes once.
+        pw = read_passphrase_from_stdin()
+        if pw and verify_passphrase(artifact_path, pw):
+            set_passphrase(pw)
+            return True
+        return False
+
+    for remaining in range(attempts, 0, -1):
+        try:
+            pw = getpass.getpass("Enter map decryption passphrase: ")
+        except (KeyboardInterrupt, EOFError):
+            print()  # leave the cancelled prompt on its own line
+            return False
+        if pw and verify_passphrase(artifact_path, pw):
+            set_passphrase(pw)
+            return True
+        if remaining > 1:
+            print(f"Wrong passphrase — {remaining - 1} attempt(s) left.")
+    return False
+
+
+def set_passphrase(passphrase: str) -> None:
+    """Inject a passphrase into the process-wide cache.
+
+    Injection point for callers that resolve the passphrase themselves — the GUI
+    dialog above all: ``get_passphrase`` would otherwise block on ``getpass``
+    (stdin looks like a TTY under a GUI launch) with the prompt invisible behind
+    the window. Callers should verify the passphrase before injecting it, since
+    a wrong one poisons every subsequent load in the process."""
+    global _CACHED_PASSPHRASE
+    if not passphrase:
+        raise EncryptionError("refusing to cache an empty passphrase")
+    _CACHED_PASSPHRASE = passphrase
+
+
+def clear_passphrase() -> None:
+    """Drop the cached passphrase. Called when switching projects, so a passphrase
+    entered for one project never silently decrypts another."""
+    global _CACHED_PASSPHRASE
+    _CACHED_PASSPHRASE = None
+
+
+def verify_passphrase(path: str, passphrase: str) -> bool:
+    """Return True if ``passphrase`` decrypts the encrypted artifact at ``path``.
+
+    Used to validate operator input before caching it. Decrypts in full, so pass
+    the smallest encrypted artifact available (calibration.json, a few KB) rather
+    than the map database. Returns False for a wrong passphrase, a tampered or
+    malformed container, or a plaintext file (nothing to verify against)."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    if not is_encrypted(data):
+        return False
+    try:
+        decrypt_bytes(data, passphrase)
+    except EncryptionError:
+        return False
+    return True
+
+
+# ================================================================================
+# File: src\security\project_scan.py
+# ================================================================================
+"""HARDENING P1-6: detect encrypted projects on disk and keep them immutable.
+
+Kept free of Qt so it is unit-testable in the pure-Python suite; the GUI
+passphrase dialog is the only consumer that needs a widget toolkit.
+
+An encrypted deployment copy has EVERY file encrypted, ``project.json``
+included, so the manifest header is the marker: one 7-byte read tells you
+whether a directory is an encrypted copy, before anything is loaded.
+
+Copies built before that (plaintext manifest, encrypted artifacts) still open —
+the artifact scan below is kept as a fallback. Artifacts live per source
+(``sources/main/database.h5``, see ProjectSettings), so their paths are resolved
+through the project's own source configuration rather than guessed.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from src.security.at_rest import EncryptionError, is_encrypted
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+# Only the header is needed to classify a file — never read a 67 MB database in.
+_HEADER_PROBE_BYTES = 64
+
+
+class EncryptedProjectWriteError(EncryptionError):
+    """Raised when something tries to write into an encrypted deployment copy."""
+
+
+def _file_is_encrypted(path: Path) -> bool:
+    """True if ``path`` carries the at-rest container header. Missing or
+    unreadable files are reported as not encrypted — a load error there is the
+    caller's problem, not a passphrase problem."""
+    try:
+        with open(path, "rb") as f:
+            return is_encrypted(f.read(_HEADER_PROBE_BYTES))
+    except OSError:
+        return False
+
+
+def _artifacts_for(root: Path, settings) -> list[Path]:
+    """Resolve a project's encryptable artifacts from its root and settings.
+
+    Returns existing paths only, ordered cheapest-to-decrypt first so a caller
+    verifying a passphrase can use ``[0]`` without decrypting the map database."""
+    calibrations: list[Path] = []
+    databases: list[Path] = []
+    others: list[Path] = []
+
+    sources = settings.get_enabled_sources()
+    if not sources:
+        # Legacy single-source project: fall back to the top-level filenames.
+        calibrations.append(root / settings.calibration_filename)
+        databases.append(root / settings.database_filename)
+
+    for source in sources:
+        calibrations.append(root / source.calibration_file)
+        databases.append(root / source.database_file)
+
+    for db_path in list(databases):
+        # Sibling artifacts are named after their database (see DatabaseBuilder).
+        others.append(db_path.parent / "vectors.lance")
+        others.append(db_path.with_name(db_path.stem + "_keypoints.mp4"))
+
+    resolved: list[Path] = []
+    for path in [*calibrations, *databases, *others]:
+        if path.is_dir():
+            # A lance dataset is a directory: probe its first data file.
+            resolved.extend(sorted(p for p in path.rglob("*") if p.is_file())[:1])
+        elif path.is_file():
+            resolved.append(path)
+    return resolved
+
+
+def encrypted_artifacts_at(project_dir: str | Path) -> list[Path]:
+    """Encrypted artifacts of the project at ``project_dir``, cheapest first.
+
+    Works from a path alone — the project cannot be loaded before the passphrase
+    is known, since the manifest itself may be encrypted. An empty list means the
+    project is plaintext and must load exactly as before: no prompt, no change.
+
+    Side-effect free and quiet: it reads ``project.json`` directly rather than
+    going through ``ProjectManager``, which logs a line per load, because the
+    project picker calls this once per listed row."""
+    from src.core.project import ProjectSettings
+
+    root = Path(project_dir)
+    manifest = root / "project.json"
+    if not manifest.is_file():
+        return []
+
+    if _file_is_encrypted(manifest):
+        # Fully encrypted copy: the manifest is both the marker and the cheapest
+        # possible verification target (a few hundred bytes).
+        return [manifest]
+
+    try:
+        settings = ProjectSettings.from_dict(json.loads(manifest.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError, KeyError):
+        return []
+    return [p for p in _artifacts_for(root, settings) if _file_is_encrypted(p)]
+
+
+def project_is_encrypted(project_dir: str | Path) -> bool:
+    """True if the project at ``project_dir`` is an encrypted deployment copy."""
+    return bool(encrypted_artifacts_at(project_dir))
+
+
+def find_project_root(path: str | Path) -> Path | None:
+    """Nearest ancestor directory (or ``path`` itself) holding a ``project.json``.
+
+    Write guards get a target file path, not a project, so they walk up to find
+    which project — if any — they are about to write into."""
+    start = Path(path)
+    start = start if start.is_dir() else start.parent
+    for candidate in [start, *start.parents]:
+        if (candidate / "project.json").is_file():
+            return candidate
+    return None
+
+
+def assert_project_writable(path: str | Path) -> None:
+    """Refuse any write that lands inside an encrypted deployment copy.
+
+    The copy is immutable by design: the ground station keeps the plaintext
+    master and the drone carries ciphertext. Without this guard a normal rebuild
+    or calibration save silently writes plaintext into a project the operator
+    believes is encrypted — observed in the field, hence the hard refusal.
+
+    Writes outside any project, or into a plaintext project, are unaffected."""
+    root = find_project_root(path)
+    if root is None or not project_is_encrypted(root):
+        return
+    logger.error(f"Refused write into encrypted project '{root.name}': {path}")
+    raise EncryptedProjectWriteError(
+        f"'{root.name}' is an encrypted deployment copy and cannot be modified. "
+        f"Rebuild, recalibrate and re-run propagation on the plaintext master "
+        f"project, then build a fresh encrypted copy from it."
+    )
+
+
+# ================================================================================
+# File: src\tracking\__init__.py
+# ================================================================================
+"""Tracking module"""
+
+
+# ================================================================================
+# File: src\tracking\kalman_filter.py
 # ================================================================================
 import numpy as np
 from filterpy.common import Q_discrete_white_noise
@@ -12669,6 +20583,12 @@ class TrajectoryFilter:
         # дозволяють фільтру швидше реагувати на зміни курсу на високих швидкостях
         self.process_noise = process_noise
         self.is_initialized = False
+        # Two-point velocity seed (живий інцидент 2026-07-18): перше update()
+        # після ініціалізації задає vx/vy з різниці перших двох сирих точок
+        # замість v=0 — без цього на траєкторіях зі сталою високою швидкістю
+        # (виміряно ~150 м/с на симуляторному польоті) filtered-позиція кілька
+        # кроків відстає від сирих фіксів, поки KF "вивчає" швидкість із нуля.
+        self._prev_raw: tuple[float, float] | None = None
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(
@@ -12678,12 +20598,19 @@ class TrajectoryFilter:
         self.kf.P *= 1000.0
 
         self.kf.F = np.array(
-            [[1.0, 0.0, dt, 0.0], [0.0, 1.0, 0.0, dt], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
         )
 
         self.kf.H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
 
         self.kf.R = np.array([[measurement_noise, 0.0], [0.0, measurement_noise]])
+        # Базовий R для адаптивного масштабування за confidence локалізації
+        self._base_R = self.kf.R.copy()
 
         self._update_matrices_for_dt(dt)
 
@@ -12706,14 +20633,34 @@ class TrajectoryFilter:
         self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
         self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
 
-    def update(self, measurement: tuple, dt: float = 1.0) -> tuple:
+    def update(self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0) -> tuple:
+        """noise_scale — адаптивний множник шуму вимірювання (B2):
+        > 1 для слабких/відносних вимірювань (низький confidence, optical flow),
+        1.0 для впевнених. Дозволяє фільтру менше довіряти поганим вимірюванням.
+        """
         z = np.array([[measurement[0]], [measurement[1]]])
 
         if not self.is_initialized:
             self.kf.x = np.array([[measurement[0]], [measurement[1]], [0.0], [0.0]])
             self.is_initialized = True
+            self._prev_raw = (float(measurement[0]), float(measurement[1]))
             logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
             return measurement
+
+        if self._prev_raw is not None:
+            # Two-point seed: рахуємо швидкість з ПЕРШОЇ пари сирих точок і
+            # підставляємо в стан ДО predict/update цього кроку. Лише один раз
+            # (одразу після ініціалізації) — далі фільтр веде швидкість сам.
+            safe_seed_dt = max(dt, 0.01)
+            vx = (measurement[0] - self._prev_raw[0]) / safe_seed_dt
+            vy = (measurement[1] - self._prev_raw[1]) / safe_seed_dt
+            self.kf.x[2, 0] = vx
+            self.kf.x[3, 0] = vy
+            self._prev_raw = None
+            logger.debug(f"Kalman two-point velocity seed: ({vx:.2f}, {vy:.2f}) m/s")
+
+        ns = float(np.clip(noise_scale, 0.25, 25.0))
+        self.kf.R = self._base_R * ns
 
         dt = max(0.01, min(dt, 5.0))
         self._update_matrices_for_dt(dt)
@@ -12726,6 +20673,16 @@ class TrajectoryFilter:
 
         return filtered_x, filtered_y
 
+    def shift(self, dx: float, dy: float) -> None:
+        """Зсув позиційної частини стану (корекція від back-end smoother'а,
+        RESEARCH 3.1). Швидкості та коваріація не чіпаються: корекція — це
+        зсув системи відліку оцінки, а не нове вимірювання.
+        """
+        if not self.is_initialized:
+            return
+        self.kf.x[0, 0] += dx
+        self.kf.x[1, 0] += dy
+
     def reset(self) -> None:
         """
         Скидає фільтр до початкового стану.
@@ -12733,13 +20690,14 @@ class TrajectoryFilter:
         хибних передбачень на основі швидкості попередньої сесії.
         """
         self.is_initialized = False
+        self._prev_raw = None
         self.kf.x = np.zeros((4, 1))
         self.kf.P = np.eye(4) * 1000.0
         logger.info("Kalman filter reset to initial state")
 
 
 # ================================================================================
-# File: tracking\object_projector.py
+# File: src\tracking\object_projector.py
 # ================================================================================
 from dataclasses import dataclass
 
@@ -12829,7 +20787,7 @@ class ObjectProjector:
 
 
 # ================================================================================
-# File: tracking\object_tracker.py
+# File: src\tracking\object_tracker.py
 # ================================================================================
 from dataclasses import dataclass
 
@@ -12956,7 +20914,7 @@ class ObjectTracker:
 
 
 # ================================================================================
-# File: tracking\outlier_detector.py
+# File: src\tracking\outlier_detector.py
 # ================================================================================
 from collections import deque
 
@@ -12970,17 +20928,54 @@ logger = get_logger(__name__)
 class OutlierDetector:
     """Detect anomalous measurements (outliers) based on trajectory history using speeds"""
 
-    def __init__(self, window_size=10, threshold_std=3.0, max_speed_mps=1000.0, max_consecutive=5):
+    def __init__(
+        self,
+        window_size=10,
+        threshold_std=3.0,
+        max_speed_mps=1000.0,
+        max_consecutive=5,
+        ground_scale=1.0,
+        zscore_enabled=True,
+    ):
         self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
         self.max_speed_mps = max_speed_mps
         self._consecutive_outliers = 0
         self._max_consecutive = max_consecutive
+        # Множник «проєкційні метри → справжні наземні» (Етап 6). 1.0 = стара
+        # поведінка побітово. Без нього WebMercator-відстані на 48° завищені у
+        # 1/cos(lat) ≈ 1.49×, тож max_speed_mps=120 реально гейтить на 80.6 м/с,
+        # а ~39% відсіювань на живому прогоні були чистими хибними спрацюваннями.
+        self._ground_scale = float(ground_scale)
+        # Z-score гілка. Заміряно на місії top 2026-07-31 (of_stride=1,
+        # of_local_speed=ON): з 70 спрацювань 47 дала вона, і ВСІ 23
+        # спрацювання на ПРАВИЛЬНИХ вимірах (distance 2.3-4.5 м при нормі
+        # 3.0 м) — теж її. Жодного справжнього зриву (>12 м) вона не спіймала:
+        # їх усі ловить фізичний max_speed. Причина — самопідтримна петля:
+        # гейт відкидає все, що вище mean_speed, тож у вікно потрапляють лише
+        # повільні виміри, mean падає (11.9-78 при реальних 89.2 м/с) і
+        # відкидається ще більше. Плюс std сідає на floor 1.0 і z сягає 159.
+        self._zscore_enabled = bool(zscore_enabled)
 
         logger.info("Initializing OutlierDetector (Speed-based Z-score)")
         logger.info(
             f"Parameters: window_size={window_size}, threshold_std={threshold_std}, max_speed_mps={max_speed_mps}"
         )
+
+    def set_ground_scale(self, scale: float) -> None:
+        """Оновлює множник проєкція→наземні метри (cos(lat) для WebMercator).
+
+        Викликається з локалізатора, коли є свіжа широта. Значення <= 0
+        ігнорується — краще лишити попереднє, ніж занулити всі швидкості.
+        """
+        s = float(scale)
+        if s > 0.0:
+            self._ground_scale = s
+
+    def reset(self) -> None:
+        """Повне скидання стану (нова сесія трекінгу)."""
+        self.window.clear()
+        self._consecutive_outliers = 0
 
     def add_position(self, position: tuple, dt: float = 1.0, reset_consecutive: bool = True):
         # Тепер зберігаємо і позицію, і dt (час, за який ця позиція була досягнута)
@@ -12988,16 +20983,37 @@ class OutlierDetector:
         if reset_consecutive:
             self._consecutive_outliers = 0
 
-    def is_outlier(self, new_position: tuple, dt: float = 1.0) -> bool:
+    def is_outlier(
+        self, new_position: tuple, dt: float = 1.0, ref_position: tuple | None = None
+    ) -> bool:
+        """Перевірка вимірювання на аномальність.
+
+        ``ref_position`` — опорна точка для МИТТЄВОЇ швидкості. За замовчуванням
+        береться остання ПРИЙНЯТА позиція з вікна, але на OF-шляху це неправильно:
+        LK трекає завжди від keyframe (tracking_worker.py:486), тож зсув росте
+        лінійно від keyframe, тоді як dt лишається кроком одного OF-кадру. Бази
+        чисельника і знаменника різні -> швидкість завищується рівно в N разів,
+        де N — номер OF-кадру після keyframe. Заміряно на місії top 2026-07-31:
+        логовані 450-1271 м/с лягають на сітку N * 89.2 м/с при N=5..14, а між
+        keyframe-ами якраз вміщається 10 OF-кадрів.
+
+        Передача попередньої СИРОЇ OF-позиції як ref_position робить розрахунок
+        локальним (кадр відносно кадру) і прибирає накопичення.
+        """
         if len(self.window) < 3:
             return False
 
         new_pos_np = np.array(new_position, dtype=np.float64)
-        last_pos, _ = self.window[-1]
+        if ref_position is not None:
+            last_pos = np.array(ref_position, dtype=np.float64)
+        else:
+            last_pos, _ = self.window[-1]
         safe_dt = max(dt, 0.01)
 
         # 1. Перевірка максимально допустимої швидкості
-        distance = float(np.linalg.norm(new_pos_np - last_pos))
+        # Відстані переводимо в СПРАВЖНІ наземні метри до порівняння з порогом,
+        # інакше поріг мовчки залежить від широти місії.
+        distance = float(np.linalg.norm(new_pos_np - last_pos)) * self._ground_scale
         instantaneous_speed = distance / safe_dt
 
         is_speed_outlier = instantaneous_speed > self.max_speed_mps
@@ -13008,7 +21024,7 @@ class OutlierDetector:
         for i in range(1, len(history)):
             p1, _ = history[i - 1]
             p2, hist_dt = history[i]
-            dist = float(np.linalg.norm(p2 - p1))
+            dist = float(np.linalg.norm(p2 - p1)) * self._ground_scale
             speeds.append(dist / hist_dt)
 
         mean_speed = np.mean(speeds)
@@ -13017,7 +21033,7 @@ class OutlierDetector:
         z_score = abs(instantaneous_speed - mean_speed) / std_speed
 
         # 15.0 m/s - мінімальна дельта швидкості, при якій Z-score має сенс
-        is_zscore_outlier = (
+        is_zscore_outlier = self._zscore_enabled and (
             z_score > self.threshold_std and abs(instantaneous_speed - mean_speed) > 15.0
         )
 
@@ -13056,18 +21072,1312 @@ class OutlierDetector:
 
 
 # ================================================================================
-# File: tracking\__init__.py
+# File: src\tracking\smoother.py
 # ================================================================================
-"""Tracking module"""
+"""Sliding-window back-end smoother for the live trajectory (RESEARCH 3.1).
+
+Architecture (docs/RESEARCH_INTEGRATION_PLAN.md §3.1, design record in
+.agents/SMOOTHER_DESIGN.md):
+
+- Front-end (TrajectoryFilter KF + OutlierDetector) stays unchanged and keeps
+  producing the per-frame output.
+- This back-end maintains a sliding window of keyframe nodes (2D metric
+  positions). Every H-based keyframe fix enters the window — including fixes
+  the front-end rejected as outliers. Robust (Huber) IRLS weighting arbitrates
+  instead of the front-end's binary accept/reject: a wrong fix gets a
+  suppressed weight, a run of consistent "outliers" (real relocation, Z-score
+  false positives during maneuvers) regains influence naturally.
+- Inter-node edges are relative odometry derived from the optical-flow track
+  (metric OF positions are anchored at the last accepted keyframe's H, so the
+  difference of two OF samples is a fix-independent relative measurement).
+- The solved window periodically corrects the KF via a position shift
+  (TrajectoryFilter.shift): the correction is the difference between the
+  smoothed and the KF estimate at the newest node.
+
+Deliberate deviations from the plan text (rationale in the design note):
+
+- Dedicated 2D linear solver instead of reusing the 5-DoF PoseGraphOptimizer.
+  The live problem is linear in positions; Huber-IRLS over two per-axis SPD
+  systems solves a 100-node window in well under a millisecond with plain
+  numpy. The 5-DoF optimizer's residual contract (5E+N+5A) is calibration
+  infrastructure with no per-anchor robust loss; wiring live usage into it
+  would couple two hot paths for no numerical benefit.
+- Synchronous solve on the keyframe cadence instead of an async thread. The
+  async design existed to hide scipy 5-DoF solve latency; a sub-millisecond
+  solve does not need hiding, and staying on the worker thread removes every
+  lock/queue hazard around the shared KF state.
+
+The problem solved per window (positions p_i, i = 0..N-1):
+
+    sum_i  w_i * ||p_i - z_i||^2          (fixes; w_i Huber-reweighted, IRLS)
+  + sum_e  w_e * ||p_j - p_i - d_e||^2    (odometry edges; quadratic)
+  + entry prior on the oldest node        (carries marginalized info forward)
+
+x and y decouple into two SPD N x N systems sharing the same matrix.
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+# OF samples older than this (relative to the new node's time) are considered
+# stale and produce no odometry edge. 0.5 s covers any realistic keyframe
+# cadence (worker default: 5 frames at 30 fps = 0.17 s).
+_OF_STALE_SEC = 0.5
+
+# Floors mirroring front-end conventions (Localizer clips confidence at 0.25
+# for the KF noise scale; OF quality below 0.2 is de facto garbage).
+_CONF_FLOOR = 0.25
+_QUALITY_FLOOR = 0.2
+
+
+@dataclass
+class _Node:
+    uid: int
+    t: float  # window-internal time of the keyframe [s]
+    z: np.ndarray  # raw metric fix (2,)
+    sigma: float  # fix sigma [m]
+    accepted: bool  # front-end verdict
+    kf_xy: np.ndarray | None  # front-end KF output at this node (accepted only)
+    # OF-track position at this node's time, recorded at ingestion (used as
+    # the edge start when this node is rejected — its own fix is untrusted).
+    of_boundary: np.ndarray | None = None
+    prior: tuple[np.ndarray, float] | None = None  # entry prior (xy, sigma)
+
+
+@dataclass
+class _Edge:
+    a: int  # uid of the older node
+    b: int  # uid of the newer node
+    delta: np.ndarray  # measured p_b - p_a (2,)
+    weight: float  # 1 / sigma^2
+
+
+@dataclass
+class _OfTrack:
+    """OF samples of the current inter-keyframe interval (metric coords,
+    anchored at the last accepted keyframe's homography). Survives rejected
+    keyframes — the anchor only changes on acceptance."""
+
+    prev: tuple[float, np.ndarray] | None = None  # (t, xy) — one before last
+    last: tuple[float, np.ndarray] | None = None  # (t, xy) — latest sample
+    q_min: float = 1.0
+    n: int = 0
+
+    def push(self, t: float, xy: np.ndarray, quality: float) -> None:
+        self.prev = self.last
+        self.last = (t, xy)
+        self.q_min = min(self.q_min, quality)
+        self.n += 1
+
+    def clear(self) -> None:
+        self.prev = None
+        self.last = None
+        self.q_min = 1.0
+        self.n = 0
+
+    def value_at(self, t: float) -> np.ndarray | None:
+        """OF-track position extrapolated forward to time t (linear from the
+        last two samples; falls back to the last sample; None if the track is
+        empty or its newest sample is stale relative to t)."""
+        if self.last is None:
+            return None
+        t_last, xy_last = self.last
+        if t - t_last > _OF_STALE_SEC:
+            return None
+        if self.prev is not None:
+            t_prev, xy_prev = self.prev
+            dt = t_last - t_prev
+            if dt > 1e-6:
+                v = (xy_last - xy_prev) / dt
+                return xy_last + v * (t - t_last)
+        return xy_last.copy()
+
+
+class SlidingWindowSmoother:
+    """Robust sliding-window smoother over live keyframe fixes + OF odometry.
+
+    Numpy-only, synchronous, deterministic. All inputs and outputs are in the
+    metric coordinate frame of the active calibration source; the window is
+    reset whenever the source changes (metric frames of different sources are
+    not commensurable).
+    """
+
+    def __init__(
+        self,
+        window: int = 60,
+        huber_k: float = 1.2,
+        fix_sigma_base_m: float = 5.0,
+        odom_sigma_base_m: float = 3.0,
+        max_correction_m: float = 50.0,
+        entry_prior_sigma_m: float = 15.0,
+        irls_iterations: int = 4,
+        correction_lag: int = 10,
+        deadband_m: float = 2.0,
+        gain: float = 0.25,
+        max_step_m: float = 3.0,
+    ) -> None:
+        self.window = max(int(window), 2)
+        # Санітизація користувацьких параметрів (живий інцидент 2026-07-18:
+        # huber_k=-0.8 в user_config робив ваги ВСІХ фіксів від'ємними —
+        # система переставала бути SPD, розв'язок і серво-кроки — сміття).
+        self.huber_k = self._sane("huber_k", huber_k, 0.1)
+        self.fix_sigma_base_m = self._sane("fix_sigma_base_m", fix_sigma_base_m, 0.1)
+        self.odom_sigma_base_m = self._sane("odom_sigma_base_m", odom_sigma_base_m, 0.1)
+        self.max_correction_m = self._sane("max_correction_m", max_correction_m, 0.1)
+        self.entry_prior_sigma_m = self._sane(
+            "entry_prior_sigma_m", entry_prior_sigma_m, 0.1
+        )
+        self.irls_iterations = max(int(irls_iterations), 1)
+        # Fixed-lag servo (v2, після живого прогону 2026-07-18): корекція
+        # рахується на вузлі з лагом — голова вікна ще не уточнена майбутніми
+        # свідченнями (smoothed[head] ≈ сирий фікс, і корекція по ній
+        # РОЗФІЛЬТРОВУВАЛА Калмана — траєкторія сіпалась до фіксів).
+        self.correction_lag = max(int(correction_lag), 1)
+        self.deadband_m = self._sane("deadband_m", deadband_m, 0.0)
+        self.gain = min(self._sane("gain", gain, 0.01), 1.0)
+        self.max_step_m = self._sane("max_step_m", max_step_m, 0.01)
+
+        self._nodes: list[_Node] = []
+        self._edges: list[_Edge] = []
+        self._of = _OfTrack()
+        self._uid_seq = 0
+        self._source_id: str | None = None
+        # Two clocks accumulating the worker's video-time deltas:
+        # _t_last_node — previous keyframe (accepted or rejected; KF dt
+        # semantics), _t_last_success — last successful localization event
+        # (accepted keyframe or OF sample; OF dt semantics).
+        self._t_last_success = 0.0
+        self._t_last_node = 0.0
+        self._last_solution: dict[int, np.ndarray] = {}
+        self._last_fix_weights: dict[int, float] = {}
+
+        logger.info(
+            f"SlidingWindowSmoother: window={self.window}, huber_k={self.huber_k}, "
+            f"fix_sigma={self.fix_sigma_base_m}m, odom_sigma={self.odom_sigma_base_m}m"
+        )
+
+    @staticmethod
+    def _sane(name: str, value, floor: float) -> float:
+        """Кламп користувацького параметра знизу з голосним warning."""
+        v = float(value)
+        if not np.isfinite(v) or v < floor:
+            logger.warning(
+                f"Smoother config: {name}={value!r} невалідне — клампимо до {floor}"
+            )
+            return float(floor)
+        return v
+
+    # ── ingestion ────────────────────────────────────────────────────────────
+
+    def reset(self) -> None:
+        self._nodes.clear()
+        self._edges.clear()
+        self._of.clear()
+        self._source_id = None
+        self._t_last_success = 0.0
+        self._t_last_node = 0.0
+        self._last_solution.clear()
+        self._last_fix_weights.clear()
+
+    def note_of(self, metric_xy, dt: float, quality: float | None = None) -> None:
+        """Register a successful optical-flow localization (raw metric point).
+
+        dt follows the worker semantics: time since the last successful
+        localization (previous OF frame or the anchoring keyframe).
+        """
+        if not self._nodes:
+            return  # OF before any keyframe fix has no anchor in the window
+        t = self._t_last_success + max(float(dt), 1e-3)
+        self._t_last_success = t
+        if quality is None:
+            q = 0.7  # mirrors the front-end's default OF confidence
+        else:
+            q = max(float(quality), _QUALITY_FLOOR)
+        self._of.push(t, np.asarray(metric_xy, dtype=np.float64).reshape(2), q)
+
+    def add_fix(
+        self,
+        metric_xy,
+        dt: float,
+        confidence: float,
+        source_id: str | None = None,
+        accepted: bool = True,
+        kf_xy=None,
+    ) -> np.ndarray | None:
+        """Ingest a keyframe fix, solve the window, return a KF correction.
+
+        dt — time since the previous keyframe (worker semantics, rejected
+        keyframes included). Returns the (dx, dy) shift to apply to the
+        front-end KF, or None (window too small / node not accepted / solve
+        skipped).
+        """
+        if source_id != self._source_id:
+            if self._nodes:
+                logger.info(
+                    f"Smoother window reset: source change "
+                    f"{self._source_id!r} -> {source_id!r}"
+                )
+            self.reset()
+            self._source_id = source_id
+
+        t_node = self._t_last_node + max(float(dt), 1e-3)
+        z = np.asarray(metric_xy, dtype=np.float64).reshape(2)
+        sigma = self.fix_sigma_base_m / max(float(confidence), _CONF_FLOOR)
+
+        # OF-track position at this node's time — recorded NOW, while the
+        # track state is contemporary (extrapolating backward later from newer
+        # samples would be invalid).
+        of_boundary = self._of.value_at(t_node)
+
+        node = _Node(
+            uid=self._uid_seq,
+            t=t_node,
+            z=z,
+            sigma=sigma,
+            accepted=bool(accepted),
+            kf_xy=None
+            if kf_xy is None
+            else np.asarray(kf_xy, dtype=np.float64).reshape(2),
+            of_boundary=of_boundary,
+        )
+        self._uid_seq += 1
+
+        # Odometry edge from the previous node: OF-track displacement between
+        # the two node times. Both boundary samples are anchored at the same
+        # accepted keyframe's homography, so their difference is a
+        # fix-independent relative measurement. An accepted previous node IS
+        # the track's origin — its raw fix is the boundary sample.
+        if self._nodes and of_boundary is not None:
+            prev = self._nodes[-1]
+            start = prev.z if prev.accepted else prev.of_boundary
+            if start is not None:
+                w = 1.0 / (self.odom_sigma_base_m / self._of.q_min) ** 2
+                self._edges.append(
+                    _Edge(a=prev.uid, b=node.uid, delta=of_boundary - start, weight=w)
+                )
+
+        self._nodes.append(node)
+        self._t_last_node = t_node
+        if accepted:
+            self._t_last_success = t_node
+            self._of.clear()  # the OF track re-anchors at this keyframe
+
+        self._slide()
+        solution = self.solve()
+
+        if solution is None or not accepted or node.kf_xy is None:
+            return None
+
+        step = self._servo_step(solution)
+        if step is not None:
+            # Контракт: повернений крок ВЖЕ вважається застосованим викликачем
+            # (localizer робить trajectory_filter.shift безумовно). Ребейз
+            # збережених kf_xy у зсунуту систему — інакше лагова різниця
+            # рахувала б той самий офсет ще lag разів і серво перелітало б.
+            for nd in self._nodes:
+                if nd.kf_xy is not None:
+                    nd.kf_xy = nd.kf_xy + step
+        return step
+
+    def _servo_step(self, solution: np.ndarray) -> np.ndarray | None:
+        """Крок корекції fixed-lag servo або None.
+
+        Різниця smoothed - KF береться на вузлі з глибиною >= correction_lag
+        (там обидві оцінки вже устоялись — різниця вимірює систематичний
+        дрейф, а не пер-фіксовий шум). Далі deadband (не смикати KF у
+        номінальному польоті), гейн і обмеження кроку (плавна збіжність
+        замість телепорту; збіжність геометрична завдяки ребейзу kf_xy).
+        """
+        lag = self.correction_lag
+        if len(self._nodes) <= lag:
+            return None
+        for idx in range(len(self._nodes) - 1 - lag, -1, -1):
+            ref = self._nodes[idx]
+            if ref.kf_xy is not None:
+                break
+        else:
+            return None  # у лаговій зоні нема жодного прийнятого вузла
+
+        corr = solution[idx] - ref.kf_xy
+        norm = float(np.linalg.norm(corr))
+        if norm > self.max_correction_m:
+            logger.warning(
+                f"Smoother drift estimate clamped: {norm:.1f} m -> {self.max_correction_m} m"
+            )
+            corr = corr * (self.max_correction_m / norm)
+            norm = self.max_correction_m
+        if norm < self.deadband_m:
+            return None
+
+        step = corr * self.gain
+        step_norm = float(np.linalg.norm(step))
+        if step_norm > self.max_step_m:
+            step = step * (self.max_step_m / step_norm)
+        logger.debug(
+            f"Smoother servo: drift {norm:.2f} m at lag {lag}, "
+            f"step {float(np.linalg.norm(step)):.2f} m"
+        )
+        return step
+
+    # ── window maintenance ───────────────────────────────────────────────────
+
+    def _slide(self) -> None:
+        while len(self._nodes) > self.window:
+            dropped = self._nodes.pop(0)
+            self._edges = [
+                e for e in self._edges if e.a != dropped.uid and e.b != dropped.uid
+            ]
+            # Entry prior: the new head keeps its last smoothed estimate as a
+            # weak unary factor — cheap stand-in for proper marginalization,
+            # prevents the window head from floating when old fixes leave.
+            head = self._nodes[0]
+            smoothed = self._last_solution.get(head.uid)
+            if smoothed is not None:
+                head.prior = (smoothed.copy(), self.entry_prior_sigma_m)
+
+    # ── solver ───────────────────────────────────────────────────────────────
+
+    def solve(self) -> np.ndarray | None:
+        """Huber-IRLS solve of the current window. Returns (N, 2) smoothed
+        positions in node order, or None if the window is empty/degenerate."""
+        n = len(self._nodes)
+        if n == 0:
+            return None
+
+        uid_to_idx = {node.uid: i for i, node in enumerate(self._nodes)}
+        z = np.stack([node.z for node in self._nodes])  # (n, 2)
+        sig = np.array([node.sigma for node in self._nodes])  # (n,)
+        w_fix_base = 1.0 / np.square(sig)
+
+        e_a = np.array([uid_to_idx[e.a] for e in self._edges], dtype=np.int64)
+        e_b = np.array([uid_to_idx[e.b] for e in self._edges], dtype=np.int64)
+        e_d = (
+            np.stack([e.delta for e in self._edges])
+            if self._edges
+            else np.zeros((0, 2))
+        )
+        e_w = np.array([e.weight for e in self._edges], dtype=np.float64)
+
+        diag = np.arange(n)
+        hw = np.ones(n, dtype=np.float64)  # Huber weights on fixes
+        p = z.copy()
+
+        for _ in range(self.irls_iterations):
+            w_fix = w_fix_base * hw
+            A = np.zeros((n, n), dtype=np.float64)
+            b = np.zeros((n, 2), dtype=np.float64)
+
+            A[diag, diag] += w_fix
+            b += w_fix[:, None] * z
+
+            for i, node in enumerate(self._nodes):
+                if node.prior is not None:
+                    pw = 1.0 / node.prior[1] ** 2
+                    A[i, i] += pw
+                    b[i] += pw * node.prior[0]
+
+            if len(self._edges):
+                np.add.at(A, (e_a, e_a), e_w)
+                np.add.at(A, (e_b, e_b), e_w)
+                np.add.at(A, (e_a, e_b), -e_w)
+                np.add.at(A, (e_b, e_a), -e_w)
+                np.subtract.at(b, e_a, e_w[:, None] * e_d)
+                np.add.at(b, e_b, e_w[:, None] * e_d)
+
+            try:
+                p = np.linalg.solve(A, b)
+            except np.linalg.LinAlgError:
+                logger.warning("Smoother solve failed (singular system) — skipping")
+                return None
+
+            u = np.linalg.norm(p - z, axis=1) / sig
+            hw = np.where(u <= self.huber_k, 1.0, self.huber_k / np.maximum(u, 1e-12))
+
+        self._last_solution = {
+            node.uid: p[i].copy() for i, node in enumerate(self._nodes)
+        }
+        self._last_fix_weights = {
+            node.uid: float(hw[i]) for i, node in enumerate(self._nodes)
+        }
+        return p
+
+    # ── introspection (tests / telemetry) ────────────────────────────────────
+
+    @property
+    def num_nodes(self) -> int:
+        return len(self._nodes)
+
+    @property
+    def num_edges(self) -> int:
+        return len(self._edges)
+
+    @property
+    def last_fix_weights(self) -> dict[int, float]:
+        """uid -> final Huber weight of the fix (1.0 = fully trusted)."""
+        return dict(self._last_fix_weights)
 
 
 # ================================================================================
-# File: utils\image_preprocessor.py
+# File: src\utils\__init__.py
+# ================================================================================
+"""Utilities module"""
+
+
+# ================================================================================
+# File: src\utils\atomic_io.py
+# ================================================================================
+"""
+Атомарний запис файлів: tempfile у тій самій директорії + os.replace.
+
+Навіщо: прямий open(path, "w") при конкурентному записі або краші процесу
+залишає файл обрізаним/зіпсованим (реальний випадок: 470 хвостових null-байтів
+у config.py після конкурентного збереження). os.replace — атомарний на
+POSIX і Windows (NTFS), тому читач завжди бачить або стару, або нову версію.
+"""
+
+import os
+import tempfile
+
+
+def atomic_write_bytes(path: str, data: bytes) -> None:
+    """Атомарно записує bytes у файл."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(path: str, text: str, encoding: str = "utf-8") -> None:
+    """Атомарно записує текст у файл."""
+    atomic_write_bytes(path, text.encode(encoding))
+
+
+# ================================================================================
+# File: src\utils\fault_injection.py
+# ================================================================================
+"""HARDENING P3-15 (first slice): deterministic fault injection for the
+soak / fault-injection harness.
+
+The payload runs unattended for hours in a contested environment; the failure
+modes that matter are *runtime* ones the unit suite never sees — a decoder
+handing back a garbled frame, a link stall that freezes the stream, a mid-flight
+end-of-stream, a decode exception. This module manufactures those on demand so
+``scripts/soak_test.py`` can drive the real pipeline through them and watch the
+operating-state machine (P1-9/10) and latency tracker (P1-8) react.
+
+Two layers, deliberately split:
+
+* ``FaultInjector`` — pure logic. Given ``(ret, frame, frame_idx)`` it returns a
+  possibly-transformed ``(ret, frame)`` plus an injected ``delay_sec``. Seeded
+  RNG makes a run byte-for-byte reproducible. No cv2, no I/O — unit-testable
+  anywhere numpy is available.
+* ``FaultInjectingVideoSource`` — a thin ``VideoSource`` subclass that reads a
+  real clip (optionally looping it for a long soak) and pipes each frame through
+  a ``FaultInjector``. It plugs into the existing seam: ``RealtimeTrackingWorker``
+  already accepts a pre-built ``VideoSource`` object, so nothing on the
+  production hot path changes.
+
+Nothing here is wired into the application. It is a test tool, invoked only by
+the harness — so it needs no config flag and carries no risk to a stock run.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from enum import StrEnum
+
+import numpy as np
+
+from src.video.video_source import VideoSource, VideoSourceConfig
+
+
+class FaultType(StrEnum):
+    """A single injectable fault. String-valued so profiles round-trip to JSON."""
+
+    NONE = "none"  # pass the frame through unchanged
+    CORRUPT = "corrupt"  # same shape, garbled pixels (decoder bit-rot)
+    BLACK = "black"  # zeroed frame (dropped/blanked capture)
+    FREEZE = "freeze"  # repeat the last good frame (stalled stream)
+    SHAPE = "shape"  # wrong dimensions (partial/resynced decode)
+    DELAY = "delay"  # frame is fine, but arrives late (link/decode stall)
+    EOF = "eof"  # (False, None): end-of-stream / connection lost
+    EXCEPTION = "exception"  # raise inside read(): a hard decode error
+
+
+class FaultInjectionError(RuntimeError):
+    """Raised by an injected EXCEPTION fault to simulate a hard decode failure."""
+
+
+@dataclass
+class FaultProfile:
+    """What faults to inject and when.
+
+    Precedence per frame, highest first:
+      1. ``schedule[frame_idx]`` — an exact single-frame event.
+      2. the first matching ``windows`` entry — an inclusive ``[start, end]`` burst.
+      3. ``probabilities`` — one seeded RNG roll walked over the cumulative mass.
+
+    ``probabilities`` values must sum to <= 1.0; the remaining mass is NONE.
+    ``delay_sec`` is how long a DELAY fault stalls; ``corrupt_full`` picks
+    whole-frame noise vs. a garbled patch.
+    """
+
+    name: str = "none"
+    enabled: bool = True
+    probabilities: dict[FaultType, float] = field(default_factory=dict)
+    schedule: dict[int, FaultType] = field(default_factory=dict)
+    windows: list[tuple[int, int, FaultType]] = field(default_factory=list)
+    delay_sec: float = 0.5
+    corrupt_full: bool = True
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        # Normalize keys that arrived as plain strings (e.g. from JSON) first,
+        # so the sum check below sees canonical FaultType keys.
+        self.probabilities = {FaultType(k): float(v) for k, v in self.probabilities.items()}
+        self.schedule = {int(k): FaultType(v) for k, v in self.schedule.items()}
+        self.windows = [(int(s), int(e), FaultType(t)) for s, e, t in self.windows]
+        total = sum(self.probabilities.values())
+        if total > 1.0 + 1e-9:
+            raise ValueError(f"FaultProfile '{self.name}': probabilities sum to {total:.3f} > 1.0")
+
+    @classmethod
+    def from_dict(cls, d: dict) -> FaultProfile:
+        return cls(**d)
+
+
+class FaultInjector:
+    """Applies a :class:`FaultProfile` to a frame stream, deterministically.
+
+    Stateless except for: the seeded RNG, the last good frame (for FREEZE), and
+    per-type hit counters (for the harness report).
+    """
+
+    def __init__(self, profile: FaultProfile):
+        self.profile = profile
+        self._rng = np.random.default_rng(profile.seed)
+        self._last_good: np.ndarray | None = None
+        self.counts: dict[FaultType, int] = {t: 0 for t in FaultType}
+
+    # -- selection -----------------------------------------------------------
+
+    def _select(self, frame_idx: int) -> FaultType:
+        """Decide which fault (if any) fires on this frame."""
+        if not self.profile.enabled:
+            return FaultType.NONE
+
+        scheduled = self.profile.schedule.get(frame_idx)
+        if scheduled is not None:
+            return scheduled
+
+        for start, end, ftype in self.profile.windows:
+            if start <= frame_idx <= end:
+                return ftype
+
+        if not self.profile.probabilities:
+            return FaultType.NONE
+
+        # One roll, walked over the cumulative probability mass. Deterministic
+        # given the seed and the number of prior rolls.
+        u = float(self._rng.random())
+        cum = 0.0
+        for ftype, p in self.profile.probabilities.items():
+            cum += p
+            if u < cum:
+                return ftype
+        return FaultType.NONE
+
+    # -- application ---------------------------------------------------------
+
+    def apply(
+        self, ret: bool, frame: np.ndarray | None, frame_idx: int
+    ) -> tuple[bool, np.ndarray | None, float]:
+        """Transform one read result. Returns ``(ret, frame, delay_sec)``.
+
+        Raises :class:`FaultInjectionError` for an EXCEPTION fault so the caller
+        exercises its real error path.
+        """
+        ftype = self._select(frame_idx)
+        self.counts[ftype] += 1
+
+        # Advance the last-good pointer so FREEZE has something to repeat — but
+        # NOT on a freeze itself: a stalled stream means no new frame arrived, so
+        # the pointer must stay on the previous frame.
+        if ret and frame is not None and ftype != FaultType.FREEZE:
+            self._last_good = frame
+
+        if ftype == FaultType.NONE:
+            return ret, frame, 0.0
+        if ftype == FaultType.EOF:
+            return False, None, 0.0
+        if ftype == FaultType.EXCEPTION:
+            raise FaultInjectionError(f"injected decode error at frame {frame_idx}")
+        if ftype == FaultType.DELAY:
+            return ret, frame, float(self.profile.delay_sec)
+
+        # The remaining faults mutate pixels; with no frame to mutate they no-op.
+        if frame is None:
+            return ret, frame, 0.0
+
+        if ftype == FaultType.BLACK:
+            return ret, np.zeros_like(frame), 0.0
+        if ftype == FaultType.FREEZE:
+            repeat = self._last_good if self._last_good is not None else frame
+            return ret, repeat.copy(), 0.0
+        if ftype == FaultType.CORRUPT:
+            return ret, self._corrupt(frame), 0.0
+        if ftype == FaultType.SHAPE:
+            return ret, self._reshape(frame), 0.0
+
+        return ret, frame, 0.0
+
+    # -- pixel mutators ------------------------------------------------------
+
+    def _corrupt(self, frame: np.ndarray) -> np.ndarray:
+        """Garble the frame while keeping a valid shape/dtype."""
+        if self.profile.corrupt_full:
+            return self._rng.integers(0, 256, size=frame.shape, dtype=frame.dtype)
+        out = frame.copy()
+        h = frame.shape[0]
+        # A garbled band across the middle third — a partial-decode look.
+        y0, y1 = h // 3, (2 * h) // 3
+        out[y0:y1] = self._rng.integers(0, 256, size=out[y0:y1].shape, dtype=frame.dtype)
+        return out
+
+    @staticmethod
+    def _reshape(frame: np.ndarray) -> np.ndarray:
+        """Return a wrong-sized frame (half resolution) to test shape handling."""
+        h, w = frame.shape[:2]
+        nh, nw = max(1, h // 2), max(1, w // 2)
+        return frame[:nh, :nw].copy()
+
+    # -- reporting -----------------------------------------------------------
+
+    def summary(self) -> dict[str, int]:
+        """Per-fault-type hit counts, only for types that fired at least once."""
+        return {t.value: c for t, c in self.counts.items() if c and t != FaultType.NONE}
+
+
+# --- built-in profiles ------------------------------------------------------
+# Named presets the harness exposes via --profile. Each is deterministic given
+# its seed; override the seed on the CLI to explore other draws.
+
+PROFILES: dict[str, FaultProfile] = {
+    # Baseline: no faults. Isolates pipeline behaviour on a clean loop.
+    "clean": FaultProfile(name="clean", enabled=True),
+    # Light mix — a soak that occasionally perturbs the stream.
+    "smoke": FaultProfile(
+        name="smoke",
+        probabilities={FaultType.CORRUPT: 0.01, FaultType.BLACK: 0.01, FaultType.DELAY: 0.01},
+        delay_sec=0.3,
+        seed=1,
+    ),
+    # Heavy corruption — stress the frame-content robustness path.
+    "corruption": FaultProfile(
+        name="corruption",
+        probabilities={FaultType.CORRUPT: 0.15, FaultType.SHAPE: 0.05},
+        seed=2,
+    ),
+    # A sustained freeze burst + jitter. NOTE: a frozen frame is still a *valid*
+    # frame, so localization keeps succeeding on it and the state stays TRACKING
+    # (confirmed empirically). This profile stresses freeze/jitter robustness, it
+    # does NOT drive LOST — use "blackout" for that.
+    "stall": FaultProfile(
+        name="stall",
+        windows=[(200, 320, FaultType.FREEZE)],
+        probabilities={FaultType.DELAY: 0.02},
+        delay_sec=0.5,
+        seed=3,
+    ),
+    # A sustained blackout: ~400 frames of unlocalizable black frames. Sized to
+    # keep the fix clock starved for well over fix_stale_sec (default 3s) even if
+    # black frames fail fast, so the state machine SHOULD go TRACKING -> LOST and
+    # then recover once real frames resume. (A 140-frame window sat right at the
+    # threshold and did not trip — see max_fix_age_sec in the soak report.)
+    "blackout": FaultProfile(
+        name="blackout",
+        windows=[(200, 600, FaultType.BLACK)],
+        seed=6,
+    ),
+    # Intermittent link loss — an injected EOF. NOTE: EOF ends the stream (the
+    # worker breaks and goes IDLE), so this tests graceful shutdown on a mid-
+    # stream drop, NOT the LOST path.
+    "link-loss": FaultProfile(
+        name="link-loss",
+        schedule={500: FaultType.EOF},
+        seed=4,
+    ),
+    # A single long link STALL: the stream stays alive but goes silent for ~6s
+    # (one frame arrives 6s late). No new fix for well over fix_stale_sec (3s),
+    # so the state SHOULD go TRACKING -> LOST and then recover when frames
+    # resume. This is the real absence-of-fix test (blackout is bad *content*;
+    # this is *no* content for a while).
+    "linkstall": FaultProfile(
+        name="linkstall",
+        schedule={400: FaultType.DELAY},
+        delay_sec=6.0,
+        seed=7,
+    ),
+    # Rare hard decode error — exercises the worker/supervisor exception path.
+    "decode-error": FaultProfile(
+        name="decode-error",
+        schedule={750: FaultType.EXCEPTION},
+        seed=5,
+    ),
+}
+
+
+def get_profile(name_or_dict) -> FaultProfile:
+    """Resolve a profile from a preset name or an inline dict/FaultProfile."""
+    if isinstance(name_or_dict, FaultProfile):
+        return name_or_dict
+    if isinstance(name_or_dict, dict):
+        return FaultProfile.from_dict(name_or_dict)
+    if name_or_dict in PROFILES:
+        return PROFILES[name_or_dict]
+    raise KeyError(f"unknown fault profile: {name_or_dict!r} (known: {sorted(PROFILES)})")
+
+
+class FaultInjectingVideoSource(VideoSource):
+    """A ``VideoSource`` that reads a real clip through a :class:`FaultInjector`.
+
+    Plugs straight into ``RealtimeTrackingWorker`` (which accepts a pre-built
+    ``VideoSource``). For a long soak it can loop the underlying clip so a short
+    video sustains an hours-long run; a deliberately-scheduled EOF fault still
+    ends the stream regardless of looping.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        profile: FaultProfile | str | dict,
+        *,
+        loop: bool = True,
+        config: VideoSourceConfig | None = None,
+    ):
+        cfg = config or VideoSourceConfig(source=str(source))
+        super().__init__(cfg)
+        self.injector = FaultInjector(get_profile(profile))
+        self.loop = loop
+        self.frame_idx = -1
+        self.loops_completed = 0
+        self._sleep = time.sleep  # bound so tests can stub out real waiting
+
+    def _read_looping(self) -> tuple[bool, np.ndarray | None]:
+        """Underlying read, re-seeking to the start on a natural EOF when looping."""
+        ret, frame = super().read()
+        if not ret and self.loop and self._cap is not None:
+            import cv2
+
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.loops_completed += 1
+            ret, frame = super().read()
+        return ret, frame
+
+    def read(self) -> tuple[bool, np.ndarray | None]:  # type: ignore[override]
+        self.frame_idx += 1
+        ret, frame = self._read_looping()
+        ret, frame, delay = self.injector.apply(ret, frame, self.frame_idx)
+        if delay > 0:
+            self._sleep(delay)
+        return ret, frame
+
+    def report(self) -> dict:
+        """Injection stats for the harness report."""
+        return {
+            "profile": self.injector.profile.name,
+            "frames_read": self.frame_idx + 1,
+            "loops_completed": self.loops_completed,
+            "faults_injected": self.injector.summary(),
+        }
+
+
+# ================================================================================
+# File: src\utils\hardware_profile.py
+# ================================================================================
+"""Hardware auto-detection and compute auto-tuning.
+
+Probes GPU (VRAM, compute capability, architecture) and CPU (cores, RAM)
+at startup, classifies the system into performance tiers, and returns
+optimal overrides for all compute-sensitive config fields.
+
+Usage::
+
+    from src.utils.hardware_profile import HardwareProfile
+
+    profile = HardwareProfile.detect()
+    profile.log_summary()
+    overrides = profile.auto_tune(current_config_dict)
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+from dataclasses import dataclass, field
+from typing import Any
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+# ── Tier thresholds ──────────────────────────────────────────────────────────
+# Tier is determined by VRAM first, then CPU cores as a secondary factor.
+_TIER_VRAM_THRESHOLDS = {
+    # (min_vram_gb, tier_name)
+    "ultra": 16.0,
+    "high": 10.0,
+    "mid": 6.0,
+    "low": 0.0,  # fallback
+}
+
+
+def _classify_tier(vram_gb: float, cpu_cores: int) -> str:
+    """Classify into low / mid / high / ultra based on VRAM and CPU cores."""
+    if vram_gb >= _TIER_VRAM_THRESHOLDS["ultra"]:
+        return "ultra"
+    if vram_gb >= _TIER_VRAM_THRESHOLDS["high"]:
+        return "high"
+    if vram_gb >= _TIER_VRAM_THRESHOLDS["mid"]:
+        # Demote to low if CPU is also very weak (≤2 cores)
+        return "mid" if cpu_cores > 2 else "low"
+    return "low"
+
+
+# ── Database-interchangeability guard ────────────────────────────────────────
+# auto_tune() may change ONLY these keys. Every one affects SPEED (or, for
+# fp16/torch_compile, tiny numeric wobble), never the STRUCTURE or content-TYPE
+# of a database. Any dot-path NOT in this set is refused by _propose() below
+# (fail-closed) — so no hardware difference can ever make two machines build
+# non-interchangeable databases. Structure-defining keys (local_extractor,
+# global_descriptor.backend, vlad.*, database.max_keypoints_stored,
+# keypoint_video_scale, frame_step, sift_max_keypoints, store_sift_features)
+# are deliberately ABSENT and must be set explicitly in user_config.json.
+TUNABLE_KEYS: frozenset[str] = frozenset({
+    "models.vram_management.max_vram_ratio",
+    "models.performance.torch_compile",
+    "models.performance.fp16_enabled",
+    "models.performance.propagation_max_workers",
+    "database.yolo_batch_size",
+    "database.prefetch_queue_size",
+    "database.decode_batch_size",
+})
+
+
+@dataclass
+class GPUInfo:
+    """Detected GPU properties."""
+    available: bool = False
+    name: str = "N/A"
+    vram_total_gb: float = 0.0
+    vram_free_gb: float = 0.0
+    compute_capability: tuple[int, int] = (0, 0)
+    # SM 8.0+ = Ampere (A100/RTX30xx), SM 8.6+ (RTX30xx consumer), SM 8.9 (RTX40xx)
+    is_ampere_plus: bool = False
+    multi_gpu_count: int = 0
+    driver_version: str = "N/A"
+
+
+@dataclass
+class CPUInfo:
+    """Detected CPU properties."""
+    physical_cores: int = 1
+    logical_threads: int = 1
+    ram_total_gb: float = 0.0
+    architecture: str = "unknown"
+
+
+@dataclass
+class HardwareProfile:
+    """Full hardware profile with tier classification and auto-tune capability."""
+    gpu: GPUInfo = field(default_factory=GPUInfo)
+    cpu: CPUInfo = field(default_factory=CPUInfo)
+    tier: str = "low"
+    os_name: str = "unknown"
+
+    @classmethod
+    def detect(cls) -> HardwareProfile:
+        """Probe the current system and return a populated HardwareProfile."""
+        profile = cls()
+        profile.os_name = platform.system()
+
+        # ── CPU Detection ────────────────────────────────────────────────────
+        profile.cpu = cls._detect_cpu()
+
+        # ── GPU Detection ────────────────────────────────────────────────────
+        profile.gpu = cls._detect_gpu()
+
+        # ── Tier Classification ──────────────────────────────────────────────
+        vram = profile.gpu.vram_total_gb if profile.gpu.available else 0.0
+        profile.tier = _classify_tier(vram, profile.cpu.physical_cores)
+
+        return profile
+
+    @staticmethod
+    def _detect_cpu() -> CPUInfo:
+        """Detect CPU core count and RAM."""
+        info = CPUInfo()
+        info.architecture = platform.machine()
+
+        # Physical cores (fallback to logical if unavailable)
+        try:
+            import psutil
+            info.physical_cores = psutil.cpu_count(logical=False) or 1
+            info.logical_threads = psutil.cpu_count(logical=True) or info.physical_cores
+            info.ram_total_gb = psutil.virtual_memory().total / (1024 ** 3)
+        except ImportError:
+            # psutil not available — use os.cpu_count (returns logical threads)
+            logical = os.cpu_count() or 1
+            info.logical_threads = logical
+            # Heuristic: assume ~half are physical on x86 with HT
+            info.physical_cores = max(1, logical // 2)
+            # RAM fallback for Windows
+            if platform.system() == "Windows":
+                try:
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    c_ulong = ctypes.c_ulonglong
+                    class MEMORYSTATUSEX(ctypes.Structure):
+                        _fields_ = [
+                            ("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", c_ulong),
+                            ("ullAvailPhys", c_ulong),
+                            ("ullTotalPageFile", c_ulong),
+                            ("ullAvailPageFile", c_ulong),
+                            ("ullTotalVirtual", c_ulong),
+                            ("ullAvailVirtual", c_ulong),
+                            ("ullAvailExtendedVirtual", c_ulong),
+                        ]
+                    stat = MEMORYSTATUSEX()
+                    stat.dwLength = ctypes.sizeof(stat)
+                    kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                    info.ram_total_gb = stat.ullTotalPhys / (1024 ** 3)
+                except Exception:
+                    info.ram_total_gb = 0.0
+            else:
+                try:
+                    with open("/proc/meminfo") as f:
+                        for line in f:
+                            if line.startswith("MemTotal"):
+                                info.ram_total_gb = int(line.split()[1]) / (1024 ** 2)
+                                break
+                except Exception:
+                    info.ram_total_gb = 0.0
+
+        return info
+
+    @staticmethod
+    def _detect_gpu() -> GPUInfo:
+        """Detect GPU via PyTorch CUDA."""
+        info = GPUInfo()
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return info
+
+            info.available = True
+            info.multi_gpu_count = torch.cuda.device_count()
+            info.name = torch.cuda.get_device_name(0)
+
+            props = torch.cuda.get_device_properties(0)
+            info.vram_total_gb = props.total_memory / (1024 ** 3)
+            info.compute_capability = (props.major, props.minor)
+            # Ampere = SM 8.0+
+            info.is_ampere_plus = props.major >= 8
+
+            free_mem, _ = torch.cuda.mem_get_info(0)
+            info.vram_free_gb = free_mem / (1024 ** 3)
+
+            # Driver version (NVML)
+            try:
+                info.driver_version = torch._C._cuda_getDriverVersion()
+                # Returns int like 12040 → "12.4"
+                if isinstance(info.driver_version, int):
+                    major = info.driver_version // 1000
+                    minor = (info.driver_version % 1000) // 10
+                    info.driver_version = f"{major}.{minor}"
+            except Exception:
+                info.driver_version = "N/A"
+
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"GPU detection failed: {e}")
+
+        return info
+
+    def log_summary(self) -> None:
+        """Log the full hardware profile to the application logger."""
+        sep = "=" * 70
+        logger.info(sep)
+        logger.info("HARDWARE PROFILE")
+        logger.info(sep)
+
+        if self.gpu.available:
+            sm = f"SM {self.gpu.compute_capability[0]}.{self.gpu.compute_capability[1]}"
+            ampere = " (Ampere+)" if self.gpu.is_ampere_plus else ""
+            logger.info(
+                f"GPU:    {self.gpu.name} | "
+                f"{self.gpu.vram_total_gb:.1f} GB VRAM "
+                f"({self.gpu.vram_free_gb:.1f} GB free) | "
+                f"{sm}{ampere}"
+            )
+            if self.gpu.multi_gpu_count > 1:
+                logger.info(f"        Multi-GPU: {self.gpu.multi_gpu_count} devices detected")
+        else:
+            logger.warning("GPU:    No CUDA GPU detected — running on CPU only")
+
+        logger.info(
+            f"CPU:    {self.cpu.physical_cores} cores / "
+            f"{self.cpu.logical_threads} threads | "
+            f"{self.cpu.ram_total_gb:.1f} GB RAM"
+        )
+        logger.info(f"Tier:   {self.tier.upper()}")
+        logger.info(sep)
+
+    def auto_tune(self, current_config: dict[str, Any]) -> dict[str, tuple[Any, Any, str]]:
+        """Compute optimal config overrides based on detected hardware.
+
+        Returns a dict of ``{dot_path: (old_value, new_value, reason)}``
+        for every setting that should be changed.  Values the user has
+        explicitly customized (non-default) are **never** overwritten.
+
+        The caller is responsible for applying the overrides to the live
+        config objects.
+        """
+        overrides: dict[str, tuple[Any, Any, str]] = {}
+        tier = self.tier
+        gpu = self.gpu
+        cpu = self.cpu
+
+        # ── Helper: only override if current value equals the default ────────
+        def _propose(path: str, default_val: Any, new_val: Any, reason: str):
+            """Propose an override only if the current config holds the default value."""
+            # Fail-closed interchangeability guard: refuse any non-tunable key so
+            # hardware can never alter a database's structure/content-type.
+            if path not in TUNABLE_KEYS:
+                logger.error(
+                    "auto_tune BLOCKED non-tunable key %r — only speed keys may be "
+                    "auto-tuned; structure-defining keys stay hardware-independent "
+                    "so databases remain interchangeable." % path
+                )
+                return
+            # Navigate dot-path in the config dict
+            keys = path.split(".")
+            current = current_config
+            for k in keys:
+                if isinstance(current, dict) and k in current:
+                    current = current[k]
+                else:
+                    current = default_val  # not found → treat as default
+                    break
+            if current == default_val and new_val != default_val:
+                overrides[path] = (default_val, new_val, reason)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # GPU-side tuning
+        # ══════════════════════════════════════════════════════════════════════
+
+        if gpu.available:
+            # VRAM ratio — higher on beefier cards
+            vram_ratios = {"low": 0.75, "mid": 0.8, "high": 0.85, "ultra": 0.9}
+            _propose(
+                "models.vram_management.max_vram_ratio",
+                0.8,
+                vram_ratios[tier],
+                f"{tier}-tier GPU: safe to use {vram_ratios[tier]*100:.0f}% VRAM",
+            )
+
+            # YOLO batch size — more VRAM → bigger batches
+            yolo_batches = {"low": 1, "mid": 2, "high": 4, "ultra": 8}
+            _propose(
+                "database.yolo_batch_size",
+                1,
+                yolo_batches[tier],
+                f"{tier}-tier GPU: YOLO micro-batch {yolo_batches[tier]}",
+            )
+
+            # torch.compile — only on high+ tier (requires Triton on Windows)
+            if tier in ("high", "ultra"):
+                _propose(
+                    "models.performance.torch_compile",
+                    False,
+                    True,
+                    f"{tier}-tier GPU: torch.compile may improve throughput",
+                )
+
+            # FP16 — force on low tier to save VRAM
+            if tier == "low":
+                _propose(
+                    "models.performance.fp16_enabled",
+                    True,
+                    True,
+                    "low-tier GPU: FP16 required to fit models in VRAM",
+                )
+
+            # NOTE: max_keypoints is intentionally NOT auto-tuned.
+            # It defines the HDF5 dataset shape (num_frames, max_kps, ...) and
+            # changing it per-system would make databases non-interchangeable.
+            # Users who want more keypoints should set it explicitly in user_config.json.
+
+        # ══════════════════════════════════════════════════════════════════════
+        # CPU-side tuning
+        # ══════════════════════════════════════════════════════════════════════
+
+        # Prefetch queue — scale with thread count and RAM
+        prefetch_sizes = {"low": 16, "mid": 32, "high": 64, "ultra": 96}
+        # Use tier but also floor at cpu-derived value
+        cpu_prefetch = max(32, cpu.logical_threads * 4)
+        target_prefetch = max(prefetch_sizes.get(tier, 32), cpu_prefetch)
+        # Cap at reasonable maximum
+        target_prefetch = min(target_prefetch, 128)
+        _propose(
+            "database.prefetch_queue_size",
+            32,
+            target_prefetch,
+            f"{cpu.logical_threads} threads → prefetch queue {target_prefetch}",
+        )
+
+        # Decode batch size — scale with CPU+GPU capability
+        decode_batches = {"low": 16, "mid": 32, "high": 64, "ultra": 96}
+        _propose(
+            "database.decode_batch_size",
+            32,
+            decode_batches[tier],
+            f"{tier}-tier: decode batch {decode_batches[tier]}",
+        )
+
+        # Propagation workers — match physical cores (capped)
+        prop_workers = min(cpu.physical_cores, 8)
+        _propose(
+            "models.performance.propagation_max_workers",
+            4,
+            prop_workers,
+            f"{cpu.physical_cores} physical cores → {prop_workers} propagation workers",
+        )
+
+        return overrides
+
+    def apply_overrides(
+        self, config_dict: dict[str, Any], overrides: dict[str, tuple[Any, Any, str]]
+    ) -> None:
+        """Apply computed overrides to a mutable config dictionary in-place."""
+        for dot_path, (_, new_val, _) in overrides.items():
+            keys = dot_path.split(".")
+            target = config_dict
+            for k in keys[:-1]:
+                if k not in target:
+                    target[k] = {}
+                target = target[k]
+            target[keys[-1]] = new_val
+
+    def apply_torch_backends(self, deterministic: bool = False) -> None:
+        """Configure PyTorch global backend settings based on hardware.
+
+        Should be called once at startup, after detection. Sets:
+        - ``torch.backends.cudnn.benchmark`` for CNN workloads
+        - TF32 matmul/convolution on Ampere+ GPUs
+        - ``torch.set_num_threads`` for CPU parallelism
+        - ``cv2.setNumThreads`` for OpenCV parallelism
+
+        HARDENING P1-8: when ``deterministic`` is True, cuDNN benchmarking is
+        disabled to bound worst-case latency (no variable first-call autotuning,
+        no nondeterministic kernel selection). Trades some throughput for
+        predictability. Default False = current throughput-tuned behavior.
+        """
+        # ── CPU thread tuning ────────────────────────────────────────────────
+        try:
+            import torch
+            physical = self.cpu.physical_cores
+            torch.set_num_threads(physical)
+            logger.info(f"torch.set_num_threads({physical})")
+        except Exception as e:
+            logger.debug(f"Could not set torch num_threads: {e}")
+
+        try:
+            import cv2
+            physical = self.cpu.physical_cores
+            cv2.setNumThreads(physical)
+            logger.info(f"cv2.setNumThreads({physical})")
+        except Exception as e:
+            logger.debug(f"Could not set cv2 num_threads: {e}")
+
+        if not self.gpu.available:
+            return
+
+        try:
+            import torch
+
+            # cuDNN benchmark: beneficial for repeated same-size convolutions,
+            # but its autotuning makes first-call cost and kernel choice vary.
+            # Deterministic mode (P1-8) disables it for worst-case latency bounding.
+            if deterministic:
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+                logger.info(
+                    "cudnn.benchmark = False, cudnn.deterministic = True "
+                    "(P1-8 deterministic mode — bounded worst-case latency)"
+                )
+            else:
+                torch.backends.cudnn.benchmark = True
+                logger.info("cudnn.benchmark = True")
+
+            # TF32: ~2× matmul throughput on Ampere+ with negligible precision loss
+            # for inference workloads (DINOv2, ALIKED, LightGlue, YOLO)
+            if self.gpu.is_ampere_plus:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                logger.info(
+                    "TF32 matmul ENABLED (Ampere+ GPU detected: "
+                    f"SM {self.gpu.compute_capability[0]}.{self.gpu.compute_capability[1]})"
+                )
+            else:
+                logger.info(
+                    "TF32 matmul not available "
+                    f"(SM {self.gpu.compute_capability[0]}.{self.gpu.compute_capability[1]} < 8.0)"
+                )
+
+        except Exception as e:
+            logger.warning(f"Failed to configure torch backends: {e}")
+
+    def log_overrides(self, overrides: dict[str, tuple[Any, Any, str]]) -> None:
+        """Pretty-print applied overrides to the log."""
+        if not overrides:
+            logger.info("Auto-tune: no overrides needed (all settings already optimal or customized)")
+            return
+
+        logger.info("Auto-tune applied:")
+        items = list(overrides.items())
+        for i, (path, (old, new, reason)) in enumerate(items):
+            connector = "└─" if i == len(items) - 1 else "├─"
+            short_path = path.split(".")[-1]
+            logger.info(f"  {connector} {short_path}: {old} → {new} ({reason})")
+
+
+# ================================================================================
+# File: src\utils\image_preprocessor.py
 # ================================================================================
 import cv2
 import numpy as np
 
-from config.config import get_cfg
+from config import get_cfg
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -13104,7 +22414,7 @@ class ImagePreprocessor:
 
 
 # ================================================================================
-# File: utils\image_utils.py
+# File: src\utils\image_utils.py
 # ================================================================================
 import cv2
 import numpy as np
@@ -13119,16 +22429,15 @@ def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
     if len(cv_image.shape) == 3:
         height, width, channel = cv_image.shape
         bytes_per_line = 3 * width
-        cv_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
 
-        # ВИПРАВЛЕНО: використовуємо .copy() щоб гарантувати неперервність
-        # буфера в пам'яті та захистити від його знищення GC раніше QPixmap.
-        # Без copy() буфер numpy може стати недійсним до відображення → segfault.
-        cv_rgb = np.ascontiguousarray(cv_rgb)
-        q_img = QImage(cv_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        # A7: Format_BGR888 (Qt ≥ 5.14) читає BGR напряму — прибирає повний
+        # cvtColor(BGR2RGB) кадру на кожен виклик (30 разів/с на GUI-потоці).
+        buf = np.ascontiguousarray(cv_image)
+        q_img = QImage(buf.data, width, height, bytes_per_line, QImage.Format.Format_BGR888)
 
-        # Копіюємо в QPixmap одразу, поки cv_rgb ще існує в цьому scope
-        return QPixmap.fromImage(q_img.copy())
+        # QPixmap.fromImage робить глибоку копію у власне сховище, поки buf
+        # живий у цьому scope — додатковий q_img.copy() був зайвою копією кадру.
+        return QPixmap.fromImage(q_img)
 
     elif len(cv_image.shape) == 2:
         height, width = cv_image.shape
@@ -13137,7 +22446,7 @@ def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
         gray = np.ascontiguousarray(cv_image)
         q_img = QImage(gray.data, width, height, bytes_per_line, QImage.Format.Format_Grayscale8)
 
-        return QPixmap.fromImage(q_img.copy())
+        return QPixmap.fromImage(q_img)
 
     return QPixmap()
 
@@ -13161,10 +22470,75 @@ def qpixmap_to_opencv(pixmap: QPixmap) -> np.ndarray:
 
 
 # ================================================================================
-# File: utils\logging_utils.py
+# File: src\utils\latency_tracker.py
+# ================================================================================
+"""HARDENING P1-8 (safe slice): per-frame latency observability.
+
+A navigation payload is judged by worst-case latency, not average FPS. The
+existing pipeline emits an averaged FPS but never surfaces the tail (p95/p99/
+max) where missed deadlines hide. ``LatencyTracker`` records per-frame
+durations the worker already computes and periodically logs percentiles.
+
+Measurement only — it does not alter timing, drop frames, or enforce a
+deadline (the deadline + drop policy is deferred pending a consumer SLA).
+"""
+
+import math
+from collections import deque
+from typing import Any
+
+
+class LatencyTracker:
+    """Rolling window of per-frame latencies with percentile reporting."""
+
+    def __init__(self, window: int = 300, log_interval: int = 100, logger: Any = None):
+        self._samples_ms: deque[float] = deque(maxlen=max(1, window))
+        self._log_interval = max(1, log_interval)
+        self._count = 0
+        self._logger = logger
+
+    def record(self, seconds: float) -> None:
+        """Record one frame's processing time (in seconds); log on interval."""
+        self._samples_ms.append(seconds * 1000.0)
+        self._count += 1
+        if self._logger is not None and self._count % self._log_interval == 0:
+            self._logger.info(self.format_stats())
+
+    def stats(self) -> dict:
+        """Nearest-rank percentiles over the current window (empty if no data)."""
+        if not self._samples_ms:
+            return {}
+        ordered = sorted(self._samples_ms)
+        n = len(ordered)
+
+        def pct(p: float) -> float:
+            rank = min(n - 1, max(0, math.ceil(p / 100.0 * n) - 1))
+            return ordered[rank]
+
+        return {
+            "n": n,
+            "p50_ms": round(pct(50), 1),
+            "p95_ms": round(pct(95), 1),
+            "p99_ms": round(pct(99), 1),
+            "max_ms": round(ordered[-1], 1),
+        }
+
+    def format_stats(self) -> str:
+        st = self.stats()
+        if not st:
+            return "latency: (no samples)"
+        return (
+            f"latency ms | p50={st['p50_ms']} p95={st['p95_ms']} "
+            f"p99={st['p99_ms']} max={st['max_ms']} (n={st['n']})"
+        )
+
+
+# ================================================================================
+# File: src\utils\logging_utils.py
 # ================================================================================
 import os
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -13176,12 +22550,15 @@ def setup_logging(log_level: str = "INFO", log_file: str = "logs/app.log") -> No
     """Налаштування системи логування для всієї програми."""
     logger.remove()
 
-    # Standart output (pretty console)
-    logger.add(
-        sys.stdout,
-        level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    )
+    # Standart output (pretty console). In a --windowed PyInstaller build there
+    # is no console: sys.stdout is None and loguru raises "Cannot log to
+    # NoneType". Skip the console sink then; the file sinks below still capture all.
+    if sys.stdout is not None:
+        logger.add(
+            sys.stdout,
+            level=log_level,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        )
 
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -13214,8 +22591,77 @@ def get_logger(name: str | None = None) -> Any:
     return logger
 
 
+# Kept at module scope so the raw file descriptor stays open for the whole
+# process lifetime — faulthandler writes to it directly from the crash handler.
+_FAULT_LOG_FH = None
+
+
+def enable_crash_handler(log_dir: Any) -> None:
+    """Capture native (CUDA/cv2/torch) crashes that ``sys.excepthook`` cannot.
+
+    HARDENING P0-2. A segfault or native abort kills the process before Python's
+    exception hook runs, leaving no trace. ``faulthandler`` dumps the C-level
+    traceback of all threads to a breadcrumb file so a field crash is
+    diagnosable. Best-effort: diagnostics setup never breaks startup.
+    """
+    global _FAULT_LOG_FH
+    import faulthandler
+
+    try:
+        from datetime import datetime
+
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        crash_path = log_path / "faulthandler.log"
+
+        # Simple size-cap rotation: retain the previous dump, bound growth.
+        try:
+            if crash_path.exists() and crash_path.stat().st_size > 5 * 1024 * 1024:
+                crash_path.replace(crash_path.parent / (crash_path.name + ".1"))
+        except OSError:
+            pass
+
+        _FAULT_LOG_FH = open(crash_path, "a", buffering=1, encoding="utf-8")
+        _FAULT_LOG_FH.write(f"\n=== session start {datetime.now().isoformat()} ===\n")
+        _FAULT_LOG_FH.flush()
+        faulthandler.enable(file=_FAULT_LOG_FH, all_threads=True)
+    except Exception:
+        # Fall back to stderr rather than leaving native crashes untraceable.
+        try:
+            faulthandler.enable()
+        except Exception:
+            pass
+
+
+def fmt_coord(lat: float, lon: float, precision: int = 6) -> str:
+    """Format a lat/lon pair for logging, honoring the redaction flag.
+
+    HARDENING P0-5. When ``models.performance.redact_coords_in_logs`` is True,
+    coordinates are masked so a captured ``app.log`` does not reveal the mission
+    route. Default (flag False) preserves full precision — current behavior.
+
+    Reads the flag defensively (like ``silent_output``): any config-access
+    failure degrades to full precision rather than crashing the caller.
+    """
+    redact = False
+    try:
+        from config import APP_SETTINGS
+
+        if APP_SETTINGS:
+            _models = getattr(APP_SETTINGS, "models", None)
+            _perf = getattr(_models, "performance", None) if _models else None
+            if _perf is not None:
+                redact = getattr(_perf, "redact_coords_in_logs", False)
+    except Exception:
+        redact = False
+
+    if redact:
+        return "lat=<redacted>, lon=<redacted>"
+    return f"lat={lat:.{precision}f}, lon={lon:.{precision}f}"
+
+
 @contextmanager
-def silent_output(force: bool = False):
+def silent_output(force: bool = False) -> Iterator[None]:
     """
     Context manager to suppress output (stdout/stderr).
     By default, it uses a safe Python-level override.
@@ -13224,7 +22670,7 @@ def silent_output(force: bool = False):
     """
     import io
 
-    from config.config import APP_SETTINGS
+    from config import APP_SETTINGS
 
     # Determine if we should be truly silent (FD-level) or just Python-silent
     # We use FD-level only if debug_mode is False to avoid the previous "permanent silence" issues
@@ -13250,21 +22696,37 @@ def silent_output(force: bool = False):
             sys.stderr = save_stderr
         return
 
-    # Aggressive mode: FD-level redirection (os.dup2)
-    # catches C++ output from OpenCV, TensorRT, etc.
-    null_fd = os.open(os.devnull, os.O_RDWR)
-    save_stdout_fd = os.dup(1)
-    save_stderr_fd = os.dup(2)
+    # Aggressive mode: FD-level redirection (os.dup2) catches C++ output from
+    # OpenCV, TensorRT, etc. In a --windowed build FDs 1/2 may be invalid (no
+    # console); output already goes nowhere, so degrade gracefully.
+    null_fd = save_stdout_fd = save_stderr_fd = None
+    try:
+        null_fd = os.open(os.devnull, os.O_RDWR)
+        save_stdout_fd = os.dup(1)
+        save_stderr_fd = os.dup(2)
+    except OSError:
+        for _fd in (null_fd, save_stdout_fd, save_stderr_fd):
+            if _fd is not None:
+                try:
+                    os.close(_fd)
+                except OSError:
+                    pass
+        yield
+        return
 
     try:
-        sys.stdout.flush()
-        sys.stderr.flush()
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        if sys.stderr is not None:
+            sys.stderr.flush()
         os.dup2(null_fd, 1)
         os.dup2(null_fd, 2)
         yield
     finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        if sys.stderr is not None:
+            sys.stderr.flush()
         os.dup2(save_stdout_fd, 1)
         os.dup2(save_stderr_fd, 2)
         os.close(null_fd)
@@ -13273,7 +22735,7 @@ def silent_output(force: bool = False):
 
 
 # ================================================================================
-# File: utils\resolution_normalizer.py
+# File: src\utils\resolution_normalizer.py
 # ================================================================================
 """
 Нормалізація роздільної здатності вхідного кадру до еталонної роздільної здатності бази даних.
@@ -13331,7 +22793,9 @@ class ResolutionNormalizer:
             )
             self._logged_once = True
 
-        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LANCZOS4
+        # A9: CUBIC замість LANCZOS4 для upscale — у рази швидше, різниця
+        # для фіч-екстракторів невідчутна
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
         resized = cv2.resize(frame, (new_w, new_h), interpolation=interpolation)
         return resized, scale
 
@@ -13350,7 +22814,7 @@ class ResolutionNormalizer:
 
 
 # ================================================================================
-# File: utils\telemetry.py
+# File: src\utils\telemetry.py
 # ================================================================================
 import atexit
 import json
@@ -13430,10 +22894,14 @@ class _TelemetryTracker:
             }
         return summary
 
-    def dump_report(self, path="logs/telemetry_report.json"):
+    def dump_report(self, path: str | None = None):
         if not self.stats:
             return
 
+        if path is None:
+            from config import user_data_dir
+
+            path = str(user_data_dir() / "logs" / "telemetry_report.json")
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -13453,13 +22921,131 @@ def _save_telemetry_on_exit():
 
 
 # ================================================================================
-# File: utils\__init__.py
+# File: src\utils\weight_integrity.py
 # ================================================================================
-"""Utilities module"""
+"""HARDENING P2-12: weight-integrity pinning (offline / air-gap assurance).
+
+The models are pre-staged offline; at startup we can verify every weight file
+against a pinned SHA-256 manifest and **fail closed** if any file is missing or
+altered. This detects a swapped/corrupted weight (supply-chain or on-disk
+tamper) before it is ever loaded — a single go/no-go preflight rather than a
+hook threaded through every model-load site.
+
+Modes (``models.performance.weight_integrity_mode``):
+- ``off``     — skip entirely (default; current behavior).
+- ``warn``    — log any mismatch/missing but continue.
+- ``enforce`` — raise on the first problem set; caller aborts startup.
+
+Generate the manifest with ``scripts/generate_weights_manifest.py`` after
+staging weights on the target, then commit/ship ``models/weights_manifest.json``.
+"""
+
+import hashlib
+import json
+from pathlib import Path
+
+WEIGHT_EXTENSIONS = (".pth", ".pt", ".onnx", ".engine")
+# The redirected torch/HF download cache is not part of the pinned weight set.
+_EXCLUDE_DIR_PARTS = (".cache",)
+
+
+class WeightIntegrityError(RuntimeError):
+    """Raised in 'enforce' mode when weights are missing or altered."""
+
+
+def compute_sha256(path: str | Path, chunk_size: int = 1 << 20) -> str:
+    """Streaming SHA-256 of a file (chunked so large .engine files don't OOM)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def iter_weight_files(root: str | Path):
+    """Yield weight files under ``root`` (relative Path), excluding the cache."""
+    root = Path(root)
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or p.suffix.lower() not in WEIGHT_EXTENSIONS:
+            continue
+        rel = p.relative_to(root)
+        if any(part in _EXCLUDE_DIR_PARTS for part in rel.parts):
+            continue
+        yield rel
+
+
+def generate_manifest(root: str | Path) -> dict:
+    """Build a manifest dict {relative_posix_path: sha256} for all weight files."""
+    root = Path(root)
+    return {rel.as_posix(): compute_sha256(root / rel) for rel in iter_weight_files(root)}
+
+
+def verify_manifest(root: str | Path, manifest: dict) -> list[str]:
+    """Return a list of human-readable problems (empty = all pinned files match).
+
+    Checks every file listed in the manifest: reports it if missing or if its
+    hash differs. Files on disk not in the manifest are ignored (the manifest is
+    the authority on what must match).
+    """
+    root = Path(root)
+    problems: list[str] = []
+    for rel, expected in manifest.items():
+        fpath = root / rel
+        if not fpath.is_file():
+            problems.append(f"MISSING: {rel}")
+            continue
+        actual = compute_sha256(fpath)
+        if actual != expected:
+            problems.append(f"MISMATCH: {rel} (expected {expected[:12]}…, got {actual[:12]}…)")
+    return problems
+
+
+def run_preflight(
+    root: str | Path,
+    manifest_path: str | Path,
+    mode: str = "off",
+    logger=None,
+) -> bool:
+    """Run the startup integrity gate. Returns True if OK / skipped.
+
+    In ``enforce`` mode, raises ``WeightIntegrityError`` on any problem. In
+    ``warn`` mode, logs and returns False. In ``off`` mode, returns True.
+    A missing manifest is a soft skip in ``off``/``warn`` but a hard failure in
+    ``enforce`` (you asked to enforce but gave nothing to enforce against).
+    """
+    mode = (mode or "off").lower()
+    if mode == "off":
+        return True
+
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        msg = f"weight_integrity_mode={mode} but manifest not found: {manifest_path}"
+        if mode == "enforce":
+            raise WeightIntegrityError(msg)
+        if logger:
+            logger.warning(msg)
+        return False
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    problems = verify_manifest(root, manifest)
+
+    if not problems:
+        if logger:
+            logger.info(f"Weight integrity OK — {len(manifest)} files verified.")
+        return True
+
+    detail = f"Weight integrity check FAILED ({len(problems)} problem(s)):\n  " + "\n  ".join(
+        problems
+    )
+    if mode == "enforce":
+        raise WeightIntegrityError(detail)
+    if logger:
+        logger.warning(detail)
+    return False
 
 
 # ================================================================================
-# File: video\video_source.py
+# File: src\video\video_source.py
 # ================================================================================
 import time
 from dataclasses import dataclass
@@ -13564,6 +23150,20 @@ class VideoSource:
     def is_opened(self) -> bool:
         return self._is_open
 
+    @property
+    def pos_msec(self) -> float:
+        """Поточна позиція відео у мс (0.0 якщо кодек не повідомляє/закрито)."""
+        if self._cap is None:
+            return 0.0
+        return float(self._cap.get(cv2.CAP_PROP_POS_MSEC))
+
+    @property
+    def pos_frames(self) -> float:
+        """Поточний номер кадру (0.0 якщо закрито)."""
+        if self._cap is None:
+            return 0.0
+        return float(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
+
     def read(self) -> tuple[bool, np.ndarray | None]:
         """Читає кадр з auto-reconnect при втраті з'єднання."""
         if not self._is_open:
@@ -13599,56 +23199,34 @@ class VideoSource:
 
 
 # ================================================================================
-# File: workers\calibration_propagation_worker.py
+# File: src\workers\__init__.py
 # ================================================================================
+"""Worker threads module"""
+
+
+# ================================================================================
+# File: src\workers\calibration_propagation_worker.py
+# ================================================================================
+"""Тонка QThread-обгортка над :class:`PropagationPipeline`.
+
+Уся математика графової пропагації живе в Qt-free ядрі
+``src/workers/propagation_pipeline.py``. Тут — лише міст між Qt-сигналами
+(``progress`` / ``completed`` / ``error``) і колбеками пайплайна + запуск у
+окремому потоці. Поведінка збережена 1:1: ті самі сигнали й тексти прогресу,
+``stop()``, ``start()`` / ``isRunning()`` (з QThread), і прямий синхронний
+виклик ``_propagate()`` (шлях бенчмарка/тестів).
 """
-Графова пропагація калібрування координат.
 
-Замість лінійного ланцюжка гомографій, будується граф кадрів із:
-  - Часовими ребрами (sequential: frame i ↔ frame i+1)
-  - Просторовими ребрами (loop closure: DINOv2 retrieval → LightGlue matching)
-  - GPS-якорями як жорсткими вузлами
-
-Оптимізація: Levenberg-Marquardt через scipy.optimize.least_squares
-з SO(2)-safe кутовими residuals (arctan2(sin, cos)).
-"""
-
-import json
-from collections import defaultdict
-
-import faiss
-import h5py
-import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from config.config import get_cfg
-from src.geometry.affine_utils import (
-    compose_affine_5dof,
-    decompose_affine,
-    decompose_affine_5dof,
-    unwrap_angles,
-)
-from src.geometry.pose_graph_optimizer import (
-    PoseGraphOptimizer,
-    homography_to_similarity,
-)
-from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
+from src.workers.propagation_pipeline import PropagationPipeline
 
 logger = get_logger(__name__)
 
 
 class CalibrationPropagationWorker(QThread):
-    """
-    Графова пропагація з глобальною оптимізацією.
-
-    Фази:
-      1. Prefetch фіч → побудова часових ребер (sequential matching)
-      2. Loop closure detection (FAISS DINOv2 retrieval → LightGlue matching)
-      3. Фіксація GPS-якорів + BFS ініціалізація початкового наближення
-      4. Глобальна оптимізація (Levenberg-Marquardt)
-      5. Збереження результатів у HDF5
-    """
+    """QThread-адаптер: емітить сигнали з колбеків PropagationPipeline."""
 
     progress = pyqtSignal(int, str)
     completed = pyqtSignal()
@@ -13656,623 +23234,39 @@ class CalibrationPropagationWorker(QThread):
 
     def __init__(self, database, calibration, matcher, config=None):
         super().__init__()
-        self.database = database
-        self.calibration = calibration
-        self.matcher = matcher
-        self.config = config or {}
-        self._is_running = True
-
-        self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
-        self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
-        self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
-        self.use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
-        self.mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
-
-        self.frame_w = self.database.metadata.get("frame_width", 1920)
-        self.frame_h = self.database.metadata.get("frame_height", 1080)
-
-        # Параметри графової оптимізації
-        self.lc_top_k = get_cfg(self.config, "graph_optimization.loop_closure_top_k", 5)
-        self.lc_min_sim = get_cfg(
-            self.config, "graph_optimization.loop_closure_min_similarity", 0.75
+        self._pipeline = PropagationPipeline(
+            database,
+            calibration,
+            matcher,
+            config=config,
+            progress_callback=self.progress.emit,
+            error_callback=self.error.emit,
+            completed_callback=self.completed.emit,
         )
-        self.lc_min_gap = get_cfg(self.config, "graph_optimization.loop_closure_min_frame_gap", 3)
-        self.lc_min_inliers = get_cfg(
-            self.config, "graph_optimization.loop_closure_min_inliers", 15
-        )
-        self.temporal_base_w = get_cfg(
-            self.config, "graph_optimization.temporal_edge_base_weight", 1.0
-        )
-        self.spatial_base_w = get_cfg(
-            self.config, "graph_optimization.spatial_edge_base_weight", 2.0
-        )
-        self.max_iters = get_cfg(self.config, "graph_optimization.max_iterations", 50)
-        self.tolerance = get_cfg(self.config, "graph_optimization.convergence_tolerance", 1e-6)
-        self.use_bfs = get_cfg(self.config, "graph_optimization.use_bfs_initialization", True)
-        self.export_geojson = get_cfg(self.config, "graph_optimization.export_geojson", True)
-
-        # Скільки кадрів можна "перестрибнути" при побудові temporal ребер
-        self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 3)
 
     def stop(self):
-        self._is_running = False
+        self._pipeline.stop()
+
+    def _propagate(self):
+        # Прямий синхронний виклик (бенчмарк/тести) — делегуємо в пайплайн.
+        # Сигнали летять через колбеки, під'єднані в __init__.
+        self._pipeline._propagate()
 
     def run(self):
         try:
-            self._propagate()
+            self._pipeline._propagate()
         except Exception as e:
             logger.error(
                 f"Graph propagation failed: {e} | "
-                f"num_anchors={len(self.calibration.anchors)}, "
-                f"db_frames={self.database.get_num_frames()}",
+                f"num_anchors={len(self._pipeline.calibration.anchors)}, "
+                f"db_frames={self._pipeline.database.get_num_frames()}",
                 exc_info=True,
             )
             self.error.emit(str(e))
 
-    # ─── Головний метод ──────────────────────────────────────────────────────
-
-    def _propagate(self):
-        num_frames = self.database.get_num_frames()
-        all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
-        anchors = [a for a in all_anchors if a.frame_id < num_frames]
-
-        if not anchors:
-            self.error.emit("Немає якорів калібрування")
-            return
-
-        logger.info(
-            f"Starting GRAPH propagation for {num_frames} frames "
-            f"using {len(anchors)} anchors: "
-            f"{[f'#{a.frame_id}' for a in anchors]}"
-        )
-
-        # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
-        self.progress.emit(0, "Передзавантаження фіч у RAM...")
-        all_features = self._prefetch_features(num_frames)
-
-        optimizer = PoseGraphOptimizer(self.frame_w, self.frame_h)
-        for i in range(num_frames):
-            if i in all_features:
-                optimizer.add_node(i)
-
-        self.progress.emit(10, "Побудова часових ребер (sequential matching)...")
-        temporal_count = self._build_temporal_edges(optimizer, all_features, num_frames)
-        logger.info(f"Phase 1 complete: {temporal_count} temporal edges")
-
-        # ── Phase 2: Loop closure detection ──────────────────────────────────
-        self.progress.emit(30, "Пошук просторових замикань (loop closure)...")
-        spatial_count = self._detect_loop_closures(optimizer, all_features, num_frames)
-        logger.info(f"Phase 2 complete: {spatial_count} spatial edges (loop closures)")
-        logger.info(
-            f"Graph: {optimizer.num_nodes} nodes, {optimizer.num_edges} edges "
-            f"({temporal_count} temporal + {spatial_count} spatial)"
-        )
-
-        # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
-        self.progress.emit(60, "Фіксація GPS-якорів (Local Origin)...")
-
-        # Визначаємо локальну опорну точку для математичної стабільності (Local Center)
-        # Використовуємо метричну трансляцію першого якоря
-        ref_anchor = anchors[0]
-        origin_tx = float(ref_anchor.affine_matrix[0, 2])
-        origin_ty = float(ref_anchor.affine_matrix[1, 2])
-        logger.info(f"Local Origin established at: ({origin_tx:.2f}, {origin_ty:.2f})")
-
-        for anchor in anchors:
-            # Створюємо копію матриці з відносною трансляцією
-            local_affine = anchor.affine_matrix.copy().astype(np.float64)
-            local_affine[0, 2] -= origin_tx
-            local_affine[1, 2] -= origin_ty
-            optimizer.fix_node(anchor.frame_id, local_affine)
-
-        if self.use_bfs:
-            bfs_count = optimizer.initialize_from_bfs()
-            logger.info(f"Phase 3 complete: {bfs_count} nodes initialized via BFS")
-        else:
-            logger.info("Phase 3 complete: BFS initialization skipped (disabled)")
-
-        # ── Phase 4: Optimize ────────────────────────────────────────────────
-        self.progress.emit(70, "Глобальна оптимізація графу (Levenberg-Marquardt)...")
-        results = optimizer.optimize(
-            max_iterations=self.max_iters,
-            tolerance=self.tolerance,
-        )
-        logger.info(f"Phase 4 complete: {len(results)} frames optimized")
-
-        # Відновлюємо абсолютні координати (додаємо Local Origin назад)
-        for fid in results:
-            results[fid][0, 2] += origin_tx
-            results[fid][1, 2] += origin_ty
-
-        # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
-        self.progress.emit(85, "Збереження результатів у HDF5...")
-        valid_count = self._save_to_hdf5(results, anchors, optimizer)
-
-        # Експорт GeoJSON для візуалізації
-        if self.export_geojson and self.calibration.converter:
-            try:
-                geojson = optimizer.export_graph_geojson(
-                    self.calibration.converter, self.frame_w, self.frame_h
-                )
-                geojson_path = str(self.database.db_path).replace(".h5", "_graph.geojson")
-                with open(geojson_path, "w", encoding="utf-8") as f:
-                    json.dump(geojson, f, indent=2, ensure_ascii=False)
-                logger.success(f"Graph exported to GeoJSON: {geojson_path}")
-            except Exception as e:
-                logger.warning(f"GeoJSON export failed: {e}")
-
-        self.progress.emit(
-            100,
-            f"Готово! {valid_count}/{num_frames} кадрів отримали координати "
-            f"({temporal_count} часових + {spatial_count} просторових ребер).",
-        )
-        self.completed.emit()
-
-    # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
-
-    def _prefetch_features(self, num_frames: int) -> dict:
-        """Завантажує всі фічі в RAM."""
-        features = {}
-        for i in range(num_frames):
-            if not self._is_running:
-                return features
-            try:
-                features[i] = self.database.get_local_features(i)
-            except Exception:
-                pass
-            if i % 500 == 0:
-                self.progress.emit(
-                    int(i / num_frames * 8),
-                    f"Prefetch: {i}/{num_frames}",
-                )
-        logger.info(f"Prefetched features for {len(features)} frames")
-        return features
-
-    def _build_temporal_edges(
-        self,
-        optimizer: PoseGraphOptimizer,
-        features: dict,
-        num_frames: int,
-    ) -> int:
-        """Побудова часових ребер між послідовними кадрами."""
-        count = 0
-        last_success_id = -1
-        last_success_feat = None
-
-        for i in range(num_frames):
-            if not self._is_running:
-                break
-
-            feat_i = features.get(i)
-            if feat_i is None:
-                continue
-
-            if last_success_feat is not None and (i - last_success_id) <= self.max_skip_frames:
-                result = self._match_and_build_edge(feat_i, last_success_feat)
-                if result is not None:
-                    H, inliers, rmse_val = result
-                    similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
-                    if similarity is not None:
-                        weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
-                        optimizer.add_edge(
-                            from_id=last_success_id,
-                            to_id=i,
-                            relative_affine_2x3=similarity,
-                            weight=weight,
-                            edge_type="temporal",
-                            inliers=inliers,
-                            rmse=rmse_val,
-                        )
-                        count += 1
-
-            last_success_id = i
-            last_success_feat = feat_i
-
-            if i % 200 == 0:
-                self.progress.emit(
-                    10 + int(i / num_frames * 18),
-                    f"Часові ребра: {count} (кадр {i}/{num_frames})",
-                )
-
-        return count
-
-    # ─── Phase 2: Loop closure detection ─────────────────────────────────────
-
-    def _detect_loop_closures(
-        self,
-        optimizer: PoseGraphOptimizer,
-        features: dict,
-        num_frames: int,
-    ) -> int:
-        """Знаходить просторові замикання через DINOv2 (LanceDB/FAISS) + LightGlue matching."""
-
-        has_lancedb = hasattr(self.database, "lance_table") and self.database.lance_table is not None
-        lance_table = self.database.lance_table if has_lancedb else None
-
-        # Завантажуємо вектори для швидкого пошуку
-        global_desc_dict = {}
-
-        if has_lancedb:
-            logger.info("Extracting global descriptors from LanceDB for loop closures...")
-            try:
-                df = lance_table.to_pandas()
-                for _, row in df.iterrows():
-                    fid = int(row["frame_id"])
-                    global_desc_dict[fid] = np.array(row["vector"], dtype=np.float32)
-            except Exception as e:
-                logger.warning(f"Failed to load vectors from LanceDB: {e}")
-        else:
-            global_desc = self.database.global_descriptors
-            if global_desc is not None and len(global_desc) > 0:
-                for i in range(len(global_desc)):
-                    if np.any(global_desc[i]):
-                        global_desc_dict[i] = global_desc[i]
-
-        if not global_desc_dict:
-            logger.warning("No global descriptors available — skipping loop closure detection")
-            return 0
-
-        # Нормалізація векторів
-        normed_dict = {}
-        for fid, vec in global_desc_dict.items():
-            norm = np.linalg.norm(vec)
-            normed_dict[fid] = vec / (norm + 1e-8) if norm > 0 else vec
-
-        # Побудова FAISS індексу якщо немає LanceDB
-        faiss_index = None
-        faiss_id_map = []
-        if not has_lancedb:
-            dim = next(iter(normed_dict.values())).shape[0]
-            faiss_index = faiss.IndexFlatIP(dim)
-            mat = []
-            for fid, vec in normed_dict.items():
-                mat.append(vec)
-                faiss_id_map.append(fid)
-            faiss_index.add(np.array(mat, dtype=np.float32))
-            logger.info(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
-
-        count = 0
-        already_matched: set[tuple[int, int]] = set()
-
-        for i in range(num_frames):
-            if not self._is_running:
-                break
-
-            feat_i = features.get(i)
-            if feat_i is None or i not in normed_dict:
-                continue
-
-            q = normed_dict[i]
-
-            candidates = []
-            if has_lancedb:
-                try:
-                    res = (
-                        lance_table.search(q.astype(np.float32))
-                        .metric("cosine")
-                        .limit(self.lc_top_k + 1)
-                        .select(["frame_id", "_distance"])
-                        .to_list()
-                    )
-                    for r in res:
-                        candidates.append((r["frame_id"], max(0.0, 1.0 - r["_distance"])))
-                except Exception:
-                    pass
-            else:
-                q_batch = np.array([q], dtype=np.float32)
-                scores, ids = faiss_index.search(q_batch, self.lc_top_k + 1)
-                for raw_idx, sim_score in zip(ids[0], scores[0]):
-                    if raw_idx != -1:
-                        candidates.append((faiss_id_map[raw_idx], float(sim_score)))
-
-            for j, sim_score in candidates:
-                j = int(j)
-                if j == i or j == -1:
-                    continue
-                if abs(i - j) <= self.lc_min_gap:
-                    continue
-                if float(sim_score) < self.lc_min_sim:
-                    continue
-
-                edge_key = (min(i, j), max(i, j))
-                if edge_key in already_matched:
-                    continue
-                already_matched.add(edge_key)
-
-                feat_j = features.get(j)
-                if feat_j is None:
-                    continue
-
-                # Matching: feat_j → feat_i (H maps j pixels → i pixels)
-                result = self._match_and_build_edge(feat_j, feat_i)
-                if result is None:
-                    continue
-
-                H, inliers, rmse_val = result
-                if inliers < self.lc_min_inliers:
-                    continue
-
-                similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
-                if similarity is None:
-                    continue
-
-                weight = self._compute_weight(inliers, rmse_val, self.spatial_base_w)
-                optimizer.add_edge(
-                    from_id=i,
-                    to_id=j,
-                    relative_affine_2x3=similarity,
-                    weight=weight,
-                    edge_type="spatial",
-                    inliers=inliers,
-                    rmse=rmse_val,
-                )
-                count += 1
-
-            if i % 200 == 0:
-                self.progress.emit(
-                    30 + int(i / num_frames * 28),
-                    f"Loop closure: {count} знайдено (кадр {i}/{num_frames})",
-                )
-
-        return count
-
-    # ─── Phase 5: Save to HDF5 ───────────────────────────────────────────────
-
-    def _save_to_hdf5(
-        self,
-        results: dict[int, np.ndarray],
-        anchors,
-        optimizer: PoseGraphOptimizer,
-    ) -> int:
-        """Зберігає оптимізовані афінні матриці у HDF5.
-
-        Формат 100% сумісний з існуючим DatabaseLoader.
-        """
-        num_frames = self.database.get_num_frames()
-        frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float64)
-        frame_valid = np.zeros(num_frames, dtype=bool)
-        frame_rmse = np.zeros(num_frames, dtype=np.float64)
-        frame_disagreement = np.zeros(num_frames, dtype=np.float64)
-        frame_matches = np.zeros(num_frames, dtype=np.int32)
-
-        # Записуємо результати оптимізації
-        # Оскільки optimizer повертає ТІЛЬКИ досяжні вузли,
-        # незв'язані кадри залишаться з frame_valid = False
-        for frame_id, affine in results.items():
-            if 0 <= frame_id < num_frames:
-                frame_affine[frame_id] = affine.astype(np.float64)
-                frame_valid[frame_id] = True
-
-        filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)
-        if filled_count > 0:
-            logger.info(f"Interpolated coordinates for {filled_count} missing frames")
-
-        # Обчислюємо QA метрики з ребер графу
-        edge_stats: dict[int, list[tuple[int, float]]] = {}
-        for edge in optimizer.edges:
-            for fid in (edge.from_id, edge.to_id):
-                if 0 <= fid < num_frames:
-                    edge_stats.setdefault(fid, []).append((edge.inliers, edge.rmse))
-
-        for fid, stats in edge_stats.items():
-            # РОБИМО РОЗРАХУНОК ТІЛЬКИ ДЛЯ ВАЛІДНИХ КАДРІВ
-            if fid < num_frames and frame_valid[fid]:
-                inliers_list = [s[0] for s in stats]
-                rmse_list = [s[1] for s in stats if s[1] > 0]
-                frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
-                frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
-
-        # Disagreement: для кадрів із ≥2 ребрами, порівнюємо predictions
-        # (simplified: використовуємо std відхилень у tx, ty)
-
-        # O(E) Optical optimization
-
-        adj = defaultdict(list)
-        for e in optimizer.edges:
-            adj[e.from_id].append(e)
-            adj[e.to_id].append(e)
-
-        for fid in range(num_frames):
-            if not frame_valid[fid]:
-                continue
-            edges_to_fid = adj[fid]
-            if len(edges_to_fid) >= 2:
-                predictions_tx = []
-                for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
-                    other_id = e.from_id if e.to_id == fid else e.to_id
-                    other_affine = results.get(other_id)
-
-                    # Перевіряємо, чи сусідній кадр також валідний
-                    if other_affine is not None:
-                        comp = decompose_affine(other_affine)
-                        predictions_tx.append(comp[0])  # tx
-                if len(predictions_tx) >= 2:
-                    frame_disagreement[fid] = float(np.std(predictions_tx))
-
-        # --- Збереження в HDF5 ---
-        db_path = self.database.db_path
-        self.database.close()
-        try:
-            with h5py.File(db_path, "a") as f:
-                if "calibration" in f:
-                    del f["calibration"]
-                grp = f.create_group("calibration")
-
-                grp.attrs["version"] = "3.0"  # Нова версія: графова оптимізація
-                grp.attrs["num_anchors"] = len(anchors)
-                grp.attrs["anchors_json"] = json.dumps(
-                    [a.to_dict() for a in anchors], ensure_ascii=False
-                )
-                grp.attrs["projection_json"] = json.dumps(
-                    self.calibration.converter.export_metadata()
-                )
-                grp.attrs["optimizer"] = "pose_graph_lm"
-                grp.attrs["num_temporal_edges"] = sum(
-                    1 for e in optimizer.edges if e.edge_type == "temporal"
-                )
-                grp.attrs["num_spatial_edges"] = sum(
-                    1 for e in optimizer.edges if e.edge_type == "spatial"
-                )
-
-                grp.create_dataset("frame_affine", data=frame_affine, compression="gzip")
-                grp.create_dataset(
-                    "frame_valid", data=frame_valid.astype(np.uint8), compression="gzip"
-                )
-                grp.create_dataset("frame_rmse", data=frame_rmse, compression="gzip")
-                grp.create_dataset(
-                    "frame_disagreement", data=frame_disagreement, compression="gzip"
-                )
-                grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
-
-                # Обчислюємо та зберігаємо frame_gps (lat/lon для кожного кадру)
-                # Для мультиджерельної геолокалізації — дозволяє SpatialIndex
-                if self.calibration.converter and self.calibration.converter.is_initialized:
-                    frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
-                    gps_count = 0
-                    for fid in range(num_frames):
-                        if not frame_valid[fid]:
-                            continue
-                        affine = frame_affine[fid]
-                        # Центр кадру в пікселях → metric через affine
-                        center_px = np.array(
-                            [[self.frame_w / 2.0, self.frame_h / 2.0]], dtype=np.float64
-                        )
-                        center_metric = GeometryTransforms.apply_affine(center_px, affine)
-                        if center_metric is not None and len(center_metric) > 0:
-                            try:
-                                lat, lon = self.calibration.converter.metric_to_gps(
-                                    float(center_metric[0, 0]),
-                                    float(center_metric[0, 1]),
-                                )
-                                frame_gps[fid] = [lat, lon]
-                                gps_count += 1
-                            except Exception:
-                                pass
-
-                    # Видаляємо старий датасет якщо є
-                    if "frame_gps" in f:
-                        del f["frame_gps"]
-                    f.create_dataset("frame_gps", data=frame_gps, compression="gzip")
-                    logger.info(
-                        f"Saved frame_gps: {gps_count}/{num_frames} frames with GPS coordinates"
-                    )
-
-            valid_count = int(np.sum(frame_valid))
-            logger.success(
-                f"Graph propagation saved to HDF5 (v3.0, "
-                f"{len(anchors)} anchors, {optimizer.num_edges} edges, "
-                f"{valid_count}/{num_frames} valid frames)"
-            )
-        finally:
-            self.database._load_hot_data()
-
-        return int(np.sum(frame_valid))
-
-    # ─── Допоміжні методи ────────────────────────────────────────────────────
-
-    def _match_and_build_edge(
-        self, features_a: dict, features_b: dict
-    ) -> tuple[np.ndarray, int, float] | None:
-        """Матчить дві фічі та повертає (H, inliers, rmse) або None.
-
-        H maps features_a (src) → features_b (dst).
-        """
-        try:
-            mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
-            if len(mkpts_a) < self.min_matches:
-                return None
-
-            H, mask = GeometryTransforms.estimate_homography(
-                mkpts_a, mkpts_b,
-                ransac_threshold=self.ransac_thresh,
-                backend=self.homography_backend,
-                use_mad_ransac=self.use_mad_ransac,
-                mad_k_factor=self.mad_k_factor,
-            )
-            if H is None or mask is None:
-                return None
-
-            inlier_mask = mask.ravel().astype(bool)
-            inliers = int(np.sum(inlier_mask))
-            if inliers < self.min_matches:
-                return None
-
-            # RMSE
-            pts_a_in = mkpts_a[inlier_mask]
-            pts_transformed = GeometryTransforms.apply_homography(pts_a_in, H)
-            pts_b_in = mkpts_b[inlier_mask]
-            rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
-
-            return H, inliers, rmse
-        except Exception:
-            return None
-
-    @staticmethod
-    def _compute_weight(inliers: int, rmse: float, base_weight: float) -> float:
-        """Обчислює вагу ребра: w = base * √inliers / (1 + RMSE)."""
-        return base_weight * np.sqrt(max(inliers, 1)) / (1.0 + rmse)
-
-    def _fill_gaps_by_interpolation(self, frame_affine: np.ndarray, frame_valid: np.ndarray) -> int:
-        """Лінійна 5-DoF інтерполяція для кадрів, пропущених через Keyframe Selection."""
-        valid_ids = np.where(frame_valid)[0]
-        if len(valid_ids) < 1:
-            return 0
-
-        filled = 0
-
-        # Екстраполяція на початок
-        first_valid = valid_ids[0]
-        for mid in range(0, first_valid):
-            frame_affine[mid] = frame_affine[first_valid].copy()
-            frame_valid[mid] = True
-            filled += 1
-
-        # Інтерполяція розривів всередині траєкторії
-        if len(valid_ids) >= 2:
-            for i in range(len(valid_ids) - 1):
-                left = valid_ids[i]
-                right = valid_ids[i + 1]
-                gap = right - left
-                if gap <= 1:
-                    continue
-
-                # ВИКОРИСТОВУЄМО 5-DoF ДЕКОМПОЗИЦІЮ
-                comp_left = np.array(decompose_affine_5dof(frame_affine[left]), dtype=np.float64)
-                comp_right = np.array(decompose_affine_5dof(frame_affine[right]), dtype=np.float64)
-
-                # Запобігаємо стрибкам кута (кут тепер під індексом 4)
-                angles = unwrap_angles([comp_left[4], comp_right[4]])
-                comp_left[4] = angles[0]
-                comp_right[4] = angles[1]
-
-                for mid in range(left + 1, right):
-                    t = (mid - left) / gap
-                    comp_mid = comp_left * (1.0 - t) + comp_right * t
-
-                    # Розпаковуємо 5 змінних
-                    tx, ty, sx, sy, angle = comp_mid
-                    sx = float(np.clip(sx, 1e-6, 1e6))
-                    sy = float(np.clip(sy, 1e-6, 1e6))
-
-                    # ВИКОРИСТОВУЄМО 5-DoF КОМПОЗИЦІЮ
-                    frame_affine[mid] = compose_affine_5dof(
-                        float(tx), float(ty), sx, sy, float(angle)
-                    )
-                    frame_valid[mid] = True
-                    filled += 1
-
-        # Екстраполяція на кінець
-        last_valid = valid_ids[-1]
-        for mid in range(last_valid + 1, len(frame_valid)):
-            frame_affine[mid] = frame_affine[last_valid].copy()
-            frame_valid[mid] = True
-            filled += 1
-
-        return filled
-
 
 # ================================================================================
-# File: workers\database_worker.py
+# File: src\workers\database_worker.py
 # ================================================================================
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -14356,7 +23350,240 @@ class DatabaseGenerationWorker(QThread):
 
 
 # ================================================================================
-# File: workers\panorama_overlay_worker.py
+# File: src\workers\debug_renderers.py
+# ================================================================================
+"""Рендер debug-каналів (вікна «очима моделей») — чистий cv2/numpy.
+
+Викликається у worker-потоці ПІСЛЯ localize_frame. Кожна функція повертає
+готове BGR-зображення (для opencv_to_qpixmap, який чекає BGR), вже
+downscale-нуте до max_width. Жодних PyQt/torch-залежностей тут немає — модуль
+можна тестувати ізольовано.
+
+Увага: cv2.putText не рендерить кирилицю → усі підписи латиницею.
+"""
+
+import cv2
+import numpy as np
+
+# COCO-класи, які маскує YOLO (person, bicycle, car, motorcycle, bus, truck)
+COCO_NAMES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+
+# Кольори bbox у BGR
+_CLASS_BGR = {
+    0: (100, 100, 255),   # person — червоний
+    1: (255, 200, 100),   # bicycle
+    2: (255, 200, 100),   # car — блакитний
+    3: (50, 200, 255),    # motorcycle — жовтогарячий
+    5: (100, 255, 50),    # bus — зелений
+    7: (50, 150, 255),    # truck — помаранчевий
+}
+
+_FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def _downscale(img: np.ndarray, max_width: int) -> np.ndarray:
+    """Downscale до max_width зі збереженням співвідношення. Повертає contiguous."""
+    h, w = img.shape[:2]
+    if max_width and w > max_width:
+        nh = max(1, int(round(h * max_width / float(w))))
+        img = cv2.resize(img, (max_width, nh), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(img)
+
+
+def _text(img, text, org, color=(255, 255, 255), scale=0.5, bg=(0, 0, 0)):
+    """Текст з непрозорою підкладкою для читабельності на будь-якому фоні."""
+    (tw, th), bl = cv2.getTextSize(text, _FONT, scale, 1)
+    x, y = org
+    cv2.rectangle(img, (x, y), (x + tw + 6, y + th + bl + 6), bg, -1)
+    cv2.putText(img, text, (x + 3, y + th + 3), _FONT, scale, color, 1, cv2.LINE_AA)
+
+
+def _panel(img, lines, scale=0.45):
+    """Лівий-верхній багаторядковий блок (retrieval-панель тощо)."""
+    y = 2
+    for ln in lines:
+        (tw, th), bl = cv2.getTextSize(ln, _FONT, scale, 1)
+        cv2.rectangle(img, (2, y), (2 + tw + 6, y + th + bl + 4), (0, 0, 0), -1)
+        cv2.putText(img, ln, (5, y + th + 2), _FONT, scale, (255, 255, 255), 1, cv2.LINE_AA)
+        y += th + bl + 6
+
+
+def render_yolo(frame_rgb, detections, static_mask, max_width) -> np.ndarray:
+    """Кадр + напівпрозорий static_mask (динаміка) + bbox класу і confidence."""
+    bgr = cv2.cvtColor(np.ascontiguousarray(frame_rgb), cv2.COLOR_RGB2BGR)
+    if static_mask is not None:
+        dyn = static_mask < 128  # 0 = динамічний об'єкт (замаскований)
+        if bool(dyn.any()):
+            overlay = bgr.copy()
+            overlay[dyn] = (0, 0, 255)  # червоний BGR
+            bgr = cv2.addWeighted(overlay, 0.35, bgr, 0.65, 0)
+    n = 0
+    for det in detections or []:
+        box = det.get("bbox")
+        if not box:
+            continue
+        cls = int(det.get("class_id", -1))
+        conf = float(det.get("confidence", 0.0))
+        x1, y1, x2, y2 = (int(round(v)) for v in box[:4])
+        color = _CLASS_BGR.get(cls, (200, 200, 200))
+        cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 2)
+        label = f"{COCO_NAMES.get(cls, str(cls))} {conf:.0%}"
+        ly = max(0, y1 - 18)
+        _text(bgr, label, (x1, ly), color=(255, 255, 255), scale=0.45, bg=color)
+        n += 1
+    _text(bgr, f"YOLO  detections:{n}", (0, 0), scale=0.5)
+    return _downscale(bgr, max_width)
+
+
+def render_matches(collector, max_width) -> np.ndarray:
+    """Query keypoints сірим, inliers зеленим, disparity-вектори q->r; лічильники."""
+    bgr = cv2.cvtColor(np.ascontiguousarray(collector.rotated_frame), cv2.COLOR_RGB2BGR)
+    qf = collector.query_features or {}
+    kpts = qf.get("keypoints")
+    n_kpts = 0
+    if kpts is not None and len(kpts):
+        n_kpts = len(kpts)
+        for x, y in kpts:
+            cv2.circle(bgr, (int(round(x)), int(round(y))), 1, (170, 170, 170), -1)
+    mq = collector.mkpts_q_inliers
+    mr = collector.mkpts_r_inliers
+    n_in = 0
+    if mq is not None and mr is not None and len(mq) == len(mr) and len(mq):
+        n_in = len(mq)
+        for (qx, qy), (rx, ry) in zip(mq, mr):
+            p = (int(round(qx)), int(round(qy)))
+            r = (int(round(rx)), int(round(ry)))
+            cv2.line(bgr, p, r, (0, 180, 0), 1, cv2.LINE_AA)
+            cv2.circle(bgr, p, 2, (0, 255, 0), -1)
+    _text(
+        bgr,
+        f"kpts:{n_kpts}  matches:{collector.total_matches}  "
+        f"inliers:{n_in}  rmse:{collector.rmse:.2f}",
+        (0, 0),
+        scale=0.45,
+    )
+    return _downscale(bgr, max_width)
+
+
+def _pca_rgb(tokens, h_p, w_p) -> np.ndarray:
+    """3 головні компоненти патч-токенів -> RGB (h_p, w_p, 3) uint8."""
+    X = np.asarray(tokens, dtype=np.float32)
+    X = X - X.mean(axis=0, keepdims=True)
+    try:
+        U, S, _ = np.linalg.svd(X, full_matrices=False)
+        comps = U[:, :3] * S[:3]
+    except np.linalg.LinAlgError:
+        comps = X[:, :3]
+    mn = comps.min(axis=0, keepdims=True)
+    mx = comps.max(axis=0, keepdims=True)
+    comps = (comps - mn) / (mx - mn + 1e-6)
+    return (comps.reshape(h_p, w_p, 3) * 255.0).clip(0, 255).astype(np.uint8)
+
+
+def render_dino(collector, max_width, pca_enabled) -> np.ndarray:
+    """PCA патч-токенів поверх кадру + панель retrieval (top-k id/score, кут, масштаб)."""
+    bgr = cv2.cvtColor(np.ascontiguousarray(collector.rotated_frame), cv2.COLOR_RGB2BGR)
+    if pca_enabled and collector.patch_tokens is not None and collector.patch_grid is not None:
+        try:
+            h_p, w_p = collector.patch_grid
+            if collector.patch_tokens.shape[0] == h_p * w_p:
+                pca = _pca_rgb(collector.patch_tokens, h_p, w_p)
+                pca_bgr = cv2.cvtColor(pca, cv2.COLOR_RGB2BGR)
+                pca_big = cv2.resize(
+                    pca_bgr, (bgr.shape[1], bgr.shape[0]), interpolation=cv2.INTER_NEAREST
+                )
+                bgr = cv2.addWeighted(pca_big, 0.6, bgr, 0.4, 0)
+        except Exception:
+            pass
+    lines = [
+        f"DINO  angle:{collector.global_angle}  scale:{collector.scale:.2f}"
+        f"  score:{collector.global_score:.3f}",
+        f"matched id:{collector.candidate_id}",
+        "top-k retrieval:",
+    ]
+    for cid, sc in (collector.retrieval_candidates or [])[:8]:
+        lines.append(f"  #{cid}: {sc:.3f}")
+    _panel(bgr, lines)
+    return _downscale(bgr, max_width)
+
+
+def render_depth(collector, max_width) -> np.ndarray:
+    """Colormap (INFERNO) відносної depth-мапи + значення relative scale."""
+    d = np.asarray(collector.depth_map, dtype=np.float32)
+    mn = float(np.nanmin(d))
+    mx = float(np.nanmax(d))
+    if mx - mn < 1e-6:
+        norm = np.zeros(d.shape, dtype=np.uint8)
+    else:
+        norm = ((d - mn) / (mx - mn) * 255.0).clip(0, 255).astype(np.uint8)
+    color = cv2.applyColorMap(norm, cv2.COLORMAP_INFERNO)  # BGR
+    scale = collector.depth_scale
+    hdr = "Depth Anything" if scale is None else f"Depth Anything  rel.scale:{scale:.3f}"
+    _text(color, hdr, (0, 0), scale=0.5)
+    return _downscale(color, max_width)
+
+
+# ================================================================================
+# File: src\workers\encrypt_copy_worker.py
+# ================================================================================
+"""HARDENING P1-6: background worker for building an encrypted project copy.
+
+Encrypting the map database and the lance index runs to tens of seconds (Scrypt
+plus whole-file AES-GCM over hundreds of MB), so it must not run on the GUI
+thread. The plaintext master is never modified — see ``build_encrypted_copy``.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class EncryptCopyWorker(QThread):
+    """Фоновий потік для створення зашифрованої копії проєкту."""
+
+    progress = pyqtSignal(str)
+    completed = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, src_dir: str, dst_dir: str, passphrase: str):
+        super().__init__()
+        self.src_dir = src_dir
+        self.dst_dir = dst_dir
+        self._passphrase = passphrase
+
+        logger.info(f"EncryptCopyWorker initialized: {src_dir} -> {dst_dir}")
+
+    def run(self):
+        try:
+            self.progress.emit("Шифрування проєкту...")
+            # scripts/ is not a package; add the repo root so the CLI builder is
+            # importable from the GUI without duplicating its logic.
+            repo_root = str(Path(__file__).resolve().parents[2])
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            from scripts.encrypt_project import build_encrypted_copy
+
+            summary = build_encrypted_copy(self.src_dir, self.dst_dir, self._passphrase)
+            logger.info(f"Encrypted copy built: {summary['total']} file(s) encrypted")
+            self.completed.emit(summary)
+
+        except Exception as e:
+            logger.error(f"Failed to build encrypted copy: {e}", exc_info=True)
+            self.error.emit(str(e))
+        finally:
+            # Do not keep the passphrase alive in the thread object.
+            self._passphrase = ""
+
+
+# ================================================================================
+# File: src\workers\panorama_overlay_worker.py
 # ================================================================================
 import base64
 
@@ -14442,7 +23669,7 @@ class PanoramaOverlayWorker(QThread):
 
 
 # ================================================================================
-# File: workers\panorama_worker.py
+# File: src\workers\panorama_worker.py
 # ================================================================================
 import cv2
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -14544,7 +23771,1489 @@ class PanoramaWorker(QThread):
 
 
 # ================================================================================
-# File: workers\tracking_worker.py
+# File: src\workers\propagation_pipeline.py
+# ================================================================================
+"""
+Графова пропагація калібрування координат.
+
+Замість лінійного ланцюжка гомографій, будується граф кадрів із:
+  - Часовими ребрами (sequential: frame i ↔ frame i+1)
+  - Просторовими ребрами (loop closure: DINOv2 retrieval → LightGlue matching)
+  - GPS-якорями як жорсткими вузлами
+
+Оптимізація: Levenberg-Marquardt через scipy.optimize.least_squares
+з SO(2)-safe кутовими residuals (arctan2(sin, cos)).
+"""
+
+import json
+from collections import defaultdict
+
+import faiss
+import h5py
+import numpy as np
+
+from config import get_cfg
+from src.geometry.affine_utils import (
+    compose_affine_5dof,
+    decompose_affine,
+    decompose_affine_5dof,
+    unwrap_angles,
+)
+from src.geometry.point_spread import inlier_spread, spread_weight_factor
+from src.geometry.pose_graph.model_5dof import _predict_forward, _predict_inverse
+from src.geometry.pose_graph.vo_guards import (
+    check_anchor_gaps,
+    downweight_gap_edges,
+    select_gap_fallback_frames,
+    temporal_edge_sane,
+)
+from src.geometry.pose_graph_optimizer import (
+    PoseGraphOptimizer,
+    affine_fit_residual,
+    homography_to_similarity,
+)
+from src.geometry.transformations import GeometryTransforms
+from src.security.project_scan import assert_project_writable
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class PropagationPipeline:
+    """
+    Графова пропагація з глобальною оптимізацією.
+
+    Фази:
+      1. Prefetch фіч → побудова часових ребер (sequential matching)
+      2. Loop closure detection (FAISS DINOv2 retrieval → LightGlue matching)
+      3. Фіксація GPS-якорів + BFS ініціалізація початкового наближення
+      4. Глобальна оптимізація (Levenberg-Marquardt)
+      5. Збереження результатів у HDF5
+    """
+
+    def __init__(
+        self,
+        database,
+        calibration,
+        matcher,
+        config=None,
+        progress_callback=None,
+        error_callback=None,
+        completed_callback=None,
+    ):
+        # Qt-free ядро графової пропагації. progress/error/completed
+        # виходять через колбеки (CalibrationPropagationWorker під'єднує
+        # їх до однойменних Qt-сигналів).
+        self._progress_cb = progress_callback
+        self._error_cb = error_callback
+        self._completed_cb = completed_callback
+        self.database = database
+        self.calibration = calibration
+        self.matcher = matcher
+        self.config = config or {}
+        self._is_running = True
+
+        self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
+        self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
+        self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
+        self.use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
+        self.mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
+
+        self.frame_w = self.database.metadata.get("frame_width", 1920)
+        self.frame_h = self.database.metadata.get("frame_height", 1080)
+
+        # Параметри графової оптимізації
+        self.lc_top_k = get_cfg(self.config, "graph_optimization.loop_closure_top_k", 5)
+        self.lc_min_sim = get_cfg(
+            self.config, "graph_optimization.loop_closure_min_similarity", 0.75
+        )
+        self.lc_min_gap = get_cfg(self.config, "graph_optimization.loop_closure_min_frame_gap", 3)
+        self.lc_auto_min_gap = get_cfg(
+            self.config, "graph_optimization.loop_closure_auto_min_gap", False
+        )
+        self.lc_overlap_factor = get_cfg(
+            self.config, "graph_optimization.loop_closure_overlap_factor", 1.0
+        )
+        self.lc_dist_prefilter = get_cfg(
+            self.config, "graph_optimization.loop_closure_dist_prefilter", False
+        )
+        self.lc_dist_margin = get_cfg(
+            self.config, "graph_optimization.loop_closure_dist_margin", 2.0
+        )
+        self.lc_odometry_check = get_cfg(
+            self.config, "graph_optimization.loop_closure_odometry_check", False
+        )
+        self.odometry_margin = get_cfg(
+            self.config, "graph_optimization.odometry_consistency_margin", 1.5
+        )
+        self.odometry_drift_frac = get_cfg(
+            self.config, "graph_optimization.odometry_drift_frac", 0.25
+        )
+        self.odometry_inconsistency_factor = get_cfg(
+            self.config, "graph_optimization.odometry_inconsistency_factor", 0.3
+        )
+        self._prelim_states: dict[int, object] = {}
+        self._prelim_centers: dict[int, object] = {}
+        self._prelim_dist_threshold = 0.0
+        self.lc_min_inliers = get_cfg(
+            self.config, "graph_optimization.loop_closure_min_inliers", 15
+        )
+        self.temporal_base_w = get_cfg(
+            self.config, "graph_optimization.temporal_edge_base_weight", 1.0
+        )
+        self.spatial_base_w = get_cfg(
+            self.config, "graph_optimization.spatial_edge_base_weight", 2.0
+        )
+        self.max_iters = get_cfg(self.config, "graph_optimization.max_iterations", 50)
+        self.tolerance = get_cfg(self.config, "graph_optimization.convergence_tolerance", 1e-6)
+        self.use_bfs = get_cfg(self.config, "graph_optimization.use_bfs_initialization", True)
+        self.export_geojson = get_cfg(self.config, "graph_optimization.export_geojson", True)
+
+        # Скільки кадрів можна "перестрибнути" при побудові temporal ребер
+        self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 3)
+        self.rotation_retry = get_cfg(self.config, "propagation.rotation_retry", False)
+        self.temporal_weight_use_fit = get_cfg(
+            self.config, "graph_optimization.temporal_weight_use_fit_quality", False
+        )
+        self.temporal_fit_k = get_cfg(
+            self.config, "graph_optimization.temporal_fit_quality_k", 0.05
+        )
+
+        # ── Нові опції (Етапи 2/3/4). Дефолти off = поточна поведінка. ──
+        go = "graph_optimization."
+        self.use_analytic_jac = get_cfg(self.config, go + "use_analytic_jacobian", False)
+        self.warm_start = get_cfg(self.config, go + "warm_start", False)
+        self.two_stage_prune = get_cfg(self.config, go + "two_stage_prune", False)
+        self.prune_mad_k = get_cfg(self.config, go + "prune_mad_k", 5.0)
+        self.prune_max_spatial_frac = get_cfg(self.config, go + "prune_max_spatial_frac", 0.2)
+        self.gnc_spatial = get_cfg(self.config, go + "gnc_spatial", False)
+        self.gnc_rounds = get_cfg(self.config, go + "gnc_rounds", 5)
+        self.gnc_mad_k = get_cfg(self.config, go + "gnc_mad_k", 3.0)
+        self.kinematic_prior_weight = get_cfg(
+            self.config, go + "kinematic_prior_weight", 0.0
+        )
+        self.pchip_gap_fill = get_cfg(self.config, go + "pchip_gap_fill", False)
+        self.log_scale_interp = get_cfg(self.config, go + "log_scale_interp", False)
+        self.edge_gate_enabled = get_cfg(self.config, go + "edge_gate_enabled", False)
+        self.edge_gate_max_rot = get_cfg(self.config, go + "edge_gate_max_rotation_deg", 40.0)
+        self.edge_gate_max_scale = get_cfg(self.config, go + "edge_gate_max_scale_ratio", 1.6)
+        self.edge_gate_min_inlier_ratio = get_cfg(
+            self.config, go + "edge_gate_min_inlier_ratio", 0.25
+        )
+        self.edge_gate_mutual = get_cfg(self.config, go + "edge_gate_mutual_check", True)
+        self.edge_gate_cluster = get_cfg(self.config, go + "edge_gate_cluster_consistency", True)
+        self.spatial_weight_use_sim = get_cfg(
+            self.config, go + "spatial_weight_use_similarity", False
+        )
+
+        # ── ADDENDUM 1.1: просторовий розкид інлаєрів ребра. Дефолти off. ──
+        self.edge_spread_weight = get_cfg(self.config, go + "edge_spread_weight", False)
+        self.edge_spread_ref = get_cfg(self.config, go + "edge_spread_ref", 0.15)
+        self.edge_spread_k = get_cfg(self.config, go + "edge_spread_k", 10.0)
+        self.edge_gate_min_spread = get_cfg(self.config, go + "edge_gate_min_spread", 0.0)
+
+        # М'які якорі (Етап 1.1). off = fix_node (жорсткий, поточна поведінка).
+        self.soft_anchors = get_cfg(self.config, go + "soft_anchors", False)
+        self.anchor_base_w = get_cfg(self.config, go + "anchor_base_w", 200.0)
+        self.anchor_sigma_floor_m = get_cfg(self.config, go + "anchor_sigma_floor_m", 0.05)
+        self.anchor_loo_threshold_m = get_cfg(self.config, go + "anchor_loo_threshold_m", 5.0)
+
+        # ── Етап 8 (сесія 2026-07-12): запобіжники temporal-VO. Дефолти off. ──
+        self.temporal_edge_gate = get_cfg(self.config, go + "temporal_edge_gate", False)
+        self.temporal_gate_max_rot = get_cfg(
+            self.config, go + "temporal_gate_max_rotation_deg", 30.0
+        )
+        self.temporal_gate_max_scale = get_cfg(
+            self.config, go + "temporal_gate_max_scale_ratio", 1.4
+        )
+        self.temporal_gate_max_shift_frac = get_cfg(
+            self.config, go + "temporal_gate_max_shift_frac", 1.2
+        )
+        self.anchor_gap_check = get_cfg(self.config, go + "anchor_gap_check", False)
+        self.anchor_gap_max_dev_m = get_cfg(self.config, go + "anchor_gap_max_dev_m", 150.0)
+        self.anchor_gap_downweight = get_cfg(self.config, go + "anchor_gap_downweight", 0.05)
+
+        # ── Аудит 2026-08-01. Дефолти = ПОТОЧНА поведінка. ──
+        self.true_disagreement = get_cfg(self.config, go + "true_disagreement", False)
+        self.ground_scale_thresholds = get_cfg(self.config, go + "ground_scale_thresholds", False)
+        self.isotropy_weight = get_cfg(self.config, go + "isotropy_weight", 200.0)
+        self.skip_bridges = get_cfg(self.config, "propagation.skip_bridges", False)
+        self.mnn_fallback = get_cfg(self.config, "propagation.mnn_fallback", False)
+        self._n_rotation_retry = 0
+        self._origin_xy = (0.0, 0.0)
+
+    def stop(self):
+        self._is_running = False
+
+    def _report_progress(self, pct, msg):
+        if self._progress_cb is not None:
+            self._progress_cb(pct, msg)
+
+    def _report_error(self, msg):
+        if self._error_cb is not None:
+            self._error_cb(msg)
+
+    def _report_completed(self):
+        if self._completed_cb is not None:
+            self._completed_cb()
+
+    # ─── Головний метод ──────────────────────────────────────────────────────
+
+    def _propagate(self):
+        num_frames = self.database.get_num_frames()
+        all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        anchors = [a for a in all_anchors if a.frame_id < num_frames]
+
+        # ВИПРАВЛЕНО: раніше якорі поза межами БД викидалися МОВЧКИ (тільки лог),
+        # і користувач не знав, що половина його якорів не використовується.
+        dropped = [a.frame_id for a in all_anchors if a.frame_id >= num_frames]
+        if dropped:
+            self._report_error(
+                f"Якорі для кадрів {dropped} виходять за межі бази даних "
+                f"({num_frames} слотів). Ймовірно, вони були створені за номерами "
+                f"кадрів оригінального відео, а не слотів БД (кадр_відео // frame_step). "
+                f"Видаліть ці якорі та додайте заново через діалог калібрування."
+            )
+            return
+
+        if not anchors:
+            self._report_error("Немає якорів калібрування")
+            return
+
+        logger.info(
+            f"Starting GRAPH propagation for {num_frames} frames "
+            f"using {len(anchors)} anchors: "
+            f"{[f'#{a.frame_id}' for a in anchors]}"
+        )
+
+        # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
+        self._report_progress(0, "Передзавантаження фіч у RAM...")
+        all_features = self._prefetch_features(num_frames)
+        if not all_features:
+            # Два випадки: (а) битий/нечитабельний файл — _prefetch_features уже
+            # викликав _report_error із деталями; (б) у базі просто немає жодного
+            # кадру з фічами — тоді рапортуємо тут. Далі йти немає сенсу:
+            # порожній граф однаково не дасть калібрації, а Phase 3 упав би на
+            # тій самій умові, спаливши до того матчинг і loop closure.
+            logger.error("Prefetch не повернув жодного кадру з фічами — пропагацію зупинено")
+            if not self._prefetch_reported_error:
+                self._report_error(
+                    "У базі даних немає жодного кадру з локальними фічами. "
+                    "Найімовірніше базу побудовано не до кінця — перебудуйте її."
+                )
+            return
+
+        optimizer = PoseGraphOptimizer(
+            self.frame_w, self.frame_h, isotropy_weight=self.isotropy_weight
+        )
+        for i in range(num_frames):
+            if i in all_features:
+                optimizer.add_node(i)
+
+        self._report_progress(10, "Побудова часових ребер (sequential matching)...")
+        temporal_count = self._build_temporal_edges(optimizer, all_features, num_frames)
+        logger.info(f"Phase 1 complete: {temporal_count} temporal edges")
+
+        # Авто min_frame_gap (Етап 2.1): з медіанного руху за слот. Замінює ручну
+        # константу; працює в парі з odometry-consistency (2.3), що ловить
+        # аліасні same-leg замикання в зоні поза фізичним перекриттям.
+        if self.lc_auto_min_gap:
+            auto_gap = optimizer.estimate_min_loop_gap(
+                self.frame_w, self.frame_h, self.lc_overlap_factor
+            )
+            if auto_gap is not None:
+                logger.info(f"Auto min_frame_gap: {auto_gap} слотів (було {self.lc_min_gap})")
+                self.lc_min_gap = auto_gap
+
+        # Дистанційний префільтр (Етап 2.2): прикидка центрів BFS-ланцюгом temporal
+        # від якорів → поріг margin×діагональ_кадру у метрах. Далекі пари не матчаться.
+        self._prelim_states = {}
+        self._prelim_centers = {}
+        self._prelim_dist_threshold = 0.0
+        if self.lc_dist_prefilter or self.lc_odometry_check:
+            seed_affines = {
+                a.frame_id: a.affine_matrix for a in anchors if a.frame_id in all_features
+            }
+            self._prelim_states = optimizer.preliminary_states(seed_affines)
+            self._prelim_centers = {fid: st[:2] for fid, st in self._prelim_states.items()}
+            if self.lc_dist_prefilter and self._prelim_centers:
+                scales = [
+                    float(np.sqrt(abs(np.linalg.det(np.asarray(a.affine_matrix)[:2, :2]))))
+                    for a in anchors
+                ]
+                scale_m_per_px = float(np.median(scales)) if scales else 0.0
+                frame_diag_px = float(np.hypot(self.frame_w, self.frame_h))
+                self._prelim_dist_threshold = self.lc_dist_margin * frame_diag_px * scale_m_per_px
+                logger.info(
+                    f"Dist prefilter: поріг {self._prelim_dist_threshold:.1f} м, "
+                    f"{len(self._prelim_centers)} прикидок центрів"
+                )
+
+        # ── Phase 2: Loop closure detection ──────────────────────────────────
+        self._report_progress(30, "Пошук просторових замикань (loop closure)...")
+        spatial_count = self._detect_loop_closures(optimizer, all_features, num_frames)
+        logger.info(f"Phase 2 complete: {spatial_count} spatial edges (loop closures)")
+        logger.info(
+            f"Graph: {optimizer.num_nodes} nodes, {optimizer.num_edges} edges "
+            f"({temporal_count} temporal + {spatial_count} spatial)"
+        )
+
+        # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
+        self._report_progress(60, "Фіксація GPS-якорів (Local Origin)...")
+
+        # ВИПРАВЛЕНО: якір міг потрапити на порожній слот (keyframe selection
+        # пропустила кадр) — тоді fix_node створював ізольований вузол без ребер,
+        # і якір мовчки ігнорувався оптимізацією. Снапимо до найближчого кадру
+        # з фічами: рух між сусідніми слотами в такому гепі нижчий за пороги
+        # keyframe selection, тому похибка снапу мізерна.
+        feature_ids = np.array(sorted(all_features.keys()), dtype=np.int64)
+        if len(feature_ids) == 0:
+            self._report_error("У базі даних немає жодного кадру з фічами")
+            return
+
+        anchor_nodes: dict[int, object] = {}
+        for anchor in anchors:
+            fid = anchor.frame_id
+            if fid not in all_features:
+                nearest = int(feature_ids[np.argmin(np.abs(feature_ids - fid))])
+                logger.warning(
+                    f"Anchor frame {fid} has no features (non-keyframe slot). "
+                    f"Snapping to nearest keyframe {nearest} (Δ={abs(nearest - fid)} slots)."
+                )
+                fid = nearest
+            if fid in anchor_nodes:
+                # Раніше — лише warning, і другий якір мовчки зникав. Це той самий
+                # клас мовчазної втрати, що й якорі поза межами БД вище, тому й
+                # реакція та сама: зупинити і сказати користувачу.
+                self._report_error(
+                    f"Якорі кадрів #{anchor_nodes[fid].frame_id} і #{anchor.frame_id} "
+                    f"після снапу до найближчого keyframe потрапили в один слот БД "
+                    f"(#{fid}) — один із них був би мовчки відкинутий. Видаліть "
+                    f"зайвий якір або перенесіть його на кадр, у якому є keyframe."
+                )
+                return
+            anchor_nodes[fid] = anchor
+
+        # Визначаємо локальну опорну точку для математичної стабільності (Local Center)
+        # Використовуємо метричну трансляцію першого якоря
+        ref_anchor = anchors[0]
+        origin_tx = float(ref_anchor.affine_matrix[0, 2])
+        origin_ty = float(ref_anchor.affine_matrix[1, 2])
+        logger.info(f"Local Origin established at: ({origin_tx:.2f}, {origin_ty:.2f})")
+        self._origin_xy = (origin_tx, origin_ty)
+
+        for fid, anchor in anchor_nodes.items():
+            # Створюємо копію матриці з відносною трансляцією
+            local_affine = anchor.affine_matrix.copy().astype(np.float64)
+            local_affine[0, 2] -= origin_tx
+            local_affine[1, 2] -= origin_ty
+            if self.soft_anchors:
+                # σ = rmse_m якоря: GT (≈0)→floor→жорсткий; реальний (5–10 м)→м'який
+                optimizer.add_anchor(
+                    fid,
+                    local_affine,
+                    sigma_m=float(getattr(anchor, "rmse_m", 0.0)),
+                    base_w=self.anchor_base_w,
+                    sigma_floor=self.anchor_sigma_floor_m,
+                )
+            else:
+                optimizer.fix_node(fid, local_affine)
+
+        # ── Пороги в наземних метрах (аудит 2026-08-01) ──────────────────────
+        # WEB_MERCATOR роздуває виміряні відстані в 1/cos(lat), тож метрові
+        # КОНСТАНТИ порогів означають проєкційні, а не наземні метри. Ділимо
+        # поріг на cos(lat): саме порівняння лишається в проєкційних одиницях,
+        # а константа починає читатись як наземні метри. Самоузгоджені перевірки
+        # (odometry, dist-prefilter, auto min_gap) не чіпаємо — там обидві
+        # сторони в одних одиницях. UTM / невідома широта → no-op.
+        gap_max_dev = float(self.anchor_gap_max_dev_m)
+        loo_threshold = float(self.anchor_loo_threshold_m)
+        if self.ground_scale_thresholds:
+            k_ground = self._ground_scale_factor(anchors)
+            if k_ground > 1e-6:
+                gap_max_dev /= k_ground
+                loo_threshold /= k_ground
+                logger.info(
+                    f"Наземний масштаб cos(lat)={k_ground:.4f}: пороги в проєкційних "
+                    f"метрах — проміжок {gap_max_dev:.0f}, LOO {loo_threshold:.2f}"
+                )
+
+        # ── Етап 8.2: звірка проміжків між якорями ДО оптимізації ────────────
+        # Консистентний аліасинг (усі ребра проміжку брешуть однаково) невидимий
+        # для резидуалів; неузгоджені проміжки глушаться, їх кадри після
+        # оптимізації перезаповнюються інтерполяцією по якорях.
+        flagged_gaps: list[tuple[int, int]] = []
+        gap_report: dict = {}
+        if self.anchor_gap_check:
+            gap_report = check_anchor_gaps(
+                optimizer.edges,
+                optimizer.anchor_states(),
+                optimizer.sign,
+                gap_max_dev,
+            )
+            flagged_gaps = [k for k, v in gap_report.items() if v["status"] != "ok"]
+            for a, b in flagged_gaps:
+                v = gap_report[(a, b)]
+                dev = (
+                    f"розбіжність {v['dev_m']:.0f} м"
+                    if v["dev_m"] is not None
+                    else "ланцюг розірваний"
+                )
+                logger.warning(
+                    f"Проміжок якорів #{a}→#{b} не узгоджений із VO-ланцюгом ({dev}) — "
+                    f"кадри проміжку підуть на інтерполяцію по якорях"
+                )
+            n_dw = downweight_gap_edges(
+                optimizer.edges,
+                [k for k in flagged_gaps if gap_report[k]["status"] == "inconsistent"],
+                self.anchor_gap_downweight,
+            )
+            if n_dw:
+                logger.info(
+                    f"Етап 8.2: приглушено {n_dw} temporal-ребер (вага ×{self.anchor_gap_downweight})"
+                )
+
+        # Warm start (Етап 4.2): x0 з попереднього розв'язку замість BFS з нуля.
+        # BFS нижче лишається для першого запуску та як fallback (заповнює лише
+        # вузли БЕЗ стану).
+        if self.warm_start:
+            prev = self._load_previous_affines()
+            if prev:
+                local_prev = {}
+                for fid, aff in prev.items():
+                    a = np.asarray(aff, dtype=np.float64).copy()
+                    a[0, 2] -= origin_tx
+                    a[1, 2] -= origin_ty
+                    local_prev[fid] = a
+                optimizer.warm_start_from_affines(local_prev)
+
+        if self.use_bfs:
+            bfs_count = optimizer.initialize_from_bfs()
+            logger.info(f"Phase 3 complete: {bfs_count} nodes initialized via BFS")
+        else:
+            logger.info("Phase 3 complete: BFS initialization skipped (disabled)")
+
+        # ── Phase 4: Optimize ────────────────────────────────────────────────
+        self._report_progress(70, "Глобальна оптимізація графу (Levenberg-Marquardt)...")
+        results = optimizer.optimize(
+            max_iterations=self.max_iters,
+            tolerance=self.tolerance,
+            progress_callback=lambda msg: self._report_progress(70, msg),
+            use_analytic_jac=self.use_analytic_jac,
+            two_stage_prune=self.two_stage_prune,
+            prune_mad_k=self.prune_mad_k,
+            prune_max_spatial_frac=self.prune_max_spatial_frac,
+            gnc_spatial=self.gnc_spatial,
+            gnc_rounds=self.gnc_rounds,
+            gnc_mad_k=self.gnc_mad_k,
+            kinematic_prior_weight=self.kinematic_prior_weight,
+        )
+        logger.info(f"Phase 4 complete: {len(results)} frames optimized")
+
+        # Звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших, anchor stress
+        try:
+            logger.info(
+                "Звіт пропагації:\n" + optimizer.format_diagnostics(loo_threshold_m=loo_threshold)
+            )
+        except Exception as diag_err:
+            logger.warning(f"Diagnostics report failed: {diag_err}")
+
+        # ── Етап 8.2: кадри неузгоджених проміжків → на інтерполяцію по якорях.
+        # Рахуємо в ЛОКАЛЬНИХ координатах (до відновлення origin).
+        force_invalid: set[int] = set()
+        if self.anchor_gap_check and flagged_gaps:
+            cxp, cyp = self.frame_w / 2.0, self.frame_h / 2.0
+            centers = {
+                fid: (
+                    float(aff[0, 0] * cxp + aff[0, 1] * cyp + aff[0, 2]),
+                    float(aff[1, 0] * cxp + aff[1, 1] * cyp + aff[1, 2]),
+                )
+                for fid, aff in results.items()
+            }
+            force_invalid = select_gap_fallback_frames(
+                centers, optimizer.anchor_states(), flagged_gaps, gap_max_dev
+            )
+            if force_invalid:
+                logger.info(
+                    f"Етап 8.2: {len(force_invalid)} кадрів перезаповнюються інтерполяцією "
+                    f"(відхилення від лінії якорів > {gap_max_dev:.0f} м): "
+                    f"{sorted(force_invalid)}"
+                )
+
+        # Відновлюємо абсолютні координати (додаємо Local Origin назад)
+        for fid in results:
+            results[fid][0, 2] += origin_tx
+            results[fid][1, 2] += origin_ty
+
+        # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
+        self._report_progress(85, "Збереження результатів у HDF5...")
+        valid_count = self._save_to_hdf5(results, anchors, optimizer, force_invalid=force_invalid)
+
+        # Експорт GeoJSON для візуалізації
+        if self.export_geojson and self.calibration.converter:
+            try:
+                geojson = optimizer.export_graph_geojson(
+                    self.calibration.converter,
+                    self.frame_w,
+                    self.frame_h,
+                    origin_xy=self._origin_xy,
+                )
+                geojson_path = str(self.database.db_path).replace(".h5", "_graph.geojson")
+                assert_project_writable(geojson_path)
+                with open(geojson_path, "w", encoding="utf-8") as f:
+                    json.dump(geojson, f, indent=2, ensure_ascii=False)
+                logger.success(f"Graph exported to GeoJSON: {geojson_path}")
+            except Exception as e:
+                logger.warning(f"GeoJSON export failed: {e}")
+
+        self._report_progress(
+            100,
+            f"Готово! {valid_count}/{num_frames} кадрів отримали координати "
+            f"({temporal_count} часових + {spatial_count} просторових ребер).",
+        )
+        self._report_completed()
+
+    # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
+
+    # Частка НЕОЧІКУВАНИХ помилок читання, вище якої база вважається битою.
+    # Порожні слоти (ValueError) сюди не входять — це нормальний стан.
+    _PREFETCH_MAX_ERROR_FRAC = 0.01
+    # Чи вже відрапортував _prefetch_features помилку користувачу (щоб
+    # викликач не дублював повідомлення). Клас-рівневий дефолт — страховка
+    # на випадок читання до першого виклику.
+    _prefetch_reported_error = False
+
+    def _prefetch_features(self, num_frames: int) -> dict:
+        """Завантажує всі фічі в RAM.
+
+        Раніше тут стояв голий ``except Exception: pass`` без логування: биту
+        HDF5, брак прав і «у цьому слоті немає keyframe» було не відрізнити,
+        пропагація мовчки будувала граф на менший набір вузлів і рапортувала
+        успіх. Тепер два класи розділені:
+
+        * ``ValueError`` / ``KeyError`` — слот порожній або відсутній. Штатно
+          для keyframe-селекції, рахуємо й не шумимо.
+        * будь-що інше (OSError на битому файлі, MemoryError…) — реальна
+          проблема: логуємо з деталями і, якщо таких понад
+          ``_PREFETCH_MAX_ERROR_FRAC``, зупиняємо пропагацію замість тихої
+          видачі неправильної калібрації.
+        """
+        features: dict = {}
+        n_empty = 0
+        n_error = 0
+        first_errors: list[str] = []
+        self._prefetch_reported_error = False
+
+        for i in range(num_frames):
+            if not self._is_running:
+                return features
+            try:
+                features[i] = self.database.get_local_features(i)
+            except (ValueError, KeyError):
+                # Порожній/відсутній слот — очікувано.
+                n_empty += 1
+            except Exception as e:  # noqa: BLE001 — класифікуємо і рапортуємо нижче
+                n_error += 1
+                if len(first_errors) < 5:
+                    first_errors.append(f"кадр {i}: {type(e).__name__}: {e}")
+            if i % 500 == 0:
+                self._report_progress(
+                    int(i / num_frames * 8),
+                    f"Prefetch: {i}/{num_frames}",
+                )
+
+        logger.info(
+            f"Prefetched features for {len(features)}/{num_frames} frames "
+            f"(порожніх слотів: {n_empty}, помилок читання: {n_error})"
+        )
+        if first_errors:
+            logger.error(
+                "Помилки читання фіч із бази (перші %d):\n  %s",
+                len(first_errors),
+                "\n  ".join(first_errors),
+            )
+
+        max_errors = max(1, int(num_frames * self._PREFETCH_MAX_ERROR_FRAC))
+        if n_error > max_errors:
+            self._prefetch_reported_error = True
+            self._report_error(
+                f"Не вдалося прочитати фічі для {n_error} із {num_frames} кадрів "
+                f"(поріг {max_errors}). Найімовірніше база пошкоджена або "
+                f"недоступна для читання. Пропагацію зупинено, щоб не видати "
+                f"неправильну калібрацію.\nПерша помилка: "
+                f"{first_errors[0] if first_errors else 'н/д'}"
+            )
+            return {}
+
+        return features
+
+    def _build_temporal_edges(
+        self,
+        optimizer: PoseGraphOptimizer,
+        features: dict,
+        num_frames: int,
+    ) -> int:
+        """Побудова часових ребер між послідовними кадрами."""
+        count = 0
+        self._n_rotation_retry = 0
+        n_gated = 0
+        n_bridged = 0
+        n_spread_down = 0
+        # ВИПРАВЛЕНО (раніше): ребро будується до попереднього кадру-З-ФІЧАМИ,
+        # незалежно від гепа keyframe selection. Етап 8 (2026-07-12): опційно
+        # (а) санітарний гейт трансформації ребра, (б) мости через розриви —
+        # якщо матч із найближчим сусідом упав/відсіяний, пробуємо глибших
+        # (до max_skip_frames), щоб ланцюг не розпадався на «острови» та
+        # «апендикси» без другого якоря (кадри 1–21 lasttest → відліт на км).
+        recent: list[tuple[int, dict]] = []
+
+        for i in range(num_frames):
+            if not self._is_running:
+                break
+
+            feat_i = features.get(i)
+            if feat_i is None:
+                continue
+
+            if recent:
+                gap = i - recent[-1][0]
+                if gap > self.max_skip_frames:
+                    logger.debug(
+                        f"Temporal edge across keyframe gap: {recent[-1][0]} → {i} ({gap} slots)"
+                    )
+                candidates = recent[::-1] if self.skip_bridges else recent[-1:]
+                for depth, (last_id, last_feat) in enumerate(candidates):
+                    similarity, inliers, rmse_val, result, spread = self._try_temporal_pair(
+                        feat_i, last_feat, last_id, i
+                    )
+                    if similarity is None:
+                        continue
+                    if self.temporal_edge_gate:
+                        ok, reason = temporal_edge_sane(
+                            similarity,
+                            i - last_id,
+                            self.frame_w,
+                            self.frame_h,
+                            self.temporal_gate_max_rot,
+                            self.temporal_gate_max_scale,
+                            self.temporal_gate_max_shift_frac,
+                        )
+                        if not ok:
+                            n_gated += 1
+                            logger.debug(f"Temporal gate відсіяв {last_id}→{i}: {reason}")
+                            continue
+                    weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
+                    # 6.2: менша довіра кадрам із нахилом/рельєфом (великий залишок
+                    # афінного фіту H). Лише первинний матч (result), не rotation-retry.
+                    if self.temporal_weight_use_fit and result is not None:
+                        fit_res = affine_fit_residual(result[0], self.frame_w, self.frame_h)
+                        if fit_res is not None:
+                            weight *= 1.0 / (1.0 + self.temporal_fit_k * fit_res)
+                    # ADDENDUM 1.1: скупчені інлаєри → ill-conditioned H → менша довіра.
+                    if self.edge_spread_weight:
+                        sf = spread_weight_factor(spread, self.edge_spread_ref, self.edge_spread_k)
+                        if sf < 1.0:
+                            n_spread_down += 1
+                        weight *= sf
+                    optimizer.add_edge(
+                        from_id=last_id,
+                        to_id=i,
+                        relative_affine_2x3=similarity,
+                        weight=weight,
+                        edge_type="temporal",
+                        inliers=inliers,
+                        rmse=rmse_val,
+                    )
+                    count += 1
+                    if depth > 0:
+                        n_bridged += 1
+                    break
+
+            recent.append((i, feat_i))
+            depth_limit = max(1, self.max_skip_frames) if self.skip_bridges else 1
+            if len(recent) > depth_limit:
+                recent.pop(0)
+
+            if i % 200 == 0:
+                self._report_progress(
+                    10 + int(i / num_frames * 18),
+                    f"Часові ребра: {count} (кадр {i}/{num_frames})",
+                )
+
+        if self.rotation_retry and self._n_rotation_retry:
+            logger.info(f"Rotation-retry врятував {self._n_rotation_retry} temporal-ребер")
+        if n_gated:
+            logger.info(
+                f"Temporal gate відсіяв {n_gated} ребер (дегенеративні трансформації)"
+            )
+        if n_bridged:
+            logger.info(f"Skip-мости з'єднали {n_bridged} розривів temporal-ланцюга")
+        if n_spread_down:
+            logger.info(
+                f"Spatial collapse: {n_spread_down}/{count} temporal-ребер отримали "
+                f"знижену вагу (інлаєри скупчені, ref={self.edge_spread_ref})"
+            )
+        return count
+
+    def _try_temporal_pair(self, feat_i, last_feat, last_id, i):
+        """Одна спроба temporal-матчу пари (last_id → i): основний матч +
+        (за прапорцем) rotation-retry (Етап 5). Повертає
+        (similarity | None, inliers, rmse, result_or_None)."""
+        similarity = None
+        inliers = 0
+        rmse_val = 0.0
+        spread = None
+        # H maps feat_i → last_feat (to→from direction)
+        result = self._match_and_build_edge(feat_i, last_feat)
+        if result is not None:
+            H, inliers, rmse_val, _n_matches, spread = result
+            similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
+
+        # Ротаційна робастність (Етап 5): матч упав → пробуємо з поворотом
+        # query на кут ланцюга frame_poses, далі перебір k·90°.
+        if similarity is None and self.rotation_retry:
+            retry = self._temporal_rotation_retry(feat_i, last_feat, last_id, i)
+            if retry is not None:
+                similarity, inliers, rmse_val, spread = retry
+                self._n_rotation_retry += 1
+
+        return similarity, inliers, rmse_val, result, spread
+
+    def _temporal_rotation_retry(self, feat_i, last_feat, from_id, to_id):
+        """Повторний temporal-матч із поворотом query (Етап 5). Повертає
+        (similarity, inliers, rmse, spread) або None. Кут — із ланцюга
+        frame_poses БД (одометричний пріор), fallback — перебір k·90°. Отриману
+        H_r (rotated_query→ref) компонуємо назад: H_true = H_r · R(θ).
+
+        ``spread`` рахується по ПОВЕРНУТИХ точках, тобто в тому ж кадрі, що й
+        матч — розкид інваріантний до повороту навколо центру, тож значення
+        порівнянне зі значеннями звичайних ребер."""
+        from src.localization.rotation_geometry import (
+            chain_relative_angle_deg,
+            rotate_keypoints,
+            rotation_homography,
+            temporal_retry_angles,
+        )
+
+        cx, cy = self.frame_w / 2.0, self.frame_h / 2.0
+        chain_angle = None
+        fp = getattr(self.database, "frame_poses", None)
+        if fp is not None and 0 <= to_id < len(fp) and 0 <= from_id < len(fp):
+            # to→from: кут, яким повертаємо query(to), щоб вирівняти з ref(from)
+            chain_angle = chain_relative_angle_deg(fp[to_id], fp[from_id])
+
+        for ang_deg in temporal_retry_angles(chain_angle, use_chain=chain_angle is not None):
+            ang = np.radians(ang_deg)
+            feat_rot = dict(feat_i)
+            feat_rot["keypoints"] = rotate_keypoints(feat_i["keypoints"], ang, cx, cy)
+            result = self._match_and_build_edge(feat_rot, last_feat)
+            if result is None:
+                continue
+            H_r, inliers, rmse_val, _n, spread = result
+            H_true = np.asarray(H_r, dtype=np.float64) @ rotation_homography(ang, cx, cy)
+            similarity = homography_to_similarity(H_true, self.frame_w, self.frame_h)
+            if similarity is not None:
+                logger.debug(
+                    f"Rotation-retry {from_id}→{to_id} OK @ {ang_deg:.1f}° (chain={chain_angle})"
+                )
+                return similarity, inliers, rmse_val, spread
+        return None
+
+    # ─── Phase 2: Loop closure detection ─────────────────────────────────────
+
+    def _detect_loop_closures(
+        self,
+        optimizer: PoseGraphOptimizer,
+        features: dict,
+        num_frames: int,
+    ) -> int:
+        """Знаходить просторові замикання через DINOv2 (LanceDB/FAISS) + LightGlue matching."""
+
+        has_lancedb = (
+            hasattr(self.database, "lance_table") and self.database.lance_table is not None
+        )
+        lance_table = self.database.lance_table if has_lancedb else None
+
+        # Завантажуємо вектори для швидкого пошуку
+        global_desc_dict = {}
+
+        if has_lancedb:
+            logger.info("Extracting global descriptors from LanceDB for loop closures...")
+            try:
+                df = lance_table.to_pandas()
+                for _, row in df.iterrows():
+                    fid = int(row["frame_id"])
+                    global_desc_dict[fid] = np.array(row["vector"], dtype=np.float32)
+            except Exception as e:
+                logger.warning(f"Failed to load vectors from LanceDB: {e}")
+        else:
+            global_desc = self.database.global_descriptors
+            if global_desc is not None and len(global_desc) > 0:
+                for i in range(len(global_desc)):
+                    if np.any(global_desc[i]):
+                        global_desc_dict[i] = global_desc[i]
+
+        if not global_desc_dict:
+            logger.warning("No global descriptors available — skipping loop closure detection")
+            return 0
+
+        # Нормалізація векторів
+        normed_dict = {}
+        for fid, vec in global_desc_dict.items():
+            norm = np.linalg.norm(vec)
+            normed_dict[fid] = vec / (norm + 1e-8) if norm > 0 else vec
+
+        # Побудова FAISS індексу якщо немає LanceDB
+        faiss_index = None
+        faiss_id_map = []
+        if not has_lancedb:
+            dim = next(iter(normed_dict.values())).shape[0]
+            faiss_index = faiss.IndexFlatIP(dim)
+            mat = []
+            for fid, vec in normed_dict.items():
+                mat.append(vec)
+                faiss_id_map.append(fid)
+            faiss_index.add(np.array(mat, dtype=np.float32))
+            logger.info(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
+
+        # ── Pass 1: retrieval top-k для всіх кадрів (для взаємної перевірки 2.2) ──
+        retrieval: dict[int, list[tuple[int, float]]] = {}
+        for i in range(num_frames):
+            if not self._is_running:
+                break
+            feat_i = features.get(i)
+            if feat_i is None or i not in normed_dict:
+                continue
+            retrieval[i] = self._retrieve_candidates(
+                normed_dict[i], has_lancedb, lance_table, faiss_index, faiss_id_map
+            )
+        topk_sets = {fid: {int(j) for j, _ in cands} for fid, cands in retrieval.items()}
+
+        # ── Pass 2: збір spatial-кандидатів + гейти (Етап 2) ──
+        already_matched: set[tuple[int, int]] = set()
+        specs: list[dict] = []
+        n_gated_phys = 0
+        n_gated_mutual = 0
+        n_gated_dist = 0
+
+        for i in range(num_frames):
+            if not self._is_running:
+                break
+            feat_i = features.get(i)
+            if feat_i is None or i not in retrieval:
+                continue
+
+            for j, sim_score in retrieval[i]:
+                j = int(j)
+                if j == i or j == -1:
+                    continue
+                if abs(i - j) <= self.lc_min_gap:
+                    continue
+                if float(sim_score) < self.lc_min_sim:
+                    continue
+
+                edge_key = (min(i, j), max(i, j))
+                if edge_key in already_matched:
+                    continue
+                already_matched.add(edge_key)
+
+                # 2.2 взаємність retrieval: j теж має бачити i у своєму top-k
+                if self.edge_gate_enabled and self.edge_gate_mutual:
+                    if i not in topk_sets.get(j, ()):
+                        n_gated_mutual += 1
+                        continue
+
+                # 2.2 дистанційний префільтр: якщо прикидки центрів далеко — не матчимо
+                if self.lc_dist_prefilter and self._prelim_dist_threshold > 0:
+                    ci = self._prelim_centers.get(i)
+                    cj = self._prelim_centers.get(j)
+                    if (
+                        ci is not None
+                        and cj is not None
+                        and (
+                            float(np.linalg.norm(np.asarray(ci) - np.asarray(cj)))
+                            > self._prelim_dist_threshold
+                        )
+                    ):
+                        n_gated_dist += 1
+                        continue
+
+                feat_j = features.get(j)
+                if feat_j is None:
+                    continue
+
+                # Matching: feat_j → feat_i (H maps j pixels → i pixels = to→from)
+                result = self._match_and_build_edge(feat_j, feat_i)
+                if result is None:
+                    continue
+
+                H, inliers, rmse_val, n_matches, spread = result
+                if inliers < self.lc_min_inliers:
+                    continue
+
+                similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
+                if similarity is None:
+                    continue
+
+                # 2.1 фізичні межі відносної трансформації
+                if self.edge_gate_enabled and not self._passes_physical_gate(
+                    similarity, inliers, n_matches, spread
+                ):
+                    n_gated_phys += 1
+                    continue
+
+                specs.append(
+                    {
+                        "i": i,
+                        "j": j,
+                        "similarity": similarity,
+                        "inliers": inliers,
+                        "rmse": rmse_val,
+                        "sim": float(sim_score),
+                        "spread": spread,
+                    }
+                )
+
+            if i % 200 == 0:
+                self._report_progress(
+                    30 + int(i / num_frames * 28),
+                    f"Loop closure: {len(specs)} кандидатів (кадр {i}/{num_frames})",
+                )
+
+        # ── Pass 3: кластерна узгодженість (2.3) + фінальні ваги + додавання ──
+        cluster_factor = (
+            self._cluster_consistency_factors(specs)
+            if (self.edge_gate_enabled and self.edge_gate_cluster)
+            else None
+        )
+        # 2.3 odometry-consistency: несумісні з temporal-ланцюгом spatial-ребра → ×factor
+        odometry_factor = (
+            optimizer.odometry_consistency_factors(
+                specs,
+                self._prelim_states,
+                self.frame_w,
+                self.frame_h,
+                margin=self.odometry_margin,
+                drift_frac=self.odometry_drift_frac,
+                factor=self.odometry_inconsistency_factor,
+            )
+            if (self.lc_odometry_check and self._prelim_states)
+            else None
+        )
+        n_odo_down = sum(1 for f in odometry_factor if f < 1.0) if odometry_factor else 0
+        for idx, spec in enumerate(specs):
+            weight = self._compute_weight(spec["inliers"], spec["rmse"], self.spatial_base_w)
+            if self.spatial_weight_use_sim:  # 4.3: w *= 0.5 + 0.5·sim
+                weight *= 0.5 + 0.5 * max(0.0, min(1.0, spec["sim"]))
+            if cluster_factor is not None:  # 2.3 (cluster): самотнє ребро → ×0.5
+                weight *= cluster_factor[idx]
+            if odometry_factor is not None:  # 2.3 (odometry): несумісне ребро → ×factor
+                weight *= odometry_factor[idx]
+            if self.edge_spread_weight:  # ADDENDUM 1.1: скупчені інлаєри → ×factor
+                weight *= spread_weight_factor(
+                    spec.get("spread"), self.edge_spread_ref, self.edge_spread_k
+                )
+            optimizer.add_edge(
+                from_id=spec["i"],
+                to_id=spec["j"],
+                relative_affine_2x3=spec["similarity"],
+                weight=weight,
+                edge_type="spatial",
+                inliers=spec["inliers"],
+                rmse=spec["rmse"],
+            )
+
+        if self.edge_gate_enabled or self.lc_dist_prefilter or self.lc_odometry_check:
+            logger.info(
+                f"Edge gating: {n_gated_phys} відсіяно фізично, "
+                f"{n_gated_mutual} за взаємністю retrieval, "
+                f"{n_gated_dist} дистанційним префільтром; "
+                f"{n_odo_down} ребер ×odometry-factor (несумісні з ланцюгом)"
+            )
+        return len(specs)
+
+    # ─── Гейти ребер (Етап 2) ────────────────────────────────────────────────
+
+    def _retrieve_candidates(
+        self, q, has_lancedb, lance_table, faiss_index, faiss_id_map
+    ) -> list[tuple[int, float]]:
+        """top-k схожих кадрів (id, similarity). Логіка ідентична попередній."""
+        candidates: list[tuple[int, float]] = []
+        if has_lancedb:
+            try:
+                res = (
+                    lance_table.search(q.astype(np.float32))
+                    .metric("cosine")
+                    .limit(self.lc_top_k + 1)
+                    .select(["frame_id", "_distance"])
+                    .to_list()
+                )
+                for r in res:
+                    candidates.append((int(r["frame_id"]), max(0.0, 1.0 - r["_distance"])))
+            except Exception as e:
+                # Мовчазний pass тут означав: loop closures просто не знаходяться,
+                # карта деградує, у логах — жодного сліду.
+                logger.warning(
+                    f"LanceDB retrieval failed — loop-closure candidates lost "
+                    f"for this frame ({type(e).__name__}: {e})"
+                )
+        else:
+            q_batch = np.array([q], dtype=np.float32)
+            scores, ids = faiss_index.search(q_batch, self.lc_top_k + 1)
+            for raw_idx, sim_score in zip(ids[0], scores[0]):
+                if raw_idx != -1:
+                    candidates.append((int(faiss_id_map[raw_idx]), float(sim_score)))
+        return candidates
+
+    def _passes_physical_gate(
+        self, similarity, inliers: int, n_matches: int, spread: float | None = None
+    ) -> bool:
+        """Фізичні межі відносної трансформації хибного loop closure (2.1).
+
+        ``spread`` (ADDENDUM 1.1) — жорсткий відсів лише на екстремумі
+        (``edge_gate_min_spread``, дефолт 0.0 = вимкнено): всі інлаєри в
+        крихітній зоні кадру = вироджена оцінка, а не слабке ребро.
+        Помірне скупчення обробляється вагою (``edge_spread_weight``), не тут.
+        """
+        _, _, sx, sy, angle = decompose_affine_5dof(similarity)
+        if abs(np.degrees(angle)) > self.edge_gate_max_rot:
+            return False
+        max_log = np.log(max(self.edge_gate_max_scale, 1.0 + 1e-9))
+        if abs(np.log(max(sx, 1e-9))) > max_log or abs(np.log(max(sy, 1e-9))) > max_log:
+            return False
+        if n_matches > 0 and (inliers / n_matches) < self.edge_gate_min_inlier_ratio:
+            return False
+        if (
+            self.edge_gate_min_spread > 0.0
+            and spread is not None
+            and spread < self.edge_gate_min_spread
+        ):
+            return False
+        return True
+
+    def _cluster_consistency_factors(self, specs: list[dict], window: int = 3) -> list[float]:
+        """Самотнє loop closure без сусіда з близькими кінцями → вага ×0.5 (2.3)."""
+        factors = [1.0] * len(specs)
+        for a in range(len(specs)):
+            ia, ja = specs[a]["i"], specs[a]["j"]
+            supported = False
+            for b in range(len(specs)):
+                if b == a:
+                    continue
+                ib, jb = specs[b]["i"], specs[b]["j"]
+                d1 = abs(ia - ib) + abs(ja - jb)
+                d2 = abs(ia - jb) + abs(ja - ib)
+                if min(d1, d2) <= 2 * window:
+                    supported = True
+                    break
+            if not supported:
+                factors[a] = 0.5
+        return factors
+
+    # ─── Phase 5: Save to HDF5 ───────────────────────────────────────────────
+
+    def _save_to_hdf5(
+        self,
+        results: dict[int, np.ndarray],
+        anchors,
+        optimizer: PoseGraphOptimizer,
+        force_invalid: set[int] | None = None,
+    ) -> int:
+        """Зберігає оптимізовані афінні матриці у HDF5.
+
+        Формат 100% сумісний з існуючим DatabaseLoader.
+        """
+        num_frames = self.database.get_num_frames()
+        frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float64)
+        frame_valid = np.zeros(num_frames, dtype=bool)
+        frame_rmse = np.zeros(num_frames, dtype=np.float64)
+        frame_disagreement = np.zeros(num_frames, dtype=np.float64)
+        frame_matches = np.zeros(num_frames, dtype=np.int32)
+
+        # Записуємо результати оптимізації
+        # Оскільки optimizer повертає ТІЛЬКИ досяжні вузли,
+        # незв'язані кадри залишаться з frame_valid = False
+        # Етап 8.2: кадри неузгоджених проміжків пропускаємо — їх заповнить
+        # штатна інтерполяція (pchip/лінійна) по якорях і валідних сусідах.
+        skip = force_invalid or set()
+        for frame_id, affine in results.items():
+            if 0 <= frame_id < num_frames and frame_id not in skip:
+                frame_affine[frame_id] = affine.astype(np.float64)
+                frame_valid[frame_id] = True
+
+        filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        if filled_count > 0:
+            logger.info(f"Interpolated coordinates for {filled_count} missing frames")
+
+        # Обчислюємо QA метрики з ребер графу
+        edge_stats: dict[int, list[tuple[int, float]]] = {}
+        for edge in optimizer.edges:
+            for fid in (edge.from_id, edge.to_id):
+                if 0 <= fid < num_frames:
+                    edge_stats.setdefault(fid, []).append((edge.inliers, edge.rmse))
+
+        for fid, stats in edge_stats.items():
+            # РОБИМО РОЗРАХУНОК ТІЛЬКИ ДЛЯ ВАЛІДНИХ КАДРІВ
+            if fid < num_frames and frame_valid[fid]:
+                inliers_list = [s[0] for s in stats]
+                rmse_list = [s[1] for s in stats if s[1] > 0]
+                frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
+                frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
+
+        # ── Disagreement ────────────────────────────────────────────────────
+        # Читається у ResultBuilder.compute_confidence (stability_score, далі R
+        # у Калмані), тож форма метрики має значення для ЖИВОЇ локалізації.
+        #
+        # Історична форма (дефолт, true_disagreement=False): std від tx сусідніх
+        # кадрів. tx = M[0,2] — метрична позиція пікселя (0,0), а не центру, тож
+        # величина змішує рух і ПОВОРОТ сусіда і сягає десятків метрів. Проти
+        # confidence.disagreement_norm_m = 5.0 вона насичується для кожного
+        # кадру з ≥2 ребрами, а кадр з одним ребром отримує рівно 0 — гірше
+        # зв'язаний кадр виглядає стабільнішим за краще зв'язаний.
+        #
+        # Нова форма (true_disagreement=True): наскільки самі ребра розходяться
+        # в тому, ДЕ цей кадр — середній розкид передбачень його центру кожним
+        # інцидентним ребром. Стани оптимізатора локальні (Local Origin ще не
+        # повернуто в них), але розкид інваріантний до трансляції, тож змішування
+        # систем координат тут неможливе.
+        adj = defaultdict(list)
+        for e in optimizer.edges:
+            adj[e.from_id].append(e)
+            adj[e.to_id].append(e)
+
+        if self.true_disagreement:
+            states = optimizer._current_states_full()
+            sign = optimizer.sign
+            for fid in range(num_frames):
+                if not frame_valid[fid] or fid not in results:
+                    continue
+                preds = []
+                for e in adj[fid][:5]:  # Обмежуємо для швидкодії
+                    other_id = e.from_id if e.to_id == fid else e.to_id
+                    st = states.get(other_id)
+                    if st is None:
+                        continue
+                    pred = (
+                        _predict_forward(st, e, sign)
+                        if e.from_id == other_id
+                        else _predict_inverse(st, e, sign)
+                    )
+                    preds.append(pred[:2])
+                if len(preds) >= 2:
+                    arr = np.asarray(preds, dtype=np.float64)
+                    frame_disagreement[fid] = float(
+                        np.mean(np.linalg.norm(arr - arr.mean(axis=0), axis=1))
+                    )
+        else:
+            for fid in range(num_frames):
+                if not frame_valid[fid]:
+                    continue
+                edges_to_fid = adj[fid]
+                if len(edges_to_fid) >= 2:
+                    predictions_tx = []
+                    for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
+                        other_id = e.from_id if e.to_id == fid else e.to_id
+                        other_affine = results.get(other_id)
+
+                        # Перевіряємо, чи сусідній кадр також валідний
+                        if other_affine is not None:
+                            comp = decompose_affine(other_affine)
+                            predictions_tx.append(comp[0])  # tx
+                    if len(predictions_tx) >= 2:
+                        frame_disagreement[fid] = float(np.std(predictions_tx))
+
+        # --- Збереження в HDF5 ---
+        # Тримаємо лок БД на весь цикл close → write → reload: інакше
+        # конкурентний get_local_features із GUI/трекінгу впаде на закритому
+        # h5py-хендлі (RuntimeError у кращому разі, сегфолт у гіршому).
+        db_path = self.database.db_path
+        # HARDENING P1-6: refuse before touching the handle — a rewrite here would
+        # replace an encrypted map with plaintext inside a deployment copy.
+        assert_project_writable(db_path)
+        self.database.lock.acquire()
+        self.database.close()
+        try:
+            with h5py.File(db_path, "a") as f:
+                if "calibration" in f:
+                    del f["calibration"]
+                grp = f.create_group("calibration")
+
+                grp.attrs["version"] = "3.0"  # Нова версія: графова оптимізація
+                grp.attrs["num_anchors"] = len(anchors)
+                grp.attrs["anchors_json"] = json.dumps(
+                    [a.to_dict() for a in anchors], ensure_ascii=False
+                )
+                grp.attrs["projection_json"] = json.dumps(
+                    self.calibration.converter.export_metadata()
+                )
+                grp.attrs["optimizer"] = "pose_graph_lm"
+                grp.attrs["num_temporal_edges"] = sum(
+                    1 for e in optimizer.edges if e.edge_type == "temporal"
+                )
+                grp.attrs["num_spatial_edges"] = sum(
+                    1 for e in optimizer.edges if e.edge_type == "spatial"
+                )
+
+                grp.create_dataset("frame_affine", data=frame_affine, compression="gzip")
+                grp.create_dataset(
+                    "frame_valid", data=frame_valid.astype(np.uint8), compression="gzip"
+                )
+                grp.create_dataset("frame_rmse", data=frame_rmse, compression="gzip")
+                grp.create_dataset(
+                    "frame_disagreement", data=frame_disagreement, compression="gzip"
+                )
+                grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
+
+                # Обчислюємо та зберігаємо frame_gps (lat/lon для кожного кадру)
+                # Для мультиджерельної геолокалізації — дозволяє SpatialIndex
+                if self.calibration.converter and self.calibration.converter.is_initialized:
+                    frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
+                    gps_count = 0
+                    for fid in range(num_frames):
+                        if not frame_valid[fid]:
+                            continue
+                        affine = frame_affine[fid]
+                        # Центр кадру в пікселях → metric через affine
+                        center_px = np.array(
+                            [[self.frame_w / 2.0, self.frame_h / 2.0]], dtype=np.float64
+                        )
+                        center_metric = GeometryTransforms.apply_affine(center_px, affine)
+                        if center_metric is not None and len(center_metric) > 0:
+                            try:
+                                lat, lon = self.calibration.converter.metric_to_gps(
+                                    float(center_metric[0, 0]),
+                                    float(center_metric[0, 1]),
+                                )
+                                frame_gps[fid] = [lat, lon]
+                                gps_count += 1
+                            except Exception:
+                                pass
+
+                    # Видаляємо старий датасет якщо є
+                    if "frame_gps" in f:
+                        del f["frame_gps"]
+                    f.create_dataset("frame_gps", data=frame_gps, compression="gzip")
+                    logger.info(
+                        f"Saved frame_gps: {gps_count}/{num_frames} frames with GPS coordinates"
+                    )
+
+            valid_count = int(np.sum(frame_valid))
+            logger.success(
+                f"Graph propagation saved to HDF5 (v3.0, "
+                f"{len(anchors)} anchors, {optimizer.num_edges} edges, "
+                f"{valid_count}/{num_frames} valid frames)"
+            )
+        finally:
+            try:
+                self.database._load_hot_data()
+            finally:
+                self.database.lock.release()
+
+        return int(np.sum(frame_valid))
+
+    # ─── Допоміжні методи ────────────────────────────────────────────────────
+
+    def _ground_scale_factor(self, anchors) -> float:
+        """cos(lat) для переведення наземних метрів у проєкційні (WEB_MERCATOR).
+
+        Широта береться з GPS-точок першого якоря, який їх має, далі —
+        з reference_gps конвертера. UTM, невідома широта або будь-яка
+        помилка → 1.0 (порогів не чіпаємо).
+        """
+        converter = getattr(self.calibration, "converter", None)
+        if converter is None:
+            return 1.0
+        lat = None
+        for a in anchors:
+            pts = getattr(a, "points_gps", None)
+            if pts:
+                lat = float(pts[0][0])
+                break
+        try:
+            return float(converter.ground_scale_factor(lat))
+        except Exception as e:  # noqa: BLE001 — поріг важливіший за причину
+            logger.warning(f"Ground scale factor unavailable ({e}) — using 1.0")
+            return 1.0
+
+    def _load_previous_affines(self) -> dict[int, np.ndarray]:
+        """Завантажує frame_affine попереднього калібрування з HDF5 (warm start)."""
+        try:
+            with h5py.File(self.database.db_path, "r") as f:
+                if "calibration" not in f or "frame_affine" not in f["calibration"]:
+                    return {}
+                fa = f["calibration"]["frame_affine"][:]
+                fv = f["calibration"]["frame_valid"][:].astype(bool)
+            return {i: fa[i] for i in range(len(fa)) if fv[i]}
+        except Exception as e:
+            logger.warning(f"Warm start: не вдалось прочитати попередній розв'язок: {e}")
+            return {}
+
+    def _match_and_build_edge(
+        self, features_a: dict, features_b: dict
+    ) -> tuple[np.ndarray, int, float, int, float | None] | None:
+        """Матчить дві фічі та повертає (H, inliers, rmse, n_matches, spread) або None.
+
+        H maps features_a (src) → features_b (dst).
+
+        ``spread`` (ADDENDUM 1.1) — просторовий розкид інлаєрів у кадрі src;
+        ``None``, якщо порахувати неможливо. Раніше точки інлаєрів тут
+        обчислювались і викидались — лишався тільки їхній лічильник, а він
+        скупчення всіх точок в одному кутку кадру не бачить.
+        """
+        try:
+            mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
+            if (
+                len(mkpts_a) < self.min_matches
+                and self.mnn_fallback
+                and hasattr(self.matcher, "match_mnn")
+            ):
+                # Етап 8: LightGlue «сліпне» на повторюваній ріллі (12–28 матчів
+                # там, де MNN по тих самих дескрипторах бачить 100–800 пар).
+                mkpts_a, mkpts_b = self.matcher.match_mnn(features_a, features_b)
+            if len(mkpts_a) < self.min_matches:
+                return None
+
+            H, mask = GeometryTransforms.estimate_homography(
+                mkpts_a,
+                mkpts_b,
+                ransac_threshold=self.ransac_thresh,
+                backend=self.homography_backend,
+                use_mad_ransac=self.use_mad_ransac,
+                mad_k_factor=self.mad_k_factor,
+            )
+            if H is None or mask is None:
+                return None
+
+            inlier_mask = mask.ravel().astype(bool)
+            inliers = int(np.sum(inlier_mask))
+            if inliers < self.min_matches:
+                return None
+
+            # RMSE
+            pts_a_in = mkpts_a[inlier_mask]
+            pts_transformed = GeometryTransforms.apply_homography(pts_a_in, H)
+            pts_b_in = mkpts_b[inlier_mask]
+            rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
+
+            spread = inlier_spread(pts_a_in, self.frame_w, self.frame_h)
+
+            return H, inliers, rmse, int(len(mkpts_a)), spread
+        except Exception:
+            return None
+
+    @staticmethod
+    def _compute_weight(inliers: int, rmse: float, base_weight: float) -> float:
+        """Обчислює вагу ребра: w = base * √inliers / (1 + RMSE)."""
+        return base_weight * np.sqrt(max(inliers, 1)) / (1.0 + rmse)
+
+    def _fill_gaps_pchip(self, frame_affine, frame_valid, valid_ids):
+        """PCHIP-заповнення (Етап 4): центр-базова shape-preserving 5-DoF інтерполяція
+        над УСІМА валідними кадрами (спільний білдер із MultiAnchorCalibration).
+        Кадри поза діапазоном валідних — clamp до крайнього (як лінійна екстраполяція).
+        None → білдер не зібрав інтерполятор → fallback на лінійну."""
+        from src.geometry.affine_utils import build_5dof_pchip, sample_5dof_pchip
+
+        ref_px = (self.frame_w / 2.0, self.frame_h / 2.0)
+        affines = [frame_affine[int(i)] for i in valid_ids]
+        interp, sign, rng = build_5dof_pchip(
+            valid_ids, affines, ref_px, log_scale=self.log_scale_interp
+        )
+        if interp is None:
+            return None
+        filled = 0
+        for fid in range(len(frame_valid)):
+            if frame_valid[fid]:
+                continue
+            M = sample_5dof_pchip(
+                interp, sign, rng, ref_px, fid, log_scale=self.log_scale_interp
+            )
+            if M is None:
+                continue
+            frame_affine[fid] = M
+            frame_valid[fid] = True
+            filled += 1
+        return filled
+
+    def _fill_gaps_by_interpolation(self, frame_affine: np.ndarray, frame_valid: np.ndarray) -> int:
+        """5-DoF інтерполяція кадрів, пропущених через Keyframe Selection.
+
+        Дефолт — посегментна лінійна. За прапорцем pchip_gap_fill — shape-preserving
+        PCHIP над усіма валідними кадрами (Етап 4), що прибирає «сходинки» на дугах.
+        """
+        valid_ids = np.where(frame_valid)[0]
+        if len(valid_ids) < 1:
+            return 0
+
+        if self.pchip_gap_fill and len(valid_ids) >= 2:
+            pchip_filled = self._fill_gaps_pchip(frame_affine, frame_valid, valid_ids)
+            if pchip_filled is not None:
+                return pchip_filled  # інакше — fallback на лінійну нижче
+
+        filled = 0
+
+        # Екстраполяція на початок
+        first_valid = valid_ids[0]
+        for mid in range(0, first_valid):
+            frame_affine[mid] = frame_affine[first_valid].copy()
+            frame_valid[mid] = True
+            filled += 1
+
+        # Інтерполяція розривів всередині траєкторії
+        if len(valid_ids) >= 2:
+            for i in range(len(valid_ids) - 1):
+                left = valid_ids[i]
+                right = valid_ids[i + 1]
+                gap = right - left
+                if gap <= 1:
+                    continue
+
+                # ВИКОРИСТОВУЄМО 5-DoF ДЕКОМПОЗИЦІЮ
+                det = np.linalg.det(frame_affine[left][:2, :2])
+                sign = -1.0 if det < 0 else 1.0
+                comp_left = np.array(decompose_affine_5dof(frame_affine[left]), dtype=np.float64)
+                comp_right = np.array(decompose_affine_5dof(frame_affine[right]), dtype=np.float64)
+
+                # Запобігаємо стрибкам кута (кут тепер під індексом 4)
+                angles = unwrap_angles([comp_left[4], comp_right[4]])
+                comp_left[4] = angles[0]
+                comp_right[4] = angles[1]
+
+                # Log-scale (RESEARCH 1.3): лінійна інтерполяція в log-просторі
+                # масштабу = геометрична інтерполяція самого масштабу.
+                if self.log_scale_interp:
+                    comp_left[2:4] = np.log(np.maximum(comp_left[2:4], 1e-12))
+                    comp_right[2:4] = np.log(np.maximum(comp_right[2:4], 1e-12))
+
+                for mid in range(left + 1, right):
+                    t = (mid - left) / gap
+                    comp_mid = comp_left * (1.0 - t) + comp_right * t
+
+                    # Розпаковуємо 5 змінних
+                    tx, ty, sx, sy, angle = comp_mid
+                    if self.log_scale_interp:
+                        sx, sy = float(np.exp(sx)), float(np.exp(sy))
+                    sx = float(np.clip(sx, 1e-6, 1e6))
+                    sy = float(np.clip(sy, 1e-6, 1e6))
+
+                    # ВИКОРИСТОВУЄМО 5-DoF КОМПОЗИЦІЮ ЗІ ЗБЕРЕЖЕННЯМ ВІДОБРАЖЕННЯ
+                    frame_affine[mid] = compose_affine_5dof(
+                        float(tx), float(ty), sx, sy, float(angle), sign=sign
+                    )
+                    frame_valid[mid] = True
+                    filled += 1
+
+        # Екстраполяція на кінець
+        last_valid = valid_ids[-1]
+        for mid in range(last_valid + 1, len(frame_valid)):
+            frame_affine[mid] = frame_affine[last_valid].copy()
+            frame_valid[mid] = True
+            filled += 1
+
+        return filled
+
+
+# ================================================================================
+# File: src\workers\tracking_worker.py
 # ================================================================================
 import threading
 import time
@@ -14553,7 +25262,7 @@ import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from config.config import get_cfg
+from config import get_cfg
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
 from src.utils.logging_utils import get_logger
 
@@ -14565,12 +25274,16 @@ class RealtimeTrackingWorker(QThread):
 
     frame_ready = pyqtSignal(np.ndarray)
     location_found = pyqtSignal(float, float, float, int)
+    # HARDENING §4a: fired only on a fresh keyframe anchor (not an OF-propagated
+    # fix) — drives the broker's anchor-staleness DEGRADED clock.
+    anchor_fix = pyqtSignal()
     fps_updated = pyqtSignal(float)
     error = pyqtSignal(str)
     status_update = pyqtSignal(str)
     fov_found = pyqtSignal(list)
     objects_detected = pyqtSignal(object)  # list[TrackedObject]
     objects_gps_updated = pyqtSignal(object)  # list[ObjectGPS]
+    debug_view_ready = pyqtSignal(str, np.ndarray)  # (channel_name, готове BGR-зображення)
 
     def __init__(self, video_source: str, localizer, model_manager=None, config=None):
         super().__init__()
@@ -14587,19 +25300,83 @@ class RealtimeTrackingWorker(QThread):
             self.config, "tracking.process_fps", 30.0 / self.keyframe_interval
         )
         self.tracking_config = get_cfg(self.config, "object_tracking", {})
+        # ADDENDUM 1.2: forward-backward фільтр треків optical flow. Дефолт off.
+        self.of_fb_check = get_cfg(self.config, "tracking.of_fb_check", False)
+        self.of_fb_max_px = get_cfg(self.config, "tracking.of_fb_max_px", 2.0)
+        # PIPELINE_OPTIMIZATION_PLAN §B1/§B2. Обидва дефолти = стара поведінка.
+        self.of_stride = max(1, int(get_cfg(self.config, "tracking.of_stride", 1)))
+        self.of_half_res = bool(get_cfg(self.config, "tracking.of_half_res", False))
+        # Локальна швидкість на OF-шляху: dt має мірятись від ПОПЕРЕДНЬОГО
+        # OF-КАДРУ, а не від останньої УСПІШНОЇ локалізації — інакше він
+        # розходиться з ref_position у детекторі (той бере попередній сирий
+        # OF-вимір). Заміряно: 4 з 20 спрацювань мали dt=0.200 при опорі,
+        # знятому 0.1 c тому, тобто перевищення 1.9-5.0x на рівному місці.
+        self.of_local_speed = bool(get_cfg(self.config, "tracking.of_local_speed", False))
+
+        # ── Debug views (вікна «очима моделей») ─────────────────────────────
+        # Порожній набір каналів ⇒ нуль overhead: колектор не створюється.
+        self._debug_lock = threading.Lock()
+        self._debug_channels = set()
+        self._debug_max_width = get_cfg(self.config, "debug_views.max_width", 640)
+        self._debug_dino_pca = get_cfg(self.config, "debug_views.dino_pca_enabled", True)
+        self._debug_inflight = {}  # {канал: monotonic-час emit} — backpressure (self-healing)
+        self._debug_inflight_stale_sec = 1.0  # авто-скидання, якщо ack від GUI не прийшов
+
+        # HARDENING P1-8: optional per-frame latency stats (measurement only,
+        # no effect on timing). Off by default = поточна поведінка.
+        self._latency_tracker = None
+        if get_cfg(self.config, "models.performance.log_latency_stats", False):
+            from src.utils.latency_tracker import LatencyTracker
+
+            self._latency_tracker = LatencyTracker(
+                log_interval=get_cfg(
+                    self.config, "models.performance.latency_log_interval", 100
+                ),
+                logger=logger,
+            )
+
+    def _models_to_pin(self) -> list[str]:
+        """Імена моделей, які треба закріпити у VRAM на час трекінгу.
+
+        Виводяться з ``models.local_extractor``, а не хардкодяться: назви мають
+        збігатися з ключами реєстру ModelManager ("aliked" | "rdd" | "xfeat",
+        "lightglue_<features>", "dinov2").
+
+        Дзеркалить ModelManager.load_local_extractor() і prewarm() ТОЧНО:
+        завантажувач розрізняє лише "rdd" і "xfeat", будь-що інше (зокрема
+        "superpoint") тихо падає на ALIKED. Якщо там колись зʼявиться новий
+        екстрактор, оновити треба обидва місця.
+        """
+        local = str(get_cfg(self.config, "models.local_extractor", "aliked")).lower()
+        if local not in ("rdd", "xfeat"):
+            if local != "aliked":
+                logger.warning(
+                    f"models.local_extractor={local!r} не підтримується "
+                    f"ModelManager.load_local_extractor() — фактично вантажиться "
+                    f"ALIKED, закріплюємо його ж"
+                )
+            local = "aliked"
+        # XFeat матчиться власним MNN, окремий LightGlue йому не потрібен.
+        if local == "xfeat":
+            return ["xfeat", "dinov2"]
+        return [local, "dinov2", f"lightglue_{local}"]
 
     def run(self):
-        # Fix #3: Скидаємо стан трекера при кожному новому старті сесії
-        if hasattr(self.localizer, "trajectory_filter"):
-            self.localizer.trajectory_filter.reset()
-        if hasattr(self.localizer, "outlier_detector"):
-            self.localizer.outlier_detector.window.clear()
-            self.localizer.outlier_detector._consecutive_outliers = 0
-        if hasattr(self.localizer, "_consecutive_failures"):
-            self.localizer._consecutive_failures = 0
+        # Fix #3: скидаємо стан сесії через публічний API (без приватних полів)
+        if hasattr(self.localizer, "reset_session"):
+            self.localizer.reset_session()
+
+        # Debug views: свіжий старт backpressure-стану для нової сесії
+        with self._debug_lock:
+            self._debug_inflight.clear()
 
         if self.model_manager:
-            self.model_manager.pin(["aliked", "lightglue_aliked", "dinov2"])
+            # ВИПРАВЛЕНО: список був захардкоджений під ALIKED. При
+            # models.local_extractor = "rdd" | "xfeat" він закріплював моделі,
+            # які взагалі не вантажаться, а ті, що реально в роботі, лишались
+            # витискуваними — _ensure_vram_available вивантажував їх саме тоді,
+            # коли VRAM закінчувалась. Імена — ті самі, що в ModelManager.
+            self.model_manager.pin(self._models_to_pin())
 
         from src.tracking.object_projector import ObjectProjector
         from src.tracking.object_tracker import ObjectTracker
@@ -14672,6 +25449,7 @@ class RealtimeTrackingWorker(QThread):
         # Замість time-based інтервалу використовуємо frame-based:
         frame_idx = 0
         prev_gray_for_of = None
+        prev_gray_half_for_of = None  # §B2: half-res копія keyframe-а для LK
         prev_pts_for_of = None
         last_tracked_objects = []  # Кеш об'єктів з останнього ключового кадру для OF-кадрів
 
@@ -14682,6 +25460,10 @@ class RealtimeTrackingWorker(QThread):
         # відхиляються, last_localization_video_time залишається -1, і dt = 0.033s,
         # що штучно завищує швидкість у 5× (keyframe_interval=5).
         last_keyframe_video_time = -1.0
+        # Час ПОПЕРЕДНЬОГО обробленого OF-кадру (успішного чи ні) — база dt
+        # при of_local_speed. Скидається на кожному keyframe, бо LK там
+        # перезапускається і перший OF міряється саме від keyframe.
+        last_of_video_time = -1.0
 
         stream_start_time = time.time()
 
@@ -14697,13 +25479,11 @@ class RealtimeTrackingWorker(QThread):
             if video_src.is_live:
                 current_video_time_sec = time.time() - stream_start_time
             else:
-                # Отримуємо поточний час САМОГО ВІДЕО у секундах
-                current_video_time_sec = video_src._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                # Отримуємо поточний час САМОГО ВІДЕО у секундах (публічний API)
+                current_video_time_sec = video_src.pos_msec / 1000.0
                 # Fallback: деякі кодеки повертають 0 — рахуємо за номером кадру
                 if current_video_time_sec <= 0:
-                    current_video_time_sec = (
-                        video_src._cap.get(cv2.CAP_PROP_POS_FRAMES) * frame_duration_sec
-                    )
+                    current_video_time_sec = video_src.pos_frames * frame_duration_sec
 
             # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
             self.frame_ready.emit(frame)
@@ -14713,6 +25493,7 @@ class RealtimeTrackingWorker(QThread):
             is_keyframe = frame_idx % self.keyframe_interval == 0
 
             # Розрахунок dt — різний для KF та OF
+            _is_of_frame = not (is_keyframe or prev_pts_for_of is None)
             if is_keyframe or prev_pts_for_of is None:
                 # Для ключових кадрів: dt = час від ПОПЕРЕДНЬОГО ключового кадру
                 # (навіть якщо він був відхилений як outlier)
@@ -14723,13 +25504,34 @@ class RealtimeTrackingWorker(QThread):
                     if calculated_dt <= 0:
                         calculated_dt = self.keyframe_interval * frame_duration_sec
             else:
-                # Для OF-кадрів: dt = час від останньої УСПІШНОЇ локалізації
-                if last_localization_video_time < 0:
+                # Для OF-кадрів: база dt має збігатися з базою ЗСУВУ.
+                # of_local_speed=True -> обидві беруться від попереднього
+                # OF-кадру. False -> стара поведінка (від успішної локалізації).
+                _dt_base = (
+                    last_of_video_time if self.of_local_speed else last_localization_video_time
+                )
+                if _dt_base < 0:
                     calculated_dt = frame_duration_sec
                 else:
-                    calculated_dt = current_video_time_sec - last_localization_video_time
+                    calculated_dt = current_video_time_sec - _dt_base
                     if calculated_dt <= 0:
                         calculated_dt = frame_duration_sec
+
+            # База для наступного OF-кроку: беремо ПІСЛЯ того, як calculated_dt
+            # уже обчислено. На keyframe теж оновлюємо — ланцюг локальних
+            # порівнянь починається заново від нього.
+            #
+            # КРИТИЧНО: тільки для кадрів, на яких OF СПРАВДІ рахується.
+            # of_stride пропускає обробку нижче (рядок ~394), тож без цієї
+            # перевірки база часу рухалась на кожному кадрі, а база ЗСУВУ —
+            # раз на of_stride кадрів. Заміряно на місії top з of_stride=5:
+            # distance 17.5 м при dt=0.033 давало 526 м/с замість реальних
+            # 105 м/с — рівно у of_stride разів більше.
+            _of_computed = _is_of_frame and (
+                self.of_stride <= 1 or (frame_idx % self.of_stride) == 0
+            )
+            if _of_computed or is_keyframe:
+                last_of_video_time = current_video_time_sec
 
             loc_result = {"success": False, "error": "Not processed"}
             start_process = time.time()
@@ -14744,9 +25546,25 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, detections = yolo_wrapper.detect_and_mask(frame_rgb)
 
+                # Debug views: знімок активних каналів + opt-in колектор.
+                with self._debug_lock:
+                    active_debug = set(self._debug_channels)
+                debug_collector = None
+                if active_debug & {"matches", "dino", "depth"}:
+                    from src.localization.debug_collector import DebugCollector
+
+                    debug_collector = DebugCollector(
+                        want_matches="matches" in active_debug,
+                        want_dino_pca=("dino" in active_debug) and self._debug_dino_pca,
+                        want_depth="depth" in active_debug,
+                    )
+
                 try:
                     loc_result = self.localizer.localize_frame(
-                        frame_rgb, static_mask=static_mask, dt=calculated_dt
+                        frame_rgb,
+                        static_mask=static_mask,
+                        dt=calculated_dt,
+                        collector=debug_collector,
                     )
                 except Exception as e:
                     import torch
@@ -14755,12 +25573,27 @@ class RealtimeTrackingWorker(QThread):
                     logger.error(f"Localization exception on keyframe: {e}", exc_info=True)
                     loc_result = {"success": False, "error": str(e)}
 
+                if active_debug:
+                    self._render_debug(
+                        active_debug, frame_rgb, detections, static_mask, debug_collector
+                    )
+
                 # Завжди оновлюємо час останнього keyframe, навіть якщо він rejected
                 last_keyframe_video_time = current_video_time_sec
 
-                if loc_result.get("success"):
+                # БАГФІКС (OF-шов): retrieval-only fallback не має H і не
+                # оновлює _last_state — ребейз OF-точок на ньому дав би OF
+                # з новими точками на старій гомографії.
+                if loc_result.get("success") and loc_result.get("fallback_mode") != "retrieval_only":
                     # Зберігаємо стан для OF на наступні кадри
                     prev_gray_for_of = curr_gray
+                    prev_gray_half_for_of = (
+                        cv2.resize(
+                            curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
+                        )
+                        if self.of_half_res
+                        else None
+                    )
                     # Трекаємо гарні точки (corners) для стабільного OF
                     prev_pts_for_of = cv2.goodFeaturesToTrack(
                         curr_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
@@ -14771,21 +25604,25 @@ class RealtimeTrackingWorker(QThread):
                     # ОНОВЛЕНО: Завжди оновлюємо кеш, навіть якщо порожній, щоб об'єкти могли зникати
                     last_tracked_objects = tracked_objects
                     self.objects_detected.emit(tracked_objects)
-                    if object_projector and getattr(self.localizer, "_last_state", None):
-                        H = self.localizer._last_state.get("H")
-                        affine = self.localizer._last_state.get("affine")
-                        angle = self.localizer._last_state.get("global_angle", 0)
+                    loc_state = getattr(self.localizer, "last_state", None)
+                    if object_projector and loc_state:
+                        H = loc_state.get("H")
+                        affine = loc_state.get("affine")
+                        angle = loc_state.get("global_angle", 0)
 
                         if H is not None and affine is not None:
                             # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
-                            scale = getattr(self.localizer, "_last_scale", 1.0)
+                            scale = loc_state.get(
+                                "scale", getattr(self.localizer, "_last_scale", 1.0)
+                            )
 
-                            # Створюємо копії об'єктів з масштабованими координатами
-                            from copy import deepcopy
+                            # Shallow copy достатньо: перезаписуємо лише center_px і bbox
+                            # (deepcopy на кожен об'єкт кожного keyframe — зайвий CPU)
+                            from copy import copy as _shallow_copy
 
                             scaled_tracked_objects = []
                             for obj in tracked_objects:
-                                s_obj = deepcopy(obj)
+                                s_obj = _shallow_copy(obj)
                                 s_obj.center_px = (
                                     obj.center_px[0] * scale,
                                     obj.center_px[1] * scale,
@@ -14805,34 +25642,119 @@ class RealtimeTrackingWorker(QThread):
                                 obj_summary = ", ".join(
                                     [f"{obj.class_name} #{obj.track_id}" for obj in objects_gps]
                                 )
-                                logger.info(
+                                logger.debug(
                                     f"Tracked {len(objects_gps)} objects (KF): {obj_summary}"
                                 )
                             self.objects_gps_updated.emit(objects_gps)
 
-                # Fix OOM: Clear PyTorch CUDA cache after heavy keyframe
-                import torch
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # ВИПРАВЛЕНО (A1): раніше тут був torch.cuda.empty_cache() після
+                # КОЖНОГО keyframe — це синхронізує GPU і повертає блоки драйверу,
+                # через що наступні алокації йдуть повільним cudaMalloc (10–100 мс
+                # "податку" на keyframe). При OOM кеш чиститься у except-гілці вище.
             else:
                 # ====== OPTICAL FLOW TRACKING ======
-                if prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
+                # §B1: OF-кадри незалежні один від одного — кожен трекається
+                # ВІД keyframe-а (prev_gray_for_of / prev_pts_for_of нижче
+                # навмисно не оновлюються). Тому пропуск кожного N-го кадру не
+                # накопичує помилку: падає лише частота видачі позиції.
+                # Кадр усе одно вже відправлено в GUI (frame_ready вище).
+                if self.of_stride > 1 and (frame_idx % self.of_stride) != 0:
+                    if object_tracker:
+                        self.objects_detected.emit(last_tracked_objects)
+                elif prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
+                    # §B2: half-res LK. Заміряно на 1080p/200 точках: 3.08 →
+                    # 1.49 мс, тобто ~2.1× (не 4× — побудова піраміди й так
+                    # дешева), ціною вдвічі грубішого субпіксельного зсуву.
+                    # Координати повертаються у простір оригіналу одразу після
+                    # фільтрації, тож увесь код нижче лишається в оригінальних
+                    # пікселях і нічого про half-res не знає.
+                    of_scale = 0.5 if (self.of_half_res and prev_gray_half_for_of is not None) else 1.0
+                    if of_scale != 1.0:
+                        g_prev = prev_gray_half_for_of
+                        g_curr = cv2.resize(
+                            curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
+                        )
+                        pts_prev = np.ascontiguousarray(
+                            prev_pts_for_of * of_scale, dtype=np.float32
+                        )
+                    else:
+                        g_prev, g_curr, pts_prev = prev_gray_for_of, curr_gray, prev_pts_for_of
+
                     curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                        prev_gray_for_of,
-                        curr_gray,
-                        prev_pts_for_of,
+                        g_prev,
+                        g_curr,
+                        pts_prev,
                         None,
                         winSize=(15, 15),
                         maxLevel=2,
                     )
-                    good_new = curr_pts[status == 1]
-                    good_old = prev_pts_for_of[status == 1]
+                    keep = status.reshape(-1) == 1
+
+                    # ADDENDUM 1.2: forward-backward перевірка. Трек, який не
+                    # повертається у власну стартову точку, «сповз» на схожу
+                    # текстуру (рілля, ліс). RANSAC нижче його й так відкине —
+                    # але доти він сидить у знаменнику inlier_ratio і ЗАНИЖУЄ
+                    # flow_quality, від якого залежить R у Калмані. Тобто це
+                    # фікс чесності метрики якості, а не самої трансформації.
+                    if self.of_fb_check and keep.any():
+                        back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
+                            g_curr,
+                            g_prev,
+                            curr_pts,
+                            None,
+                            winSize=(15, 15),
+                            maxLevel=2,
+                        )
+                        # Поріг застосовується в РОБОЧІЙ роздільності: на
+                        # half-res він тим самим числом стає вдвічі
+                        # м'якшим у повних пікселях — що й треба, бо сама
+                        # точність LK там теж удвічі грубіша.
+                        rt_err = np.linalg.norm(
+                            back_pts.reshape(-1, 2) - pts_prev.reshape(-1, 2), axis=1
+                        )
+                        fb_ok = (back_status.reshape(-1) == 1) & (rt_err <= self.of_fb_max_px)
+                        # Захист: якщо перевірка зрізала майже все (різка зміна
+                        # експозиції, розмиття), лишаємо початковий набір —
+                        # краще шумний OF, ніж примусовий keyframe.
+                        if int((keep & fb_ok).sum()) >= 10:
+                            keep = keep & fb_ok
+
+                    # reshape(-1, 2) перед маскою: маска плоска (N,), а масиви
+                    # від goodFeaturesToTrack/LK мають форму (N, 1, 2).
+                    # Результат (M, 2) — точно як у попередньої версії
+                    # `curr_pts[status == 1]`, downstream не змінюється.
+                    good_new = curr_pts.reshape(-1, 2)[keep]
+                    good_old = pts_prev.reshape(-1, 2)[keep]
+                    if of_scale != 1.0:
+                        # half-res → оригінальні пікселі
+                        good_new = good_new / of_scale
+                        good_old = good_old / of_scale
 
                     if len(good_new) > 10:
-                        # Зсув у пікселях
+                        # Зсув у пікселях (fallback, якщо симілярність не зійдеться)
                         flow_vectors = good_new - good_old
                         dx_px, dy_px = np.median(flow_vectors, axis=0)
+
+                        # B4: повна симілярність (R+T+S) замість чистої трансляції —
+                        # враховує обертання дрона та зміну висоти між keyframe-ами.
+                        # flow_quality (0..1) — чесна оцінка якості OF для Kalman R.
+                        flow_affine = None
+                        flow_quality = None
+                        try:
+                            S_of, of_mask = cv2.estimateAffinePartial2D(
+                                good_old,
+                                good_new,
+                                method=cv2.RANSAC,
+                                ransacReprojThreshold=3.0,
+                            )
+                            if S_of is not None and np.all(np.isfinite(S_of)):
+                                flow_affine = S_of
+                                if of_mask is not None and len(of_mask) > 0:
+                                    inlier_ratio = float(of_mask.sum()) / len(of_mask)
+                                    n_norm = min(1.0, len(good_new) / 120.0)
+                                    flow_quality = inlier_ratio * n_norm
+                        except cv2.error:
+                            pass
 
                         try:
                             loc_result = self.localizer.localize_optical_flow(
@@ -14841,6 +25763,8 @@ class RealtimeTrackingWorker(QThread):
                                 dt=calculated_dt,
                                 rot_width=frame.shape[1],
                                 rot_height=frame.shape[0],
+                                flow_affine=flow_affine,
+                                flow_quality=flow_quality,
                             )
                         except Exception as e:
                             logger.error(f"OF Localization error: {e}")
@@ -14866,6 +25790,11 @@ class RealtimeTrackingWorker(QThread):
                     loc_result["confidence"],
                     loc_result["inliers"],
                 )
+                # HARDENING §4a: a fresh keyframe anchor (real re-localization)
+                # refreshes the broker's anchor-staleness clock; OF-propagated
+                # fixes do not, so a long OF coast honestly reads DEGRADED.
+                if not loc_result.get("is_of"):
+                    self.anchor_fix.emit()
                 if loc_result.get("fov_polygon"):
                     self.fov_found.emit(loc_result["fov_polygon"])
 
@@ -14897,6 +25826,8 @@ class RealtimeTrackingWorker(QThread):
                 self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
 
             process_duration = time.time() - start_process
+            if self._latency_tracker is not None:
+                self._latency_tracker.record(process_duration)
             self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
 
             frame_idx += 1
@@ -14926,6 +25857,70 @@ class RealtimeTrackingWorker(QThread):
                 exc_info=True,
             )
 
+    def set_debug_channels(self, channels) -> None:
+        """GUI → worker: набір активних debug-каналів (thread-safe).
+
+        Порожній набір ⇒ нуль overhead. Викликається з GUI-потоку при зміні
+        видимості вікон і при старті трекінгу.
+        """
+        with self._debug_lock:
+            self._debug_channels = set(channels or [])
+
+    def _render_debug(self, active, frame_rgb, detections, static_mask, collector) -> None:
+        """Рендерить активні debug-канали й emit-ить готові BGR-кадри у GUI.
+
+        Лише на keyframe-ах, у worker-потоці. Емітяться свіжі масиви (не аліаси
+        кадру/колектора), тож безпечно між потоками.
+
+        Backpressure «drop замість черги»: на канал одночасно ≤1 кадр «у льоті».
+        Поки GUI не підтвердив попередній (mark_debug_channel_free), нові кадри
+        цього каналу не рендеряться і не emit-яться — GUI-черга не росте, ми
+        показуємо найсвіжіший кадр, а не відстаємо. Кожен рендер у своєму try:
+        помилка одного вікна не валить локалізацію чи інші вікна.
+        """
+        from src.workers import debug_renderers as dr
+
+        mw = self._debug_max_width
+
+        def emit_if_free(channel, render_fn):
+            now = time.monotonic()
+            with self._debug_lock:
+                ts = self._debug_inflight.get(channel)
+                # Свіжий in-flight → drop. Застарілий (ack втрачено?) → self-heal,
+                # рендеримо знову, щоб канал не «замерзав» назавжди.
+                if ts is not None and (now - ts) < self._debug_inflight_stale_sec:
+                    return
+            try:
+                img = render_fn()
+            except Exception as e:
+                logger.debug(f"{channel} debug render failed: {e}")
+                return
+            with self._debug_lock:
+                self._debug_inflight[channel] = time.monotonic()
+            self.debug_view_ready.emit(channel, img)
+
+        if "yolo" in active:
+            emit_if_free(
+                "yolo", lambda: dr.render_yolo(frame_rgb, detections, static_mask, mw)
+            )
+        if collector is None:
+            return
+        if "matches" in active and collector.rotated_frame is not None:
+            emit_if_free("matches", lambda: dr.render_matches(collector, mw))
+        if "dino" in active and collector.rotated_frame is not None:
+            emit_if_free("dino", lambda: dr.render_dino(collector, mw, self._debug_dino_pca))
+        if "depth" in active and collector.depth_map is not None:
+            emit_if_free("depth", lambda: dr.render_depth(collector, mw))
+
+    def mark_debug_channel_free(self, channel) -> None:
+        """GUI → worker: підтвердження, що кадр каналу спожито (thread-safe).
+
+        Знімає in-flight позначку, дозволяючи emit наступного кадру цього
+        каналу. Викликається зі слота _on_debug_view_ready у GUI-потоці.
+        """
+        with self._debug_lock:
+            self._debug_inflight.pop(channel, None)
+
     def stop(self):
         logger.info("Stopping tracking worker...")
         self._stop_event.set()
@@ -14936,7 +25931,7 @@ class RealtimeTrackingWorker(QThread):
 
 
 # ================================================================================
-# File: workers\video_decode_worker.py
+# File: src\workers\video_decode_worker.py
 # ================================================================================
 import queue
 import time
@@ -15110,6 +26105,393 @@ class VideoDecodeWorker(QThread):
 
 
 # ================================================================================
-# File: workers\__init__.py
+# File: main.py
 # ================================================================================
-"""Worker threads module"""
+import os
+import sys
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# --- PyInstaller: fix DLL loading & redirect caches for frozen builds ---
+if getattr(sys, "frozen", False):
+    from pathlib import Path
+
+    _meipass = getattr(sys, "_MEIPASS", str(Path(sys.executable).parent))
+    _app_dir = str(Path(sys.executable).parent)
+
+    # 1) Fix tensorrt DLL loading if needed
+    _trt_lib = os.path.join(_meipass, "tensorrt_libs")
+    if os.path.isdir(_trt_lib):
+        os.add_dll_directory(_trt_lib)
+        os.environ["PATH"] = _trt_lib + ";" + os.environ.get("PATH", "")
+
+    # 2) Redirect TORCH_HOME / HF_HOME
+    _cache_dir = os.path.join(_meipass, ".cache")
+    if os.path.isdir(_cache_dir):
+        os.environ.setdefault("TORCH_HOME", os.path.join(_cache_dir, "torch"))
+        _hf_hub = os.path.join(_cache_dir, "huggingface", "hub")
+        if os.path.isdir(_hf_hub):
+            os.environ.setdefault("HF_HOME", os.path.join(_cache_dir, "huggingface"))
+            os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _hf_hub)
+
+# WORKAROUND FOR PYINSTALLER + PYTORCH + WINDOWS WinError 1114:
+# Import torch BEFORE anything else to prevent DLL conflicts
+import warnings
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+os.environ["YOLO_VERBOSE"] = "False"
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+os.environ["TRT_LOGGER_SEVERITY"] = "3"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", category=UserWarning, message="xFormers is not available")
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import argparse
+import traceback
+
+from PyQt6.QtCore import Qt, QThread
+from PyQt6.QtWidgets import QApplication
+
+from config import APP_SETTINGS, CONFIG_LOAD_STATUS, CONFIG_LOADED_FROM, user_data_dir
+from src.core.headless_runner import HeadlessRunner
+from src.gui.main_window import MainWindow
+from src.utils.logging_utils import enable_crash_handler, get_logger, setup_logging
+
+
+class StartupWorker(QThread):
+    def __init__(self, model_manager):
+        super().__init__()
+        self.model_manager = model_manager
+
+    def run(self):
+        try:
+            self.model_manager.prewarm()
+        except Exception as e:
+            logger = get_logger(__name__)
+            logger.warning(f"Startup prewarm failed: {e}. Models will load on first use.")
+
+
+def _build_exception_hook(log):
+    """Return sys.excepthook that logs unhandled exceptions before exit."""
+
+    def hook(exctype, value, tb):
+        # Ctrl+C is a deliberate cancellation, not a crash — it must not print a
+        # traceback or be logged as one. It reaches here because KeyboardInterrupt
+        # is a BaseException and slips past every `except Exception`.
+        if issubclass(exctype, KeyboardInterrupt):
+            log.info("Interrupted by user (Ctrl+C) — exiting")
+            sys.exit(130)
+
+        log.critical(
+            "Unhandled exception caught — application will exit",
+            exc_info=(exctype, value, tb),
+        )
+
+        traceback.print_exception(exctype, value, tb)
+        sys.exit(1)
+
+    return hook
+
+
+def _run_supervised(args, logger) -> int:
+    """HARDENING P0-3: run the headless pipeline in a child process and restart
+    it on crash with exponential backoff.
+
+    Because the pipeline runs as a separate process, even a native segfault
+    (CUDA/cv2/torch) is survivable — the supervisor sees a non-zero exit and
+    relaunches. Turns "silent death" into "logged auto-recovery". Active only
+    with ``--supervise --headless``; default behavior is unchanged.
+    """
+    import subprocess
+    import time as _time
+
+    if getattr(sys, "frozen", False):
+        base_cmd = [sys.executable]
+    else:
+        base_cmd = [sys.executable, os.path.abspath(sys.argv[0])]
+
+    child_cmd = base_cmd + [
+        "--headless",
+        "--project", args.project,
+        "--source", args.source,
+    ]
+    # Порти передаємо дитині ЛИШЕ якщо їх явно задали в CLI: інакше дитина має
+    # взяти їх із user_config.json так само, як це зробив би одиночний запуск.
+    if args.ws_port is not None:
+        child_cmd += ["--ws-port", str(args.ws_port)]
+    if args.rest_port is not None:
+        child_cmd += ["--rest-port", str(args.rest_port)]
+
+    # HARDENING P1-6: an encrypted project needs the passphrase on EVERY child
+    # start. Ask once here, in the supervisor, and pipe it to each child on its
+    # stdin — unattended restart is the whole point of this mode, so re-prompting
+    # a human per restart would defeat it. A pipe (unlike an env var) is invisible
+    # in process listings, not inherited by grandchildren, and consumed once.
+    child_input = None
+    try:
+        from src.security.at_rest import get_passphrase, prompt_and_verify_passphrase
+        from src.security.project_scan import encrypted_artifacts_at
+
+        encrypted = encrypted_artifacts_at(args.project)
+        if encrypted:
+            if not prompt_and_verify_passphrase(str(encrypted[0])):
+                logger.error(
+                    "Project is encrypted and no valid passphrase was given — "
+                    "supervisor will not start."
+                )
+                return 1
+            child_input = get_passphrase().encode("utf-8") + b"\n"
+            logger.info("Map passphrase accepted — it will be piped to each child")
+    except Exception as e:
+        logger.error(f"Could not resolve the map passphrase: {e}")
+        return 1
+
+    backoff = 1.0
+    backoff_max = 60.0
+    restarts = 0
+    max_restarts = args.max_restarts  # 0 = unlimited
+
+    logger.info(
+        f"Supervisor starting | max_restarts={max_restarts or 'unlimited'} | "
+        f"child={' '.join(child_cmd)}"
+    )
+
+    while True:
+        start = _time.monotonic()
+        try:
+            # Passing input= replaces the child's stdin with a pipe, which is what
+            # its get_passphrase reads. Plaintext projects pass None and keep
+            # inheriting the terminal exactly as before.
+            rc = subprocess.run(child_cmd, input=child_input).returncode
+        except KeyboardInterrupt:
+            logger.info("Supervisor received interrupt — shutting down")
+            return 0
+        runtime = _time.monotonic() - start
+
+        if rc == 0:
+            logger.info("Supervised pipeline exited cleanly (rc=0) — supervisor stopping")
+            return 0
+
+        restarts += 1
+        logger.error(
+            f"Supervised pipeline crashed (rc={rc}) after {runtime:.1f}s — restart #{restarts}"
+        )
+
+        if max_restarts and restarts >= max_restarts:
+            logger.critical(f"Supervisor reached max_restarts={max_restarts}; giving up.")
+            return 1
+
+        # A child that ran long enough is 'healthy'; reset the backoff.
+        if runtime >= backoff_max:
+            backoff = 1.0
+
+        logger.warning(f"Restarting in {backoff:.0f}s (backoff)")
+        try:
+            _time.sleep(backoff)
+        except KeyboardInterrupt:
+            logger.info("Supervisor interrupted during backoff — shutting down")
+            return 0
+        backoff = min(backoff * 2, backoff_max)
+
+
+def main() -> None:
+    try:
+        log_level = APP_SETTINGS.models.performance.log_level
+    except Exception:
+        log_level = "INFO"  # Safe default
+    setup_logging(log_level=log_level, log_file=str(user_data_dir() / "logs" / "app.log"))
+    logger = get_logger(__name__)
+
+    # HARDENING P0-2: capture native segfaults/aborts before the excepthook.
+    enable_crash_handler(user_data_dir() / "logs")
+
+    sys.excepthook = _build_exception_hook(logger)
+
+    logger.info("=" * 70)
+    logger.info("DRONE TOPOMETRIC LOCALIZATION SYSTEM STARTING")
+    logger.info("=" * 70)
+
+    logger.info(f"Python: {sys.version}")
+    logger.info(f"PyTorch: {torch.__version__}")
+
+    # Звідки взято налаштування. Якщо файл не знайдено — це WARNING, а не тиша:
+    # старт на вбудованих дефолтах вимикає smoother, edge-гейти й torch_compile,
+    # і раніше про це не було жодного сигналу в логах.
+    if CONFIG_LOADED_FROM:
+        logger.info(CONFIG_LOAD_STATUS)
+    else:
+        logger.warning(CONFIG_LOAD_STATUS)
+
+    # ── HARDENING P2-12: weight-integrity preflight (fail-closed go/no-go) ────
+    try:
+        _wi_mode = APP_SETTINGS.models.performance.weight_integrity_mode
+    except Exception:
+        _wi_mode = "off"
+    if _wi_mode and _wi_mode.lower() != "off":
+        from src.utils.weight_integrity import WeightIntegrityError, run_preflight
+
+        _models_root = Path(__file__).parent / "models"
+        try:
+            run_preflight(
+                _models_root,
+                _models_root / "weights_manifest.json",
+                mode=_wi_mode,
+                logger=logger,
+            )
+        except WeightIntegrityError as e:
+            logger.critical(f"Weight integrity preflight failed — aborting startup.\n{e}")
+            sys.exit(1)
+
+    # ── Hardware auto-detection & compute auto-tuning ────────────────────────
+    from src.utils.hardware_profile import HardwareProfile
+
+    hw_profile = HardwareProfile.detect()
+    hw_profile.log_summary()
+
+    # Apply PyTorch backend optimizations (TF32, cudnn.benchmark, thread counts).
+    # HARDENING P1-8: deterministic mode bounds worst-case latency when enabled.
+    try:
+        _deterministic = APP_SETTINGS.models.performance.deterministic
+    except Exception:
+        _deterministic = False
+    hw_profile.apply_torch_backends(deterministic=_deterministic)
+
+    # Auto-tune config values if enabled
+    if APP_SETTINGS.models.performance.auto_tune:
+        import config as _cfg_module
+
+        overrides = hw_profile.auto_tune(_cfg_module.APP_CONFIG)
+        if overrides:
+            hw_profile.apply_overrides(_cfg_module.APP_CONFIG, overrides)
+            hw_profile.log_overrides(overrides)
+            # Перезаливаємо APP_SETTINGS У МІСЦІ. Переприв'язка (`= AppConfig(...)`)
+            # оновлювала лише config.* і main.*, а headless_runner/main_window/
+            # config_dialog лишалися на старому об'єкті — auto-tune до них не
+            # доходив, а --ws-port/--rest-port писалися в об'єкт, якого ніхто
+            # не читає.
+            _cfg_module.reload_settings_in_place(_cfg_module.APP_CONFIG)
+        else:
+            logger.info("Auto-tune: all settings already optimal or user-customized")
+    else:
+        logger.info("Auto-tune disabled (models.performance.auto_tune = false)")
+
+    parser = argparse.ArgumentParser(description="Drone Topometric Localization")
+    parser.add_argument("--headless", action="store_true", help="Run without GUI")
+    parser.add_argument(
+        "--project", type=str, help="Path to project directory (required for headless)"
+    )
+    parser.add_argument(
+        "--source", type=str, help="Video source URL or path (required for headless)"
+    )
+    # ВАЖЛИВО: default=None, а не число. Раніше дефолти argparse (8765/8080)
+    # БЕЗУМОВНО перезаписували network_api.ws_port / rest_port із user_config.json
+    # навіть коли прапорець не передавали — headless завжди слухав 8080, хоча
+    # конфіг казав 8081.
+    parser.add_argument(
+        "--ws-port", type=int, default=None,
+        help="WebSocket port (default: network_api.ws_port from config)",
+    )
+    parser.add_argument(
+        "--rest-port", type=int, default=None,
+        help="REST API port (default: network_api.rest_port from config)",
+    )
+    parser.add_argument(
+        "--supervise",
+        action="store_true",
+        help="Headless: run the pipeline in a child process and auto-restart it on crash",
+    )
+    parser.add_argument(
+        "--max-restarts",
+        type=int,
+        default=0,
+        help="Supervisor: stop after N restarts (0 = unlimited)",
+    )
+
+    args = parser.parse_args()
+
+    # HARDENING P0-3: supervisor mode wraps the headless pipeline in an
+    # auto-restarting parent process. Flag-gated; off = current behavior.
+    if args.supervise:
+        if not args.headless:
+            logger.error("--supervise requires --headless")
+            sys.exit(1)
+        if not args.project or not args.source:
+            logger.error("--project and --source are required with --supervise")
+            sys.exit(1)
+        sys.exit(_run_supervised(args, logger))
+
+    # HARDENING P1-6 SP3: a crashed run leaves decrypted global descriptors in a
+    # temp directory. Wipe only those whose owner process is gone. Applies to both
+    # modes — a headless run decrypts the same LanceDB index.
+    try:
+        from src.database.database_loader import sweep_stale_lance_tempdirs
+
+        sweep_stale_lance_tempdirs()
+    except Exception as e:
+        logger.warning(f"Stale decrypted-index sweep failed: {e}")
+
+    try:
+        if args.headless:
+            logger.info("Running in headless mode")
+            if not args.project or not args.source:
+                logger.error("--project and --source are required in headless mode")
+                sys.exit(1)
+
+            # Перекриваємо конфіг лише тим, що явно задане в CLI.
+            if args.ws_port is not None:
+                APP_SETTINGS.network_api.ws_port = args.ws_port
+            if args.rest_port is not None:
+                APP_SETTINGS.network_api.rest_port = args.rest_port
+            logger.info(
+                f"Network API ports: ws={APP_SETTINGS.network_api.ws_port}, "
+                f"rest={APP_SETTINGS.network_api.rest_port}"
+            )
+
+            runner = HeadlessRunner(args.project, args.source)
+            runner.run()
+            exit_code = 0
+        else:
+            QApplication.setHighDpiScaleFactorRoundingPolicy(
+                Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+            )
+            app = QApplication(sys.argv)
+            app.setApplicationName("Drone Localization")
+            app.setOrganizationName("UAV Systems")
+            logger.info("Qt application initialized")
+
+            window = MainWindow()
+            window.show()
+
+            # Запускаємо prewarm у фоновому потоці
+            if hasattr(window, "model_manager") and window.model_manager:
+                app._startup_worker = StartupWorker(window.model_manager)
+                app._startup_worker.start()
+
+            logger.success("Application startup complete")
+
+            exit_code = app.exec()
+
+    except KeyboardInterrupt:
+        # Most likely Ctrl+C at the map passphrase prompt. Cancelling a decrypt is
+        # a normal outcome, so exit quietly with the conventional 130.
+        logger.info("Interrupted by user (Ctrl+C) — exiting")
+        sys.exit(130)
+    except Exception as e:
+        logger.critical(f"Fatal error during startup: {e}", exc_info=True)
+        sys.exit(1)
+
+    logger.info(f"Application exiting | code={exit_code}")
+    logger.info("=" * 70)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

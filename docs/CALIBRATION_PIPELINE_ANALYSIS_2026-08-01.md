@@ -13,6 +13,10 @@ algebra re-derived by hand — they match), but two adjacent mechanisms silently
 break when `soft_anchors` is enabled, and several reporting/consistency issues
 remain from the previous pass.
 
+**Status: all findings below were FIXED on 2026-08-01** (same session).
+Behaviour-changing fixes ship flag-gated with defaults = previous behaviour;
+`tests/test_calibration_audit_2026_08.py` locks them. See §6.
+
 ## 1. Data flow (verified against code)
 
 1. **Anchors** — `MultiAnchorCalibration` (v2.3): list of `AnchorCalibration`
@@ -57,18 +61,35 @@ already does).
 — with soft anchors the "anchor #N stress" diagnostics disappear entirely.
 The LOO check handles both kinds (`:123-125`); stress does not.
 
-**A3. `get_metric_position_with_depth` computes and discards the correction**
+**A3. `get_metric_position_with_depth` is dead code, not just wrong code**
 (`multi_anchor_calibration.py:299-333`). `correction` is computed, clipped,
-logged — and `mx, my` is returned unchanged. The method name promises a
-depth-corrected position it does not deliver. Either apply it or rename.
-`set_gsd_calculator` stores `_gsd` that is never read in this class.
+logged — and `mx, my` is returned unchanged, so the name promises a
+depth-corrected position it does not deliver. Re-checking call sites raised the
+severity in the other direction: it has **zero callers** anywhere in `src/`,
+`tests/` or `main.py`, as does `set_reference_depth_scale`. Only
+`set_gsd_calculator` is called (`localizer.py:281`), and the `_gsd` it stores is
+never read. So the fix is deletion, not repair.
 
-**A4. `frame_disagreement` is not disagreement**
-(`propagation_pipeline.py:1107-1122`). It is the std of *neighbor* frame tx
-values taken directly, not predictions propagated through edge transforms —
-i.e. the natural spread of neighboring positions during motion. It is surfaced
-to the user as "drift, m" with a red/green verdict
-(`calibration_mixin.py:449-487`) — a placebo metric coloring the summary.
+**A4. `frame_disagreement` is not disagreement — and it reaches live
+localization** (`propagation_pipeline.py:1107-1122`). It is the std of
+*neighbour* frame `tx` values taken directly, not predictions propagated
+through edge transforms. `tx = M[0,2]` is the metric position of pixel (0,0),
+not of the centre, so the value mixes translation with the neighbour's
+*rotation*.
+
+This is not merely cosmetic: `ResultBuilder.compute_confidence:61` reads it as
+`stability_score = 1 − (rmse/10·0.5 + disagreement/5·0.5)`, stability is 30% of
+the final confidence, and confidence drives R in the Kalman filter. It is also
+shown to the user as "drift, m" with a red/green verdict
+(`calibration_mixin.py:449-487`).
+
+Measured on a synthetic graph in which *every edge agrees perfectly* (so the
+true disagreement is zero by construction): the legacy metric reports a mean of
+51 m across well-connected frames and saturates `disagreement_norm_m = 5.0` on
+6 of 8 frames, while frames with a single edge report exactly 0. A
+worse-connected frame therefore looks more stable than a better-connected one.
+The replacement metric reports ~1e-14 m on the same graph and saturates
+nothing.
 
 **A5. Edge extrapolation is a frozen constant.** Frames before the first /
 after the last valid frame get a copy of the boundary affine with
@@ -93,9 +114,19 @@ WEB_MERCATOR at ~48° latitude all metric values are inflated by
 1/cos(lat) ≈ 1.5×: `anchor_gap_max_dev_m=150`, `anchor_rmse_threshold_m=3.0`,
 odometry margins, LOO thresholds, `dev_m` in logs. `ground_scale_factor`
 exists (`coordinates.py:54`) but is never applied in the calibration pipeline.
-Consistent on sim data (all-Mercator); on real flights the thresholds are
-effectively ~50% looser and reported figures inflated. Recompute per-latitude
-via cos(lat).
+Consistent on sim data (all-Mercator). On real flights the constants are
+therefore *stricter* than their names suggest, not looser — the earlier draft
+of this note had the direction backwards. At 48° (cos = 0.669) the
+`anchor_gap_max_dev_m = 150` gate fires at ≈100 ground metres; expressing 150
+ground metres needs ≈224 projection metres. Reported `dev_m` figures are
+correspondingly inflated.
+
+Scope refinement after re-checking: the *self-consistent* comparisons need no
+correction, because both sides are in the same units — `odometry_consistency_factors`,
+`_prelim_dist_threshold`, `estimate_min_loop_gap`. Only a hardcoded metre
+constant meeting a measured Mercator distance is affected: `anchor_gap_max_dev_m`,
+`anchor_loo_threshold_m`, `anchor_rmse_threshold_m` / `anchor_max_error_m`,
+`anchor_sigma_floor_m`, `disagreement_norm_m` / `rmse_norm_m`.
 
 **B2. Isotropy regularizer is hardcoded** (`optimizer.py:633, 761`).
 `w_reg = 200·cx ≈ 192 000` forces `log_sx == log_sy` — the model is
@@ -146,3 +177,54 @@ hygiene.
 `calibration_dialog` was read selectively (index mapping, video loading); the
 point/anchor UI code was not audited. `matcher` and `database_loader` are
 outside this pass. The 1.5× figure at 48° follows from the Mercator formula.
+
+
+## 6. Fixes applied (2026-08-01)
+
+Behaviour-changing items are flag-gated with defaults equal to the previous
+behaviour, per the repo convention (pydantic defaults OFF; enablement belongs in
+`user_config.json`, which was deliberately **not** touched).
+
+| # | Fix | Files | Flag |
+|---|-----|-------|------|
+| A1 | `_anchor_reachable` seeds from `anchor_states()` (hard + soft), restoring the prune disconnect-guard | `pose_graph/pruning.py` | none (bug fix) |
+| A2 | `compute_anchor_stress`, `diagnostics_report.num_anchors`, GeoJSON anchor marking and the optimizer log all use `anchor_states()` | `pose_graph/diagnostics.py`, `optimizer.py` | none |
+| A4 | Disagreement = mean spread of edge-predicted centres for the frame, in metres | `propagation_pipeline.py` | `graph_optimization.true_disagreement` |
+| A6 | Two anchors snapping to one node → `_report_error` + abort, as for out-of-range anchors | `propagation_pipeline.py` | none |
+| A7 | `save_all` overwrites an existing calibration file even when all anchors were deleted | `multi_calibration_manager.py` | none |
+| B1 | `anchor_gap_max_dev_m` and `anchor_loo_threshold_m` divided by cos(lat) so the constants read as ground metres | `propagation_pipeline.py` | `graph_optimization.ground_scale_thresholds` |
+| B2 | Isotropy regularizer weight is a constructor argument plumbed from config | `pose_graph/optimizer.py`, `propagation_pipeline.py` | `graph_optimization.isotropy_weight` (default 200.0) |
+| A3 | `get_metric_position_with_depth` and `set_reference_depth_scale` deleted; `set_gsd_calculator` documented as informational | `multi_anchor_calibration.py` | none |
+| C | Stale module docstring rewritten; propagation RMSE debug log relabelled px | `gui/mixins/calibration_mixin.py` | none |
+
+**Not fixed, deliberately:** A5 (`frame_extrapolated` flag) adds an HDF5
+dataset and a consumer contract — worth doing, but it is a schema change that
+deserves its own change and its own benchmark, not a rider on an audit fix.
+The remaining §2C minor items (O(n²) cluster consistency, permanent
+`downweight_gap_edges` mutation, shear in the 5-DoF decomposition) are
+unchanged.
+
+### Verification performed
+
+- `tests/test_calibration_audit_2026_08.py` — 5 pure tests pass in-sandbox,
+  4 more skip here and run where `h5py`/`faiss` are installed (Windows).
+  The disagreement tests use a graph whose edges agree exactly, so the correct
+  answer is zero and the legacy defect is visible as a failed sanity check.
+- Existing runnable suites (`test_affine_utils`, `test_geometry_utils`,
+  `test_pose_graph_optimizer`, `test_config_sync`, `test_coordinates*`,
+  `test_projections`, `test_multi_anchor_calibration`): 59 passed, 4 skipped.
+- Real imports of every touched module; zero null bytes; CRLF preserved on the
+  one CRLF file (`calibration_mixin.py`).
+- `ruff check` clean. `ruff format` was **not** run wholesale: the repo is not
+  format-clean, so only the lines introduced here were formatted, to avoid a
+  large diff in unreviewed code.
+
+### Still required (cannot run in this environment)
+
+1. A mission benchmark on Windows before enabling `true_disagreement` — the
+   metric drops to near zero on healthy graphs, so confidence rises and Kalman
+   R falls. This is a real behaviour change even though the flag defaults off.
+2. A mission benchmark before enabling `ground_scale_thresholds` on
+   WEB_MERCATOR projects; UTM projects are unaffected (factor 1.0).
+3. `soft_anchors` may now be enabled with its guards intact — but that
+   enablement is a `user_config.json` edit for the user to confirm.

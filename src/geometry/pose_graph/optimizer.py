@@ -28,7 +28,9 @@ logger = get_logger(__name__)
 class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
     """5-DoF Pose Graph Optimizer з Levenberg-Marquardt."""
 
-    def __init__(self, frame_w: int = 1920, frame_h: int = 1080) -> None:
+    def __init__(
+        self, frame_w: int = 1920, frame_h: int = 1080, isotropy_weight: float = 200.0
+    ) -> None:
         # frame_id → [center_x_metric, center_y_metric, log_sx, log_sy, θ]
         self._free_nodes: dict[int, np.ndarray] = {}
         self._fixed_nodes: dict[int, np.ndarray] = {}
@@ -40,6 +42,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
 
         self.cx = frame_w / 2.0
         self.cy = frame_h / 2.0
+
+        # Вага регуляризатора ізотропії: r = isotropy_weight·cx·(log_sx − log_sy).
+        # Історично захардкоджена 200.0; винесена в конфіг без зміни дефолту.
+        self.isotropy_weight = float(isotropy_weight)
 
         # Кеш пер-ребрових резидуалів (діагностика, Етап 1). None = ще не рахували.
         self._last_edge_residuals: np.ndarray | None = None
@@ -433,7 +439,8 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         )
 
         logger.info(
-            f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), {n_residuals} residuals, {len(self._fixed_nodes)} anchors"
+            f"Optimization: {n_vars} variables ({len(free_ids)} free nodes), "
+            f"{n_residuals} residuals, {len(self.anchor_states())} anchors"
         )
 
         # jac_sparsity is ignored by 'lm'. method='trf' with sparse jacobian runs 100x faster.
@@ -473,6 +480,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             "dtheta": np.array([e.dtheta for e in valid_edges], dtype=np.float64),
             "weights": np.array([e.weight for e in valid_edges], dtype=np.float64),
             "cx": self.cx,
+            "w_reg": self.isotropy_weight * self.cx,
             "sign": self._sign,
             "n_edges": n_edges,
             "n_free": len(free_ids),
@@ -630,7 +638,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             d["sign"],
         )
 
-        w_reg = 200.0 * d["cx"]
+        w_reg = d["w_reg"]
         x_reshaped = x.reshape(-1, 5)
         res_reg = w_reg * (x_reshaped[:, 2] - x_reshaped[:, 3])
 
@@ -758,7 +766,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         if n_free > 0:
             p_idx = np.arange(n_free)
             reg_row = 5 * n_edges + p_idx
-            w_reg = 200.0 * cx
+            w_reg = d["w_reg"]
             add(reg_row, 5 * p_idx + 2, np.full(n_free, w_reg))
             add(reg_row, 5 * p_idx + 3, np.full(n_free, -w_reg))
 

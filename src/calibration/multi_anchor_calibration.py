@@ -296,49 +296,19 @@ class MultiAnchorCalibration:
                 return m1[0] * (1 - w2) + m2[0] * w2, m1[1] * (1 - w2) + m2[1] * w2
         return None
 
-    def get_metric_position_with_depth(
-        self,
-        frame_id: int,
-        x: float,
-        y: float,
-        depth_scale: float = 1.0,
-    ) -> tuple[float, float] | None:
-        """Версія get_metric_position з корекцією масштабу через depth.
-
-        depth_scale — відносний масштаб з DepthEstimator.get_relative_scale().
-        При depth_scale > 1: об'єкт ближче (нижча висота) → більший pixel scale.
-        При depth_scale < 1: об'єкт далі (вища висота) → менший pixel scale.
-        """
-        result = self.get_metric_position(frame_id, x, y)
-        if result is None:
-            return None
-
-        mx, my = result
-
-        # Нормалізуємо depth_scale відносно reference (медіана всіх якорів).
-        ref_depth = getattr(self, "_reference_depth_scale", 1.0)
-        if ref_depth > 1e-6:
-            correction = depth_scale / ref_depth
-            # Обмежуємо корекцію: максимум 2x в будь-який бік
-            correction = float(np.clip(correction, 0.5, 2.0))
-
-            # TODO: У майбутньому тут можна додати зміщення відносно оптичного центру
-            # для більш точної компенсації паралаксу. Поки що — логуємо.
-            if abs(correction - 1.0) > 0.05:
-                logger.debug(
-                    f"Depth scale correction: ref={ref_depth:.3f}, "
-                    f"current={depth_scale:.3f}, ratio={correction:.3f}"
-                )
-
-        return mx, my
-
-    def set_reference_depth_scale(self, depth_scale: float) -> None:
-        """Встановлює референсний depth_scale (зі збудови БД)."""
-        self._reference_depth_scale = float(depth_scale)
-        logger.info(f"Reference depth scale set: {depth_scale:.4f}")
-
     def set_gsd_calculator(self, gsd_calculator) -> None:
-        """Встановлює калькулятор GSD для прив'язки до фізичного масштабу."""
+        """Прив'язує калькулятор GSD — ІНФОРМАЦІЙНО (аудит 2026-08-01).
+
+        Викликається з Localizer, але сам ``_gsd`` ніде не читається: масштаб
+        приходить із афінних матриць якорів. Метод лишено як точку розширення
+        і для лога фактичного GSD; якщо він знадобиться для обчислень —
+        додавати разом із тестом, що це доводить.
+
+        Разом із цим приберано ``get_metric_position_with_depth`` і
+        ``set_reference_depth_scale``: у них не було ЖОДНОГО виклику, а перший
+        до того ж рахував depth-корекцію, логував її й повертав позицію БЕЗ
+        неї — назва обіцяла те, чого метод не робив.
+        """
         self._gsd = gsd_calculator
         if self._gsd:
             logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px * 100:.2f} cm/px")
