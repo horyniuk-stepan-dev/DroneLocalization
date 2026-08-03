@@ -38,6 +38,7 @@ def _make_d(
         "dtheta": np.array(edge_params["dtheta"], dtype=np.float64),
         "weights": np.array(edge_params["weights"], dtype=np.float64),
         "cx": cx,
+        "w_reg": 200.0 * cx,
         "sign": sign,
         "n_edges": ne,
         "n_free": n_free,

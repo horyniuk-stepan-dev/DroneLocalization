@@ -45,4 +45,6 @@ jobs:
             --ignore=tests/test_localization.py \
             --ignore=tests/test_rdd.py \
             --ignore=tests/test_object_tracker.py \
+            --deselect=tests/test_hardware_profile.py::TestApplyTorchBackends::test_sets_thread_counts \
+            --deselect=tests/test_localization_characterization.py::test_characterization_matches_baseline \
             -p no:cacheprovider

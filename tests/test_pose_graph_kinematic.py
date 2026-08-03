@@ -120,6 +120,7 @@ def _kin_d(n_nodes: int = 4):
         "dtheta": np.array([0.0]),
         "weights": np.array([1.0]),
         "cx": CX,
+        "w_reg": 200.0 * CX,
         "sign": 1.0,
         "n_edges": 1,
         "n_free": 3,

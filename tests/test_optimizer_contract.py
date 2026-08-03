@@ -39,6 +39,7 @@ def _build_d(cx=960.0, sign=1.0):
         "dtheta": np.array([0.25]),
         "weights": np.array([2.0]),
         "cx": cx,
+        "w_reg": 200.0 * cx,
         "sign": sign,
         "n_edges": 1,
     }

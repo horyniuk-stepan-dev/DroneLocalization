@@ -61,6 +61,7 @@ def test_analytic_jacobian_with_anchors_matches_fd():
         "dtheta": np.array([0.2]),
         "weights": np.array([1.4]),
         "cx": 960.0,
+        "w_reg": 200.0 * 960.0,
         "sign": 1.0,
         "n_edges": 1,
         "n_free": 2,
