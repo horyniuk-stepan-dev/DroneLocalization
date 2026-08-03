@@ -261,9 +261,10 @@ class HardwareProfile:
             # hardware can never alter a database's structure/content-type.
             if path not in TUNABLE_KEYS:
                 logger.error(
-                    "auto_tune BLOCKED non-tunable key %r — only speed keys may be "
+                    "auto_tune BLOCKED non-tunable key {!r} — only speed keys may be "
                     "auto-tuned; structure-defining keys stay hardware-independent "
-                    "so databases remain interchangeable." % path
+                    "so databases remain interchangeable.",
+                    path,
                 )
                 return
             # Navigate dot-path in the config dict
