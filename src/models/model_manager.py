@@ -1,13 +1,13 @@
 import gc
 import os
 import threading
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 
 from config import get_cfg
+from src.models.vram import VramBudget
 from src.utils.logging_utils import get_logger, silent_output
 
 # Lazy imports moved to top level as requested
@@ -92,17 +92,22 @@ class ModelManager:
         else:  # auto: стара поведінка (respects legacy use_cuda + requested device)
             self.device = "cuda" if (cuda_ok and device == "cuda") else "cpu"
         self.models = {}
-        self.model_usage = {}
 
         # Fix #4: Захист від race condition при паралельному завантаженні моделей (prewarm + main thread)
         self._model_lock = threading.Lock()
-
-        self._pinned_models: set[str] = set()
 
         # Конфігурація VRAM
         self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
         self.default_vram_required = get_cfg(
             self.config, "models.vram_management.default_required_mb", 2000.0
+        )
+        # Політика виселення винесена у VramBudget (без torch, тестована).
+        # Лок лишається тут: _model_lock має охоплювати load+evict атомарно.
+        self._vram = VramBudget(
+            free_vram_mb=self.get_available_vram_mb,
+            unload=self._unload_model_unsafe,
+            default_required_mb=self.default_vram_required,
+            enabled=self.device != "cpu",
         )
 
         logger.info(f"ModelManager initialized with device: {self.device}")
@@ -150,44 +155,40 @@ class ModelManager:
 
         return True
 
+    @property
+    def model_usage(self) -> dict:
+        """LRU-мітки (сумісність: облік живе у VramBudget)."""
+        return self._vram.usage
+
+    @property
+    def _pinned_models(self) -> set[str]:
+        """Закріплені моделі (сумісність: множина живе у VramBudget)."""
+        return self._vram.pinned
+
     def pin(self, models: list[str]):
         """Закріплює моделі в пам'яті (запобігає вивантаженню при нестачі VRAM)"""
         with self._model_lock:
-            for m in models:
-                self._pinned_models.add(m)
-            logger.info(f"Pinned models: {self._pinned_models}")
+            self._vram.pin(models)
 
     def unpin_all(self):
         """Знімає закріплення з усіх моделей"""
         with self._model_lock:
-            self._pinned_models.clear()
-            logger.info("Unpinned all models")
+            self._vram.unpin_all()
 
     def _unload_model_unsafe(self, name: str):
         if name in self.models:
             logger.info(f"Unloading model to free VRAM: {name}")
             del self.models[name]
-            del self.model_usage[name]
+            self._vram.forget(name)
             if self.device != "cpu":
                 torch.cuda.empty_cache()
                 gc.collect()
 
     def _ensure_vram_available(self, required_mb: float | None = None):
-        if self.device == "cpu":
-            return
-
-        req = required_mb if required_mb is not None else self.default_vram_required
-
-        while self.get_available_vram_mb() < req and self.models:
-            non_pinned = {k: v for k, v in self.model_usage.items() if k not in self._pinned_models}
-            if not non_pinned:
-                logger.warning("All models pinned, cannot free VRAM. Risk of OOM.")
-                return
-            least = min(non_pinned, key=non_pinned.get)
-            self._unload_model_unsafe(least)
+        self._vram.ensure(required_mb, loaded=self.models)
 
     def _register_model_usage(self, name: str):
-        self.model_usage[name] = time.time()
+        self._vram.touch(name)
 
     def prewarm(self):
         """Centralized model prewarming, usually called at startup in parallel"""

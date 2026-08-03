@@ -18,6 +18,8 @@ class OutlierDetector:
         max_consecutive=5,
         ground_scale=1.0,
         zscore_enabled=True,
+        mahalanobis_enabled=False,
+        chi2_threshold=13.816,
     ):
         self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
@@ -38,6 +40,13 @@ class OutlierDetector:
         # повільні виміри, mean падає (11.9-78 при реальних 89.2 м/с) і
         # відкидається ще більше. Плюс std сідає на floor 1.0 і z сягає 159.
         self._zscore_enabled = bool(zscore_enabled)
+        # Mahalanobis-гейт (флаг, дефолт off): χ² від коваріації інновації KF
+        # замість Z-score за швидкістю. Поріг за замовчуванням — χ²(2 ст.св.,
+        # p=0.999) = 13.816, тобто ~0.1% хибних відсіювань на коректній моделі.
+        # Гілка незалежна від Z-score: обидві можна тримати увімкненими, але
+        # сенс переходу саме в тому, щоб Z-score вимкнути.
+        self._mahalanobis_enabled = bool(mahalanobis_enabled)
+        self._chi2_threshold = float(chi2_threshold)
 
         logger.info("Initializing OutlierDetector (Speed-based Z-score)")
         logger.info(
@@ -66,7 +75,11 @@ class OutlierDetector:
             self._consecutive_outliers = 0
 
     def is_outlier(
-        self, new_position: tuple, dt: float = 1.0, ref_position: tuple | None = None
+        self,
+        new_position: tuple,
+        dt: float = 1.0,
+        ref_position: tuple | None = None,
+        maha_d2: float | None = None,
     ) -> bool:
         """Перевірка вимірювання на аномальність.
 
@@ -82,7 +95,31 @@ class OutlierDetector:
         Передача попередньої СИРОЇ OF-позиції як ref_position робить розрахунок
         локальним (кадр відносно кадру) і прибирає накопичення.
         """
+        # Mahalanobis-гілка не потребує вікна швидкостей: коваріація фільтра
+        # вже містить усю історію. Тому вона перевіряється ДО раннього виходу
+        # за довжиною вікна — інакше перші кадри після скидання лишались би
+        # без жодного гейта, крім фізичної швидкості.
+        is_maha_outlier = (
+            self._mahalanobis_enabled and maha_d2 is not None and maha_d2 > self._chi2_threshold
+        )
+
         if len(self.window) < 3:
+            if is_maha_outlier:
+                self._consecutive_outliers += 1
+                if self._consecutive_outliers >= self._max_consecutive:
+                    logger.warning(
+                        f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
+                        f"accepting new position (mahalanobis d2={maha_d2:.1f})"
+                    )
+                    self.window.clear()
+                    self._consecutive_outliers = 0
+                    return False
+                logger.warning(
+                    f"OUTLIER DETECTED (mahalanobis): d2={maha_d2:.2f} > "
+                    f"{self._chi2_threshold:.2f} | consecutive="
+                    f"{self._consecutive_outliers}/{self._max_consecutive}"
+                )
+                return True
             return False
 
         new_pos_np = np.array(new_position, dtype=np.float64)
@@ -119,7 +156,7 @@ class OutlierDetector:
             z_score > self.threshold_std and abs(instantaneous_speed - mean_speed) > 15.0
         )
 
-        if is_speed_outlier or is_zscore_outlier:
+        if is_speed_outlier or is_zscore_outlier or is_maha_outlier:
             self._consecutive_outliers += 1
 
             # Якщо забагато підряд — дрон реально перемістився, скидаємо вікно
@@ -134,7 +171,13 @@ class OutlierDetector:
                 self._consecutive_outliers = 0
                 return False  # Приймаємо нову позицію
 
-            if is_speed_outlier:
+            if is_maha_outlier and not is_speed_outlier:
+                logger.warning(
+                    f"OUTLIER DETECTED (mahalanobis): d2={maha_d2:.2f} > {self._chi2_threshold:.2f} | "
+                    f"speed={instantaneous_speed:.1f}m/s, distance={distance:.1f}m, dt={safe_dt:.3f}s, "
+                    f"consecutive={self._consecutive_outliers}/{self._max_consecutive}"
+                )
+            elif is_speed_outlier:
                 logger.warning(
                     f"OUTLIER DETECTED (speed): {instantaneous_speed:.1f} m/s > {self.max_speed_mps} m/s | "
                     f"distance={distance:.1f}m, dt={safe_dt:.3f}s, "

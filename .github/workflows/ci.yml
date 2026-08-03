@@ -23,6 +23,22 @@ jobs:
       - name: Ruff format check
         run: ruff format --check src/ config/ tests/
 
+  types:
+    # mypy strict на вже повністю типізованих модулях (список — [tool.mypy]
+    # files у pyproject.toml). Конфіг існував давно, але CI його не викликав,
+    # тож гейт мовчав; модулі онбордяться в цей список по одному.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install mypy and typed deps
+        run: pip install mypy numpy'<2.0.0' pydantic loguru
+      - name: Mypy (strict, onboarded modules only)
+        run: mypy
+
   unit-tests:
     runs-on: ubuntu-latest
     steps:

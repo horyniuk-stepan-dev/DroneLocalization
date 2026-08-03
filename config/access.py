@@ -113,7 +113,7 @@ def save_user_config(config: AppConfig) -> None:
                 pass
 
 
-def reload_settings_in_place(data: dict) -> AppConfig:
+def reload_settings_in_place(data: dict[str, Any]) -> AppConfig:
     """Перезаливає APP_SETTINGS значеннями з ``data`` БЕЗ створення нового об'єкта.
 
     Критично: модулі роблять ``from config import APP_SETTINGS`` на рівні

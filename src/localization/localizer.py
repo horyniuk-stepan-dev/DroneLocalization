@@ -64,6 +64,11 @@ class Localizer:
             max_speed_mps=get_cfg(self.config, "tracking.max_speed_mps", 120.0),
             max_consecutive=get_cfg(self.config, "tracking.max_consecutive_outliers", 5),
             zscore_enabled=get_cfg(self.config, "tracking.outlier_zscore_enabled", True),
+            mahalanobis_enabled=get_cfg(self.config, "tracking.outlier_mahalanobis_enabled", False),
+            chi2_threshold=get_cfg(self.config, "tracking.outlier_chi2_threshold", 13.816),
+        )
+        self._maha_gate_enabled = get_cfg(
+            self.config, "tracking.outlier_mahalanobis_enabled", False
         )
 
         # RESEARCH 3.1: ковзний віконний back-end smoother (флаг, дефолт off).
@@ -766,7 +771,17 @@ class Localizer:
                 f"Kinematic gate bypassed: {best_inliers} inliers "
                 f">= {self._trust_min_inliers} (geometry outranks motion prior)"
             )
-        if not _strong and self.outlier_detector.is_outlier(metric_pt, dt):
+        # Mahalanobis-гейт (флаг): d² рахуємо ДО оновлення фільтра, чистою
+        # функцією. noise_scale=1.0 — базове R: confidence на цій точці коду ще
+        # не пораховано (воно нижче, у Кроці 8), а переставляти порядок заради
+        # гейта означало б міняти більше, ніж вимагає задача. Наслідок: для
+        # фіксів із низьким confidence гейт трохи суворіший за подальший update.
+        _maha_d2 = (
+            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.0)
+            if self._maha_gate_enabled
+            else None
+        )
+        if not _strong and self.outlier_detector.is_outlier(metric_pt, dt, maha_d2=_maha_d2):
             logger.warning(
                 f"Outlier filtered | matched_frame={best_candidate_id}, "
                 f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
@@ -1011,10 +1026,19 @@ class Localizer:
         # відкинутий). Без неї база — остання прийнята позиція, зазвичай
         # keyframe, і швидкість накопичується разом зі зсувом LK.
         _of_ref = self._last_of_raw if self._of_local_speed else None
+        # noise_scale=1.5 повторює базовий множник OF-гілки update() при
+        # of_conf=1.0 — OF-вимір апріорі шумніший за keyframe-фікс.
+        _maha_d2 = (
+            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.5)
+            if self._maha_gate_enabled
+            else None
+        )
         _is_out = (
             self._of_outlier_gate
             and not _strong_flow
-            and self.outlier_detector.is_outlier(metric_pt, dt, ref_position=_of_ref)
+            and self.outlier_detector.is_outlier(
+                metric_pt, dt, ref_position=_of_ref, maha_d2=_maha_d2
+            )
         )
         # Оновлюємо ДО раннього return: наступний кадр має порівнюватись із цим
         # виміром незалежно від того, прийняли ми його чи ні.

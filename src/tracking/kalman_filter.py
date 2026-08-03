@@ -68,6 +68,62 @@ class TrajectoryFilter:
         self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
         self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
 
+    def mahalanobis_sq(
+        self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0
+    ) -> float | None:
+        """d² = yᵀ S⁻¹ y для вимірювання ``measurement`` — БЕЗ зміни стану фільтра.
+
+        y — інновація (вимір мінус прогноз), S = H·P_pred·Hᵀ + R — її коваріація.
+        На відміну від Z-score за швидкістю, ця відстань нормується власною
+        невизначеністю фільтра: після довгої серії узгоджених фіксів P мала і
+        гейт жорсткий, після зриву/скидання P велика і гейт сам себе відпускає.
+        Саме тому вона не має самопідтримної петлі, яку має Z-score (вікно
+        швидкостей там і фільтрується, і формує поріг).
+
+        Повертає None, якщо фільтр ще не ініціалізований (гейтити нема від чого)
+        або S вироджена — виклик тоді має пропустити вимір, а не відкинути.
+
+        Обчислення дублює predict-крок на ЛОКАЛЬНИХ копіях F/Q/P: filterpy
+        ``kf.predict()`` мутує стан, а гейт зобов'язаний бути чистим — інакше
+        відкинуте вимірювання все одно зсуне фільтр.
+        """
+        if not self.is_initialized:
+            return None
+
+        dt = max(0.01, min(dt, 5.0))
+        ns = float(np.clip(noise_scale, 0.25, 25.0))
+
+        F = self.kf.F.copy()
+        F[0, 2] = dt
+        F[1, 3] = dt
+
+        q_var = Q_discrete_white_noise(dim=2, dt=dt, var=self.process_noise)
+        Q = np.zeros((4, 4))
+        Q[0, 0] = Q[1, 1] = q_var[0, 0]
+        Q[0, 2] = Q[1, 3] = q_var[0, 1]
+        Q[2, 0] = Q[3, 1] = q_var[1, 0]
+        Q[2, 2] = Q[3, 3] = q_var[1, 1]
+
+        x_pred = F @ self.kf.x
+        P_pred = F @ self.kf.P @ F.T + Q
+
+        H = self.kf.H
+        R = self._base_R * ns
+        S = H @ P_pred @ H.T + R
+
+        z = np.array([[float(measurement[0])], [float(measurement[1])]])
+        y = z - H @ x_pred
+
+        try:
+            # [0, 0]: результат — матриця 1×1; float() від неї застаріле в numpy
+            d2 = float((y.T @ np.linalg.inv(S) @ y)[0, 0])
+        except np.linalg.LinAlgError:
+            return None
+
+        if not np.isfinite(d2) or d2 < 0.0:
+            return None
+        return d2
+
     def update(self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0) -> tuple:
         """noise_scale — адаптивний множник шуму вимірювання (B2):
         > 1 для слабких/відносних вимірювань (низький confidence, optical flow),
