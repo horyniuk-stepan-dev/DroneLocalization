@@ -6,6 +6,7 @@ is_significant_motion — чиста numpy-логіка; compute_inter_frame_hom
 """
 
 import numpy as np
+import pytest
 
 from src.database import keyframe_selector as ks
 
@@ -99,3 +100,44 @@ class TestComputeInterFrameHomography:
         assert (
             ks.compute_inter_frame_homography(_FakeMatcher(a, b), {}, {}, min_matches=999) is None
         )
+
+
+class TestOverlapFraction:
+    """Адаптивний семпл за реальним зміщенням: частка площі keyframe-а, що ще видна.
+
+    ``H`` тут — НАКОПИЧЕНА гомографія «поточний кадр → останній keyframe», а не
+    покрокова: саме тому критерій здатен виразити «змістилося на 50%», чого
+    is_significant_motion (сусідні кадри) виразити не може.
+    """
+
+    def test_identity_is_full_overlap(self):
+        assert ks.overlap_fraction(np.eye(3), W, H) == 1.0
+
+    def test_half_frame_shift_is_half_overlap(self):
+        assert ks.overlap_fraction(_translation_H(W * 0.5, 0), W, H) == pytest.approx(0.5, abs=1e-3)
+
+    def test_quarter_shift_leaves_three_quarters(self):
+        got = ks.overlap_fraction(_translation_H(W * 0.25, 0), W, H)
+        assert got == pytest.approx(0.75, abs=1e-3)
+
+    def test_full_shift_is_zero_overlap(self):
+        assert ks.overlap_fraction(_translation_H(W, 0), W, H) == pytest.approx(0.0, abs=1e-6)
+
+    def test_diagonal_shift_multiplies(self):
+        # 50% по X і 50% по Y → лишається чверть площі
+        got = ks.overlap_fraction(_translation_H(W * 0.5, H * 0.5), W, H)
+        assert got == pytest.approx(0.25, abs=1e-3)
+
+    def test_rotation_reduces_overlap(self):
+        got = ks.overlap_fraction(_rotation_about_center_H(30), W, H)
+        assert 0.0 < got < 1.0
+
+    def test_degenerate_and_broken_H_report_no_overlap(self):
+        # Безпечний напрям: 0.0 змушує взяти keyframe, а не мовчки пропустити.
+        assert ks.overlap_fraction(np.zeros((3, 3)), W, H) == 0.0
+        assert ks.overlap_fraction(np.full((3, 3), np.nan), W, H) == 0.0
+        assert ks.overlap_fraction(None, W, H) == 0.0
+
+    def test_gate_fires_at_threshold_not_before(self):
+        assert ks.is_overlap_below(_translation_H(W * 0.5, 0), W, H, max_overlap=0.5)
+        assert not ks.is_overlap_below(_translation_H(W * 0.25, 0), W, H, max_overlap=0.5)

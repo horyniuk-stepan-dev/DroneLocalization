@@ -55,6 +55,71 @@ def is_significant_motion(
     return bool(angle_deg >= min_rotation_deg)
 
 
+def overlap_fraction(H: np.ndarray, frame_w: int, frame_h: int) -> float:
+    """Частка площі keyframe-а, яку ще видно в поточному кадрі, ∈ [0, 1].
+
+    ``H`` — гомографія, що переводить координати ПОТОЧНОГО кадру в координати
+    останнього збереженого keyframe (накопичена, не покрокова). Кути поточного
+    кадру проєктуються через ``H``, і рахується площа перетину отриманого
+    чотирикутника з прямокутником keyframe-а, поділена на площу кадру.
+
+    На відміну від зсуву центру, ця метрика реагує і на поворот, і на зміну
+    масштабу (набір/втрата висоти), тобто відповідає буквальному «зображення
+    змістилося на N%».
+
+    Метрика асиметрична щодо висоти за побудовою: набір висоти (кадр охоплює
+    більше землі) лишає площу keyframe-а повністю видимою → 1.0 і keyframe не
+    береться; зниження → перекриття падає. Це навмисно: критерій міряє, скільки
+    ЗБЕРЕЖЕНОГО виду ще видно, а не симетричну схожість двох кадрів.
+
+    Вироджені випадки (не-скінченна H, |det| < 1e-9, точка за площиною
+    зображення w' ≤ 0, неопуклий результат) → 0.0, тобто «перекриття немає».
+    Напрям безпечний: нуль змушує взяти keyframe, а не пропустити його.
+    """
+    if H is None or not np.all(np.isfinite(H)):
+        return 0.0
+
+    H = np.asarray(H, dtype=np.float64)
+    if abs(np.linalg.det(H)) < 1e-9:
+        return 0.0
+
+    w, h = float(frame_w), float(frame_h)
+    if w <= 0 or h <= 0:
+        return 0.0
+
+    corners = np.array([[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]], dtype=np.float64)
+    homo = np.hstack([corners, np.ones((4, 1))])
+    projected = homo @ H.T
+
+    # w' ≤ 0 означає, що кут пішов за площину зображення — перетин невизначений
+    if np.any(projected[:, 2] <= 1e-12) or not np.all(np.isfinite(projected)):
+        return 0.0
+    projected = projected[:, :2] / projected[:, 2:3]
+    if not np.all(np.isfinite(projected)):
+        return 0.0
+
+    # Імпортуємо тут: модуль лишається придатним до headless-тесту без cv2-GUI
+    import cv2
+
+    inter_area, _ = cv2.intersectConvexConvex(
+        projected.astype(np.float32), corners.astype(np.float32)
+    )
+    frame_area = w * h
+    if frame_area <= 0:
+        return 0.0
+    return float(np.clip(inter_area / frame_area, 0.0, 1.0))
+
+
+def is_overlap_below(
+    H: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+    max_overlap: float = 0.5,
+) -> bool:
+    """True, якщо перекриття з останнім keyframe впало до ``max_overlap`` — час брати новий."""
+    return overlap_fraction(H, frame_w, frame_h) <= max_overlap
+
+
 def compute_inter_frame_homography(
     matcher,
     fa: dict,

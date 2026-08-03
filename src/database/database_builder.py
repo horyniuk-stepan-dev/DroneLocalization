@@ -1,22 +1,18 @@
 import gc
 import math
-import shutil
 import traceback
-from datetime import datetime
 from pathlib import Path
-from queue import Queue
-from threading import Thread
 
 import cv2
-import h5py
-import lancedb
 import numpy as np
-import pyarrow as pa
 import torch
 
 from config import get_active_descriptor_cfg, get_cfg
 from src.database import keyframe_selector, keypoint_video_writer
-from src.localization.matcher import FeatureMatcher, extract_sift_features
+from src.database.db_writer import DbWriter
+from src.database.frame_processor import FrameProcessor
+from src.database.video_frame_source import EOF_INDEX, VideoFrameSource
+from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
 from src.models.wrappers.masking_strategy import create_masking_strategy
 from src.security.project_scan import assert_project_writable
@@ -27,7 +23,18 @@ logger = get_logger(__name__)
 
 
 class DatabaseBuilder:
-    """Builds HDF5 topometric database from reference video using XFeat & DINOv2"""
+    """Builds HDF5 topometric database from reference video using XFeat & DINOv2.
+
+    Orchestration only. The three phases live in their own modules
+    (IMPROVEMENT_PLAN п.1.3):
+
+    * :class:`src.database.video_frame_source.VideoFrameSource` — decode + prefetch
+    * :class:`src.database.frame_processor.FrameProcessor` — per-frame work
+    * :class:`src.database.db_writer.DbWriter` — HDF5/LanceDB storage, end-to-end
+
+    Model loading, dimension detection and the YOLO micro-batching loop stay
+    here, because they are what ties the three together.
+    """
 
     def __init__(self, output_path, matcher=None, config=None):
         # HARDENING P1-6: refuse up front — a build writes the database, the lance
@@ -37,7 +44,6 @@ class DatabaseBuilder:
         self.output_path = output_path
         self.config = config or {}
         self.matcher = matcher
-        db_cfg = self.config.get("database", {})
         self.descriptor_dim = get_active_descriptor_cfg(self.config).descriptor_dim
         # RESEARCH 2.1: VLAD змінює розмірність глобального дескриптора —
         # читаємо out_dim зі словника, щоб HDF5/LanceDB схема збігалася з
@@ -59,17 +65,45 @@ class DatabaseBuilder:
         self.sift_max_kps = get_cfg(self.config, "database.sift_max_keypoints", 2048)
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
-        self.db_file = None
         self.use_lancedb = get_cfg(self.config, "database.use_lancedb", True)
-        self.lance_batch_size = get_cfg(self.config, "database.lancedb_batch_size", 64)
-        self.lance_index_min_frames = get_cfg(self.config, "database.lancedb_index_min_frames", 256)
-        self.lance_table = None
-        self.lance_batch = []
+
+        # DbWriter owns HDF5 + LanceDB end-to-end (locked decomposition decision).
+        self.writer = DbWriter(output_path, config=self.config, descriptor_dim=self.descriptor_dim)
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
         if self.matcher:
             logger.info("Using provided FeatureMatcher for inter-frame poses")
         logger.info(f"DINOv2 descriptor dimension: {self.descriptor_dim}")
+
+    # ------------------------------------------------------------------
+    # Backwards-compatible storage handles (delegate to DbWriter)
+    # ------------------------------------------------------------------
+
+    @property
+    def db_file(self):
+        return self.writer.db_file
+
+    @property
+    def lance_table(self):
+        return self.writer.lance_table
+
+    @property
+    def lance_batch(self):
+        return self.writer.lance_batch
+
+    def create_hdf5_structure(self, *args, **kwargs):
+        """Deprecated shim — see :meth:`DbWriter.create_structure`."""
+        self.writer.descriptor_dim = self.descriptor_dim
+        self.writer.local_descriptor_dim = getattr(self, "local_descriptor_dim", 128)
+        return self.writer.create_structure(*args, **kwargs)
+
+    def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
+        """Deprecated shim — see :meth:`DbWriter.save_frame_data`."""
+        return self.writer.save_frame_data(frame_id, features, pose_2d)
+
+    # ------------------------------------------------------------------
+    # Build
+    # ------------------------------------------------------------------
 
     def build_from_video(
         self,
@@ -86,74 +120,16 @@ class DatabaseBuilder:
         self._project_manager = project_manager
         logger.info(f"Starting database build from video: {video_path}")
 
-        # Читаємо налаштування з конфігу (з дефолтом)
-        frame_step = get_cfg(self.config, "database.frame_step", 3)
-        if frame_step < 1:
-            frame_step = 1
-
-        use_decord = get_cfg(self.config, "database.use_decord", True)
-        vr = None
-        cap = None
-
-        if use_decord:
-            try:
-                import decord
-
-                decord.bridge.set_bridge("numpy")
-                # FFMPEG multi-threaded CPU decode is usually the most stable fallback
-                # GPU decode requires custom decord builds on Windows
-                vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
-                logger.info("Decord VideoReader initialized successfully.")
-            except ImportError:
-                logger.warning("decord not installed, falling back to cv2.VideoCapture")
-                use_decord = False
-            except Exception as e:
-                logger.warning(
-                    f"Failed to initialize decord VideoReader: {e}. Falling back to cv2.VideoCapture"
-                )
-                use_decord = False
-
-        if not use_decord:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                logger.error(
-                    f"Failed to open video: {video_path}. "
-                    f"Check that the file exists and uses a supported codec (H.264/H.265 recommended)."
-                )
-                raise ValueError(f"Не вдалося відкрити відео: {video_path}")
-
-        if use_decord:
-            total_frames = len(vr)
-            # Sample first frame to get dims
-            h, w, c = vr.get_batch([0]).shape[1:]
-            width, height = int(w), int(h)
-            original_fps = vr.get_avg_fps()
-        else:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            original_fps = cap.get(cv2.CAP_PROP_FPS)
-
-        # Обчислюємо скільки кадрів РЕАЛЬНО буде оброблено
-        num_frames = (total_frames + frame_step - 1) // frame_step
-        effective_fps = original_fps / frame_step
-
-        if num_frames <= 0:
-            cap.release()
-            logger.error(
-                f"Invalid frame count ({num_frames}). Video might be corrupted or uses unsupported codec."
-            )
-            raise ValueError(
-                "OpenCV не зміг розпізнати відео. Файл пошкоджений або використовує непідтримуваний кодек. "
-                "Спробуйте переконвертувати відео у стандартний MP4 (H.264)."
-            )
-
-        logger.info(
-            f"Video properties: {width}x{height}, {total_frames} total frames, {original_fps:.2f} FPS"
+        # --- Phase 1: video source ------------------------------------
+        source = VideoFrameSource(
+            video_path,
+            frame_step=get_cfg(self.config, "database.frame_step", 3),
+            use_decord=get_cfg(self.config, "database.use_decord", True),
+            decode_batch_size=get_cfg(self.config, "database.decode_batch_size", 32),
+            prefetch_size=self.prefetch_size,
         )
-        logger.info(
-            f"Processing with step={frame_step} -> {num_frames} frames to process ({effective_fps:.2f} effective FPS)"
-        )
+        width, height = source.width, source.height
+        num_frames = source.num_frames
 
         # Зберігаємо еталонну роздільну здатність у проєкт
         if (
@@ -167,56 +143,10 @@ class DatabaseBuilder:
             logger.info(f"Reference resolution saved to project: {width}x{height}")
 
         # Ініціалізуємо запис відео з keypoints
-        kp_video_path = None
-        kp_writer = None
         kp_scale = 1.0  # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
-        if save_keypoint_video:
-            try:
-                import os
-                import sys
-
-                kp_width = int(width * kp_scale)
-                kp_height = int(height * kp_scale)
-                kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
-
-                # Порядок кодеків:
-                # - Windows: avc1 потребує openh264.dll → пропускаємо, щоб уникнути FFmpeg-шуму
-                # - XVID: надійний cross-platform без сторонніх DLL
-                # - mp4v: абсолютний fallback
-                codecs = []
-                if sys.platform != "win32":
-                    codecs.append("avc1")  # H.264 — тільки на Linux/macOS де є нативна підтримка
-                codecs += ["XVID", "mp4v"]
-
-                for codec_name in codecs:
-                    fourcc = cv2.VideoWriter_fourcc(*codec_name)
-                    # Пригнічуємо C-рівневий stderr від FFmpeg (fd=2) щоб уникнути OpenH264-шуму
-                    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-                    old_stderr_fd = os.dup(2)
-                    os.dup2(devnull_fd, 2)
-                    try:
-                        with silent_output():
-                            kp_writer = cv2.VideoWriter(
-                                kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
-                            )
-                    finally:
-                        os.dup2(old_stderr_fd, 2)
-                        os.close(old_stderr_fd)
-                        os.close(devnull_fd)
-
-                    if kp_writer and kp_writer.isOpened():
-                        logger.info(
-                            f"Keypoint video: {kp_video_path} | {kp_width}x{kp_height} | codec={codec_name}"
-                        )
-                        break
-                    kp_writer = None
-                else:
-                    logger.warning("No compatible video codec found, keypoint video disabled")
-                    kp_writer = None
-
-            except Exception as e:
-                logger.warning(f"VideoWriter initialization crashed: {e}")
-                kp_writer = None
+        kp_writer = self._open_keypoint_writer(
+            save_keypoint_video, width, height, kp_scale, source.effective_fps
+        )
 
         # Ініціалізуємо стратегію маскування (YOLO / none / ...)
         masking_strategy_name = get_cfg(self.config, "preprocessing.masking_strategy", "yolo")
@@ -277,7 +207,214 @@ class DatabaseBuilder:
             except Exception as e:
                 logger.warning(f"Failed to initialize depth estimator: {e}")
 
-        # Fix 10: Dynamic descriptor dimension detection to avoid broadcast errors
+        self._detect_descriptor_dims(
+            feature_extractor, nv_model, cesp, model_manager, local_ext_type
+        )
+
+        # Create empty database structure
+        logger.info("Creating HDF5 database structure...")
+        self.writer.descriptor_dim = self.descriptor_dim
+        self.writer.local_descriptor_dim = self.local_descriptor_dim
+        self.writer.create_structure(
+            num_frames,
+            width,
+            height,
+            use_patchify=use_patchify,
+            num_patches=patchify.num_patches if patchify else 0,
+            frame_step=source.frame_step,
+            source_total_frames=source.total_frames,
+        )
+
+        # Adaptive Keyframe Selection (П4)
+        keyframe_criterion = get_cfg(self.config, "database.keyframe_criterion", "step")
+        max_overlap = get_cfg(self.config, "database.keyframe_max_overlap", 0.5)
+        max_gap_frames = get_cfg(self.config, "database.keyframe_max_gap_frames", 0)
+        use_keyframe_selection = (
+            get_cfg(self.config, "database.keyframe_min_translation_px", 0.0) > 0
+            or keyframe_criterion == "overlap"
+        )
+        if use_keyframe_selection and keyframe_criterion == "overlap":
+            logger.info(
+                f"Adaptive keyframe selection ENABLED (criterion=overlap: keep a frame once "
+                f"overlap with the last keyframe drops to {max_overlap:.0%}, "
+                f"forced keyframe every {max_gap_frames} frames)"
+            )
+        elif use_keyframe_selection:
+            logger.info(
+                f"Adaptive keyframe selection ENABLED "
+                f"(min_translation={get_cfg(self.config, 'database.keyframe_min_translation_px', 15.0)}px, "
+                f"min_rotation={get_cfg(self.config, 'database.keyframe_min_rotation_deg', 1.5)}°)"
+            )
+
+        processor = FrameProcessor(
+            feature_extractor=feature_extractor,
+            db_writer=self.writer,
+            compute_inter_frame_h=self._compute_inter_frame_H,
+            is_significant_motion=self._is_significant_motion,
+            draw_keypoints=self._draw_keypoints_frame,
+            config=self.config,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            patchify=patchify,
+            depth_estimator=self._depth_estimator,
+            kp_writer=kp_writer,
+            kp_scale=kp_scale,
+            use_keyframe_selection=use_keyframe_selection,
+            keyframe_criterion=keyframe_criterion,
+            overlap_gate=lambda H, w, h: keyframe_selector.is_overlap_below(
+                H, w, h, max_overlap=max_overlap
+            ),
+            keyframe_max_gap_frames=max_gap_frames,
+            progress_callback=progress_callback,
+        )
+
+        # cuDNN benchmark is now set globally at startup by HardwareProfile.apply_torch_backends()
+        # (previously was conditional on CNN model type; now all architectures benefit)
+
+        # Increased prefetch queue (Fix 5)
+        frame_queue = source.start_prefetch()
+
+        try:
+            self.writer.open()
+
+            # YOLO micro-batching (П8)
+            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 1)
+            if yolo_batch_size > 1:
+                logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
+            pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
+
+            def _flush_mask_batch(batch: list) -> list:
+                """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
+                images_rgb = [b[2] for b in batch]
+                with Telemetry.profile("yolo"):
+                    masks_list = masking_strategy.get_mask_batch(images_rgb)
+                return [(b[0], b[1], b[2], m) for b, m in zip(batch, masks_list)]
+
+            with torch.no_grad():
+                while True:
+                    idx, data = frame_queue.get()
+
+                    if idx != EOF_INDEX and data is not None:
+                        frame, frame_rgb = data
+                        pending_frames.append((idx, frame, frame_rgb))
+                        if len(pending_frames) < yolo_batch_size:
+                            continue  # накопичуємо батч
+
+                    # Якщо EOF або батч повний — обробляємо все накопичене
+                    if not pending_frames:
+                        break
+
+                    processed = _flush_mask_batch(pending_frames)
+                    pending_frames = []
+
+                    for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
+                        processor.process(p_idx, p_frame, p_frame_rgb, p_static_mask)
+                        # A1: empty_cache() після КОЖНОГО кадру синхронізував GPU і
+                        # змушував наступні алокації йти повільним cudaMalloc —
+                        # головний гальмівний фактор збудови. Гігієнічно чистимо рідко.
+                        if torch.cuda.is_available() and p_idx % 500 == 0 and p_idx > 0:
+                            torch.cuda.empty_cache()
+                    if idx == EOF_INDEX:
+                        break
+
+        except Exception as e:
+            logger.error(
+                f"Error during database building: {e} | "
+                f"video={video_path}, output={self.output_path}, "
+                f"processed_frames={processor.saved_count}",
+                exc_info=True,
+            )
+            raise
+        finally:
+            self.writer.finalize_vectors(processor.saved_count)
+
+            # Зберігаємо frame_index_map і actual_num_frames у metadata
+            self.writer.write_frame_index_map(
+                processor.saved_count,
+                processor.frame_index_map,
+                num_frames,
+                use_keyframe_selection,
+            )
+
+            source.join(timeout=5)
+            if kp_writer is not None:
+                kp_writer.release()
+            self.writer.close()
+            source.release()
+
+        logger.success(f"Database build completed successfully: {self.output_path}")
+
+    # ------------------------------------------------------------------
+    # Build helpers
+    # ------------------------------------------------------------------
+
+    def _open_keypoint_writer(
+        self,
+        save_keypoint_video: bool,
+        width: int,
+        height: int,
+        kp_scale: float,
+        effective_fps: float,
+    ):
+        """Opens the keypoint-overlay VideoWriter, or returns None."""
+        if not save_keypoint_video:
+            return None
+
+        kp_writer = None
+        try:
+            import os
+            import sys
+
+            kp_width = int(width * kp_scale)
+            kp_height = int(height * kp_scale)
+            kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
+
+            # Порядок кодеків:
+            # - Windows: avc1 потребує openh264.dll → пропускаємо, щоб уникнути FFmpeg-шуму
+            # - XVID: надійний cross-platform без сторонніх DLL
+            # - mp4v: абсолютний fallback
+            codecs = []
+            if sys.platform != "win32":
+                codecs.append("avc1")  # H.264 — тільки на Linux/macOS де є нативна підтримка
+            codecs += ["XVID", "mp4v"]
+
+            for codec_name in codecs:
+                fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                # Пригнічуємо C-рівневий stderr від FFmpeg (fd=2) щоб уникнути OpenH264-шуму
+                devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                old_stderr_fd = os.dup(2)
+                os.dup2(devnull_fd, 2)
+                try:
+                    with silent_output():
+                        kp_writer = cv2.VideoWriter(
+                            kp_video_path, fourcc, effective_fps, (kp_width, kp_height)
+                        )
+                finally:
+                    os.dup2(old_stderr_fd, 2)
+                    os.close(old_stderr_fd)
+                    os.close(devnull_fd)
+
+                if kp_writer and kp_writer.isOpened():
+                    logger.info(
+                        f"Keypoint video: {kp_video_path} | {kp_width}x{kp_height} | codec={codec_name}"
+                    )
+                    break
+                kp_writer = None
+            else:
+                logger.warning("No compatible video codec found, keypoint video disabled")
+                kp_writer = None
+
+        except Exception as e:
+            logger.warning(f"VideoWriter initialization crashed: {e}")
+            kp_writer = None
+
+        return kp_writer
+
+    def _detect_descriptor_dims(
+        self, feature_extractor, nv_model, cesp, model_manager, local_ext_type: str
+    ) -> None:
+        """Fix 10: Dynamic descriptor dimension detection to avoid broadcast errors."""
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -335,280 +472,9 @@ class DatabaseBuilder:
             logger.warning(f"Failed to detect local feature dimension: {e}. Using 128 as fallback.")
             self.local_descriptor_dim = 128
 
-        # Create empty database structure
-        logger.info("Creating HDF5 database structure...")
-        self.create_hdf5_structure(
-            num_frames,
-            width,
-            height,
-            use_patchify=use_patchify,
-            num_patches=patchify.num_patches if patchify else 0,
-            frame_step=frame_step,
-            source_total_frames=total_frames,
-        )
-
-        current_pose = np.eye(3, dtype=np.float32)
-        prev_features = None
-
-        # Adaptive Keyframe Selection (П4)
-        saved_count = 0  # лічильник РЕАЛЬНО записаних кадрів
-        frame_index_map: list[int] = []  # список збережених frame_id
-        use_keyframe_selection = (
-            get_cfg(self.config, "database.keyframe_min_translation_px", 0.0) > 0
-        )
-        if use_keyframe_selection:
-            logger.info(
-                f"Adaptive keyframe selection ENABLED "
-                f"(min_translation={get_cfg(self.config, 'database.keyframe_min_translation_px', 15.0)}px, "
-                f"min_rotation={get_cfg(self.config, 'database.keyframe_min_rotation_deg', 1.5)}°)"
-            )
-
-        # cuDNN benchmark is now set globally at startup by HardwareProfile.apply_torch_backends()
-        # (previously was conditional on CNN model type; now all architectures benefit)
-
-        # Increased prefetch queue (Fix 5)
-        frame_queue = Queue(maxsize=self.prefetch_size)
-
-        def prefetch_frames():
-            if use_decord:
-                # Decord provides batched read
-                batch_size = get_cfg(self.config, "database.decode_batch_size", 32)
-                indices = list(range(0, total_frames, frame_step))
-                for chunk_start in range(0, len(indices), batch_size):
-                    chunk_indices = indices[chunk_start : chunk_start + batch_size]
-
-                    with Telemetry.profile("video_read"):
-                        # Decord returns RGB (B, H, W, C)
-                        frames_rgb = vr.get_batch(chunk_indices).asnumpy()
-
-                    for i, frame_rgb in enumerate(frames_rgb):
-                        orig_frame_idx = chunk_indices[i] // frame_step
-                        with Telemetry.profile("rgb_to_bgr"):
-                            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                        frame_queue.put((orig_frame_idx, (frame_bgr, frame_rgb)))
-            else:
-                for i in range(total_frames):
-                    with Telemetry.profile("video_read"):
-                        ret, frame = cap.read()
-                    if not ret:
-                        break
-
-                    if i % frame_step != 0:
-                        continue
-
-                    with Telemetry.profile("bgr_to_rgb"):
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    orig_frame_idx = i // frame_step
-                    frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
-
-            frame_queue.put((-1, None))
-
-        prefetch_thread = Thread(target=prefetch_frames, daemon=True)
-        prefetch_thread.start()
-
-        try:
-            self.db_file = h5py.File(self.output_path, "a")
-            logger.info(f"Opened HDF5 file for writing: {self.output_path}")
-
-            # YOLO micro-batching (П8)
-            yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 1)
-            if yolo_batch_size > 1:
-                logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
-            pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
-
-            def _flush_mask_batch(batch: list) -> list:
-                """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
-                images_rgb = [b[2] for b in batch]
-                with Telemetry.profile("yolo"):
-                    masks_list = masking_strategy.get_mask_batch(images_rgb)
-                return [(b[0], b[1], b[2], m) for b, m in zip(batch, masks_list)]
-
-            def _process_single_frame(
-                p_idx,
-                p_frame,
-                p_frame_rgb,
-                p_static_mask,
-                current_pose,
-                prev_features,
-                saved_count,
-                frame_index_map,
-            ):
-                """Обробляє один кадр після YOLO: feature extraction, pose, keyframe selection."""
-                features = feature_extractor.extract_features(p_frame_rgb, p_static_mask)
-                features["coords_2d"] = features["keypoints"]
-
-                # Patchify: витягуємо патч-дескриптори
-                if patchify is not None:
-                    features["patch_descriptors"] = patchify.compute_patch_descriptors(p_frame_rgb)
-
-                # Phase 2.2: Depth estimation for scale recovery
-                # A6: скаляр depth_scale змінюється повільно (висота польоту) —
-                # повний інференс Depth-Anything на КОЖНОМУ кадрі був марнотратним.
-                # Рахуємо кожен depth_every_n-й кадр, між ними реюзаємо останнє значення.
-                features["depth_scale"] = np.float32(getattr(self, "_last_depth_scale", 1.0))
-                if self._depth_estimator is not None:
-                    depth_every = max(1, int(get_cfg(self.config, "database.depth_every_n", 10)))
-                    if p_idx % depth_every == 0 or not hasattr(self, "_last_depth_scale"):
-                        try:
-                            self._last_depth_scale = float(
-                                self._depth_estimator.get_relative_scale(p_frame_rgb)
-                            )
-                            features["depth_scale"] = np.float32(self._last_depth_scale)
-                        except Exception as e:
-                            logger.warning(f"Depth estimation failed for frame {p_idx}: {e}")
-
-                if kp_writer is not None:
-                    kp_frame = self._draw_keypoints_frame(
-                        p_frame, features["keypoints"], p_static_mask, p_idx, num_frames
-                    )
-                    if kp_scale != 1.0:
-                        kp_w = int(width * kp_scale)
-                        kp_h = int(height * kp_scale)
-                        kp_frame = cv2.resize(kp_frame, (kp_w, kp_h), interpolation=cv2.INTER_AREA)
-                    kp_writer.write(kp_frame)
-
-                if p_idx == 0 or prev_features is None:
-                    current_pose = np.eye(3, dtype=np.float64)
-                    save_this_frame = True
-                else:
-                    H_step = self._compute_inter_frame_H(prev_features, features)
-                    if H_step is not None:
-                        current_pose = current_pose @ H_step.astype(np.float64)
-                        if use_keyframe_selection:
-                            save_this_frame = self._is_significant_motion(H_step, width, height)
-                        else:
-                            save_this_frame = True
-                    else:
-                        logger.warning(
-                            f"Frame {p_idx}: inter-frame match failed, reusing previous pose"
-                        )
-                        save_this_frame = (
-                            True  # Or False? Usually better to keep it if tracking fails
-                        )
-
-                prev_features = features
-
-                # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
-                # навіть якщо кадр не є keyframe (пропущений через малий рух).
-                # Без цього frame_poses[frame_id] = zeros → пропагація ламається.
-                if self.db_file:
-                    self.db_file["global_descriptors"]["frame_poses"][p_idx] = current_pose
-
-                if save_this_frame:
-                    # RESEARCH 2.2: SIFT рахуємо лише для кадрів, що реально
-                    # зберігаються (keyframe-ів) — на пропущених це марна робота
-                    if self.store_sift:
-                        try:
-                            sift_feats = extract_sift_features(
-                                p_frame_rgb, p_static_mask, self.sift_max_kps
-                            )
-                            features["sift_keypoints"] = sift_feats["keypoints"]
-                            features["sift_descriptors"] = sift_feats["descriptors"]
-                        except Exception as e:
-                            logger.warning(f"SIFT extraction failed for frame {p_idx}: {e}")
-                    frame_index_map.append(p_idx)
-                    # Зберігаємо за ОРИГІНАЛЬНИМ індексом p_idx, а не послідовним
-                    # Це зберігає frame_id ↔ slot identity для калібрування/пропагації
-                    self.save_frame_data(p_idx, features, current_pose)
-                    saved_count += 1
-
-                    if saved_count % 100 == 0:
-                        progress_pct = int((p_idx + 1) / num_frames * 100)
-                        logger.info(
-                            f"Saved {saved_count} keyframes from {p_idx + 1}/{num_frames} processed "
-                            f"({progress_pct}%)"
-                        )
-
-                progress_percent = int((p_idx + 1) / num_frames * 100)
-                if progress_callback:
-                    progress_callback(progress_percent)
-
-                return current_pose, prev_features, saved_count
-
-            with torch.no_grad():
-                while True:
-                    idx, data = frame_queue.get()
-
-                    if idx != -1 and data is not None:
-                        frame, frame_rgb = data
-                        pending_frames.append((idx, frame, frame_rgb))
-                        if len(pending_frames) < yolo_batch_size:
-                            continue  # накопичуємо батч
-
-                    # Якщо EOF або батч повний — обробляємо все накопичене
-                    if not pending_frames:
-                        break
-
-                    processed = _flush_mask_batch(pending_frames)
-                    pending_frames = []
-
-                    for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
-                        current_pose, prev_features, saved_count = _process_single_frame(
-                            p_idx,
-                            p_frame,
-                            p_frame_rgb,
-                            p_static_mask,
-                            current_pose,
-                            prev_features,
-                            saved_count,
-                            frame_index_map,
-                        )
-                        # A1: empty_cache() після КОЖНОГО кадру синхронізував GPU і
-                        # змушував наступні алокації йти повільним cudaMalloc —
-                        # головний гальмівний фактор збудови. Гігієнічно чистимо рідко.
-                        if torch.cuda.is_available() and p_idx % 500 == 0 and p_idx > 0:
-                            torch.cuda.empty_cache()
-                    if idx == -1:
-                        break
-
-        except Exception as e:
-            logger.error(
-                f"Error during database building: {e} | "
-                f"video={video_path}, output={self.output_path}, "
-                f"processed_frames={saved_count}",
-                exc_info=True,
-            )
-            raise
-        finally:
-            if self.use_lancedb and self.lance_table is not None:
-                if self.lance_batch:
-                    self.lance_table.add(self.lance_batch)
-                    self.lance_batch = []
-                if saved_count >= self.lance_index_min_frames:
-                    logger.info("Building LanceDB IVF-PQ index...")
-                    self.lance_table.create_index(
-                        metric="cosine",
-                        num_partitions=min(256, saved_count // 8),
-                        num_sub_vectors=32,
-                    )
-
-            # Зберігаємо frame_index_map і actual_num_frames у metadata
-            if self.db_file and saved_count > 0:
-                try:
-                    meta = self.db_file["metadata"]
-                    meta.attrs["actual_num_frames"] = saved_count
-                    if "frame_index_map" not in meta:
-                        meta.create_dataset(
-                            "frame_index_map",
-                            data=np.array(frame_index_map, dtype=np.int32),
-                        )
-                    if use_keyframe_selection:
-                        logger.info(
-                            f"Keyframe selection: {saved_count}/{num_frames} frames saved "
-                            f"({100 - saved_count / num_frames * 100:.1f}% reduction)"
-                        )
-                except Exception as e:
-                    logger.warning(f"Could not save frame_index_map: {e}")
-
-            prefetch_thread.join(timeout=5)
-            if kp_writer is not None:
-                kp_writer.release()
-            if self.db_file:
-                self.db_file.close()
-            if cap is not None:
-                cap.release()
-
-        logger.success(f"Database build completed successfully: {self.output_path}")
+    # ------------------------------------------------------------------
+    # Thin wrappers over the extracted pure helpers
+    # ------------------------------------------------------------------
 
     def _draw_keypoints_frame(
         self,
@@ -659,254 +525,3 @@ class DatabaseBuilder:
             min_translation_px=get_cfg(self.config, "database.keyframe_min_translation_px", 15.0),
             min_rotation_deg=get_cfg(self.config, "database.keyframe_min_rotation_deg", 1.5),
         )
-
-    def create_hdf5_structure(
-        self,
-        num_frames: int,
-        width: int,
-        height: int,
-        use_patchify: bool = False,
-        num_patches: int = 0,
-        frame_step: int = 1,
-        source_total_frames: int = 0,
-    ):
-        """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
-        compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
-        chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
-        max_kps = get_cfg(self.config, "database.max_keypoints_stored", 2048)
-        local_desc_dim = getattr(self, "local_descriptor_dim", 128)
-
-        logger.info(
-            f"Creating HDF5 v2 structure for {num_frames} frames "
-            f"(compression={compression}, chunks={chunk_f}, max_kps={max_kps})"
-        )
-
-        if self.use_lancedb:
-            lance_path = Path(self.output_path).parent / "vectors.lance"
-            if lance_path.exists():
-                shutil.rmtree(lance_path)
-            db = lancedb.connect(str(lance_path))
-            schema = pa.schema(
-                [
-                    pa.field("frame_id", pa.int32()),
-                    pa.field("vector", pa.list_(pa.float32(), self.descriptor_dim)),
-                ]
-            )
-            self.lance_table = db.create_table("global_vectors", schema=schema, mode="create")
-            self.lance_batch = []
-            logger.info(f"LanceDB table created at {lance_path}")
-
-        with h5py.File(self.output_path, "w", libver="latest") as f:
-            # --- global_descriptors: chunked ---
-            g1 = f.create_group("global_descriptors")
-            if not self.use_lancedb:
-                g1.create_dataset(
-                    "descriptors",
-                    shape=(num_frames, self.descriptor_dim),
-                    maxshape=(None, self.descriptor_dim),
-                    dtype="float32",
-                    compression=compression,
-                    chunks=(min(256, num_frames), self.descriptor_dim),
-                )
-            g1.create_dataset(
-                "frame_poses",
-                shape=(num_frames, 3, 3),
-                maxshape=(None, 3, 3),
-                dtype="float64",
-                compression=compression,
-                chunks=(min(256, num_frames), 3, 3),
-            )
-
-            # --- local_features: PRE-ALLOCATED chunked arrays (НОВА СХЕМА v2) ---
-            lf = f.create_group("local_features")
-            lf.create_dataset(
-                "keypoints",
-                shape=(num_frames, max_kps, 2),
-                maxshape=(None, max_kps, 2),
-                dtype="float32",
-                compression=compression,
-                chunks=(min(chunk_f, num_frames), max_kps, 2),
-                fillvalue=0.0,
-            )
-            lf.create_dataset(
-                "descriptors",
-                shape=(num_frames, max_kps, local_desc_dim),
-                maxshape=(None, max_kps, local_desc_dim),
-                dtype="float16",  # float16: -50% розміру (П2)
-                compression=compression,
-                chunks=(min(chunk_f, num_frames), max_kps, local_desc_dim),
-                fillvalue=0.0,
-            )
-            lf.create_dataset(
-                "coords_2d",
-                shape=(num_frames, max_kps, 2),
-                maxshape=(None, max_kps, 2),
-                dtype="float32",
-                compression=compression,
-                chunks=(min(chunk_f, num_frames), max_kps, 2),
-                fillvalue=0.0,
-            )
-            lf.create_dataset(
-                "kp_counts",  # скільки keypoints у кожному кадрі
-                shape=(num_frames,),
-                maxshape=(None,),
-                dtype="int16",
-                compression=compression,
-                chunks=(min(num_frames, 4096),),
-                fillvalue=0,
-            )
-            # Розміри кадру — зберігаємо ОДИН РАЗ у групі
-            lf.attrs["frame_width"] = width
-            lf.attrs["frame_height"] = height
-
-            # --- RESEARCH 2.2: SIFT-ознаки для аварійного фолбека ---
-            if self.store_sift:
-                sf = f.create_group("sift_features")
-                sf.create_dataset(
-                    "keypoints",
-                    shape=(num_frames, self.sift_max_kps, 2),
-                    maxshape=(None, self.sift_max_kps, 2),
-                    dtype="float32",
-                    compression=compression,
-                    chunks=(min(chunk_f, num_frames), self.sift_max_kps, 2),
-                    fillvalue=0.0,
-                )
-                sf.create_dataset(
-                    "descriptors",
-                    shape=(num_frames, self.sift_max_kps, 128),
-                    maxshape=(None, self.sift_max_kps, 128),
-                    dtype="float16",  # rootSIFT ∈ [0,1] — f16 безпечний
-                    compression=compression,
-                    chunks=(min(chunk_f, num_frames), self.sift_max_kps, 128),
-                    fillvalue=0.0,
-                )
-                sf.create_dataset(
-                    "kp_counts",
-                    shape=(num_frames,),
-                    maxshape=(None,),
-                    dtype="int16",
-                    compression=compression,
-                    chunks=(min(num_frames, 4096),),
-                    fillvalue=0,
-                )
-                logger.info(f"SIFT fallback group created (max {self.sift_max_kps} kps/frame)")
-
-            g3 = f.create_group("metadata")
-            g3.attrs["num_frames"] = num_frames
-            g3.attrs["creation_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            g3.attrs["frame_width"] = width
-            g3.attrs["frame_height"] = height
-            g3.attrs["descriptor_dim"] = self.descriptor_dim
-            g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
-            g3.attrs["max_keypoints"] = max_kps
-            # Крок семплінгу відео: DB slot i = кадр відео i * frame_step.
-            # Критично для калібрування — діалог конвертує номери кадрів відео у слоти БД.
-            g3.attrs["frame_step"] = int(frame_step)
-            g3.attrs["source_total_frames"] = int(source_total_frames)
-
-            # Schema fingerprint: a stable hash of every structure/content-
-            # defining setting (models, dims, keypoint budget, scale, frame
-            # step, SIFT/VLAD policy). Lets databases built on different
-            # machines be checked for interchangeability instead of silently
-            # mixed. See src/database/schema_fingerprint.py. Never fatal.
-            try:
-                import json as _json
-
-                from src.database.schema_fingerprint import (
-                    build_components,
-                    compute_fingerprint,
-                )
-
-                _fp_components = build_components(
-                    self.config,
-                    descriptor_dim=self.descriptor_dim,
-                    local_descriptor_dim=getattr(self, "local_descriptor_dim", 128),
-                    schema_version="v2",
-                )
-                g3.attrs["schema_fingerprint"] = compute_fingerprint(_fp_components)
-                g3.attrs["schema_components"] = _json.dumps(_fp_components, sort_keys=True)
-                logger.info(f"DB schema fingerprint: {g3.attrs['schema_fingerprint']}")
-            except Exception as _fp_err:  # metadata must never break a build
-                logger.warning(f"Could not write schema fingerprint: {_fp_err}")
-
-            # Phase 2.2: Dataset for depth scales
-            g3.create_dataset(
-                "depth_scales",
-                shape=(num_frames,),
-                maxshape=(None,),
-                dtype="float32",
-                compression=compression,
-                fillvalue=1.0,
-            )
-
-            # --- Patchify: мультимасштабні патч-дескриптори ---
-            if use_patchify and num_patches > 0:
-                pf = f.create_group("patch_descriptors")
-                pf.create_dataset(
-                    "descriptors",
-                    shape=(num_frames, num_patches, self.descriptor_dim),
-                    maxshape=(None, num_patches, self.descriptor_dim),
-                    dtype="float32",
-                    compression=compression,
-                    chunks=(min(64, num_frames), num_patches, self.descriptor_dim),
-                )
-                g3.attrs["use_patchify"] = True
-                g3.attrs["patchify_num_patches"] = num_patches
-                logger.info(
-                    f"Patchify HDF5 group created: {num_patches} patches × {self.descriptor_dim}D"
-                )
-
-            # Enable SWMR mode for parallel reading while writing
-            f.swmr_mode = True
-
-        logger.success("HDF5 v2 structure created successfully in SWMR mode")
-
-    def save_frame_data(self, frame_id: int, features: dict, pose_2d: np.ndarray):
-        """Save extracted data for a single frame via slice assignment (schema v2)"""
-        with Telemetry.profile("hdf5_write"):
-            if self.use_lancedb:
-                self.lance_batch.append({"frame_id": frame_id, "vector": features["global_desc"]})
-                if len(self.lance_batch) >= self.lance_batch_size:
-                    self.lance_table.add(self.lance_batch)
-                    self.lance_batch = []
-            else:
-                self.db_file["global_descriptors"]["descriptors"][frame_id] = features[
-                    "global_desc"
-                ]
-
-            self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
-
-            # local — slice assignment замість create_group + create_dataset
-            kps = features["keypoints"]
-            descs = features["descriptors"]
-            c2d = features["coords_2d"]
-
-            max_kps = self.db_file["local_features"]["keypoints"].shape[1]
-            n = min(len(kps), max_kps)
-
-            lf = self.db_file["local_features"]
-            lf["keypoints"][frame_id, :n] = kps[:n]
-            lf["descriptors"][frame_id, :n] = descs[:n].astype("float16")
-            lf["coords_2d"][frame_id, :n] = c2d[:n]
-            lf["kp_counts"][frame_id] = n
-
-            # Patchify descriptors
-            if "patch_descriptors" in features and "patch_descriptors" in self.db_file:
-                self.db_file["patch_descriptors"]["descriptors"][frame_id] = features[
-                    "patch_descriptors"
-                ]
-
-            # RESEARCH 2.2: SIFT-ознаки
-            if "sift_keypoints" in features and "sift_features" in self.db_file:
-                sf = self.db_file["sift_features"]
-                s_kps = features["sift_keypoints"]
-                s_descs = features["sift_descriptors"]
-                sn = min(len(s_kps), sf["keypoints"].shape[1])
-                if sn > 0:
-                    sf["keypoints"][frame_id, :sn] = s_kps[:sn]
-                    sf["descriptors"][frame_id, :sn] = s_descs[:sn].astype("float16")
-                sf["kp_counts"][frame_id] = sn
-
-            # Save depth scale
-            if "depth_scale" in features:
-                self.db_file["metadata"]["depth_scales"][frame_id] = features["depth_scale"]

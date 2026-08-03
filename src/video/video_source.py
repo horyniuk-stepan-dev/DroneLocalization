@@ -1,3 +1,4 @@
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -26,6 +27,9 @@ class VideoSourceConfig:
     reconnect_delay_sec: float = 2.0
     buffer_size: int = 1  # Для live: буфер 1 кадр (мінімальна затримка)
     read_timeout_sec: float = 10.0
+    # Для live: фоновий читач тримає лише останній кадр (drop-late).
+    # Без нього споживач, повільніший за потік, хронічно відстає від реального часу.
+    drop_late_frames: bool = True
 
 
 class VideoSource:
@@ -36,6 +40,14 @@ class VideoSource:
         self._cap = None
         self._fps = 30.0
         self._is_open = False
+
+        # Фоновий drop-late читач (тільки для live-джерел)
+        self._reader_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
+        self._latest_seq = 0
+        self._consumed_seq = 0
 
         # Визначаємо тип джерела, якщо він не вказаний явно
         if self.config.source_type == VideoSourceType.FILE:
@@ -53,6 +65,76 @@ class VideoSource:
                     self.config.source = self.config.source[4:]
 
         self._connect()
+
+        if self._is_open and self.is_live and self.config.drop_late_frames:
+            self._start_reader()
+
+    def _start_reader(self):
+        """Запускає фоновий потік, що постійно тягне кадри й лишає тільки останній."""
+        if self._reader_thread is not None:
+            return
+        self._stop_event.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, name="VideoSourceReader", daemon=True
+        )
+        self._reader_thread.start()
+        logger.info("Drop-late reader thread started for live source.")
+
+    def _reader_loop(self):
+        """Читає потік максимально швидко; зберігає лише найсвіжіший кадр."""
+        failures = 0
+        while not self._stop_event.is_set():
+            cap = self._cap
+            if cap is None:
+                break
+
+            ret, frame = cap.read()
+
+            if ret:
+                failures = 0
+                with self._frame_lock:
+                    self._latest_frame = frame
+                    self._latest_seq += 1
+                continue
+
+            if self._stop_event.is_set():
+                break
+
+            # Лічильник рахує ПІДРЯД невдалі читання, а не невдалі open():
+            # RTSP-сервер може приймати зʼєднання й не віддавати кадрів.
+            failures += 1
+            if failures > self.config.reconnect_attempts:
+                logger.error("Failed to reconnect after multiple attempts.")
+                self._is_open = False
+                return
+
+            logger.warning(
+                f"Live stream read failed. Reconnect attempt "
+                f"{failures}/{self.config.reconnect_attempts}..."
+            )
+            if self._stop_event.wait(self.config.reconnect_delay_sec):
+                return
+            self._connect()
+
+    def _read_latest(self) -> tuple[bool, np.ndarray | None]:
+        """Віддає найсвіжіший кадр від фонового читача; чекає нового, не повторює старий."""
+        deadline = time.monotonic() + self.config.read_timeout_sec
+        while True:
+            with self._frame_lock:
+                if self._latest_seq > self._consumed_seq:
+                    self._consumed_seq = self._latest_seq
+                    return True, self._latest_frame
+
+            if not self._is_open or self._stop_event.is_set():
+                return False, None
+
+            if time.monotonic() >= deadline:
+                logger.error(
+                    f"No frame from live source within {self.config.read_timeout_sec:.1f}s."
+                )
+                return False, None
+
+            time.sleep(0.002)
 
     def _connect(self):
         """Підключається до джерела. Якщо це live, налаштовує розмір буфера."""
@@ -129,6 +211,9 @@ class VideoSource:
         if not self._is_open:
             return False, None
 
+        if self._reader_thread is not None:
+            return self._read_latest()
+
         ret, frame = self._cap.read()
 
         if not ret and self.is_live:
@@ -152,6 +237,10 @@ class VideoSource:
 
     def release(self):
         """Звільняє ресурси."""
+        self._stop_event.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
         if self._cap is not None:
             self._cap.release()
             self._cap = None
