@@ -497,8 +497,12 @@ class RealtimeTrackingWorker(QThread):
                                     inlier_ratio = float(of_mask.sum()) / len(of_mask)
                                     n_norm = min(1.0, len(good_new) / 120.0)
                                     flow_quality = inlier_ratio * n_norm
-                        except cv2.error:
-                            pass
+                        except cv2.error as e:
+                            # Гарячий шлях: рівень debug навмисно. Наслідок збою
+                            # видимий далі як flow_quality=0, і без цього рядка
+                            # причина «поганого потоку» не відрізнялася від
+                            # справжнього зриву LK.
+                            logger.debug(f"OF affine estimation failed: {e}")
 
                         try:
                             loc_result = self.localizer.localize_optical_flow(

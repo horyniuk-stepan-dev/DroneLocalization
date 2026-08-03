@@ -146,8 +146,14 @@ class MultiDatabaseManager:
             if raw:
                 try:
                     comps[sid] = _json.loads(raw)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Симетрично до гілки «немає fingerprint» вище: перевірка
+                    # сумісності, що тихо перестала перевіряти, гірша за
+                    # відсутню — вона виглядає як пройдена.
+                    logger.warning(
+                        f"Source '{sid}': schema_components is not valid JSON ({e}) — "
+                        f"per-field comparison unavailable, only the fingerprint is checked."
+                    )
 
         distinct = set(fps.values())
         if len(distinct) <= 1:

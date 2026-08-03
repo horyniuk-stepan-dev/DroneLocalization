@@ -1230,6 +1230,8 @@ class PropagationPipeline:
                 if self.calibration.converter and self.calibration.converter.is_initialized:
                     frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
                     gps_count = 0
+                    gps_failed = 0
+                    gps_first_error = None
                     for fid in range(num_frames):
                         if not frame_valid[fid]:
                             continue
@@ -1247,8 +1249,15 @@ class PropagationPipeline:
                                 )
                                 frame_gps[fid] = [lat, lon]
                                 gps_count += 1
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                # Раніше збій ковтався мовчки: при систематичній
+                                # помилці конвертера (побита метадата проєкції)
+                                # у HDF5 лягав майже порожній frame_gps без
+                                # жодного сліду в лозі. Лічильник + перша
+                                # причина повідомляються після циклу.
+                                gps_failed += 1
+                                if gps_first_error is None:
+                                    gps_first_error = repr(e)
 
                     # Видаляємо старий датасет якщо є
                     if "frame_gps" in f:
@@ -1257,6 +1266,11 @@ class PropagationPipeline:
                     logger.info(
                         f"Saved frame_gps: {gps_count}/{num_frames} frames with GPS coordinates"
                     )
+                    if gps_failed:
+                        logger.warning(
+                            f"frame_gps: {gps_failed} frame(s) failed metric→GPS conversion "
+                            f"and stay NaN. First error: {gps_first_error}"
+                        )
 
             valid_count = int(np.sum(frame_valid))
             logger.success(
