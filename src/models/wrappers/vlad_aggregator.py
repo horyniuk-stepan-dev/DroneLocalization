@@ -43,10 +43,10 @@ class VladAggregator:
         self.low_norm_fraction = float(low_norm_fraction)
         self.seed = int(seed)
 
-        self.centers: np.ndarray | None = None      # (K, D)
-        self.pca_mean: np.ndarray | None = None      # (K*D,)
+        self.centers: np.ndarray | None = None  # (K, D)
+        self.pca_mean: np.ndarray | None = None  # (K*D,)
         self.pca_components: np.ndarray | None = None  # (pca_dim, K*D)
-        self.pca_eigvals: np.ndarray | None = None   # (pca_dim,)
+        self.pca_eigvals: np.ndarray | None = None  # (pca_dim,)
 
     # ── Властивості ──────────────────────────────────────────────────────
 
@@ -166,8 +166,8 @@ class VladAggregator:
 
         # Жорстке призначення до найближчого центру: argmin ||t - c||²
         # через розклад (економія пам'яті проти повної матриці відстаней)
-        dots = t @ self.centers.T                      # (N, K)
-        c_sq = np.sum(self.centers**2, axis=1)         # (K,)
+        dots = t @ self.centers.T  # (N, K)
+        c_sq = np.sum(self.centers**2, axis=1)  # (K,)
         assign = np.argmax(dots - 0.5 * c_sq, axis=1)  # (N,)
 
         vlad = np.zeros((k, d), dtype=np.float32)
@@ -212,9 +212,7 @@ class VladAggregator:
                 self.pca_components if self.pca_components is not None else np.empty((0, 0))
             ),
             pca_eigvals=self.pca_eigvals if self.pca_eigvals is not None else np.empty(0),
-            meta=np.array(
-                [self.n_clusters, self.pca_dim, self.seed], dtype=np.int64
-            ),
+            meta=np.array([self.n_clusters, self.pca_dim, self.seed], dtype=np.int64),
             low_norm_fraction=np.float64(self.low_norm_fraction),
         )
         logger.info(f"VLAD vocabulary saved: {path} (out_dim={self.out_dim})")
@@ -234,7 +232,5 @@ class VladAggregator:
             agg.pca_mean = data["pca_mean"].astype(np.float32)
             agg.pca_components = data["pca_components"].astype(np.float32)
             agg.pca_eigvals = data["pca_eigvals"].astype(np.float32)
-        logger.info(
-            f"VLAD vocabulary loaded: {path} | k={n_clusters}, out_dim={agg.out_dim}"
-        )
+        logger.info(f"VLAD vocabulary loaded: {path} | k={n_clusters}, out_dim={agg.out_dim}")
         return agg

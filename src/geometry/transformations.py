@@ -114,9 +114,7 @@ class GeometryTransforms:
             return False
 
     @staticmethod
-    def reprojection_errors(
-        src_pts: np.ndarray, dst_pts: np.ndarray, H: np.ndarray
-    ) -> np.ndarray:
+    def reprojection_errors(src_pts: np.ndarray, dst_pts: np.ndarray, H: np.ndarray) -> np.ndarray:
         """Помилки репроєкції ``|H·src − dst|`` для кожної відповідності, (N,)."""
         pts_transformed = GeometryTransforms.apply_homography(src_pts, H)
         return np.sqrt(np.sum((pts_transformed - dst_pts) ** 2, axis=1))

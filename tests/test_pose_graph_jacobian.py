@@ -13,8 +13,18 @@ from src.geometry.affine_utils import compose_affine
 from src.geometry.pose_graph_optimizer import PoseGraphOptimizer
 
 
-def _make_d(X_fixed, free_indices, edges_from, edges_to, edge_from_free,
-            edge_to_free, n_free, edge_params, cx=960.0, sign=1.0):
+def _make_d(
+    X_fixed,
+    free_indices,
+    edges_from,
+    edges_to,
+    edge_from_free,
+    edge_to_free,
+    n_free,
+    edge_params,
+    cx=960.0,
+    sign=1.0,
+):
     ne = len(edges_from)
     return {
         "X_full": X_fixed.copy(),
@@ -27,7 +37,10 @@ def _make_d(X_fixed, free_indices, edges_from, edges_to, edge_from_free,
         "log_dsy": np.array(edge_params["log_dsy"], dtype=np.float64),
         "dtheta": np.array(edge_params["dtheta"], dtype=np.float64),
         "weights": np.array(edge_params["weights"], dtype=np.float64),
-        "cx": cx, "sign": sign, "n_edges": ne, "n_free": n_free,
+        "cx": cx,
+        "sign": sign,
+        "n_edges": ne,
+        "n_free": n_free,
         "edge_from_free": np.array(edge_from_free, dtype=np.int64),
         "edge_to_free": np.array(edge_to_free, dtype=np.int64),
     }
@@ -60,11 +73,20 @@ class TestAnalyticJacobianVsFiniteDiff:
         for _ in range(20):
             d = _make_d(
                 X_fixed=np.zeros((2, 5)),
-                free_indices=[0, 1], edges_from=[0], edges_to=[1],
-                edge_from_free=[0], edge_to_free=[1], n_free=2,
-                edge_params={"dtx": [rng.uniform(-20, 20)], "dty": [rng.uniform(-20, 20)],
-                             "log_dsx": [rng.uniform(-0.3, 0.3)], "log_dsy": [rng.uniform(-0.3, 0.3)],
-                             "dtheta": [rng.uniform(-1, 1)], "weights": [rng.uniform(0.3, 3.0)]},
+                free_indices=[0, 1],
+                edges_from=[0],
+                edges_to=[1],
+                edge_from_free=[0],
+                edge_to_free=[1],
+                n_free=2,
+                edge_params={
+                    "dtx": [rng.uniform(-20, 20)],
+                    "dty": [rng.uniform(-20, 20)],
+                    "log_dsx": [rng.uniform(-0.3, 0.3)],
+                    "log_dsy": [rng.uniform(-0.3, 0.3)],
+                    "dtheta": [rng.uniform(-1, 1)],
+                    "weights": [rng.uniform(0.3, 3.0)],
+                },
             )
             x = rng.uniform(-2, 2, size=10)
             x[2] = rng.uniform(-0.5, 0.5)  # log-scales moderate
@@ -82,10 +104,21 @@ class TestAnalyticJacobianVsFiniteDiff:
         X_fixed = np.zeros((2, 5))
         X_fixed[0] = [1.0, -2.0, 0.1, -0.2, 0.3]  # фіксований вузол 0
         d = _make_d(
-            X_fixed=X_fixed, free_indices=[1], edges_from=[0], edges_to=[1],
-            edge_from_free=[-1], edge_to_free=[0], n_free=1,
-            edge_params={"dtx": [7.0], "dty": [-3.0], "log_dsx": [0.05],
-                         "log_dsy": [-0.1], "dtheta": [0.2], "weights": [1.5]},
+            X_fixed=X_fixed,
+            free_indices=[1],
+            edges_from=[0],
+            edges_to=[1],
+            edge_from_free=[-1],
+            edge_to_free=[0],
+            n_free=1,
+            edge_params={
+                "dtx": [7.0],
+                "dty": [-3.0],
+                "log_dsx": [0.05],
+                "log_dsy": [-0.1],
+                "dtheta": [0.2],
+                "weights": [1.5],
+            },
         )
         x = rng.uniform(-1, 1, size=5)
         Ja = opt._jacobian_vec(x, d).toarray()
@@ -99,11 +132,20 @@ class TestAnalyticJacobianVsFiniteDiff:
         # 3 free вузли, 2 ребра 0->1, 1->2
         d = _make_d(
             X_fixed=np.zeros((3, 5)),
-            free_indices=[0, 1, 2], edges_from=[0, 1], edges_to=[1, 2],
-            edge_from_free=[0, 1], edge_to_free=[1, 2], n_free=3,
-            edge_params={"dtx": [5.0, -4.0], "dty": [2.0, 3.0],
-                         "log_dsx": [0.02, -0.03], "log_dsy": [0.01, 0.04],
-                         "dtheta": [0.1, -0.15], "weights": [1.0, 2.0]},
+            free_indices=[0, 1, 2],
+            edges_from=[0, 1],
+            edges_to=[1, 2],
+            edge_from_free=[0, 1],
+            edge_to_free=[1, 2],
+            n_free=3,
+            edge_params={
+                "dtx": [5.0, -4.0],
+                "dty": [2.0, 3.0],
+                "log_dsx": [0.02, -0.03],
+                "log_dsy": [0.01, 0.04],
+                "dtheta": [0.1, -0.15],
+                "weights": [1.0, 2.0],
+            },
         )
         x = rng.uniform(-1, 1, size=15)
         Ja = opt._jacobian_vec(x, d).toarray()
@@ -130,10 +172,9 @@ class TestAnalyticJacGivesSameSolution:
         return opt
 
     def test_analytic_matches_fd_solution(self):
-        r_fd = self._ring().optimize(max_iterations=80, tolerance=1e-12,
-                                     use_analytic_jac=False)
-        r_an = self._ring().optimize(max_iterations=80, tolerance=1e-12,
-                                     use_analytic_jac=True)
+        r_fd = self._ring().optimize(max_iterations=80, tolerance=1e-12, use_analytic_jac=False)
+        r_an = self._ring().optimize(max_iterations=80, tolerance=1e-12, use_analytic_jac=True)
         for k in r_fd:
-            np.testing.assert_allclose(r_fd[k], r_an[k], atol=1e-4,
-                                       err_msg=f"розв'язки FD vs analytic різні на вузлі {k}")
+            np.testing.assert_allclose(
+                r_fd[k], r_an[k], atol=1e-4, err_msg=f"розв'язки FD vs analytic різні на вузлі {k}"
+            )

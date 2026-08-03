@@ -14,10 +14,10 @@ import pytest
 
 from src.tracking.outlier_detector import OutlierDetector
 
-V_TRUE = 89.2   # справжня швидкість платформи, м/с (медіана між keyframe-ами)
-DT = 0.1        # of_stride=3 @ 30 fps
+V_TRUE = 89.2  # справжня швидкість платформи, м/с (медіана між keyframe-ами)
+DT = 0.1  # of_stride=3 @ 30 fps
 STEP = V_TRUE * DT  # 8.92 м — реальний зсув за один OF-крок
-CAP = 200.0     # поріг із запасом 2.2x над справжньою швидкістю
+CAP = 200.0  # поріг із запасом 2.2x над справжньою швидкістю
 
 
 def _det():
@@ -49,7 +49,7 @@ def test_without_ref_speed_accumulates_and_false_triggers():
     base = _seed_keyframe(det)
     seen = []
     for n in range(1, 11):
-        pos = (0.0, base + STEP * n)          # накопичений зсув від keyframe
+        pos = (0.0, base + STEP * n)  # накопичений зсув від keyframe
         seen.append(det.is_outlier(pos, dt=DT))
     # N=1,2 -> 89, 178 м/с проходять; з N=3 (268 м/с) починаються спрацювання
     assert seen[:2] == [False, False]
@@ -105,14 +105,17 @@ def test_logged_values_lie_on_the_accumulation_grid():
 # (distance 2.3-4.5 м при нормі 3.0) — теж вона. Жодного справжнього зриву
 # (>12 м) вона не спіймала: їх усі ловить фізичний max_speed.
 
-DT33 = 1 / 30      # of_stride=1 @ 30 fps
+DT33 = 1 / 30  # of_stride=1 @ 30 fps
 NORM = 89.2 * DT33  # ≈ 2.97 м — нормальний зсув за один кадр
 
 
 def _det33(zscore: bool):
     return OutlierDetector(
-        window_size=10, threshold_std=4.0, max_speed_mps=350.0,
-        max_consecutive=10**6, zscore_enabled=zscore,
+        window_size=10,
+        threshold_std=4.0,
+        max_speed_mps=350.0,
+        max_consecutive=10**6,
+        zscore_enabled=zscore,
     )
 
 

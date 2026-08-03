@@ -115,13 +115,9 @@ def test_composition_recovers_true_homography(r):
     np.testing.assert_allclose(composed, H_true, atol=1e-8)
 
     corners = np.array([[0, 0], [W, 0], [W, H], [0, H]], dtype=np.float64)
-    np.testing.assert_allclose(
-        _apply(composed, corners), _apply(H_true, corners), atol=1e-6
-    )
+    np.testing.assert_allclose(_apply(composed, corners), _apply(H_true, corners), atol=1e-6)
     center = np.array([[W / 2.0, H / 2.0]])
-    np.testing.assert_allclose(
-        _apply(composed, center), _apply(H_true, center), atol=1e-6
-    )
+    np.testing.assert_allclose(_apply(composed, center), _apply(H_true, center), atol=1e-6)
 
 
 def test_uncomposed_center_bias_documents_the_bug():

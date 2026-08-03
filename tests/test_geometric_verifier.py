@@ -132,9 +132,7 @@ class TestEarlyStop:
     def test_early_stop_skips_remaining_candidates(self):
         good_q, good_r = _identity_matches(40)
         db = FakeDB({1: _feats(40, fid=1), 2: _feats(40, fid=2), 3: _feats(40, fid=3)})
-        matcher = FakeMatcher({
-            1: (good_q, good_r), 2: (good_q, good_r), 3: (good_q, good_r)
-        })
+        matcher = FakeMatcher({1: (good_q, good_r), 2: (good_q, good_r), 3: (good_q, good_r)})
         ver = _verifier(matcher=matcher, early_stop_inliers=10)
 
         res = ver.verify(_feats(40), [(1, 0.9), (2, 0.8), (3, 0.7)], db)
@@ -200,14 +198,18 @@ class TestPrefilter:
     def test_prefilter_keeps_requested_number(self):
         good_q, good_r = _identity_matches(40)
         target = _feats(30, fid=2, seed=11)
-        db = FakeDB({
-            1: _feats(30, fid=1, seed=21),
-            2: target,
-            3: _feats(30, fid=3, seed=31),
-        })
+        db = FakeDB(
+            {
+                1: _feats(30, fid=1, seed=21),
+                2: target,
+                3: _feats(30, fid=3, seed=31),
+            }
+        )
         matcher = FakeMatcher({1: (good_q, good_r), 2: (good_q, good_r), 3: (good_q, good_r)})
         ver = _verifier(
-            matcher=matcher, prefilter_enabled=True, prefilter_keep=1,
+            matcher=matcher,
+            prefilter_enabled=True,
+            prefilter_keep=1,
             early_stop_inliers=10_000,
         )
         # query == кандидат 2 → MNN має вивести саме його
@@ -222,7 +224,9 @@ class TestPrefilter:
         good_q, good_r = _identity_matches(40)
         matcher = FakeMatcher({1: (good_q, good_r), 2: (good_q, good_r)})
         ver = _verifier(
-            matcher=matcher, prefilter_enabled=True, prefilter_keep=1,
+            matcher=matcher,
+            prefilter_enabled=True,
+            prefilter_keep=1,
             early_stop_inliers=10_000,
         )
         ver.verify(q, [(1, 0.9), (2, 0.8)], db)

@@ -48,6 +48,7 @@ COMBO_OPTIONS = {
     "source_type": ["file", "rtsp", "usb"],
 }
 
+
 class ConfigDialog(QDialog):
     """Інтерактивне діалогове вікно для редагування конфігурації (APP_SETTINGS)."""
 
@@ -116,7 +117,7 @@ class ConfigDialog(QDialog):
                     widget = self._create_widget(group_name, f"{field_name}.{sub_name}", sub_val)
                     form_layout.addRow(f"  {sub_name}:", widget)
                     self.field_widgets[(group_name, f"{field_name}.{sub_name}")] = widget
-                form_layout.addRow(QLabel("")) # Spacer
+                form_layout.addRow(QLabel(""))  # Spacer
                 continue
 
             widget = self._create_widget(group_name, field_name, val)
@@ -130,13 +131,13 @@ class ConfigDialog(QDialog):
         """Створює відповідний віджет (QSpinBox, QComboBox і т.д.) на основі типу значення."""
         # Перевірка на ComboBox (наперед задані варіанти)
         combo_options = None
-        base_field = field_name.split('.')[-1]
+        base_field = field_name.split(".")[-1]
 
         if base_field in COMBO_OPTIONS:
             opts = COMBO_OPTIONS[base_field]
             if isinstance(opts, dict):
                 # Наприклад backend залежить від батьківської групи
-                parent_prefix = field_name.split('.')[0] if '.' in field_name else group_name
+                parent_prefix = field_name.split(".")[0] if "." in field_name else group_name
                 if parent_prefix in opts:
                     combo_options = opts[parent_prefix]
             else:
@@ -172,6 +173,7 @@ class ConfigDialog(QDialog):
         elif isinstance(value, list):
             le = QLineEdit()
             import json
+
             le.setText(json.dumps(value))
             return le
         else:
@@ -195,6 +197,7 @@ class ConfigDialog(QDialog):
                 if not text.strip():
                     return []
                 import json
+
                 try:
                     return json.loads(text)
                 except json.JSONDecodeError:
@@ -208,6 +211,7 @@ class ConfigDialog(QDialog):
     def _load_defaults(self):
         """Скидає всі поля до заводських налаштувань (визначених у коді)."""
         from config import AppConfig
+
         default_config = AppConfig()
 
         # Оновлюємо значення в UI на основі дефолтних
@@ -259,6 +263,7 @@ class ConfigDialog(QDialog):
         elif isinstance(widget, QLineEdit):
             if isinstance(value, list):
                 import json
+
                 widget.setText(json.dumps(value))
             else:
                 widget.setText(str(value) if value is not None else "")
@@ -298,6 +303,7 @@ class ConfigDialog(QDialog):
 
             # Зберігаємо на диск
             from config import save_user_config
+
             save_user_config(APP_SETTINGS)
 
             QMessageBox.information(
@@ -305,7 +311,7 @@ class ConfigDialog(QDialog):
                 "Успіх",
                 "Налаштування успішно збережено.\n\n"
                 "Деякі зміни (наприклад, завантаження моделей) "
-                "почнуть діяти лише після перезапуску програми або трекінгу."
+                "почнуть діяти лише після перезапуску програми або трекінгу.",
             )
             self.accept()
 

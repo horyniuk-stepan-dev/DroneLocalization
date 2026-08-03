@@ -30,10 +30,10 @@ class ProjectVideoSource:
         if gb is not None:
             d["geo_bounds"] = tuple(gb)
         import dataclasses
+
         known = {f.name for f in dataclasses.fields(cls)}
         d = {k: v for k, v in d.items() if k in known}
         return cls(**d)
-
 
     def contains_point(self, lat: float, lon: float) -> bool:
         if self.geo_bounds is None:

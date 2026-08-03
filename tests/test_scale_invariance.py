@@ -79,9 +79,7 @@ def poly_diameter_m(poly: list) -> float | None:
     best = 0.0
     for i in range(len(poly)):
         for j in range(i + 1, len(poly)):
-            best = max(
-                best, geo_dist_m(poly[i][0], poly[i][1], poly[j][0], poly[j][1])
-            )
+            best = max(best, geo_dist_m(poly[i][0], poly[i][1], poly[j][0], poly[j][1]))
     return best
 
 
@@ -92,9 +90,7 @@ def test_synth_gsd_low_altitude_is_center_crop():
     assert out.shape == frame.shape
     cw, ch = int(640 * 0.5), int(360 * 0.5)
     x1, y1 = (640 - cw) // 2, (360 - ch) // 2
-    ref = cv2.resize(
-        frame[y1 : y1 + ch, x1 : x1 + cw], (640, 360), interpolation=cv2.INTER_CUBIC
-    )
+    ref = cv2.resize(frame[y1 : y1 + ch, x1 : x1 + cw], (640, 360), interpolation=cv2.INTER_CUBIC)
     np.testing.assert_array_equal(out, ref)
 
 
@@ -121,9 +117,7 @@ def _env():
     d = os.environ.get("DRONELOC_ACCEPT_DIR")
     v = os.environ.get("DRONELOC_ACCEPT_VIDEO")
     if not d or not v:
-        pytest.skip(
-            "set DRONELOC_ACCEPT_DIR + DRONELOC_ACCEPT_VIDEO (Windows acceptance run)"
-        )
+        pytest.skip("set DRONELOC_ACCEPT_DIR + DRONELOC_ACCEPT_VIDEO (Windows acceptance run)")
     if not os.path.isfile(os.path.join(d, "database.h5")):
         pytest.skip(f"no database.h5 in {d}")
     if not os.path.isfile(v):
@@ -145,9 +139,7 @@ def stack():
     from src.models.wrappers.feature_extractor import FeatureExtractor
 
     mm = ModelManager(config=APP_CONFIG)
-    fe = FeatureExtractor(
-        mm.load_local_extractor(), mm.load_dinov2(), mm.device, config=APP_CONFIG
-    )
+    fe = FeatureExtractor(mm.load_local_extractor(), mm.load_dinov2(), mm.device, config=APP_CONFIG)
     matcher = FeatureMatcher(model_manager=mm, config=APP_CONFIG)
 
     db = DatabaseLoader(os.path.join(proj_dir, "database.h5"))

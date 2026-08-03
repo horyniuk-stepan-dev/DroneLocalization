@@ -33,7 +33,9 @@ class DebugViewsConfig(BaseModel):
     """
 
     max_width: int = 640  # ширина зображень у вікнах (downscale перед emit)
-    depth_every_n_keyframes: int = 1  # частота depth-інференсу (1 = кожен keyframe; окремий GPU-прохід)
+    depth_every_n_keyframes: int = (
+        1  # частота depth-інференсу (1 = кожен keyframe; окремий GPU-прохід)
+    )
     dino_pca_enabled: bool = True  # PCA патч-токенів (інакше — лише панель retrieval)
     # Стан видимості вікон (відновлюється при старті, зберігається при виході)
     show_yolo: bool = False

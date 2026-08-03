@@ -63,4 +63,3 @@ def test_auto_create_default_config(tmp_path, monkeypatch):
 
     assert "global_descriptor" in data
     assert cfg.global_descriptor == AppConfig().global_descriptor
-

@@ -52,11 +52,7 @@ class ResultBuilder:
 
         inlier_score = min(1.0, best_inliers / max_inliers)
 
-        rmse = (
-            database.frame_rmse[best_candidate_id]
-            if database.frame_rmse is not None
-            else 0.0
-        )
+        rmse = database.frame_rmse[best_candidate_id] if database.frame_rmse is not None else 0.0
         disagreement = (
             database.frame_disagreement[best_candidate_id]
             if database.frame_disagreement is not None
@@ -64,8 +60,7 @@ class ResultBuilder:
         )
 
         stability_score = 1.0 - (
-            min(rmse, rmse_norm) / rmse_norm * 0.5
-            + min(disagreement, diag_norm) / diag_norm * 0.5
+            min(rmse, rmse_norm) / rmse_norm * 0.5 + min(disagreement, diag_norm) / diag_norm * 0.5
         )
         stability_score = float(np.clip(stability_score, 0.0, 1.0))
 
@@ -130,9 +125,19 @@ class ResultBuilder:
         }
 
     def build_fov(
-        self, M_query_to_ref: Any, affine_ref: Any, rot_width: int, rot_height: int,
-        mkpts_q_inliers: Any, converter: Any, dx: float, dy: float,
-        mx: float, my: float, filtered_pt: Any, candidate_id: int,
+        self,
+        M_query_to_ref: Any,
+        affine_ref: Any,
+        rot_width: int,
+        rot_height: int,
+        mkpts_q_inliers: Any,
+        converter: Any,
+        dx: float,
+        dy: float,
+        mx: float,
+        my: float,
+        filtered_pt: Any,
+        candidate_id: int,
     ) -> list:
         """Project the frame FOV to a GPS polygon, guarding against exploded homographies."""
         corners = np.array(
@@ -190,9 +195,7 @@ class ResultBuilder:
             if metric_corners is not None:
                 fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
                 fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
-                logger.debug(
-                    f"[3] FOV mapped to metric space: {fov_w:.1f}m x {fov_h:.1f}m"
-                )
+                logger.debug(f"[3] FOV mapped to metric space: {fov_w:.1f}m x {fov_h:.1f}m")
                 logger.debug(
                     f"FOV dimensions: {fov_w:.1f}m x {fov_h:.1f}m | "
                     f"Center metric: ({mx:.1f}, {my:.1f}) | "
@@ -202,9 +205,7 @@ class ResultBuilder:
                 # відсутній — споживачі (GUI-мапа, експорт) чекають чотирикутник.
                 try:
                     for cx, cy in metric_corners:
-                        clat, clon = converter.metric_to_gps(
-                            float(cx + dx), float(cy + dy)
-                        )
+                        clat, clon = converter.metric_to_gps(float(cx + dx), float(cy + dy))
                         gps_corners.append((clat, clon))
                 except Exception as e:
                     logger.warning(

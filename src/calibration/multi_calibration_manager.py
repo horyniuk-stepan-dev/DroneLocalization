@@ -4,6 +4,7 @@ multi_calibration_manager.py — Менеджер множинних каліб�
 Зберігає dict[source_id → MultiAnchorCalibration].
 Логіка самої калібрації не змінюється — лише оркестрація.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

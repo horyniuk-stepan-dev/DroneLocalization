@@ -75,9 +75,7 @@ def edge_residual(state_i, state_j, dtx, dty, log_dsx, log_dsy, dtheta, weight, 
 
     sx_i, sy_i = np.exp(log_sx_i), np.exp(log_sy_i)
     cos_i, sin_i = np.cos(theta_i), np.sin(theta_i)
-    pred_tx, pred_ty = _predicted_translation(
-        tx_i, ty_i, sx_i, sy_i, cos_i, sin_i, dtx, dty, sign
-    )
+    pred_tx, pred_ty = _predicted_translation(tx_i, ty_i, sx_i, sy_i, cos_i, sin_i, dtx, dty, sign)
 
     angle_diff = theta_j - theta_i - sign * dtheta
     r0 = (weight / sx_i) * (tx_j - pred_tx)

@@ -221,9 +221,9 @@ class TestSO2Correctness:
         M1 = results[1]
         _, _, _, angle = decompose_affine(M1)
         angle_deg = np.degrees(angle)
-        assert (
-            abs(abs(angle_deg) - 180.0) < 10.0 or abs(angle_deg) < 10.0
-        ), f"Angle={angle_deg}°, expected near ±180° (SO(2) wrapping test)"
+        assert abs(abs(angle_deg) - 180.0) < 10.0 or abs(angle_deg) < 10.0, (
+            f"Angle={angle_deg}°, expected near ±180° (SO(2) wrapping test)"
+        )
 
 
 class TestHomographyToSimilarity:

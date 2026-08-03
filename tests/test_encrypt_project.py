@@ -14,7 +14,9 @@ import pytest
 from src.security.at_rest import decrypt_bytes, is_encrypted
 
 _REPO = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("encrypt_project", _REPO / "scripts" / "encrypt_project.py")
+_spec = importlib.util.spec_from_file_location(
+    "encrypt_project", _REPO / "scripts" / "encrypt_project.py"
+)
 encrypt_project = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(encrypt_project)
 

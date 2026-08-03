@@ -115,9 +115,7 @@ def test_characterization_reset_grants_two_free_passes():
 
     Якщо цей тест впаде — дефект полагоджено, оновіть його.
     """
-    det = OutlierDetector(
-        window_size=10, threshold_std=1e9, max_speed_mps=120.0, max_consecutive=3
-    )
+    det = OutlierDetector(window_size=10, threshold_std=1e9, max_speed_mps=120.0, max_consecutive=3)
     _seed(det)
     huge = 1000.0  # свідомо абсурдний стрибок
 

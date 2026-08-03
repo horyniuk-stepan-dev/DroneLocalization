@@ -35,8 +35,9 @@ class TestWarmStart:
         r_warm = warm.optimize(max_iterations=80, tolerance=1e-12, use_analytic_jac=True)
 
         for k in r_bfs:
-            np.testing.assert_allclose(r_bfs[k], r_warm[k], atol=1e-4,
-                                       err_msg=f"теплий старт дав інший розв'язок на {k}")
+            np.testing.assert_allclose(
+                r_bfs[k], r_warm[k], atol=1e-4, err_msg=f"теплий старт дав інший розв'язок на {k}"
+            )
 
     def test_warm_start_skips_anchors(self):
         opt = _ring()

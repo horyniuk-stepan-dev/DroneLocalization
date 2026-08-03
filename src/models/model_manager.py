@@ -485,9 +485,7 @@ class ModelManager:
             if target_backend in ["torchscript", "tensorrt"] and not path.exists():
                 logger.info(f"Exporting LightGlue ({features}) to TorchScript: {model_path}")
                 model.eval()
-                dim = {"aliked": 128, "superpoint": 256, "rdd": 256, "sift": 128}.get(
-                    features, 128
-                )
+                dim = {"aliked": 128, "superpoint": 256, "rdd": 256, "sift": 128}.get(features, 128)
                 dummy_data = {
                     "image0": {
                         "keypoints": torch.zeros((1, 10, 2), device=self.device),
@@ -585,9 +583,7 @@ class ModelManager:
                 model_name = get_cfg(
                     self.config, "global_descriptor.dinov2.hub_model", "dinov2_vitl14"
                 )
-                vram_req = get_cfg(
-                    self.config, "global_descriptor.dinov2.vram_required_mb", 1600.0
-                )
+                vram_req = get_cfg(self.config, "global_descriptor.dinov2.vram_required_mb", 1600.0)
 
                 logger.info(f"Loading DINOv2 ({model_name}) model...")
                 self._ensure_vram_available(vram_req)
@@ -728,9 +724,7 @@ class ModelManager:
                     weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
                     if weights_path:
                         cesp.load_state_dict(
-                            torch.load(
-                                weights_path, map_location=self.device, weights_only=True
-                            )
+                            torch.load(weights_path, map_location=self.device, weights_only=True)
                         )
                         logger.success(f"CESP pretrained weights loaded from {weights_path}")
                     else:

@@ -33,17 +33,15 @@ class FakeGlobalExtractor:
 
     def __init__(self, dim: int = _DIM) -> None:
         self.dim = dim
-        self.calls = 0            # inspect to assert A3-prior avoids full scan
+        self.calls = 0  # inspect to assert A3-prior avoids full scan
 
     def extract_global_descriptor(self, image: NDArray[Any]) -> NDArray[np.float64]:
         self.calls += 1
         v = _seeded(image, 1, self.dim)[0]
         return v / (np.linalg.norm(v) + 1e-12)
 
-    def extract_global_descriptors_multi(
-        self, images: list[NDArray[Any]]
-    ) -> NDArray[np.float64]:
-        self.calls += 1          # one batched forward pass
+    def extract_global_descriptors_multi(self, images: list[NDArray[Any]]) -> NDArray[np.float64]:
+        self.calls += 1  # one batched forward pass
         return np.stack([self._one(im) for im in images])
 
     def _one(self, image: NDArray[Any]) -> NDArray[np.float64]:
@@ -99,15 +97,16 @@ class FakeCalibration:
 class FakeDatabase:
     """In-memory keyframe DB (FrameDatabase) + attrs Localizer reads directly."""
 
-    def __init__(self, num_frames: int = 8, dim: int = _DIM,
-                 frame_w: int = 640, frame_h: int = 480) -> None:
+    def __init__(
+        self, num_frames: int = 8, dim: int = _DIM, frame_w: int = 640, frame_h: int = 480
+    ) -> None:
         self._n = num_frames
         self.frame_w, self.frame_h = frame_w, frame_h
         rng = np.random.default_rng(0)
         g = rng.standard_normal((num_frames, dim)).astype(np.float32)
         self.global_descriptors = g / (np.linalg.norm(g, axis=1, keepdims=True) + 1e-12)
-        self.lance_table = None            # -> Localizer uses FastRetrieval
-        self.frame_rmse = None             # -> confidence uses 0.0 branch
+        self.lance_table = None  # -> Localizer uses FastRetrieval
+        self.frame_rmse = None  # -> confidence uses 0.0 branch
         self.frame_disagreement = None
         self._local = FakeLocalExtractor()
 
@@ -135,6 +134,7 @@ def build_localizer(config: dict[str, Any] | None = None) -> Any:
     """Construct a Localizer wired with fakes. Imports Localizer lazily so this
     module stays torch-free; call this only where torch/faiss are installed."""
     from src.localization.localizer import Localizer  # noqa: PLC0415 (lazy by design)
+
     db = FakeDatabase()
     return Localizer(
         database=db,

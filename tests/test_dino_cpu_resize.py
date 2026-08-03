@@ -127,7 +127,7 @@ class TestCpuResize:
     def test_transfer_volume_actually_drops(self):
         """Кількісно: те, заради чого все це робиться."""
         img = np.random.default_rng(6).integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
-        before = img.nbytes                      # uint8, повний кадр
+        before = img.nbytes  # uint8, повний кадр
         after = _cpu_resize_dino(img, 224).nbytes
         assert after < before / 30, f"очікували ≥30× менше, отримали {before / after:.1f}×"
 

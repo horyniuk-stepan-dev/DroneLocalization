@@ -44,7 +44,11 @@ class TrackingMixin:
         calib_manager = getattr(self, "calib_manager", None)
 
         return Localizer(
-            self.database, fe, matcher, self.calibration, config=localizer_config,
+            self.database,
+            fe,
+            matcher,
+            self.calibration,
+            config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
             ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
             db_manager=db_manager,
@@ -136,7 +140,7 @@ class TrackingMixin:
             self,
             "Живий потік",
             "Введіть RTSP URL (rtsp://...) або індекс камери (0, 1, usb:0):",
-            text="rtsp://"
+            text="rtsp://",
         )
         if not ok or not source:
             return
@@ -166,7 +170,9 @@ class TrackingMixin:
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
             self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
-            self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
+            self.tracking_worker.objects_gps_updated.connect(
+                self.coordinates_broker.on_objects_gps_updated
+            )
             self.coordinates_broker.set_tracking_active(True)
 
         self.map_widget.clear_trajectory()
@@ -179,7 +185,10 @@ class TrackingMixin:
         self.control_panel.mark_source_tracking(str(video_source))
         # Тайтл-бар: додаємо ім'я відеофайлу
         from pathlib import Path as _Path
-        src_name = _Path(str(video_source)).name if not str(video_source).startswith("rtsp") else "RTSP"
+
+        src_name = (
+            _Path(str(video_source)).name if not str(video_source).startswith("rtsp") else "RTSP"
+        )
         project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
         self.setWindowTitle(f"Drone Topometric Localizer - {project_name}  🔴 {src_name}")
 
@@ -215,7 +224,8 @@ class TrackingMixin:
         # Повертаємо звичайний заголовок вікна
         project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
         self.setWindowTitle(
-            f"Drone Topometric Localizer - {project_name}" if project_name
+            f"Drone Topometric Localizer - {project_name}"
+            if project_name
             else "Drone Topometric Localizer"
         )
         self.status_bar.showMessage("Відстеження зупинено")
@@ -360,23 +370,27 @@ class TrackingMixin:
     def on_objects_gps_updated(self, objects_gps: list):
         points_to_show = []
         for obj in objects_gps:
-            points_to_show.append({
-                'lat': obj.lat,
-                'lon': obj.lon,
-                'label': f"#{obj.track_id} {obj.class_name}",
-                'class_name': obj.class_name
-            })
+            points_to_show.append(
+                {
+                    "lat": obj.lat,
+                    "lon": obj.lon,
+                    "label": f"#{obj.track_id} {obj.class_name}",
+                    "class_name": obj.class_name,
+                }
+            )
 
             if not hasattr(self, "_object_tracking_results"):
                 self._object_tracking_results = []
-            self._object_tracking_results.append({
-                "track_id": obj.track_id,
-                "class_name": obj.class_name,
-                "lat": obj.lat,
-                "lon": obj.lon,
-                "confidence": obj.confidence,
-                "timestamp": str(np.datetime64("now"))
-            })
+            self._object_tracking_results.append(
+                {
+                    "track_id": obj.track_id,
+                    "class_name": obj.class_name,
+                    "lat": obj.lat,
+                    "lon": obj.lon,
+                    "confidence": obj.confidence,
+                    "timestamp": str(np.datetime64("now")),
+                }
+            )
 
         if hasattr(self.map_widget, "update_object_markers"):
             self.map_widget.update_object_markers(points_to_show)

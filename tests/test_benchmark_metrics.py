@@ -1,6 +1,5 @@
 """Тести чистих функцій бенчмарка пропагації (Етап 0.1): метрики + гейт."""
 
-
 import scripts.benchmark_propagation as B
 from src.geometry.affine_utils import compose_affine_5dof
 

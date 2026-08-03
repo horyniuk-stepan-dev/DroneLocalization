@@ -154,9 +154,7 @@ class PropagationPipeline:
         self.gnc_spatial = get_cfg(self.config, go + "gnc_spatial", False)
         self.gnc_rounds = get_cfg(self.config, go + "gnc_rounds", 5)
         self.gnc_mad_k = get_cfg(self.config, go + "gnc_mad_k", 3.0)
-        self.kinematic_prior_weight = get_cfg(
-            self.config, go + "kinematic_prior_weight", 0.0
-        )
+        self.kinematic_prior_weight = get_cfg(self.config, go + "kinematic_prior_weight", 0.0)
         self.pchip_gap_fill = get_cfg(self.config, go + "pchip_gap_fill", False)
         self.log_scale_interp = get_cfg(self.config, go + "log_scale_interp", False)
         self.edge_gate_enabled = get_cfg(self.config, go + "edge_gate_enabled", False)
@@ -708,9 +706,7 @@ class PropagationPipeline:
         if self.rotation_retry and self._n_rotation_retry:
             logger.info(f"Rotation-retry врятував {self._n_rotation_retry} temporal-ребер")
         if n_gated:
-            logger.info(
-                f"Temporal gate відсіяв {n_gated} ребер (дегенеративні трансформації)"
-            )
+            logger.info(f"Temporal gate відсіяв {n_gated} ребер (дегенеративні трансформації)")
         if n_bridged:
             logger.info(f"Skip-мости з'єднали {n_bridged} розривів temporal-ланцюга")
         if n_spread_down:
@@ -1389,9 +1385,7 @@ class PropagationPipeline:
         for fid in range(len(frame_valid)):
             if frame_valid[fid]:
                 continue
-            M = sample_5dof_pchip(
-                interp, sign, rng, ref_px, fid, log_scale=self.log_scale_interp
-            )
+            M = sample_5dof_pchip(interp, sign, rng, ref_px, fid, log_scale=self.log_scale_interp)
             if M is None:
                 continue
             frame_affine[fid] = M

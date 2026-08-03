@@ -4,6 +4,7 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
 class RestApiServer:
     """Легкий HTTP-сервер для REST API координат.
 
@@ -38,12 +39,14 @@ class RestApiServer:
                 f"public on the network. Set network.api_token or bind 127.0.0.1."
             )
 
-        self.app.add_routes([
-            web.get('/api/position', self.get_position),
-            web.get('/api/objects', self.get_objects),
-            web.get('/api/trajectory', self.get_trajectory),
-            web.get('/api/status', self.get_status)
-        ])
+        self.app.add_routes(
+            [
+                web.get("/api/position", self.get_position),
+                web.get("/api/objects", self.get_objects),
+                web.get("/api/trajectory", self.get_trajectory),
+                web.get("/api/status", self.get_status),
+            ]
+        )
 
     @web.middleware
     async def _auth_middleware(self, request, handler):
@@ -65,7 +68,7 @@ class RestApiServer:
 
     async def get_trajectory(self, request):
         try:
-            limit = int(request.query.get('limit', '100'))
+            limit = int(request.query.get("limit", "100"))
         except ValueError:
             limit = 100
 

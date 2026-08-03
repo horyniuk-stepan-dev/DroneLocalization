@@ -15,8 +15,9 @@ class DatabaseGenerationWorker(QThread):
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, video_path: str, output_path: str, model_manager, config=None,
-                 project_manager=None):
+    def __init__(
+        self, video_path: str, output_path: str, model_manager, config=None, project_manager=None
+    ):
         super().__init__()
         self.video_path = video_path
         self.output_path = output_path

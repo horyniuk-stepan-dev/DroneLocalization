@@ -84,7 +84,8 @@ def test_disabled_profile_is_passthrough():
 def test_same_seed_same_sequence():
     def prof():
         return FaultProfile(
-            name="d", seed=42,
+            name="d",
+            seed=42,
             probabilities={FaultType.CORRUPT: 0.3, FaultType.BLACK: 0.3},
         )
 

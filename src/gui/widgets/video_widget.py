@@ -89,11 +89,11 @@ class VideoWidget(QGraphicsView):
             return
 
         COLOR_MAP = {
-            0: QColor(255, 100, 100),   # person
-            2: QColor(100, 200, 255),   # car
-            3: QColor(255, 200, 50),    # motorcycle
-            5: QColor(50, 255, 100),    # bus
-            7: QColor(255, 150, 50),    # truck
+            0: QColor(255, 100, 100),  # person
+            2: QColor(100, 200, 255),  # car
+            3: QColor(255, 200, 50),  # motorcycle
+            5: QColor(50, 255, 100),  # bus
+            7: QColor(255, 150, 50),  # truck
         }
 
         dpr = self._dpr()
@@ -106,12 +106,7 @@ class VideoWidget(QGraphicsView):
             lx2 = obj.bbox[2] / dpr
             ly2 = obj.bbox[3] / dpr
 
-            rect = self._scene.addRect(
-                lx1, ly1,
-                lx2 - lx1,
-                ly2 - ly1,
-                QPen(color, 2)
-            )
+            rect = self._scene.addRect(lx1, ly1, lx2 - lx1, ly2 - ly1, QPen(color, 2))
             self._object_overlay_items.append(rect)
 
             label = f"#{obj.track_id} {obj.class_name} {obj.confidence:.0%}"

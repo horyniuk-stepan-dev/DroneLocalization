@@ -97,8 +97,4 @@ def describe(components: dict[str, Any]) -> str:
 
 def compare(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
     """Human-readable list of differing fields between two component dicts."""
-    return [
-        f"{k}: {a.get(k)!r} != {b.get(k)!r}"
-        for k in SCHEMA_FIELDS
-        if a.get(k) != b.get(k)
-    ]
+    return [f"{k}: {a.get(k)!r} != {b.get(k)!r}" for k in SCHEMA_FIELDS if a.get(k) != b.get(k)]

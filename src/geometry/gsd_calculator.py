@@ -18,18 +18,19 @@ logger = get_logger(__name__)
 
 @dataclass
 class GSDCalculator:
-    altitude_m: float        # висота польоту [м] (еталонна)
-    focal_length_mm: float   # фокусна відстань [мм]
-    sensor_width_mm: float   # ширина сенсора [мм]
-    image_width_px: int      # ширина зображення [пікселі]
+    altitude_m: float  # висота польоту [м] (еталонна)
+    focal_length_mm: float  # фокусна відстань [мм]
+    sensor_width_mm: float  # ширина сенсора [мм]
+    image_width_px: int  # ширина зображення [пікселі]
 
     @property
     def gsd_m_per_px(self) -> float:
         """Метрів на піксель для поточних параметрів польоту."""
         if self.focal_length_mm <= 0 or self.image_width_px <= 0:
             return 0.0
-        gsd = (self.altitude_m * self.sensor_width_mm) / \
-              (self.focal_length_mm * self.image_width_px)
+        gsd = (self.altitude_m * self.sensor_width_mm) / (
+            self.focal_length_mm * self.image_width_px
+        )
         return gsd
 
     @property
@@ -56,6 +57,4 @@ class GSDCalculator:
             f"sensor={self.sensor_width_mm}mm, "
             f"img_w={self.image_width_px}px"
         )
-        logger.info(
-            f"Resulting GSD: {gsd*100:.2f} cm/px ({self.px_per_meter:.1f} px/m)"
-        )
+        logger.info(f"Resulting GSD: {gsd * 100:.2f} cm/px ({self.px_per_meter:.1f} px/m)")

@@ -21,9 +21,9 @@ import numpy as np
 @dataclass
 class DebugCollector:
     # ── Запити від worker-а: що саме рахувати (дороге — лише за потреби) ─────
-    want_matches: bool = False   # keypoints / inlier-матчі / RMSE
+    want_matches: bool = False  # keypoints / inlier-матчі / RMSE
     want_dino_pca: bool = False  # патч-токени DINO для PCA-візуалізації (окремий forward)
-    want_depth: bool = False     # depth-мапа (окремий GPU-прохід)
+    want_depth: bool = False  # depth-мапа (окремий GPU-прохід)
 
     # ── Вихід: повернутий + GSD-нормалізований кадр (RGB) ───────────────────
     # У просторі саме цього кадру лежать keypoints/mkpts та патч-токени.
@@ -48,9 +48,9 @@ class DebugCollector:
     global_score: float = 0.0
 
     # ── Вихід: DINO PCA ─────────────────────────────────────────────────────
-    patch_tokens: np.ndarray | None = None    # (N, D) на CPU
-    patch_grid: tuple | None = None           # (h_p, w_p)
+    patch_tokens: np.ndarray | None = None  # (N, D) на CPU
+    patch_grid: tuple | None = None  # (h_p, w_p)
 
     # ── Вихід: depth ────────────────────────────────────────────────────────
-    depth_map: np.ndarray | None = None       # (H, W) float32, відносна глибина
-    depth_scale: float | None = None          # відносний масштаб (1 / median depth)
+    depth_map: np.ndarray | None = None  # (H, W) float32, відносна глибина
+    depth_scale: float | None = None  # відносний масштаб (1 / median depth)

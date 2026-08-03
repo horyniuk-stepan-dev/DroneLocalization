@@ -40,9 +40,7 @@ class GlobalDescriptorExtractor(Protocol):
 
     def extract_global_descriptor(self, image: NDArray[Any]) -> NDArray[Any]: ...
 
-    def extract_global_descriptors_multi(
-        self, images: list[NDArray[Any]]
-    ) -> NDArray[Any]: ...
+    def extract_global_descriptors_multi(self, images: list[NDArray[Any]]) -> NDArray[Any]: ...
 
 
 @runtime_checkable

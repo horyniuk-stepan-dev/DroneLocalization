@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class Dinov2ModelConfig(BaseModel):
     """DINOv2 ViT-L/14 — ImageNet pretrained, завантажується через torch.hub"""
+
     descriptor_dim: int = 1024
     input_size: int = 336
     normalize_mean: list[float] = [0.485, 0.456, 0.406]
@@ -16,6 +17,7 @@ class Dinov2ModelConfig(BaseModel):
 
 class Dinov3ModelConfig(BaseModel):
     """DINOv3 ViT-L/16 — pretrained на 493M супутникових знімків, HuggingFace"""
+
     descriptor_dim: int = 1024
     input_size: int = 224
     normalize_mean: list[float] = [0.430, 0.411, 0.296]
@@ -30,6 +32,7 @@ class Dinov3ModelConfig(BaseModel):
 
 class GlobalDescriptorConfig(BaseModel):
     """Вибір глобального дескриптора: 'dinov2' або 'dinov3'"""
+
     backend: str = "dinov3"  # "dinov2" | "dinov3"
     dinov2: Dinov2ModelConfig = Dinov2ModelConfig()
     dinov3: Dinov3ModelConfig = Dinov3ModelConfig()
@@ -75,6 +78,7 @@ class VladConfig(BaseModel):
     База даних має бути перебудована з тим самим словником (розмірність
     глобального дескриптора змінюється: 1024 → pca_dim).
     """
+
     enabled: bool = False
     vocab_path: str | None = None
     n_clusters: int = 32
@@ -100,7 +104,9 @@ class ModelsCacheConfig(BaseModel):
 
 class PerformanceConfig(BaseModel):
     auto_tune: bool = True  # Auto-detect hardware and tune batch sizes, threads, VRAM limits
-    auto_tune_vram_headroom: float = 0.0  # Extra VRAM (MB) to reserve beyond tier default (0 = auto)
+    auto_tune_vram_headroom: float = (
+        0.0  # Extra VRAM (MB) to reserve beyond tier default (0 = auto)
+    )
     propagation_max_workers: int = 4
     fp16_enabled: bool = True
     # ADDENDUM §3 (слабкі GPU): максимальний батч ViT-форварда в
@@ -182,7 +188,9 @@ class ModelsConfig(BaseModel):
     # Legacy-аліас: use_cuda:false = device:"cpu". Лишений для сумісності зі
     # старими user_config.json; нове — через models.device.
     use_cuda: bool = True
-    local_extractor: str = Field(default_factory=get_default_local_extractor)  # "aliked" | "rdd" | "xfeat"
+    local_extractor: str = Field(
+        default_factory=get_default_local_extractor
+    )  # "aliked" | "rdd" | "xfeat"
     yolo: YoloConfig = YoloConfig()
     xfeat: ModelSettings = ModelSettings(
         hub_repo="verlab/accelerated_features",

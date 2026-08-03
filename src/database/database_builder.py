@@ -824,12 +824,8 @@ class DatabaseBuilder:
                     schema_version="v2",
                 )
                 g3.attrs["schema_fingerprint"] = compute_fingerprint(_fp_components)
-                g3.attrs["schema_components"] = _json.dumps(
-                    _fp_components, sort_keys=True
-                )
-                logger.info(
-                    f"DB schema fingerprint: {g3.attrs['schema_fingerprint']}"
-                )
+                g3.attrs["schema_components"] = _json.dumps(_fp_components, sort_keys=True)
+                logger.info(f"DB schema fingerprint: {g3.attrs['schema_fingerprint']}")
             except Exception as _fp_err:  # metadata must never break a build
                 logger.warning(f"Could not write schema fingerprint: {_fp_err}")
 

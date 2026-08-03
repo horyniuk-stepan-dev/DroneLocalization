@@ -211,9 +211,7 @@ class CalibrationMixin:
                     if M_loo is None:
                         loo_errors.append(float("nan"))
                         continue
-                    proj_j = GeometryTransforms.apply_affine(
-                        pts_2d_np[j].reshape(1, 2), M_loo
-                    )[0]
+                    proj_j = GeometryTransforms.apply_affine(pts_2d_np[j].reshape(1, 2), M_loo)[0]
                     loo_errors.append(float(np.linalg.norm(proj_j - pts_metric_np[j])))
 
                 finite = [e for e in loo_errors if np.isfinite(e)]
@@ -372,8 +370,9 @@ class CalibrationMixin:
         tw = getattr(self, "tracking_worker", None)
         if tw is not None and tw.isRunning():
             QMessageBox.warning(
-                self, "Увага", "Зупиніть трекінг перед запуском пропагації — "
-                "вони використовують одну базу даних."
+                self,
+                "Увага",
+                "Зупиніть трекінг перед запуском пропагації — вони використовують одну базу даних.",
             )
             return
 
@@ -619,7 +618,7 @@ class CalibrationMixin:
 
         current_db = str(Path(self.database.db_path).resolve())
         project_dir = self.project_manager.project_dir
-        for src_dict in (self.project_manager.settings.video_sources or []):
+        for src_dict in self.project_manager.settings.video_sources or []:
             db_file = src_dict.get("database_file", "")
             if db_file and str((project_dir / db_file).resolve()) == current_db:
                 return src_dict.get("source_id", "main")
@@ -640,7 +639,7 @@ class CalibrationMixin:
         # Пошук джерела відповідно до поточної БД
         if self.database and self.project_manager.settings:
             current_db = str(Path(self.database.db_path).resolve())
-            for src_dict in (self.project_manager.settings.video_sources or []):
+            for src_dict in self.project_manager.settings.video_sources or []:
                 db_file = src_dict.get("database_file", "")
                 cal_file = src_dict.get("calibration_file", "")
                 if not db_file or not cal_file:
@@ -649,8 +648,7 @@ class CalibrationMixin:
                     cal_path = project_dir / cal_file
                     cal_path.parent.mkdir(parents=True, exist_ok=True)
                     logger.debug(
-                        f"Calibration path: {cal_path} "
-                        f"(source='{src_dict.get('source_id', '?')}')"
+                        f"Calibration path: {cal_path} (source='{src_dict.get('source_id', '?')}')"
                     )
                     return str(cal_path)
 
@@ -717,9 +715,7 @@ class CalibrationMixin:
                     Path(source_cal_path).parent.mkdir(parents=True, exist_ok=True)
                     self.calibration.save(source_cal_path)
                     copied_to_source = True
-                    logger.info(
-                        f"Calibration copied to source folder: {source_cal_path}"
-                    )
+                    logger.info(f"Calibration copied to source folder: {source_cal_path}")
                 else:
                     logger.debug("Calibration loaded directly from source folder, no copy needed.")
 

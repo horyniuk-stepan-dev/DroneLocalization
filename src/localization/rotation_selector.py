@@ -49,8 +49,12 @@ class RotationSelector:
         self.config = config
 
     def select(
-        self, query_frame: Any, prior_angle: int | None, use_prior: bool,
-        angles_to_try: list[int], top_k: int,
+        self,
+        query_frame: Any,
+        prior_angle: int | None,
+        use_prior: bool,
+        angles_to_try: list[int],
+        top_k: int,
         scale_manager: Any = None,
     ) -> RotationResult | None:
         best_global_score = -1.0
@@ -127,9 +131,7 @@ class RotationSelector:
                 else:
                     descs = [self.feature_extractor.extract_global_descriptor(f) for f in frames]
 
-                for (angle, sc), global_desc, (frm, crop) in zip(
-                    stage_combos, descs, prepared
-                ):
+                for (angle, sc), global_desc, (frm, crop) in zip(stage_combos, descs, prepared):
                     with Telemetry.profile("retrieval"):
                         src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
 

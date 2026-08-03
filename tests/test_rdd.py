@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 try:
     from src.models.wrappers.rdd_wrapper import RDDWrapper
+
     print("Loading RDDWrapper...")
     wrapper = RDDWrapper(device="cuda")
 
@@ -21,5 +22,6 @@ try:
     print(f"Descriptors shape: {out['descriptors'].shape}")
 except Exception as e:
     import traceback
+
     traceback.print_exc()
     print(f"Failed: {e}")

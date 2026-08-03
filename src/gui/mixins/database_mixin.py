@@ -391,21 +391,21 @@ class DatabaseMixin:
             try:
                 # Перевіряємо чи проєкт мультиджерельний
                 sources = self.project_manager.settings.get_enabled_sources()
-                is_multi = len(sources) > 1 or any(
-                    s.source_id != "main" for s in sources
-                )
+                is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
 
                 if is_multi and len(sources) > 0:
                     # Мультиджерельний режим
                     project_dir = self.project_manager.project_dir
-                    self.db_manager = MultiDatabaseManager(
-                        sources, project_dir, config=self.config
-                    )
+                    self.db_manager = MultiDatabaseManager(sources, project_dir, config=self.config)
                     self.calib_manager = MultiCalibrationManager()
                     self.calib_manager.load_all(sources, project_dir)
 
                     # self.database — перше джерело для сумісності з UI
-                    first_id = self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                    first_id = (
+                        self.db_manager.all_source_ids[0]
+                        if self.db_manager.all_source_ids
+                        else None
+                    )
                     if first_id:
                         self.database = self.db_manager.get_database(first_id)
                         self.calibration = self.calib_manager.get(first_id)
@@ -557,7 +557,6 @@ class DatabaseMixin:
                 self.calibration.save(calib_path)
                 logger.info(f"Calibration saved before rebuild: {calib_path}")
 
-
         self._start_database_generation(video_path, self.project_manager.database_path)
 
     # ── Експорт результатів ───────────────────────────────────────────────────
@@ -662,7 +661,9 @@ class DatabaseMixin:
         if not self.project_manager.is_loaded or not self.project_manager.settings:
             return
         sources_raw = self.project_manager.settings.video_sources or []
-        project_dir = str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
+        project_dir = (
+            str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
+        )
 
         # Визначаємо активне джерело
         active_id = self._get_current_source_id()
@@ -711,14 +712,12 @@ class DatabaseMixin:
 
         # Збираємо існуючі area_id
         existing_areas = set()
-        for src in (self.project_manager.settings.video_sources or []):
+        for src in self.project_manager.settings.video_sources or []:
             area = src.get("area_id", "")
             if area:
                 existing_areas.add(area)
 
-        dialog = AddVideoSourceDialog(
-            existing_area_ids=sorted(existing_areas), parent=self
-        )
+        dialog = AddVideoSourceDialog(existing_area_ids=sorted(existing_areas), parent=self)
         if not dialog.exec():
             return
 
@@ -727,8 +726,7 @@ class DatabaseMixin:
         # Перевірка на дублікат
         if self.project_manager.settings.get_source(new_source.source_id) is not None:
             QMessageBox.warning(
-                self, "Помилка",
-                f"Джерело з ID '{new_source.source_id}' вже існує в проєкті!"
+                self, "Помилка", f"Джерело з ID '{new_source.source_id}' вже існує в проєкті!"
             )
             return
 
@@ -834,4 +832,3 @@ class DatabaseMixin:
                 self.project_manager.save_project()
                 self._refresh_sources_panel()
                 self.status_bar.showMessage(f"Джерело '{source_id}' видалено з проєкту")
-

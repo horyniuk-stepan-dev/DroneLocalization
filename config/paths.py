@@ -13,6 +13,7 @@ redirect writable data to %LOCALAPPDATA%\\DroneLocalization (always writable).
 розбіжностей, серед них вимкнений smoother, edge-гейти й torch_compile.
 ``models_root()`` нижче вже був cwd-незалежним; тепер обидва однакові.
 """
+
 from __future__ import annotations
 
 import os

@@ -104,12 +104,8 @@ class ScaleManager:
             get_cfg(cfg, "localization.scale_pyramid", list(_DEFAULT_PYRAMID))
         )
         self._ema_alpha: float = get_cfg(cfg, "localization.scale_prior_ema", 0.7)
-        self._rescan_min: float = get_cfg(
-            cfg, "localization.scale_rescan_min_score", 0.65
-        )
-        self._use_depth_hint: bool = get_cfg(
-            cfg, "localization.scale_use_depth_hint", True
-        )
+        self._rescan_min: float = get_cfg(cfg, "localization.scale_rescan_min_score", 0.65)
+        self._use_depth_hint: bool = get_cfg(cfg, "localization.scale_use_depth_hint", True)
         # Clipping range for the prior (prevents runaway EMA)
         self._min_r: float = 0.3
         self._max_r: float = 3.5
@@ -153,9 +149,7 @@ class ScaleManager:
             # Sort pyramid by distance to depth hint — closest first
             hint = self._depth_hint
             pyramid.sort(key=lambda r: abs(r - hint))
-            logger.debug(
-                f"Scale pyramid reordered by depth hint {hint:.2f}: {pyramid}"
-            )
+            logger.debug(f"Scale pyramid reordered by depth hint {hint:.2f}: {pyramid}")
 
         return pyramid
 
@@ -178,8 +172,12 @@ class ScaleManager:
         # Tolerance band — no transform needed
         if 0.85 <= r <= 1.18:
             return frame, CropInfo(
-                scale_r=r, crop_x=0, crop_y=0,
-                crop_w=w, crop_h=h, resize_scale=1.0,
+                scale_r=r,
+                crop_x=0,
+                crop_y=0,
+                crop_w=w,
+                crop_h=h,
+                resize_scale=1.0,
             )
 
         if r > 1.0:
@@ -201,8 +199,11 @@ class ScaleManager:
             actual_scale = w / (x2 - x1)
 
             return normalised, CropInfo(
-                scale_r=r, crop_x=x1, crop_y=y1,
-                crop_w=x2 - x1, crop_h=y2 - y1,
+                scale_r=r,
+                crop_x=x1,
+                crop_y=y1,
+                crop_w=x2 - x1,
+                crop_h=y2 - y1,
                 resize_scale=actual_scale,
             )
         else:
@@ -210,20 +211,19 @@ class ScaleManager:
             # The query covers a smaller area — fewer pixels is correct.
             new_w = max(32, int(w * r))
             new_h = max(32, int(h * r))
-            downscaled = cv2.resize(
-                frame, (new_w, new_h), interpolation=cv2.INTER_AREA
-            )
+            downscaled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
             actual_scale = new_w / w
 
             return downscaled, CropInfo(
-                scale_r=r, crop_x=0, crop_y=0,
-                crop_w=w, crop_h=h,
+                scale_r=r,
+                crop_x=0,
+                crop_y=0,
+                crop_w=w,
+                crop_h=h,
                 resize_scale=actual_scale,
             )
 
-    def reverse_center(
-        self, center_norm: np.ndarray, crop_info: CropInfo
-    ) -> np.ndarray:
+    def reverse_center(self, center_norm: np.ndarray, crop_info: CropInfo) -> np.ndarray:
         """Map a point from the normalised frame back to the original frame coords.
 
         Args:
@@ -251,9 +251,7 @@ class ScaleManager:
 
         return np.array([[x_orig, y_orig]], dtype=np.float64)
 
-    def update_from_homography(
-        self, H: np.ndarray, frame_w: int, frame_h: int
-    ) -> None:
+    def update_from_homography(self, H: np.ndarray, frame_w: int, frame_h: int) -> None:
         """Extract scale from a successful homography and update the EMA prior.
 
         Uses homography_to_affine → decompose_affine_5dof → sqrt(sx * sy).
@@ -280,24 +278,14 @@ class ScaleManager:
             if self._prior is None:
                 self._prior = r_measured
             else:
-                self._prior = (
-                    self._ema_alpha * r_measured
-                    + (1.0 - self._ema_alpha) * self._prior
-                )
-                self._prior = float(
-                    np.clip(self._prior, self._min_r, self._max_r)
-                )
+                self._prior = self._ema_alpha * r_measured + (1.0 - self._ema_alpha) * self._prior
+                self._prior = float(np.clip(self._prior, self._min_r, self._max_r))
 
-            logger.debug(
-                f"ScaleManager: r_measured={r_measured:.3f}, "
-                f"prior={self._prior:.3f}"
-            )
+            logger.debug(f"ScaleManager: r_measured={r_measured:.3f}, prior={self._prior:.3f}")
         except Exception as e:
             logger.warning(f"ScaleManager.update_from_homography failed: {e}")
 
-    def set_depth_hint(
-        self, query_depth_scale: float, db_depth_scale: float
-    ) -> None:
+    def set_depth_hint(self, query_depth_scale: float, db_depth_scale: float) -> None:
         """Set a depth-based scale hint for pyramid reordering.
 
         Args:

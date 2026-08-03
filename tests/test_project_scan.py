@@ -62,9 +62,7 @@ def _make_project(root, *, mode: str):
     (src_dir / "database_keypoints.mp4").write_bytes(maybe(b"kp-video", artifact=True))
     (src_dir / "vectors.lance").mkdir()
     (src_dir / "vectors.lance" / "data-0.lance").write_bytes(maybe(b"vec", artifact=True))
-    (root / "project.json").write_bytes(
-        maybe(json.dumps(MANIFEST).encode("utf-8"), artifact=False)
-    )
+    (root / "project.json").write_bytes(maybe(json.dumps(MANIFEST).encode("utf-8"), artifact=False))
     return root
 
 

@@ -45,7 +45,6 @@ def _build_d(cx=960.0, sign=1.0):
 
 
 class TestOptimizerContract:
-
     def test_optimize_signature_frozen(self):
         params = inspect.signature(PoseGraphOptimizer.optimize).parameters
         assert "max_iterations" in params
@@ -57,8 +56,7 @@ class TestOptimizerContract:
         opt = PoseGraphOptimizer()
         d = _build_d()
         # state0 = identity, state1 — довільний
-        x = np.array([0, 0, 0, 0, 0,
-                      10.0, 5.0, 0.1, 0.2, 0.3], dtype=np.float64)
+        x = np.array([0, 0, 0, 0, 0, 10.0, 5.0, 0.1, 0.2, 0.3], dtype=np.float64)
         res = opt._residuals_vec(x, d)
         E, Nfree = 1, 2
         assert res.shape[0] == 5 * E + Nfree, f"структура резидуалів змінилась: {res.shape[0]}"
@@ -67,9 +65,21 @@ class TestOptimizerContract:
         """Еталонні числа пінять формули ваг (w/sx_i, w*cx, w_reg=200*cx)."""
         opt = PoseGraphOptimizer()
         d = _build_d(cx=960.0, sign=1.0)
-        x = np.array([0.0, 0.0, 0.0, 0.0, 0.0,      # вузол 0: identity
-                      10.0, 5.0, 0.1, 0.2, 0.3],     # вузол 1
-                     dtype=np.float64)
+        x = np.array(
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,  # вузол 0: identity
+                10.0,
+                5.0,
+                0.1,
+                0.2,
+                0.3,
+            ],  # вузол 1
+            dtype=np.float64,
+        )
         res = opt._residuals_vec(x, d)
 
         # Еталони (виведені вручну з інваріантних формул, звірені з поточним кодом):
@@ -81,25 +91,33 @@ class TestOptimizerContract:
         #   res4 = w*cx*wrap(theta_j-theta_i-dtheta) = 1920*wrap(0.05)
         #   reg0 = 200*cx*(log_sx0-log_sy0) = 192000*0 = 0
         #   reg1 = 200*cx*(log_sx1-log_sy1) = 192000*(0.1-0.2) = -19200
-        expected = np.array([
-            4.0,
-            4.0,
-            96.0,
-            96.0,
-            1920.0 * np.arctan2(np.sin(0.05), np.cos(0.05)),
-            0.0,
-            -19200.0,
-        ])
-        np.testing.assert_allclose(res, expected, rtol=0, atol=1e-9,
-                                   err_msg="ФОРМУЛИ ВАГ ЗМІНИЛИСЬ — див. інваріанти плану")
+        expected = np.array(
+            [
+                4.0,
+                4.0,
+                96.0,
+                96.0,
+                1920.0 * np.arctan2(np.sin(0.05), np.cos(0.05)),
+                0.0,
+                -19200.0,
+            ]
+        )
+        np.testing.assert_allclose(
+            res,
+            expected,
+            rtol=0,
+            atol=1e-9,
+            err_msg="ФОРМУЛИ ВАГ ЗМІНИЛИСЬ — див. інваріанти плану",
+        )
 
     def test_translation_weight_is_per_node(self):
         """w/sx_i індивідуальна: більший sx_i -> менша вага трансляції (не фіксована)."""
         opt = PoseGraphOptimizer()
         d = _build_d()
         # робимо sx вузла 0 удвічі більшим (log_sx0 = ln 2) — вага трансляції ділиться на 2
-        x = np.array([0, 0, np.log(2.0), np.log(2.0), 0,
-                      10.0, 5.0, 0.1, 0.2, 0.3], dtype=np.float64)
+        x = np.array(
+            [0, 0, np.log(2.0), np.log(2.0), 0, 10.0, 5.0, 0.1, 0.2, 0.3], dtype=np.float64
+        )
         res = opt._residuals_vec(x, d)
         # sx_i=sy_i=2 -> pred_tx = 0 + 1*2*8 = 16 ; w_trans_x = 2/2 = 1
         # res0 = 1*(10-16) = -6

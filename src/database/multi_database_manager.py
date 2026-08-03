@@ -4,6 +4,7 @@ multi_database_manager.py — Менеджер множинних баз дан�
 Координує завантаження DatabaseLoader для кожного джерела,
 просторову фільтрацію активних джерел та вибір найкращого збігу.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -307,10 +308,7 @@ class MultiDatabaseManager:
         }
         if new_active != self._active_source_ids:
             self._active_source_ids = new_active
-            logger.info(
-                f"Active area set to '{area_id}': "
-                f"{sorted(self._active_source_ids)}"
-            )
+            logger.info(f"Active area set to '{area_id}': {sorted(self._active_source_ids)}")
 
     def set_active_by_gps(
         self,

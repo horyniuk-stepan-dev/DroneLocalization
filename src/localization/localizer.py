@@ -41,7 +41,7 @@ class Localizer:
         self._failure_logger = FailureLogger()
 
         # Мультиджерельна підтримка (Phase 3 ТЗ)
-        self.db_manager = db_manager        # MultiDatabaseManager | None
+        self.db_manager = db_manager  # MultiDatabaseManager | None
         self.calib_manager = calib_manager  # MultiCalibrationManager | None
         self._active_source_id: str | None = None
 
@@ -76,24 +76,14 @@ class Localizer:
             self._smoother = SlidingWindowSmoother(
                 window=get_cfg(self.config, "tracking.smoother_window", 60),
                 huber_k=get_cfg(self.config, "tracking.smoother_huber_k", 1.2),
-                fix_sigma_base_m=get_cfg(
-                    self.config, "tracking.smoother_fix_sigma_base_m", 5.0
-                ),
-                odom_sigma_base_m=get_cfg(
-                    self.config, "tracking.smoother_odom_sigma_base_m", 3.0
-                ),
-                max_correction_m=get_cfg(
-                    self.config, "tracking.smoother_max_correction_m", 50.0
-                ),
+                fix_sigma_base_m=get_cfg(self.config, "tracking.smoother_fix_sigma_base_m", 5.0),
+                odom_sigma_base_m=get_cfg(self.config, "tracking.smoother_odom_sigma_base_m", 3.0),
+                max_correction_m=get_cfg(self.config, "tracking.smoother_max_correction_m", 50.0),
                 entry_prior_sigma_m=get_cfg(
                     self.config, "tracking.smoother_entry_prior_sigma_m", 15.0
                 ),
-                irls_iterations=get_cfg(
-                    self.config, "tracking.smoother_irls_iterations", 4
-                ),
-                correction_lag=get_cfg(
-                    self.config, "tracking.smoother_correction_lag", 10
-                ),
+                irls_iterations=get_cfg(self.config, "tracking.smoother_irls_iterations", 4),
+                correction_lag=get_cfg(self.config, "tracking.smoother_correction_lag", 10),
                 deadband_m=get_cfg(self.config, "tracking.smoother_deadband_m", 2.0),
                 gain=get_cfg(self.config, "tracking.smoother_gain", 0.25),
                 max_step_m=get_cfg(self.config, "tracking.smoother_max_step_m", 3.0),
@@ -124,9 +114,7 @@ class Localizer:
         # (470 мс із 945 на GTX 1650), хоча відповідь — номер кадру БД — уже
         # відома з попереднього keyframe: дрон за секунду не телепортується.
         # Прапорець дефолтом вимкнено: поведінка без нього побітово стара.
-        self._temporal_prior = get_cfg(
-            self.config, "localization.temporal_candidate_prior", False
-        )
+        self._temporal_prior = get_cfg(self.config, "localization.temporal_candidate_prior", False)
         self._tp_window = int(get_cfg(self.config, "localization.temporal_prior_window", 2))
         self._tp_keep = int(get_cfg(self.config, "localization.temporal_prior_keep", 1))
         self._tp_min_mnn = int(get_cfg(self.config, "localization.temporal_prior_min_mnn", 20))
@@ -169,9 +157,7 @@ class Localizer:
         # Обхід кінематичного гейта за силою незалежних доказів (див.
         # config/localization.py). Кінематика — це пріор про рух платформи;
         # інлаєри та flow_quality — прямі свідчення про саме вимірювання.
-        self._trust_strong = get_cfg(
-            self.config, "tracking.outlier_trust_strong_evidence", False
-        )
+        self._trust_strong = get_cfg(self.config, "tracking.outlier_trust_strong_evidence", False)
         self._trust_min_inliers = int(
             get_cfg(self.config, "tracking.outlier_trust_min_inliers", 100)
         )
@@ -202,9 +188,7 @@ class Localizer:
         self._depth_hint_counter = 0
 
         # ── Debug views: незалежний depth-інференс для вікна (окрема каденція) ─
-        self._debug_depth_every_n = get_cfg(
-            self.config, "debug_views.depth_every_n_keyframes", 1
-        )
+        self._debug_depth_every_n = get_cfg(self.config, "debug_views.depth_every_n_keyframes", 1)
         self._debug_depth_estimator = None
         self._debug_depth_counter = 0
 
@@ -220,12 +204,11 @@ class Localizer:
             if patch_desc is not None and len(patch_desc) > 0:
                 try:
                     from src.localization.patchify import PatchifyRetrieval
+
                     patchify_grids = get_cfg(
                         self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
                     )
-                    patchify_batch = get_cfg(
-                        self.config, "localization.patchify_batch_size", 1
-                    )
+                    patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
                     desc_dim = int(patch_desc.shape[-1])
                     self.patchify_retrieval = PatchifyRetrieval(
                         self.feature_extractor,
@@ -246,16 +229,18 @@ class Localizer:
                     )
                     self.patchify_retrieval = None
             else:
-                logger.info(
-                    "Patchify enabled in config but database has no patch_descriptors. "
-                )
+                logger.info("Patchify enabled in config but database has no patch_descriptors. ")
 
         self._candidate_retriever = CandidateRetriever(
             self.db_manager, self.retriever, self.patchify_retrieval, self.config
         )
         self._geometric_verifier = GeometricVerifier(
-            self.matcher, self.min_matches, self.ransac_thresh,
-            self.homography_backend, self.use_mad_ransac, self.mad_k_factor,
+            self.matcher,
+            self.min_matches,
+            self.ransac_thresh,
+            self.homography_backend,
+            self.use_mad_ransac,
+            self.mad_k_factor,
             self.early_stop_inliers,
             prefilter_enabled=get_cfg(self.config, "localization.candidate_prefilter", False),
             prefilter_keep=get_cfg(self.config, "localization.prefilter_keep", 2),
@@ -270,6 +255,7 @@ class Localizer:
         if project_manager and project_manager.settings:
             try:
                 from src.geometry.gsd_calculator import GSDCalculator
+
                 s = project_manager.settings
                 gsd = GSDCalculator(
                     altitude_m=getattr(s, "altitude_m", 100.0),
@@ -551,7 +537,11 @@ class Localizer:
                 _crop_info,
                 best_query_features,
             ) = self._prepare_and_extract(
-                query_frame, static_mask, best_global_angle, best_scale, _feat_cache,
+                query_frame,
+                static_mask,
+                best_global_angle,
+                best_scale,
+                _feat_cache,
                 # §2.2: селектор уже повернув і відмасштабував саме цей кадр
                 prepared=(rot.frame, rot.crop_info),
             )
@@ -833,9 +823,7 @@ class Localizer:
                     float(filtered_pt[0]) + float(corr[0]),
                     float(filtered_pt[1]) + float(corr[1]),
                 )
-                logger.debug(
-                    f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m"
-                )
+                logger.debug(f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m")
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         # Новий keyframe перезапускає LK, тож ланцюг локальних OF-порівнянь
         # обривається: перший OF після keyframe має міряти зсув ВІД keyframe
@@ -850,11 +838,23 @@ class Localizer:
 
         # ── Крок 8: Розрахунок FOV ───────────────────────────────────────────
         gps_corners = self._result_builder.build_fov(
-            M_query_to_ref, affine_ref, rot_width, rot_height, best_mkpts_q_inliers,
-            self.calibration.converter, dx, dy, mx, my, filtered_pt, best_candidate_id,
+            M_query_to_ref,
+            affine_ref,
+            rot_width,
+            rot_height,
+            best_mkpts_q_inliers,
+            self.calibration.converter,
+            dx,
+            dy,
+            mx,
+            my,
+            filtered_pt,
+            best_candidate_id,
         )
 
-        logger.debug(f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)")
+        logger.debug(
+            f"Localize Frame {best_candidate_id}: Center transformed via Homography (8 DoF)"
+        )
         logger.debug(f"Sample Center METRIC: ({mx:.1f}, {my:.1f})")
         source_str = f" | source={self._active_source_id}" if self._active_source_id else ""
         logger.success(
@@ -866,9 +866,7 @@ class Localizer:
         self._last_best_angle = best_global_angle
 
         # Scale prior: extract scale from H for the next keyframe
-        self._scale_manager.update_from_homography(
-            M_query_to_ref, rot_width, rot_height
-        )
+        self._scale_manager.update_from_homography(M_query_to_ref, rot_width, rot_height)
 
         return {
             "success": True,
@@ -1123,9 +1121,7 @@ class Localizer:
                     f"{rotated.shape[1]}x{rotated.shape[0]}"
                 )
 
-        feats = self.feature_extractor.extract_local_features(
-            rotated, static_mask=rot_mask
-        )
+        feats = self.feature_extractor.extract_local_features(rotated, static_mask=rot_mask)
         cache[key] = (rotated, rot_mask, crop_info, feats)
         return cache[key]
 
@@ -1186,9 +1182,7 @@ class Localizer:
 
         cands = [(int(i), 0.0) for i in ids]
         ref_cache: dict = {}
-        scored = self._geometric_verifier.mnn_counts(
-            feats, cands, self.database, ref_cache
-        )
+        scored = self._geometric_verifier.mnn_counts(feats, cands, self.database, ref_cache)
         if not scored:
             return None
         scored.sort(key=lambda t: -t[0])
@@ -1200,9 +1194,7 @@ class Localizer:
             return None
 
         probe = [(cid, float(m)) for m, cid, _ in scored[: max(1, self._tp_keep)]]
-        ver = self._geometric_verifier.verify(
-            feats, probe, self.database, ref_cache=ref_cache
-        )
+        ver = self._geometric_verifier.verify(feats, probe, self.database, ref_cache=ref_cache)
         if ver is None or ver.inliers < self._tp_accept:
             got = ver.inliers if ver is not None else 0
             logger.debug(

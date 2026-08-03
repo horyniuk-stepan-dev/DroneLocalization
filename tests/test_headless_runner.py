@@ -10,6 +10,7 @@ Two layers:
     with every heavy collaborator mocked; needs PyQt6/torch/etc., so it
     self-skips where those are unavailable (e.g. the Linux CI sandbox).
 """
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -40,10 +41,17 @@ def test_app_config_is_a_plain_dict_contract():
 
 
 _MOCK_TARGETS = (
-    "QCoreApplication", "ModelManager", "MultiAnchorCalibration",
-    "CoordinatesBroker", "ProjectManager", "MultiDatabaseManager",
-    "MultiCalibrationManager", "DatabaseLoader", "FeatureExtractor",
-    "FeatureMatcher", "Localizer",
+    "QCoreApplication",
+    "ModelManager",
+    "MultiAnchorCalibration",
+    "CoordinatesBroker",
+    "ProjectManager",
+    "MultiDatabaseManager",
+    "MultiCalibrationManager",
+    "DatabaseLoader",
+    "FeatureExtractor",
+    "FeatureMatcher",
+    "Localizer",
 )
 
 
@@ -62,7 +70,8 @@ def test_headless_setup_and_build_use_dict_config():
         pm = started["ProjectManager"].return_value
         pm.load_project.return_value = True
         pm.settings.get_enabled_sources.return_value = [
-            MagicMock(source_id="main"), MagicMock(source_id="cam2"),
+            MagicMock(source_id="main"),
+            MagicMock(source_id="cam2"),
         ]
 
         dbm = started["MultiDatabaseManager"].return_value

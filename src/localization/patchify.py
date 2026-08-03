@@ -16,8 +16,13 @@ class PatchifyRetrieval:
 
     DEFAULT_GRIDS = [(1, 1), (2, 2), (3, 3)]  # 1 + 4 + 9 = 14 патчів
 
-    def __init__(self, feature_extractor, descriptor_dim: int = 1024,
-                 grids: list[list[int]] | None = None, batch_size: int = 1):
+    def __init__(
+        self,
+        feature_extractor,
+        descriptor_dim: int = 1024,
+        grids: list[list[int]] | None = None,
+        batch_size: int = 1,
+    ):
         self.feature_extractor = feature_extractor
         self.descriptor_dim = descriptor_dim
         self.batch_size = max(1, batch_size)
@@ -94,9 +99,9 @@ class PatchifyRetrieval:
         else:
             # Батчований інференс — швидше, але більше VRAM
             for start in range(0, len(patches), self.batch_size):
-                batch = patches[start:start + self.batch_size]
+                batch = patches[start : start + self.batch_size]
                 batch_descs = self._extract_batch_descriptors(batch)
-                descriptors[start:start + len(batch)] = batch_descs
+                descriptors[start : start + len(batch)] = batch_descs
 
         return descriptors
 
@@ -218,7 +223,7 @@ class PatchifyRetrieval:
         for fid in frame_scores:
             hits = frame_hits[fid]
             avg_score = frame_scores[fid] / hits  # якість патчів що знайшли
-            coverage = hits / num_patches          # частка патчів що знайшли
+            coverage = hits / num_patches  # частка патчів що знайшли
             final_scores[fid] = coverage * avg_score
 
         # Сортуємо та повертаємо top-K

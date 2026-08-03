@@ -29,8 +29,9 @@ def _chain_with_bad_closure():
     for i in range(4):
         opt.add_edge(i, i + 1, step, weight=1.0, edge_type="temporal", inliers=50, rmse=1.0)
     # хибне закриття 1->3: стверджує нульовий зсув (реальний ~200) — слабка вага
-    opt.add_edge(1, 3, _sim(0.0, 0.0, 1.0, 0.0), weight=0.3,
-                 edge_type="spatial", inliers=16, rmse=4.0)
+    opt.add_edge(
+        1, 3, _sim(0.0, 0.0, 1.0, 0.0), weight=0.3, edge_type="spatial", inliers=16, rmse=4.0
+    )
     opt.initialize_from_bfs()
     return opt
 
@@ -66,8 +67,9 @@ class TestAnchorStress:
         for i in range(3):
             opt.add_edge(i, i + 1, step, weight=1.0, edge_type="temporal", inliers=50, rmse=1.0)
         # додаткове коротке ребро, щоб було кілька «нормальних» резидуалів для медіани
-        opt.add_edge(0, 2, _sim(200.0, 0.0, 1.0, 0.0), weight=1.0,
-                     edge_type="temporal", inliers=50, rmse=1.0)
+        opt.add_edge(
+            0, 2, _sim(200.0, 0.0, 1.0, 0.0), weight=1.0, edge_type="temporal", inliers=50, rmse=1.0
+        )
         # якір на кадрі 3 «кривий»: далеко від того, куди веде ланцюг (300,0)
         opt.fix_node(3, _sim(300.0, 250.0, 1.0, 0.0))
         opt.initialize_from_bfs()
@@ -111,6 +113,7 @@ class TestGeoJSONHasResidual:
 
         class MockConv:
             is_initialized = True
+
             def metric_to_gps(self, x, y):
                 return (y * 1e-5, x * 1e-5)
 

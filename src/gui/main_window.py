@@ -173,6 +173,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
     def on_open_config(self):
         """Open the configuration editor dialog."""
         from src.gui.dialogs.config_dialog import ConfigDialog
+
         dialog = ConfigDialog(self)
         dialog.exec()
 

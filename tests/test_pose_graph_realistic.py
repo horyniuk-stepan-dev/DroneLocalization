@@ -26,12 +26,12 @@ from src.geometry.pose_graph_optimizer import PoseGraphOptimizer
 W, H = 1920, 1080
 CX, CY = W / 2.0, H / 2.0
 
-N_OUT = 8                # кадрів на кожному з двох треків
-N = 2 * N_OUT            # усього кадрів (16 — компактно, щоб 2-point FD
-                         # чисто збігався в CI за секунди; структура реальна)
-STEP_X_M = 8.0           # крок центру по X, метри
-OFFSET_Y_M = 5.0         # зсув зустрічного треку по Y, метри
-GSD = 0.05               # метрів на піксель (масштаб афінної матриці)
+N_OUT = 8  # кадрів на кожному з двох треків
+N = 2 * N_OUT  # усього кадрів (16 — компактно, щоб 2-point FD
+# чисто збігався в CI за секунди; структура реальна)
+STEP_X_M = 8.0  # крок центру по X, метри
+OFFSET_Y_M = 5.0  # зсув зустрічного треку по Y, метри
+GSD = 0.05  # метрів на піксель (масштаб афінної матриці)
 SEED = 20260705
 
 
@@ -135,8 +135,12 @@ def build_realistic_graph(seed=SEED):
         opt.fix_node(aid, local)
 
     opt.initialize_from_bfs()
-    meta = {"n_temporal": n_temporal, "n_spatial": n_spatial,
-            "n_false": n_false, "anchor_ids": anchor_ids}
+    meta = {
+        "n_temporal": n_temporal,
+        "n_spatial": n_spatial,
+        "n_false": n_false,
+        "anchor_ids": anchor_ids,
+    }
     return opt, gt, origin, meta
 
 
@@ -150,8 +154,13 @@ def _solve_and_measure(opt, gt, origin, **kw):
         if np.linalg.det(M[:2, :2]) < 0:
             dets_ok += 1
     errs = np.array(errs)
-    return {"median": float(np.median(errs)), "p95": float(np.percentile(errs, 95)),
-            "max": float(np.max(errs)), "det_sign_ok": dets_ok / N, "errs": errs}
+    return {
+        "median": float(np.median(errs)),
+        "p95": float(np.percentile(errs, 95)),
+        "max": float(np.max(errs)),
+        "det_sign_ok": dets_ok / N,
+        "errs": errs,
+    }
 
 
 class TestRealisticGraph:
@@ -185,4 +194,8 @@ if __name__ == "__main__":
     opt, gt, origin, meta = build_realistic_graph()
     print("meta:", meta)
     m = _solve_and_measure(opt, gt, origin)
-    print("median={:.3f} p95={:.3f} max={:.3f} det_ok={:.2f}".format(m["median"], m["p95"], m["max"], m["det_sign_ok"]))
+    print(
+        "median={:.3f} p95={:.3f} max={:.3f} det_ok={:.2f}".format(
+            m["median"], m["p95"], m["max"], m["det_sign_ok"]
+        )
+    )

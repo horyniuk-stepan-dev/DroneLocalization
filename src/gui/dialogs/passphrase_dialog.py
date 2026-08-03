@@ -107,9 +107,7 @@ class PassphraseDialog(QDialog):
             logger.warning("Map passphrase rejected: attempts exhausted.")
             self.reject()
             return
-        self.error_label.setText(
-            f"Невірний пароль. Залишилось спроб: {self.attempts_left}."
-        )
+        self.error_label.setText(f"Невірний пароль. Залишилось спроб: {self.attempts_left}.")
 
 
 class NewPassphraseDialog(QDialog):

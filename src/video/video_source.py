@@ -9,12 +9,14 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
 class VideoSourceType(Enum):
-    FILE = "file"           # /path/to/video.mp4
-    RTSP = "rtsp"           # rtsp://ip:port/stream
-    RTMP = "rtmp"           # rtmp://ip/live/stream
-    USB = "usb"             # device index (0, 1, ...)
-    HTTP = "http"           # http://ip/mjpeg
+    FILE = "file"  # /path/to/video.mp4
+    RTSP = "rtsp"  # rtsp://ip:port/stream
+    RTMP = "rtmp"  # rtmp://ip/live/stream
+    USB = "usb"  # device index (0, 1, ...)
+    HTTP = "http"  # http://ip/mjpeg
+
 
 @dataclass
 class VideoSourceConfig:
@@ -22,8 +24,9 @@ class VideoSourceConfig:
     source_type: VideoSourceType = VideoSourceType.FILE
     reconnect_attempts: int = 5
     reconnect_delay_sec: float = 2.0
-    buffer_size: int = 1        # Для live: буфер 1 кадр (мінімальна затримка)
+    buffer_size: int = 1  # Для live: буфер 1 кадр (мінімальна затримка)
     read_timeout_sec: float = 10.0
+
 
 class VideoSource:
     """Обгортка над cv2.VideoCapture з auto-reconnect та type detection."""
@@ -56,9 +59,15 @@ class VideoSource:
         if self._cap is not None:
             self._cap.release()
 
-        source_val = int(self.config.source) if self.config.source_type == VideoSourceType.USB else self.config.source
+        source_val = (
+            int(self.config.source)
+            if self.config.source_type == VideoSourceType.USB
+            else self.config.source
+        )
 
-        logger.info(f"Connecting to video source: {source_val} (Type: {self.config.source_type.name})")
+        logger.info(
+            f"Connecting to video source: {source_val} (Type: {self.config.source_type.name})"
+        )
 
         self._cap = cv2.VideoCapture(source_val)
 
@@ -89,7 +98,7 @@ class VideoSource:
             VideoSourceType.RTSP,
             VideoSourceType.RTMP,
             VideoSourceType.USB,
-            VideoSourceType.HTTP
+            VideoSourceType.HTTP,
         ]
 
     @property

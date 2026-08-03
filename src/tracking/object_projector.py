@@ -21,7 +21,9 @@ class ObjectProjector:
     def __init__(self, calibration_manager):
         self.calibration_manager = calibration_manager
 
-    def _apply_rotation(self, px_x: float, px_y: float, angle: int, frame_w: int, frame_h: int) -> tuple[float, float]:
+    def _apply_rotation(
+        self, px_x: float, px_y: float, angle: int, frame_w: int, frame_h: int
+    ) -> tuple[float, float]:
         """Обертає координати відповідно до повороту кадру (0, 90, 180, 270)."""
         if angle == 0:
             return px_x, px_y
@@ -36,11 +38,11 @@ class ObjectProjector:
     def project_objects(
         self,
         objects: list[TrackedObject],
-        H: np.ndarray,          # Homography query->ref
-        affine: np.ndarray,     # Affine ref->metric
-        rotation_angle: int,    # Кут обертання кадру
+        H: np.ndarray,  # Homography query->ref
+        affine: np.ndarray,  # Affine ref->metric
+        rotation_angle: int,  # Кут обертання кадру
         frame_w: int,
-        frame_h: int
+        frame_h: int,
     ) -> list[ObjectGPS]:
         """Трансформує центри bbox: Query px -> Ref px (H) -> Metric (Affine) -> GPS."""
 
@@ -71,13 +73,15 @@ class ObjectProjector:
                     float(pt_metric[0, 0]), float(pt_metric[0, 1])
                 )
 
-                objects_gps.append(ObjectGPS(
-                    track_id=obj.track_id,
-                    class_name=obj.class_name,
-                    lat=lat,
-                    lon=lon,
-                    confidence=obj.confidence
-                ))
+                objects_gps.append(
+                    ObjectGPS(
+                        track_id=obj.track_id,
+                        class_name=obj.class_name,
+                        lat=lat,
+                        lon=lon,
+                        confidence=obj.confidence,
+                    )
+                )
             except Exception as e:
                 # В разі виродженої матриці або інших помилок математики
                 continue

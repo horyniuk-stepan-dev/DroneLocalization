@@ -56,20 +56,23 @@ def _classify_tier(vram_gb: float, cpu_cores: int) -> str:
 # global_descriptor.backend, vlad.*, database.max_keypoints_stored,
 # keypoint_video_scale, frame_step, sift_max_keypoints, store_sift_features)
 # are deliberately ABSENT and must be set explicitly in user_config.json.
-TUNABLE_KEYS: frozenset[str] = frozenset({
-    "models.vram_management.max_vram_ratio",
-    "models.performance.torch_compile",
-    "models.performance.fp16_enabled",
-    "models.performance.propagation_max_workers",
-    "database.yolo_batch_size",
-    "database.prefetch_queue_size",
-    "database.decode_batch_size",
-})
+TUNABLE_KEYS: frozenset[str] = frozenset(
+    {
+        "models.vram_management.max_vram_ratio",
+        "models.performance.torch_compile",
+        "models.performance.fp16_enabled",
+        "models.performance.propagation_max_workers",
+        "database.yolo_batch_size",
+        "database.prefetch_queue_size",
+        "database.decode_batch_size",
+    }
+)
 
 
 @dataclass
 class GPUInfo:
     """Detected GPU properties."""
+
     available: bool = False
     name: str = "N/A"
     vram_total_gb: float = 0.0
@@ -84,6 +87,7 @@ class GPUInfo:
 @dataclass
 class CPUInfo:
     """Detected CPU properties."""
+
     physical_cores: int = 1
     logical_threads: int = 1
     ram_total_gb: float = 0.0
@@ -93,6 +97,7 @@ class CPUInfo:
 @dataclass
 class HardwareProfile:
     """Full hardware profile with tier classification and auto-tune capability."""
+
     gpu: GPUInfo = field(default_factory=GPUInfo)
     cpu: CPUInfo = field(default_factory=CPUInfo)
     tier: str = "low"
@@ -125,9 +130,10 @@ class HardwareProfile:
         # Physical cores (fallback to logical if unavailable)
         try:
             import psutil
+
             info.physical_cores = psutil.cpu_count(logical=False) or 1
             info.logical_threads = psutil.cpu_count(logical=True) or info.physical_cores
-            info.ram_total_gb = psutil.virtual_memory().total / (1024 ** 3)
+            info.ram_total_gb = psutil.virtual_memory().total / (1024**3)
         except ImportError:
             # psutil not available — use os.cpu_count (returns logical threads)
             logical = os.cpu_count() or 1
@@ -138,8 +144,10 @@ class HardwareProfile:
             if platform.system() == "Windows":
                 try:
                     import ctypes
+
                     kernel32 = ctypes.windll.kernel32
                     c_ulong = ctypes.c_ulonglong
+
                     class MEMORYSTATUSEX(ctypes.Structure):
                         _fields_ = [
                             ("dwLength", ctypes.c_ulong),
@@ -152,10 +160,11 @@ class HardwareProfile:
                             ("ullAvailVirtual", c_ulong),
                             ("ullAvailExtendedVirtual", c_ulong),
                         ]
+
                     stat = MEMORYSTATUSEX()
                     stat.dwLength = ctypes.sizeof(stat)
                     kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-                    info.ram_total_gb = stat.ullTotalPhys / (1024 ** 3)
+                    info.ram_total_gb = stat.ullTotalPhys / (1024**3)
                 except Exception:
                     info.ram_total_gb = 0.0
             else:
@@ -163,7 +172,7 @@ class HardwareProfile:
                     with open("/proc/meminfo") as f:
                         for line in f:
                             if line.startswith("MemTotal"):
-                                info.ram_total_gb = int(line.split()[1]) / (1024 ** 2)
+                                info.ram_total_gb = int(line.split()[1]) / (1024**2)
                                 break
                 except Exception:
                     info.ram_total_gb = 0.0
@@ -176,6 +185,7 @@ class HardwareProfile:
         info = GPUInfo()
         try:
             import torch
+
             if not torch.cuda.is_available():
                 return info
 
@@ -184,13 +194,13 @@ class HardwareProfile:
             info.name = torch.cuda.get_device_name(0)
 
             props = torch.cuda.get_device_properties(0)
-            info.vram_total_gb = props.total_memory / (1024 ** 3)
+            info.vram_total_gb = props.total_memory / (1024**3)
             info.compute_capability = (props.major, props.minor)
             # Ampere = SM 8.0+
             info.is_ampere_plus = props.major >= 8
 
             free_mem, _ = torch.cuda.mem_get_info(0)
-            info.vram_free_gb = free_mem / (1024 ** 3)
+            info.vram_free_gb = free_mem / (1024**3)
 
             # Driver version (NVML)
             try:
@@ -290,7 +300,7 @@ class HardwareProfile:
                 "models.vram_management.max_vram_ratio",
                 0.8,
                 vram_ratios[tier],
-                f"{tier}-tier GPU: safe to use {vram_ratios[tier]*100:.0f}% VRAM",
+                f"{tier}-tier GPU: safe to use {vram_ratios[tier] * 100:.0f}% VRAM",
             )
 
             # YOLO batch size — more VRAM → bigger batches
@@ -393,6 +403,7 @@ class HardwareProfile:
         # ── CPU thread tuning ────────────────────────────────────────────────
         try:
             import torch
+
             physical = self.cpu.physical_cores
             torch.set_num_threads(physical)
             logger.info(f"torch.set_num_threads({physical})")
@@ -401,6 +412,7 @@ class HardwareProfile:
 
         try:
             import cv2
+
             physical = self.cpu.physical_cores
             cv2.setNumThreads(physical)
             logger.info(f"cv2.setNumThreads({physical})")
@@ -448,7 +460,9 @@ class HardwareProfile:
     def log_overrides(self, overrides: dict[str, tuple[Any, Any, str]]) -> None:
         """Pretty-print applied overrides to the log."""
         if not overrides:
-            logger.info("Auto-tune: no overrides needed (all settings already optimal or customized)")
+            logger.info(
+                "Auto-tune: no overrides needed (all settings already optimal or customized)"
+            )
             return
 
         logger.info("Auto-tune applied:")

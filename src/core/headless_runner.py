@@ -77,13 +77,13 @@ class HeadlessRunner:
 
             if is_multi and len(sources) > 0:
                 # Мультиджерельний режим
-                self.db_manager = MultiDatabaseManager(
-                    sources, self.project_dir, config=APP_CONFIG
-                )
+                self.db_manager = MultiDatabaseManager(sources, self.project_dir, config=APP_CONFIG)
                 self.calib_manager = MultiCalibrationManager()
                 self.calib_manager.load_all(sources, self.project_dir)
 
-                first_id = self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                first_id = (
+                    self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                )
                 if first_id:
                     self.database = self.db_manager.get_database(first_id)
                     self.calibration = self.calib_manager.get(first_id)
@@ -98,7 +98,9 @@ class HeadlessRunner:
                 # Single-source mode. Resolve the DB/calibration from the paths
                 # the project actually declares (modern layout: sources/main/…),
                 # falling back to the legacy flat root so old projects still load.
-                db_path = Path(pm.database_path) if pm.database_path else self.project_dir / "database.h5"
+                db_path = (
+                    Path(pm.database_path) if pm.database_path else self.project_dir / "database.h5"
+                )
                 if not db_path.exists():
                     legacy_db = self.project_dir / "database.h5"
                     if legacy_db.exists():
@@ -157,7 +159,11 @@ class HeadlessRunner:
         localizer_config = {**APP_CONFIG, "_model_manager": self.model_manager}
 
         return Localizer(
-            self.database, fe, matcher, self.calibration, config=localizer_config,
+            self.database,
+            fe,
+            matcher,
+            self.calibration,
+            config=localizer_config,
             ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
             ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
             db_manager=self.db_manager,
@@ -185,7 +191,9 @@ class HeadlessRunner:
         # Підключаємо брокер координат
         self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
         self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
-        self.tracking_worker.objects_gps_updated.connect(self.coordinates_broker.on_objects_gps_updated)
+        self.tracking_worker.objects_gps_updated.connect(
+            self.coordinates_broker.on_objects_gps_updated
+        )
 
         def on_tracking_finished():
             logger.info("Tracking finished.")

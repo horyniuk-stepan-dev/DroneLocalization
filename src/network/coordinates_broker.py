@@ -251,7 +251,7 @@ class CoordinatesBroker(QObject):
                     "class": o.class_name,
                     "lat": o.lat,
                     "lon": o.lon,
-                    "conf": o.confidence
+                    "conf": o.confidence,
                 }
                 for o in objects_gps
             ],

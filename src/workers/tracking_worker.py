@@ -72,9 +72,7 @@ class RealtimeTrackingWorker(QThread):
             from src.utils.latency_tracker import LatencyTracker
 
             self._latency_tracker = LatencyTracker(
-                log_interval=get_cfg(
-                    self.config, "models.performance.latency_log_interval", 100
-                ),
+                log_interval=get_cfg(self.config, "models.performance.latency_log_interval", 100),
                 logger=logger,
             )
 
@@ -327,13 +325,14 @@ class RealtimeTrackingWorker(QThread):
                 # БАГФІКС (OF-шов): retrieval-only fallback не має H і не
                 # оновлює _last_state — ребейз OF-точок на ньому дав би OF
                 # з новими точками на старій гомографії.
-                if loc_result.get("success") and loc_result.get("fallback_mode") != "retrieval_only":
+                if (
+                    loc_result.get("success")
+                    and loc_result.get("fallback_mode") != "retrieval_only"
+                ):
                     # Зберігаємо стан для OF на наступні кадри
                     prev_gray_for_of = curr_gray
                     prev_gray_half_for_of = (
-                        cv2.resize(
-                            curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
-                        )
+                        cv2.resize(curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
                         if self.of_half_res
                         else None
                     )
@@ -411,7 +410,9 @@ class RealtimeTrackingWorker(QThread):
                     # Координати повертаються у простір оригіналу одразу після
                     # фільтрації, тож увесь код нижче лишається в оригінальних
                     # пікселях і нічого про half-res не знає.
-                    of_scale = 0.5 if (self.of_half_res and prev_gray_half_for_of is not None) else 1.0
+                    of_scale = (
+                        0.5 if (self.of_half_res and prev_gray_half_for_of is not None) else 1.0
+                    )
                     if of_scale != 1.0:
                         g_prev = prev_gray_half_for_of
                         g_curr = cv2.resize(
@@ -643,9 +644,7 @@ class RealtimeTrackingWorker(QThread):
             self.debug_view_ready.emit(channel, img)
 
         if "yolo" in active:
-            emit_if_free(
-                "yolo", lambda: dr.render_yolo(frame_rgb, detections, static_mask, mw)
-            )
+            emit_if_free("yolo", lambda: dr.render_yolo(frame_rgb, detections, static_mask, mw))
         if collector is None:
             return
         if "matches" in active and collector.rotated_frame is not None:

@@ -4,6 +4,7 @@ spatial_index.py — Просторовий тайловий індекс для
 Будується поверх даних frame_gps з HDF5. Не вимагає зовнішніх
 геосторонніх бібліотек (H3, S2 тощо).
 """
+
 from __future__ import annotations
 
 from collections import defaultdict

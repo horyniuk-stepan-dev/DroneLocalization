@@ -46,9 +46,11 @@ def run_scenarios() -> dict[str, Any]:
     loc = build_localizer()
     snap["frame1"] = loc.localize_frame(synthetic_frame(1))
     ls = loc.last_state
-    snap["last_state"] = None if ls is None else {
-        k: ls.get(k) for k in ("candidate_id", "inliers", "global_angle", "source_id")
-    }
+    snap["last_state"] = (
+        None
+        if ls is None
+        else {k: ls.get(k) for k in ("candidate_id", "inliers", "global_angle", "source_id")}
+    )
 
     # B) A3 temporal prior: a second identical keyframe should reuse the angle
     #    (1 forward pass, not a full 4-angle scan). Track via the fake's call counter.
@@ -75,4 +77,6 @@ def test_characterization_matches_baseline() -> None:
         _BASELINE.write_text(json.dumps(snap, indent=2, sort_keys=True), encoding="utf-8")
         pytest.skip(f"baseline captured at {_BASELINE} ({len(snap)} scenarios)")
     baseline = json.loads(_BASELINE.read_text(encoding="utf-8"))
-    assert snap == baseline, "localize_frame behaviour changed vs baseline (refactor introduced a diff)"
+    assert snap == baseline, (
+        "localize_frame behaviour changed vs baseline (refactor introduced a diff)"
+    )

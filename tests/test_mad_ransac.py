@@ -45,9 +45,7 @@ class TestMadThreshold:
         H = np.eye(3)
 
         thr_all = G.compute_mad_threshold(src, dst, H, k=2.5)
-        thr_in = G.compute_mad_threshold(
-            src, dst, H, k=2.5, inlier_mask=mask.ravel().astype(bool)
-        )
+        thr_in = G.compute_mad_threshold(src, dst, H, k=2.5, inlier_mask=mask.ravel().astype(bool))
 
         assert thr_in < 10.0, f"поріг по інлаєрах має бути тісним, отримано {thr_in}"
         assert thr_all > 100.0, "контроль: по всьому набору поріг таки роздувається"

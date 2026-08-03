@@ -33,7 +33,10 @@ def get_cfg(config: Any, path: str, default: Any = None) -> Any:
     # really bundled (preserves the old fallback behaviour).
     import os
     import sys
-    if isinstance(current, str) and (current.startswith("models/") or current.startswith("models\\")):
+
+    if isinstance(current, str) and (
+        current.startswith("models/") or current.startswith("models\\")
+    ):
         resolved = os.path.join(str(models_root().parent), current)
         if not getattr(sys, "frozen", False) or os.path.exists(resolved):
             return resolved
@@ -165,6 +168,7 @@ def load_user_config() -> AppConfig:
     )
     print(CONFIG_LOAD_STATUS)
     return default_cfg
+
 
 # Екземпляр конфігу за замовчуванням (зчитаний з файлу або дефолтний).
 APP_SETTINGS = load_user_config()

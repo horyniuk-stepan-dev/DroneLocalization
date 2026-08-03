@@ -8,6 +8,7 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
 class WebSocketServer:
     """Асинхронний WebSocket-сервер для розсилки координат.
 
@@ -61,9 +62,7 @@ class WebSocketServer:
             if auth.startswith("Bearer "):
                 supplied = auth[7:]
             if supplied != self.api_token:
-                logger.warning(
-                    f"WebSocket auth failed from {websocket.remote_address} — closing"
-                )
+                logger.warning(f"WebSocket auth failed from {websocket.remote_address} — closing")
                 await websocket.close(code=4401, reason="Unauthorized")
                 return
 
@@ -97,9 +96,7 @@ class WebSocketServer:
         ssl_ctx = self._build_ssl_context()
         scheme = "wss" if ssl_ctx else "ws"
         logger.info(f"Starting WebSocket server on {scheme}://{self.host}:{self.port}...")
-        self.server = await websockets.serve(
-            self.handler, self.host, self.port, ssl=ssl_ctx
-        )
+        self.server = await websockets.serve(self.handler, self.host, self.port, ssl=ssl_ctx)
 
     async def stop(self):
         if self.server:
@@ -114,6 +111,8 @@ class WebSocketServer:
         try:
             msg_str = json.dumps(message)
             # Розсилаємо повідомлення всім підключеним клієнтам
-            await asyncio.gather(*[client.send(msg_str) for client in self.clients], return_exceptions=True)
+            await asyncio.gather(
+                *[client.send(msg_str) for client in self.clients], return_exceptions=True
+            )
         except Exception as e:
             logger.error(f"Error broadcasting WebSocket message: {e}")

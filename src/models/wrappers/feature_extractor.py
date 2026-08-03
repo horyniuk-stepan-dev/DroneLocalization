@@ -214,7 +214,9 @@ class FeatureExtractor:
 
         if self.cesp_module is not None:
             # CESP mode: отримуємо patch tokens замість CLS
-            with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+            with torch.amp.autocast(
+                self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+            ):
                 features = self.global_model.forward_features(dino_input)
                 patch_tokens = features["x_norm_patchtokens"].float()
 
@@ -225,7 +227,9 @@ class FeatureExtractor:
             global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
         else:
             # Стандартний mode: CLS token
-            with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+            with torch.amp.autocast(
+                self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+            ):
                 global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
 
         return global_desc
@@ -257,9 +261,7 @@ class FeatureExtractor:
                 )
                 batch = self._dino_normalize(t)  # (B, 3, S, S)
             else:
-                prepped = [
-                    self.dinov2_transform(self._upload_chw(img))[0] for img in images
-                ]
+                prepped = [self.dinov2_transform(self._upload_chw(img))[0] for img in images]
                 batch = torch.stack(prepped)  # (B, 3, S, S)
 
             # ADDENDUM §3: чанкування батча — кап піку VRAM на слабких GPU.
@@ -275,13 +277,17 @@ class FeatureExtractor:
                 if self.vlad_aggregator is not None:
                     outs.append(np.asarray(self._vlad_descriptors(chunk)))
                 elif self.cesp_module is not None:
-                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(
+                        self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                    ):
                         features = self.global_model.forward_features(chunk)
                     patch_tokens = features["x_norm_patchtokens"].float()
                     h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
                     outs.append(self.cesp_module(patch_tokens, h_p, w_p).float().cpu().numpy())
                 else:
-                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(
+                        self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                    ):
                         outs.append(self.global_model(chunk).float().cpu().numpy())
 
             return np.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
@@ -320,7 +326,7 @@ class FeatureExtractor:
             scale_factor = max_edge / float(max(orig_h, orig_w))
             new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
             rgb_tensor = torch.nn.functional.interpolate(
-                rgb_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False
+                rgb_tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
             )
             logger.debug(f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
 
@@ -413,9 +419,7 @@ class FeatureExtractor:
         # _dino_input на онлайн-шляху: інакше дескриптори БД і запиту були б
         # порахованими різними фільтрами.
         _dino_src = (
-            [self._cpu_resize_dino(img) for img in images]
-            if self._dino_cpu_resize
-            else images
+            [self._cpu_resize_dino(img) for img in images] if self._dino_cpu_resize else images
         )
         dino_batch = (
             torch.from_numpy(np.ascontiguousarray(np.stack(_dino_src)))
@@ -448,9 +452,11 @@ class FeatureExtractor:
             scale_factor = max_edge / float(max(orig_h, orig_w))
             new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
             local_batch = torch.nn.functional.interpolate(
-                local_batch, size=(new_h, new_w), mode='bilinear', align_corners=False
+                local_batch, size=(new_h, new_w), mode="bilinear", align_corners=False
             )
-            logger.debug(f"Downscaled local batch extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
+            logger.debug(
+                f"Downscaled local batch extraction from {orig_w}x{orig_h} to {new_w}x{new_h}"
+            )
 
         is_xfeat = (
             hasattr(self.local_model, "__class__")
@@ -487,14 +493,18 @@ class FeatureExtractor:
                 if self.vlad_aggregator is not None:
                     out_global = torch.from_numpy(self._vlad_descriptors(dino_input))
                 elif self.cesp_module is not None:
-                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(
+                        self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                    ):
                         features = self.global_model.forward_features(dino_input)
                     patch_tokens = features["x_norm_patchtokens"].float()
                     # RESEARCH 1.1: сітка з фактичної кількості токенів, не //14
                     h_p = w_p = self._patch_grid_side(patch_tokens.shape[1])
                     out_global = self.cesp_module(patch_tokens, h_p, w_p)
                 else:
-                    with torch.amp.autocast(self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half):
+                    with torch.amp.autocast(
+                        self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                    ):
                         out_global = self.global_model(dino_input).float()
 
         out_kpts = []
@@ -557,9 +567,16 @@ class FeatureExtractor:
                     kp = np.empty((0, 2), dtype=np.float32)
                     desc = np.empty((0, desc_dim), dtype=np.float32)
 
-            results.append({
-                "keypoints": kp, "descriptors": desc, "coords_2d": kp.copy(), "global_desc": gd,
-                "image_size": np.array([images[i].shape[0], images[i].shape[1]], dtype=np.int32),
-            })
+            results.append(
+                {
+                    "keypoints": kp,
+                    "descriptors": desc,
+                    "coords_2d": kp.copy(),
+                    "global_desc": gd,
+                    "image_size": np.array(
+                        [images[i].shape[0], images[i].shape[1]], dtype=np.int32
+                    ),
+                }
+            )
 
         return results

@@ -30,9 +30,7 @@ def keyframe_bypasses(trust_enabled: bool, inliers: int, min_inliers: int = MIN_
     return trust_enabled and inliers >= min_inliers
 
 
-def of_bypasses(
-    trust_enabled: bool, flow_quality, min_q: float = MIN_FLOW_Q
-) -> bool:
+def of_bypasses(trust_enabled: bool, flow_quality, min_q: float = MIN_FLOW_Q) -> bool:
     """Дзеркалить `_strong_flow` у localize_optical_flow."""
     return trust_enabled and flow_quality is not None and float(flow_quality) >= min_q
 

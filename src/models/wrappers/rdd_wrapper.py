@@ -20,7 +20,7 @@ def _import_rdd():
     # Пошук RDD пакету у кількох місцях
     search_paths = [
         Path(__file__).resolve().parents[3] / "third_party" / "rdd",  # <project>/third_party/rdd
-        Path(__file__).resolve().parents[3] / "models" / "rdd",       # <project>/models/rdd
+        Path(__file__).resolve().parents[3] / "models" / "rdd",  # <project>/models/rdd
     ]
 
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -36,6 +36,7 @@ def _import_rdd():
     try:
         from RDD.RDD import build as rdd_build
         from RDD.utils import read_config
+
         _RDD_BUILD = (rdd_build, read_config, rdd_path)
         logger.info("RDD module imported successfully")
         return _RDD_BUILD
@@ -91,7 +92,9 @@ class RDDWrapper:
 
         # Визначаємо descriptor dim
         self._desc_dim = self._detect_desc_dim()
-        logger.info(f"RDD initialized: desc_dim={self._desc_dim}, max_kpts={max_keypoints}, device={device}")
+        logger.info(
+            f"RDD initialized: desc_dim={self._desc_dim}, max_kpts={max_keypoints}, device={device}"
+        )
 
     def _detect_desc_dim(self) -> int:
         """Probe model to detect descriptor dimensionality."""
@@ -126,9 +129,9 @@ class RDDWrapper:
         all_descs = []
 
         for i in range(B):
-            out_list = self.model.extract(image[i:i+1])
+            out_list = self.model.extract(image[i : i + 1])
             out = out_list[0]
-            kpts = out["keypoints"]     # (1, N, 2) або (N, 2)
+            kpts = out["keypoints"]  # (1, N, 2) або (N, 2)
             descs = out["descriptors"]  # (1, N, D) або (N, D)
 
             # Нормалізація формату до (1, N, D)
@@ -139,8 +142,8 @@ class RDDWrapper:
 
             # Обмеження кількості keypoints
             if kpts.shape[1] > self.max_keypoints:
-                kpts = kpts[:, :self.max_keypoints]
-                descs = descs[:, :self.max_keypoints]
+                kpts = kpts[:, : self.max_keypoints]
+                descs = descs[:, : self.max_keypoints]
 
             all_kpts.append(kpts)
             all_descs.append(descs)
@@ -158,7 +161,7 @@ class RDDWrapper:
             padded_descs.append(d)
 
         return {
-            "keypoints": torch.cat(padded_kpts, dim=0),     # (B, N, 2)
+            "keypoints": torch.cat(padded_kpts, dim=0),  # (B, N, 2)
             "descriptors": torch.cat(padded_descs, dim=0),  # (B, N, D)
         }
 

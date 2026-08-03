@@ -153,9 +153,7 @@ class SlidingWindowSmoother:
         self.fix_sigma_base_m = self._sane("fix_sigma_base_m", fix_sigma_base_m, 0.1)
         self.odom_sigma_base_m = self._sane("odom_sigma_base_m", odom_sigma_base_m, 0.1)
         self.max_correction_m = self._sane("max_correction_m", max_correction_m, 0.1)
-        self.entry_prior_sigma_m = self._sane(
-            "entry_prior_sigma_m", entry_prior_sigma_m, 0.1
-        )
+        self.entry_prior_sigma_m = self._sane("entry_prior_sigma_m", entry_prior_sigma_m, 0.1)
         self.irls_iterations = max(int(irls_iterations), 1)
         # Fixed-lag servo (v2, після живого прогону 2026-07-18): корекція
         # рахується на вузлі з лагом — голова вікна ще не уточнена майбутніми
@@ -190,9 +188,7 @@ class SlidingWindowSmoother:
         """Кламп користувацького параметра знизу з голосним warning."""
         v = float(value)
         if not np.isfinite(v) or v < floor:
-            logger.warning(
-                f"Smoother config: {name}={value!r} невалідне — клампимо до {floor}"
-            )
+            logger.warning(f"Smoother config: {name}={value!r} невалідне — клампимо до {floor}")
             return float(floor)
         return v
 
@@ -243,8 +239,7 @@ class SlidingWindowSmoother:
         if source_id != self._source_id:
             if self._nodes:
                 logger.info(
-                    f"Smoother window reset: source change "
-                    f"{self._source_id!r} -> {source_id!r}"
+                    f"Smoother window reset: source change {self._source_id!r} -> {source_id!r}"
                 )
             self.reset()
             self._source_id = source_id
@@ -264,9 +259,7 @@ class SlidingWindowSmoother:
             z=z,
             sigma=sigma,
             accepted=bool(accepted),
-            kf_xy=None
-            if kf_xy is None
-            else np.asarray(kf_xy, dtype=np.float64).reshape(2),
+            kf_xy=None if kf_xy is None else np.asarray(kf_xy, dtype=np.float64).reshape(2),
             of_boundary=of_boundary,
         )
         self._uid_seq += 1
@@ -353,9 +346,7 @@ class SlidingWindowSmoother:
     def _slide(self) -> None:
         while len(self._nodes) > self.window:
             dropped = self._nodes.pop(0)
-            self._edges = [
-                e for e in self._edges if e.a != dropped.uid and e.b != dropped.uid
-            ]
+            self._edges = [e for e in self._edges if e.a != dropped.uid and e.b != dropped.uid]
             # Entry prior: the new head keeps its last smoothed estimate as a
             # weak unary factor — cheap stand-in for proper marginalization,
             # prevents the window head from floating when old fixes leave.
@@ -380,11 +371,7 @@ class SlidingWindowSmoother:
 
         e_a = np.array([uid_to_idx[e.a] for e in self._edges], dtype=np.int64)
         e_b = np.array([uid_to_idx[e.b] for e in self._edges], dtype=np.int64)
-        e_d = (
-            np.stack([e.delta for e in self._edges])
-            if self._edges
-            else np.zeros((0, 2))
-        )
+        e_d = np.stack([e.delta for e in self._edges]) if self._edges else np.zeros((0, 2))
         e_w = np.array([e.weight for e in self._edges], dtype=np.float64)
 
         diag = np.arange(n)
@@ -422,12 +409,8 @@ class SlidingWindowSmoother:
             u = np.linalg.norm(p - z, axis=1) / sig
             hw = np.where(u <= self.huber_k, 1.0, self.huber_k / np.maximum(u, 1e-12))
 
-        self._last_solution = {
-            node.uid: p[i].copy() for i, node in enumerate(self._nodes)
-        }
-        self._last_fix_weights = {
-            node.uid: float(hw[i]) for i, node in enumerate(self._nodes)
-        }
+        self._last_solution = {node.uid: p[i].copy() for i, node in enumerate(self._nodes)}
+        self._last_fix_weights = {node.uid: float(hw[i]) for i, node in enumerate(self._nodes)}
         return p
 
     # ── introspection (tests / telemetry) ────────────────────────────────────

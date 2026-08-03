@@ -101,6 +101,8 @@ class FastRetrieval:
         scores, ids = self.index.search(q, top_k)
         results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
+
+
 class LanceDBRetrieval:
     """Fast candidate search using LanceDB for vector similarity."""
 
@@ -299,9 +301,7 @@ class FeatureMatcher:
             return np.empty((0, 2)), np.empty((0, 2))
         return self._lightglue_match(query_features, ref_features, model=self._lightglue_sift)
 
-    def _lightglue_match(
-        self, query_features: dict, ref_features: dict, model=None
-    ) -> tuple:
+    def _lightglue_match(self, query_features: dict, ref_features: dict, model=None) -> tuple:
         """Matches features using Neural LightGlue Matcher"""
         try:
             if model is None:
@@ -320,17 +320,13 @@ class FeatureMatcher:
             # image_size для коректної нормалізації координат [-1, 1] у LightGlue.
             # Без цього крос-роздільні пари (4K query vs 1080p ref) дають ~0 matches.
             image0_data = {
-                "keypoints": torch.from_numpy(query_features["keypoints"])
-                .float()[None]
-                .to(device),
+                "keypoints": torch.from_numpy(query_features["keypoints"]).float()[None].to(device),
                 "descriptors": torch.from_numpy(query_features["descriptors"])
                 .float()[None]
                 .to(device),
             }
             image1_data = {
-                "keypoints": torch.from_numpy(ref_features["keypoints"])
-                .float()[None]
-                .to(device),
+                "keypoints": torch.from_numpy(ref_features["keypoints"]).float()[None].to(device),
                 "descriptors": torch.from_numpy(ref_features["descriptors"])
                 .float()[None]
                 .to(device),

@@ -13,18 +13,20 @@ from src.utils.hardware_profile import TUNABLE_KEYS, HardwareProfile
 
 # Keys that define a database's structure/content-type. Auto-tune must never
 # touch any of these, or databases stop being interchangeable across machines.
-STRUCTURE_DEFINING_KEYS = frozenset({
-    "models.local_extractor",
-    "global_descriptor.backend",
-    "models.global_descriptor.backend",
-    "models.vlad.enabled",
-    "models.vlad.pca_dim",
-    "database.max_keypoints_stored",
-    "database.keypoint_video_scale",
-    "database.frame_step",
-    "database.store_sift_features",
-    "database.sift_max_keypoints",
-})
+STRUCTURE_DEFINING_KEYS = frozenset(
+    {
+        "models.local_extractor",
+        "global_descriptor.backend",
+        "models.global_descriptor.backend",
+        "models.vlad.enabled",
+        "models.vlad.pca_dim",
+        "database.max_keypoints_stored",
+        "database.keypoint_video_scale",
+        "database.frame_step",
+        "database.store_sift_features",
+        "database.sift_max_keypoints",
+    }
+)
 
 # (tier, physical_cores, vram_gb, ampere_plus)
 _TIERS = [

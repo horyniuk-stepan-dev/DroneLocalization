@@ -12,19 +12,22 @@ def tracker():
     }
     return ObjectTracker(config)
 
+
 def test_tracker_initialization(tracker):
     assert tracker is not None
     assert tracker.tracker is not None
+
 
 def test_tracker_update_empty(tracker):
     detections = []
     tracked = tracker.update(detections, (1080, 1920))
     assert len(tracked) == 0
 
+
 def test_tracker_update_with_detections(tracker):
     detections = [
         {"class_id": 0, "confidence": 0.9, "bbox": [100.0, 100.0, 200.0, 300.0]},
-        {"class_id": 2, "confidence": 0.85, "bbox": [500.0, 500.0, 600.0, 600.0]}
+        {"class_id": 2, "confidence": 0.85, "bbox": [500.0, 500.0, 600.0, 600.0]},
     ]
 
     tracked = tracker.update(detections, (1080, 1920))
@@ -46,6 +49,7 @@ def test_tracker_update_with_detections(tracker):
         elif t.class_id == 2:
             assert t.center_px == (550.0, 550.0)
             assert t.class_name == "car"
+
 
 def test_tracker_reset(tracker):
     # Process some detections

@@ -83,11 +83,7 @@ class Scenario:
         ts = self.t_kf + FRAME
         while ts < t_until - 1e-9:
             if self.anchor_z is not None:
-                xy = (
-                    self.anchor_z
-                    + (self.pos(ts) - self.anchor_truth)
-                    + self._noise(self.of_noise)
-                )
+                xy = self.anchor_z + (self.pos(ts) - self.anchor_truth) + self._noise(self.of_noise)
                 self.sm.note_of(xy, dt=ts - self.t_success, quality=self.of_quality)
                 self.t_success = ts
             ts += FRAME
@@ -187,9 +183,7 @@ def test_pure_ls_matches_brute_force():
     rng = np.random.default_rng(7)
     # huber_k huge -> weights stay 1 -> plain weighted LS
     sm = make_smoother(huber_k=1e9, irls_iterations=3)
-    Scenario(
-        sm, lambda t: (12.0 * t, 3.0 * t), rng=rng, fix_noise=2.0, of_noise=0.3
-    ).run(25)
+    Scenario(sm, lambda t: (12.0 * t, 3.0 * t), rng=rng, fix_noise=2.0, of_noise=0.3).run(25)
     p = sm.solve()
     expected = brute_force_solve(sm)
     np.testing.assert_allclose(p, expected, atol=1e-8)
@@ -198,9 +192,7 @@ def test_pure_ls_matches_brute_force():
 def test_solve_deterministic_and_stateless():
     rng = np.random.default_rng(3)
     sm = make_smoother()
-    Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=2.0, of_noise=0.3).run(
-        20
-    )
+    Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=2.0, of_noise=0.3).run(20)
     p1 = sm.solve()
     p2 = sm.solve()
     np.testing.assert_array_equal(p1, p2)
@@ -234,9 +226,9 @@ def test_wrong_fix_cluster_outvoted():
     rng = np.random.default_rng(13)
     sm = make_smoother()
     off = (80.0, 0.0)
-    Scenario(
-        sm, lambda t: (15.0 * t, 5.0 * t), rng=rng, fix_noise=1.0, of_noise=0.2
-    ).run(20, tamper={8: off, 9: off, 10: off})
+    Scenario(sm, lambda t: (15.0 * t, 5.0 * t), rng=rng, fix_noise=1.0, of_noise=0.2).run(
+        20, tamper={8: off, 9: off, 10: off}
+    )
     p = sm.solve()
     for k in (8, 9, 10):
         truth = np.array([15.0, 5.0]) * (k + 1) * KF_DT
@@ -272,9 +264,9 @@ def test_relocation_recovery_steps_toward_target():
 def test_rejected_fixes_enter_window_without_correction():
     rng = np.random.default_rng(19)
     sm = make_smoother()
-    corr = Scenario(
-        sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=1.0, of_noise=0.2
-    ).run(10, accepted_fn=lambda k: k not in (6, 7))
+    corr = Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=1.0, of_noise=0.2).run(
+        10, accepted_fn=lambda k: k not in (6, 7)
+    )
     assert sm.num_nodes == 10  # rejected fixes are still nodes
     assert corr[6] is None and corr[7] is None  # but produce no correction
 
@@ -285,9 +277,9 @@ def test_rejected_fixes_enter_window_without_correction():
 def test_window_slide_bounds_and_continuity():
     rng = np.random.default_rng(23)
     sm = make_smoother(window=60)
-    corr = Scenario(
-        sm, lambda t: (20.0 * t, -7.0 * t), rng=rng, fix_noise=2.0, of_noise=0.3
-    ).run(150)
+    corr = Scenario(sm, lambda t: (20.0 * t, -7.0 * t), rng=rng, fix_noise=2.0, of_noise=0.3).run(
+        150
+    )
     assert sm.num_nodes == 60
     assert sm.num_edges <= 59
     # ГОЛОВНИЙ регрес живого прогону 2026-07-18: KF слідує за truth, дані
@@ -304,9 +296,7 @@ def test_window_slide_bounds_and_continuity():
 def test_entry_prior_set_after_slide():
     rng = np.random.default_rng(29)
     sm = make_smoother(window=10)
-    Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=1.0, of_noise=0.2).run(
-        15
-    )
+    Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=1.0, of_noise=0.2).run(15)
     assert sm._nodes[0].prior is not None
 
 
@@ -338,9 +328,7 @@ def test_correction_lag_gate():
     corrs = []
     for k in range(6):
         corrs.append(
-            sm.add_fix(
-                (k * 2.0, 0.0), dt=KF_DT, confidence=0.8, kf_xy=(k * 2.0 + 6.0, 0.0)
-            )
+            sm.add_fix((k * 2.0, 0.0), dt=KF_DT, confidence=0.8, kf_xy=(k * 2.0 + 6.0, 0.0))
         )
     assert all(c is None for c in corrs[:3])  # вікно <= lag
     assert corrs[3] is not None  # drift 6 m > deadband -> перший крок
@@ -379,9 +367,7 @@ def test_hostile_config_sanitized():
     assert sm.huber_k == pytest.approx(0.1)
     assert sm.gain == pytest.approx(1.0)
     assert sm.odom_sigma_base_m == pytest.approx(0.1)
-    Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=1.0, of_noise=0.2).run(
-        15
-    )
+    Scenario(sm, lambda t: (10.0 * t, 0.0), rng=rng, fix_noise=1.0, of_noise=0.2).run(15)
     p = sm.solve()
     assert p is not None and np.all(np.isfinite(p))
     hw = np.array(list(sm.last_fix_weights.values()))
@@ -459,9 +445,7 @@ def test_wrong_anchor_offset_cancels_in_edges():
 def test_solve_budget_120_nodes():
     rng = np.random.default_rng(31)
     sm = make_smoother(window=120)
-    Scenario(
-        sm, lambda t: (25.0 * t, 10.0 * t), rng=rng, fix_noise=2.0, of_noise=0.3
-    ).run(130)
+    Scenario(sm, lambda t: (25.0 * t, 10.0 * t), rng=rng, fix_noise=2.0, of_noise=0.3).run(130)
     assert sm.num_nodes == 120
     t0 = time.perf_counter()
     n_runs = 20

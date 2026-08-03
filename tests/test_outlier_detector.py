@@ -47,7 +47,7 @@ class TestSpeedGate:
         """Та сама відстань за довший час — це не викид."""
         det = OutlierDetector(threshold_std=100.0, max_speed_mps=50.0)
         _steady(det, step=10.0, dt=1.0)
-        assert det.is_outlier((140.0, 0.0), dt=1.0) is True    # 100 м/с
+        assert det.is_outlier((140.0, 0.0), dt=1.0) is True  # 100 м/с
         det2 = OutlierDetector(threshold_std=100.0, max_speed_mps=50.0)
         _steady(det2, step=10.0, dt=1.0)
         assert det2.is_outlier((140.0, 0.0), dt=10.0) is False  # 10 м/с
@@ -168,7 +168,6 @@ class TestZScoreDependsOnHistoryVariance:
     def test_crossover_below_threshold_zscore_fires_first(self, std_noise):
         """Нижче кросоверу Z-поріг < cap, отже Z спрацьовує раніше за cap."""
         assert 80.0 * max(std_noise, 1.0) < 350.0
-
 
 
 class TestArrayLikeInput:

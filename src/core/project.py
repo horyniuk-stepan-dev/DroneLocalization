@@ -49,6 +49,7 @@ class ProjectSettings:
     def from_dict(cls, data: dict):
         # Фільтруємо тільки відомі поля
         import dataclasses
+
         known_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known_fields}
         instance = cls(**filtered)

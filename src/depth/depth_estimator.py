@@ -10,7 +10,6 @@
   scale = depth_est.get_relative_scale(frame_rgb)  # float
 """
 
-
 import cv2
 import numpy as np
 import torch
@@ -80,6 +79,7 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                 # Шукаємо у third_party/Depth-Anything-V2
                 import os
                 import sys
+
                 project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
                 local_path = os.path.join(project_root, "third_party", "Depth-Anything-V2")
                 if os.path.exists(local_path):
@@ -89,22 +89,28 @@ class _DepthAnythingV2Estimator(DepthEstimator):
                     raise ImportError(f"Depth-Anything-V2 not found in {local_path}") from None
 
             model_configs = {
-                'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-                'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-                'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-                'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+                "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+                "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+                "vitl": {
+                    "encoder": "vitl",
+                    "features": 256,
+                    "out_channels": [256, 512, 1024, 1024],
+                },
+                "vitg": {
+                    "encoder": "vitg",
+                    "features": 384,
+                    "out_channels": [1536, 1536, 1536, 1536],
+                },
             }
 
             # Визначаємо тип енкодера (за замовчуванням vits для швидкості)
-            encoder = 'vits'
+            encoder = "vits"
             self._model = DepthAnythingV2(**model_configs[encoder])
 
             import os
+
             # Шукаємо ваги за різними можливими іменами
-            weight_names = [
-                f"depth_anything_v2_{encoder}.pth",
-                "depth_anything_v2_vits.pth"
-            ]
+            weight_names = [f"depth_anything_v2_{encoder}.pth", "depth_anything_v2_vits.pth"]
 
             from config.paths import models_root
 
@@ -121,14 +127,12 @@ class _DepthAnythingV2Estimator(DepthEstimator):
             for wp in weight_paths:
                 if os.path.exists(wp):
                     self._model.load_state_dict(
-                        torch.load(wp, map_location='cpu', weights_only=True)
+                        torch.load(wp, map_location="cpu", weights_only=True)
                     )
                     logger.info(f"Depth Anything V2 weights loaded from {wp}")
                     break
             else:
-                logger.warning(
-                    f"Depth Anything V2 weights not found. Searched in: {weight_paths}"
-                )
+                logger.warning(f"Depth Anything V2 weights not found. Searched in: {weight_paths}")
 
             self._model = self._model.to(self.device).eval()
             logger.info(f"Depth Anything V2 ({encoder}) initialized on {self.device}")
@@ -189,5 +193,6 @@ class _MiDaSEstimator(DepthEstimator):
 
 class _DummyDepthEstimator(DepthEstimator):
     """Заглушка для систем без GPU."""
+
     def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
         return np.ones(image_rgb.shape[:2], dtype=np.float32)

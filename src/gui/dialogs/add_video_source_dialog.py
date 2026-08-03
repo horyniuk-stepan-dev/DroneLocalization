@@ -4,6 +4,7 @@ add_video_source_dialog.py — Діалог додавання нового ві
 Дозволяє вибрати відео, вказати source_id, area_id, режим (шар/зона),
 та опціонально geo_bounds.
 """
+
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -84,7 +85,9 @@ class AddVideoSourceDialog(QDialog):
         self.priority_spin = QSpinBox()
         self.priority_spin.setRange(0, 100)
         self.priority_spin.setValue(0)
-        self.priority_spin.setToolTip("0 = найвищий пріоритет. При рівних cosine — вибирається джерело з нижчим priority.")
+        self.priority_spin.setToolTip(
+            "0 = найвищий пріоритет. При рівних cosine — вибирається джерело з нижчим priority."
+        )
         form.addRow("Пріоритет:", self.priority_spin)
 
         layout.addWidget(basic_group)
@@ -193,8 +196,7 @@ class AddVideoSourceDialog(QDialog):
             return
         if not source_id.replace("_", "").replace("-", "").isalnum():
             QMessageBox.warning(
-                self, "Помилка",
-                "Source ID може містити тільки латинські літери, цифри, _ та -"
+                self, "Помилка", "Source ID може містити тільки латинські літери, цифри, _ та -"
             )
             return
         if not self.video_path_edit.text():

@@ -80,8 +80,7 @@ class TestScaleManagerReverseCenter:
 
     def test_noop_reverse(self):
         sm = ScaleManager()
-        info = CropInfo(scale_r=1.0, crop_x=0, crop_y=0,
-                        crop_w=640, crop_h=480, resize_scale=1.0)
+        info = CropInfo(scale_r=1.0, crop_x=0, crop_y=0, crop_w=640, crop_h=480, resize_scale=1.0)
         pt = np.array([[320.0, 240.0]])
         out = sm.reverse_center(pt, info)
         np.testing.assert_allclose(out, pt)
@@ -89,8 +88,9 @@ class TestScaleManagerReverseCenter:
     def test_crop_reverse(self):
         sm = ScaleManager()
         # Simulating r=2.0: crop center (160,120)-(480,360) then upscale 2x
-        info = CropInfo(scale_r=2.0, crop_x=160, crop_y=120,
-                        crop_w=320, crop_h=240, resize_scale=2.0)
+        info = CropInfo(
+            scale_r=2.0, crop_x=160, crop_y=120, crop_w=320, crop_h=240, resize_scale=2.0
+        )
         # Center of normalised frame (320, 240)
         pt = np.array([[320.0, 240.0]])
         out = sm.reverse_center(pt, info)
@@ -99,8 +99,7 @@ class TestScaleManagerReverseCenter:
 
     def test_downscale_reverse(self):
         sm = ScaleManager()
-        info = CropInfo(scale_r=0.5, crop_x=0, crop_y=0,
-                        crop_w=640, crop_h=480, resize_scale=0.5)
+        info = CropInfo(scale_r=0.5, crop_x=0, crop_y=0, crop_w=640, crop_h=480, resize_scale=0.5)
         # Center of downscaled frame (160, 120)
         pt = np.array([[160.0, 120.0]])
         out = sm.reverse_center(pt, info)

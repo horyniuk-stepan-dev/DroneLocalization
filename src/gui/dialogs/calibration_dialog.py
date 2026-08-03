@@ -753,7 +753,10 @@ class CalibrationDialog(QDialog):
                     self.editing_point_index = None
                     self.btn_add_point.setText("Додати точку")
                     self.btn_cancel_edit.setVisible(False)
-                elif getattr(self, "editing_point_index", None) is not None and row < self.editing_point_index:
+                elif (
+                    getattr(self, "editing_point_index", None) is not None
+                    and row < self.editing_point_index
+                ):
                     self.editing_point_index -= 1
                 self.points_2d.pop(row)
                 self.points_gps.pop(row)

@@ -198,9 +198,7 @@ def test_midpoint_sag_reduced_between_anchors():
         max_iterations=80, use_analytic_jac=True, kinematic_prior_weight=1.0
     )
     y4_kin = abs(_center(kin[4])[1])
-    assert y4_kin < 0.4 * y4_base, (
-        f"prior не гасить провисання: |y4| {y4_base:.1f} → {y4_kin:.1f}"
-    )
+    assert y4_kin < 0.4 * y4_base, f"prior не гасить провисання: |y4| {y4_base:.1f} → {y4_kin:.1f}"
     # Сильніший prior не слабший (сатурація ~9 px: гасимо кривину, не амплітуду)
     kin2 = _chain(bump=True).optimize(
         max_iterations=80, use_analytic_jac=True, kinematic_prior_weight=2.0
@@ -240,10 +238,6 @@ def _arc() -> PoseGraphOptimizer:
 
 def test_consistent_arc_not_degraded():
     base = _arc().optimize(max_iterations=80, use_analytic_jac=True)
-    kin = _arc().optimize(
-        max_iterations=80, use_analytic_jac=True, kinematic_prior_weight=0.02
-    )
-    shifts = [
-        float(np.linalg.norm(_center(kin[fid]) - _center(base[fid]))) for fid in base
-    ]
+    kin = _arc().optimize(max_iterations=80, use_analytic_jac=True, kinematic_prior_weight=0.02)
+    shifts = [float(np.linalg.norm(_center(kin[fid]) - _center(base[fid]))) for fid in base]
     assert max(shifts) < 5.0, f"дуга деградувала: max зсув {max(shifts):.2f} px"

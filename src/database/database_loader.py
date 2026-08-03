@@ -293,6 +293,7 @@ class DatabaseLoader:
                 valid_count = int(np.sum(~np.isnan(self.frame_gps[:, 0])))
                 if valid_count > 0:
                     from src.database.spatial_index import SpatialIndex
+
                     self.spatial_index = SpatialIndex(self.frame_gps)
                     logger.info(
                         f"Loaded frame_gps: {valid_count}/{len(self.frame_gps)} "
@@ -307,10 +308,7 @@ class DatabaseLoader:
             # Завантажуємо дані пропагації якщо є
             self._load_propagation_data()
 
-            logger.success(
-                f"Hot data loaded successfully | "
-                f"{len(self.frame_poses)} frames"
-            )
+            logger.success(f"Hot data loaded successfully | {len(self.frame_poses)} frames")
 
         except KeyError as e:
             logger.error(

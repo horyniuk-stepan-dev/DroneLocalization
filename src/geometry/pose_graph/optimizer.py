@@ -431,7 +431,12 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
 
         n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5 + 2 * n_kin
         jac_sp = self._build_jac_sparsity(
-            valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx,
+            valid_edges,
+            id_to_var,
+            n_residuals,
+            n_vars,
+            n_edges,
+            anchor_var_idx,
             kin_free=[
                 (id_to_var.get(a, -1), id_to_var.get(b, -1), id_to_var.get(c, -1))
                 for a, b, c in kin_ids
@@ -601,9 +606,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         if weight <= 0.0:
             return [], [], []
         participating = sorted(
-            fid
-            for fid in self._node_ids
-            if fid in id_to_var or fid in self._fixed_nodes
+            fid for fid in self._node_ids if fid in id_to_var or fid in self._fixed_nodes
         )
         ids: list[tuple[int, int, int]] = []
         alphas: list[float] = []
@@ -652,10 +655,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             aw = d["anchor_w"][:, None]
             parts.append(
                 (
-                    aw
-                    * np.column_stack(
-                        [diff[:, 0], diff[:, 1], diff[:, 2], diff[:, 3], ang]
-                    )
+                    aw * np.column_stack([diff[:, 0], diff[:, 1], diff[:, 2], diff[:, 3], ang])
                 ).ravel()
             )
 
@@ -806,7 +806,13 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         return J.tocsr()
 
     def _build_jac_sparsity(
-        self, valid_edges, id_to_var, n_residuals, n_vars, n_edges, anchor_var_idx=None,
+        self,
+        valid_edges,
+        id_to_var,
+        n_residuals,
+        n_vars,
+        n_edges,
+        anchor_var_idx=None,
         kin_free=None,
     ):
         # COO-конструктор (rows/cols списками) швидший за поелементний lil на

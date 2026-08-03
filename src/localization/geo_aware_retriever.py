@@ -5,6 +5,7 @@ geo_aware_retriever.py — Геозалежний ретривер з фонов
 просторового контексту будує FAISS IndexFlatIP тільки з підмножини
 кадрів в активному радіусі.
 """
+
 from __future__ import annotations
 
 import threading
@@ -52,9 +53,7 @@ class GeoAwareRetriever:
         self._lock = threading.Lock()
 
         # Починаємо з повного індексу
-        self._index = self._build_faiss_index(
-            global_descriptors, self._active_frame_ids
-        )
+        self._index = self._build_faiss_index(global_descriptors, self._active_frame_ids)
 
         if spatial_index is not None and spatial_index.is_available:
             logger.info(
@@ -80,9 +79,7 @@ class GeoAwareRetriever:
         if len(frame_ids) == 0:
             return index
 
-        normed = descriptors / (
-            np.linalg.norm(descriptors, axis=1, keepdims=True) + 1e-8
-        )
+        normed = descriptors / (np.linalg.norm(descriptors, axis=1, keepdims=True) + 1e-8)
         ids = np.array(frame_ids, dtype=np.int64)
         index.add_with_ids(normed.astype(np.float32), ids)
         return index
@@ -102,9 +99,7 @@ class GeoAwareRetriever:
         if self._spatial_index is None or not self._spatial_index.is_available:
             return False
 
-        new_frame_ids = sorted(
-            self._spatial_index.get_frame_ids_near(lat, lon, radius_tiles)
-        )
+        new_frame_ids = sorted(self._spatial_index.get_frame_ids_near(lat, lon, radius_tiles))
 
         if new_frame_ids == self._active_frame_ids:
             return False
@@ -135,9 +130,7 @@ class GeoAwareRetriever:
                 self._index = new_index
                 self._active_frame_ids = new_frame_ids
 
-            logger.info(
-                f"GeoAwareRetriever: index rebuilt with {len(new_frame_ids)} frames"
-            )
+            logger.info(f"GeoAwareRetriever: index rebuilt with {len(new_frame_ids)} frames")
         except Exception as e:
             logger.error(
                 f"GeoAwareRetriever: background rebuild failed: {e}",
@@ -167,11 +160,7 @@ class GeoAwareRetriever:
                 return []
             scores, ids = self._index.search(q, min(top_k, self._index.ntotal))
 
-        results = [
-            (int(idx), float(score))
-            for idx, score in zip(ids[0], scores[0])
-            if idx != -1
-        ]
+        results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
 
     # ── Утиліти ──────────────────────────────────────────────────────────────
