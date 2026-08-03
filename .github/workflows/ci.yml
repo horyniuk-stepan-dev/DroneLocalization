@@ -35,7 +35,7 @@ jobs:
         run: |
           pip install numpy'<2.0.0' scipy opencv-python-headless pyproj \
             pydantic loguru orjson filterpy pytest pytest-cov \
-            cryptography h5py PyQt6 lancedb aiohttp
+            cryptography h5py PyQt6 lancedb aiohttp websockets
       - name: Run unit tests
         run: |
           pytest tests/ -q \
