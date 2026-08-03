@@ -261,6 +261,7 @@ class DatabaseBuilder:
             kp_writer=kp_writer,
             kp_scale=kp_scale,
             use_keyframe_selection=use_keyframe_selection,
+            always_save_first=get_cfg(self.config, "database.keyframe_always_save_first", True),
             keyframe_criterion=keyframe_criterion,
             overlap_gate=lambda H, w, h: keyframe_selector.is_overlap_below(
                 H, w, h, max_overlap=max_overlap

@@ -56,6 +56,7 @@ class FrameProcessor:
         kp_writer=None,
         kp_scale: float = 1.0,
         use_keyframe_selection: bool = False,
+        always_save_first: bool = True,
         keyframe_criterion: str = "step",
         overlap_gate: Callable | None = None,
         keyframe_max_gap_frames: int = 0,
@@ -75,6 +76,9 @@ class FrameProcessor:
         self.kp_writer = kp_writer
         self.kp_scale = kp_scale
         self.use_keyframe_selection = use_keyframe_selection
+        # database.keyframe_always_save_first: до цього ключ існував у конфігу,
+        # але ніде не читався — перший кадр зберігався беззастережно.
+        self.always_save_first = always_save_first
         # "step" = legacy adjacent-frame motion; "overlap" = displacement
         # accumulated since the last KEPT keyframe (config keyframe_criterion).
         self.keyframe_criterion = keyframe_criterion
@@ -135,7 +139,9 @@ class FrameProcessor:
 
         if p_idx == 0 or self.prev_features is None:
             self.current_pose = np.eye(3, dtype=np.float64)
-            save_this_frame = True
+            # Порівнювати нема з чим (немає попереднього кадру), тож рішення
+            # приймає прапорець, а не критерій руху.
+            save_this_frame = self.always_save_first
         else:
             H_step = self.compute_inter_frame_h(self.prev_features, features)
             if H_step is not None:

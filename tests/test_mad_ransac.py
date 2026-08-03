@@ -21,7 +21,7 @@
 import numpy as np
 import pytest
 
-from src.geometry.transformations import GeometryTransforms as G
+from src.geometry.transformations import GeometryTransforms
 
 
 def _split_matches(n_inliers: int, n_outliers: int, seed: int = 0):
@@ -44,8 +44,10 @@ class TestMadThreshold:
         src, dst, mask = _split_matches(20, 40)
         H = np.eye(3)
 
-        thr_all = G.compute_mad_threshold(src, dst, H, k=2.5)
-        thr_in = G.compute_mad_threshold(src, dst, H, k=2.5, inlier_mask=mask.ravel().astype(bool))
+        thr_all = GeometryTransforms.compute_mad_threshold(src, dst, H, k=2.5)
+        thr_in = GeometryTransforms.compute_mad_threshold(
+            src, dst, H, k=2.5, inlier_mask=mask.ravel().astype(bool)
+        )
 
         assert thr_in < 10.0, f"поріг по інлаєрах має бути тісним, отримано {thr_in}"
         assert thr_all > 100.0, "контроль: по всьому набору поріг таки роздувається"
@@ -54,7 +56,7 @@ class TestMadThreshold:
         """Порожня маска не має ділити на нуль — тихо беремо всі точки."""
         src, dst, _ = _split_matches(10, 10)
         empty = np.zeros(20, dtype=bool)
-        thr = G.compute_mad_threshold(src, dst, np.eye(3), inlier_mask=empty)
+        thr = GeometryTransforms.compute_mad_threshold(src, dst, np.eye(3), inlier_mask=empty)
         assert np.isfinite(thr) and thr > 0.0
 
 
@@ -69,13 +71,13 @@ class TestRefineMaskNeverGrows:
         Саме це давало 60 «інлаєрів» із 20 справжніх у старій реалізації.
         """
         src, dst, mask = _split_matches(n_in, n_out)
-        refined = G._refine_mask_mad(src, dst, np.eye(3), mask, 2.5, 3.0)
+        refined = GeometryTransforms._refine_mask_mad(src, dst, np.eye(3), mask, 2.5, 3.0)
         assert int(refined.sum()) <= int(mask.sum())
 
     def test_outlier_majority_does_not_inflate(self):
         """Регресія 1-в-1: 20 справжніх із 60 матчів не мають стати 60."""
         src, dst, mask = _split_matches(20, 40)
-        refined = G._refine_mask_mad(src, dst, np.eye(3), mask, 2.5, 3.0)
+        refined = GeometryTransforms._refine_mask_mad(src, dst, np.eye(3), mask, 2.5, 3.0)
         n = int(refined.sum())
         assert n <= 20, f"маска роздулась до {n} — баг §1.1 повернувся"
         # І жоден зі справжніх аутлаєрів не потрапив усередину
@@ -84,7 +86,7 @@ class TestRefineMaskNeverGrows:
     def test_clean_set_is_preserved(self):
         """На чистому наборі уточнення не має викошувати справжні інлаєри."""
         src, dst, mask = _split_matches(45, 15)
-        refined = G._refine_mask_mad(src, dst, np.eye(3), mask, 2.5, 3.0)
+        refined = GeometryTransforms._refine_mask_mad(src, dst, np.eye(3), mask, 2.5, 3.0)
         assert int(refined.sum()) >= 40, "MAD не має різати здорові матчі"
 
     def test_never_drops_below_minimum_for_homography(self):
@@ -92,12 +94,12 @@ class TestRefineMaskNeverGrows:
         src, dst, _ = _split_matches(30, 30)
         mask = np.zeros((60, 1), dtype=np.uint8)
         mask[:5] = 1
-        refined = G._refine_mask_mad(src, dst, np.eye(3), mask, 0.0, 3.0)
-        assert int(refined.sum()) >= G._MIN_HOMOGRAPHY_PTS
+        refined = GeometryTransforms._refine_mask_mad(src, dst, np.eye(3), mask, 0.0, 3.0)
+        assert int(refined.sum()) >= GeometryTransforms._MIN_HOMOGRAPHY_PTS
 
     def test_none_mask_is_passthrough(self):
         src, dst, _ = _split_matches(10, 10)
-        assert G._refine_mask_mad(src, dst, np.eye(3), None, 2.5, 3.0) is None
+        assert GeometryTransforms._refine_mask_mad(src, dst, np.eye(3), None, 2.5, 3.0) is None
 
 
 class TestEstimateHomographyIntegration:
@@ -105,8 +107,8 @@ class TestEstimateHomographyIntegration:
         """Через публічний API: use_mad_ransac не має завищувати лічильник."""
         src, dst, _ = _split_matches(40, 20, seed=7)
 
-        _H_off, mask_off = G.estimate_homography(src, dst, use_mad_ransac=False)
-        _H_on, mask_on = G.estimate_homography(src, dst, use_mad_ransac=True)
+        _H_off, mask_off = GeometryTransforms.estimate_homography(src, dst, use_mad_ransac=False)
+        _H_on, mask_on = GeometryTransforms.estimate_homography(src, dst, use_mad_ransac=True)
 
         assert mask_off is not None and mask_on is not None
         n_off, n_on = int(mask_off.sum()), int(mask_on.sum())

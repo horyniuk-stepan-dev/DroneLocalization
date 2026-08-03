@@ -1,7 +1,10 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    # Ruff version.
-    rev: v0.1.9
+    # Ruff version. МУСИТЬ збігатися з пінами в ci.yml і pyproject.toml:
+    # репозиторій відформатовано сучасним ruff, а v0.1.9 форматує інакше
+    # (9 файлів "would be reformatted") — розбіжні піни означали, що локальний
+    # хук і CI перевіряли РІЗНІ правила.
+    rev: v0.16.1
     hooks:
       - id: ruff
         args: [ --fix ]

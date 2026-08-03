@@ -28,13 +28,13 @@ def _clean(obj: Any) -> Any:
     """JSON-comparable + tolerant of last-ULP float noise on the same machine."""
     if isinstance(obj, dict):
         return {k: _clean(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, list | tuple):
         return [_clean(v) for v in obj]
     if isinstance(obj, np.ndarray):
         return _clean(obj.tolist())
     if isinstance(obj, np.integer):
         return int(obj)
-    if isinstance(obj, (float, np.floating)):
+    if isinstance(obj, float | np.floating):
         return round(float(obj), 9)
     return obj
 

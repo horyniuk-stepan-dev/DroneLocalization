@@ -401,7 +401,6 @@
         "fallback_to_webmercator": true,
         "anchor_rmse_threshold_m": 3.0,
         "anchor_max_error_m": 5.0,
-        "propagation_disagreement_threshold_m": 2.0,
         "localizer_sample_points": 9,
         "localizer_expected_spread_m": 150.0
     },

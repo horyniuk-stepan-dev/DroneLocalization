@@ -13,7 +13,9 @@ class ProjectionConfig(BaseModel):
     fallback_to_webmercator: bool = True
     anchor_rmse_threshold_m: float = 3.0
     anchor_max_error_m: float = 5.0
-    propagation_disagreement_threshold_m: float = 2.0
+    # propagation_disagreement_threshold_m ВИДАЛЕНО: жоден код його не читав.
+    # Живий поріг розбіжності якорів — graph_optimization.anchor_loo_threshold_m
+    # (див. PoseGraphDiagnostics.leave_one_out_anchor_check).
     localizer_sample_points: int = 9
     localizer_expected_spread_m: float = 150.0
 
