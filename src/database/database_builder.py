@@ -286,7 +286,13 @@ class DatabaseBuilder:
                 logger.info(f"VRAM before dimension detection: {free_mb / (1024**2):.1f}MB free")
 
             logger.info("Detecting descriptor dimension...")
-            if hasattr(nv_model, "embed_dim"):
+            if feature_extractor.vlad_aggregator is not None:
+                # RESEARCH 2.1: при VLAD розмірність задає словник (out_dim),
+                # а не бекбон. Пробінг nv_model повернув би розмір CLS (1024),
+                # і схема LanceDB/HDF5 розійшлася б із тим, що реально пише
+                # FeatureExtractor (256) → Arrow cast error на першому флаші.
+                self.descriptor_dim = int(feature_extractor.global_descriptor_dim)
+            elif hasattr(nv_model, "embed_dim"):
                 self.descriptor_dim = int(nv_model.embed_dim)
             else:
                 # Use a small dummy tensor directly to save VRAM
