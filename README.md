@@ -6,15 +6,20 @@
 
 - **Desktop GUI (PyQt6)**: Багатопотоковий графічний інтерфейс для Windows, оптимізований для роботи в реальному часі.
 - **Headless режим**: Серверне розгортання з WebSocket + REST API для зовнішніх інтеграцій.
-- **Семантична глобальна локалізація (DINOv2)**: Використання Foundation Model від Meta для вилучення глобальних дескрипторів, стійких до змін освітлення, тіней та пір року.
+- **Семантична глобальна локалізація (DINOv3 / DINOv2)**: Foundation Model від Meta для глобальних дескрипторів, стійких до змін освітлення, тіней та пір року. За замовчуванням — **DINOv3 ViT-L/16**, попередньо навчена на 493M супутникових знімків (`models.global_descriptor.backend = "dinov3"`); DINOv2 ViT-L/14 залишається як альтернативний бекенд.
+- **VLAD-агрегація (AnyLoc, опційно)**: Ненавчена VLAD-агрегація патч-токенів DINOv3 замість CLS-дескриптора — вмикається у конфізі, потребує словника (`scripts/build_vlad_vocab.py`) і перебудови бази.
 - **Фільтрація динамічних об'єктів (YOLOv11-Seg)**: Автоматичне нейромережеве маскування рухомих об'єктів (машин, людей) для прив'язки лише до стабільної геометрії.
 - **Адаптивний препроцесинг (CLAHE)**: Локальне вирівнювання контрасту для витягування текстур із глибоких тіней.
-- **Гібридний матчинг ознак**: Використання **ALIKED + LightGlue** для високоточного зіставлення ключових точок у складних сценаріях.
+- **Гібридний матчинг ознак**: Використання **ALIKED + LightGlue** для високоточного зіставлення ключових точок у складних сценаріях; **RDD** доступний як альтернативний детектор локальних ознак.
 - **Оцінка глибини (Depth-Anything-V2)**: Монокулярна оцінка глибини для масштабно-усвідомленої локалізації.
 - **Мульти-якірне калібрування**: Інтерактивне задання GPS-якорів з автоматичною оптимізацією через граф поз (5-DoF Levenberg-Marquardt).
-- **Інтелектуальний трекінг**: Згладжування траєкторії через **Kalman Filter** та детекція аномалій за допомогою Z-score.
+- **Інтелектуальний трекінг**: Згладжування траєкторії через **Kalman Filter**, fixed-lag згладжувач (servo-режим) та детекція аномалій за Z-score.
+- **Трекінг об'єктів**: Детекція та проєкція рухомих об'єктів із кадру в GPS-координати.
+- **Мульти-база / мульти-калібрування**: Одночасне завантаження кількох баз та калібрувань із перемиканням активної під час локалізації.
 - **Інтерактивна карта**: Візуалізація Field of View (FOV) та маршруту на Leaflet карті у реальному часі.
 - **Експорт результатів**: CSV, GeoJSON та KML формати для збереження локалізаційних даних.
+- **Шифрування проєкту (at-rest)**: Опційне парольне шифрування файлів проєкту (бази, калібрування, відео) з дешифруванням у пам'ять під час завантаження.
+- **Автопідбір під залізо**: Автоматичне визначення GPU/CPU-профілю та тюнінг батчів, потоків і бюджету VRAM (`models.performance.auto_tune`).
 
 ## 📋 Вимоги до системи
 
@@ -77,12 +82,52 @@ pip install -r third_party/Depth-Anything-V2/requirements.txt
 
 ### 1.3 Завантаження ваг моделей
 
+**Основний спосіб — архів `models.zip` з Google Drive.** Автоматичне завантаження
+покриває не всі моделі: `scripts/download_models.py` тягне лише `yolo11n-seg.pt` і
+`depth_anything_v2_vits.pth`, а ваги RDD та **DINOv3** так завантажити не вийде —
+`facebook/dinov3-vitl16-pretrain-sat493m` є gated-репозиторієм HuggingFace і потребує
+окремо схваленого доступу.
+
 ```powershell
-# Автоматичне завантаження всіх необхідних ваг
-python scripts/download_models.py
+# Розпакувати архів у корінь репозиторію — має утворитися папка models/
+Expand-Archive models.zip -DestinationPath .
 ```
 
-Або завантажте `models.zip` вручну [за цим посиланням](https://drive.google.com/drive/folders/1qyO9AtUNkmkHXswvCbNkYcoTv8ChBbyP?usp=sharing) та розпакуйте у `models/weights/`.
+Архів [за цим посиланням](https://drive.google.com/drive/folders/1qyO9AtUNkmkHXswvCbNkYcoTv8ChBbyP?usp=sharing).
+Після розпакування структура має бути такою:
+
+```
+models/
+├── yolo11n-seg.pt / .onnx / .engine   # маскування динаміки
+├── depth_anything_v2_vits.pth         # оцінка глибини
+├── RDD-v*.pth, RDD_lg-v*.pth          # альтернативний детектор ознак
+├── vlad_vocab_c32_p256.npz            # словник VLAD (опційно)
+└── .cache/                            # torch.hub + HuggingFace кеш (DINOv2/DINOv3)
+```
+
+> `models/` — **єдиний** корінь зберігання ваг: `config.paths.ensure_model_cache_env`
+> перенаправляє `TORCH_HOME`, `HF_HOME` і `HUGGINGFACE_HUB_CACHE` у `models/.cache/`,
+> тож нічого не осідає у `C:\Users\<you>\.cache`.
+
+**Якщо ви завантажуєте DINOv3 самостійно** (замість готового кешу з архіву):
+
+1. Запросіть доступ до `facebook/dinov3-vitl16-pretrain-sat493m` на HuggingFace і дочекайтесь схвалення.
+2. Залогіньтесь так, щоб токен ліг у кеш проєкту, інакше буде 401:
+
+```powershell
+$env:HF_HOME = "$PWD\models\.cache\huggingface"
+hf auth login          # старіші версії huggingface_hub: huggingface-cli login
+```
+
+> **Безпека:** DINOv3 вантажиться з `trust_remote_code=True`. Зафіксуйте
+> `models.global_descriptor.dinov3.hf_revision` (commit hash), щоб зміна upstream-коду
+> не перетворилась на виконання чужого коду на вашій машині. Порожнє значення = latest.
+
+Часткове довантаження (YOLO + Depth-Anything) залишається доступним:
+
+```powershell
+python scripts/download_models.py
+```
 
 > **Примітка:** PyTorch з підтримкою CUDA встановлюється окремо згідно з
 > [офіційною інструкцією](https://pytorch.org/get-started/locally/), оскільки
@@ -105,8 +150,10 @@ python main.py --headless --project /шлях/до/проєкту --source rtsp:
 |---|---|---|
 | `--project` | обов'язково | Шлях до директорії проєкту |
 | `--source` | обов'язково | Шлях до відеофайлу або RTSP/HTTP потік |
-| `--ws-port` | 8765 | Порт WebSocket сервера |
-| `--rest-port` | 8080 | Порт REST API сервера |
+| `--ws-port` | з конфігу (`network_api.ws_port`) | Порт WebSocket сервера |
+| `--rest-port` | з конфігу (`network_api.rest_port`) | Порт REST API сервера |
+| `--supervise` | вимкнено | Запуск пайплайна в дочірньому процесі з автоперезапуском після падіння |
+| `--max-restarts` | 0 (без ліміту) | Зупинитись після N перезапусків (лише зі `--supervise`) |
 
 ## 📖 Workflow
 
@@ -143,20 +190,26 @@ python main.py --headless --project /шлях/до/проєкту --source rtsp:
 
 ```
 src/
-├── core/             # Lifecycle проєкту, headless runner, експорт результатів
-├── models/           # AI обгортки (DINOv2, ALIKED, YOLOv11, LightGlue, TensorRT)
-├── database/         # HDF5 v2 + LanceDB (Builder, Loader)
-├── localization/     # Основний пайплайн (Localizer, FeatureMatcher, retrieval)
-├── geometry/         # Математика (Affine, Homography, PoseGraph, UTM координати)
+├── core/             # Lifecycle проєкту, headless runner, реєстр проєктів, експорт
+├── models/           # AI обгортки (DINOv3/DINOv2, ALIKED, RDD, YOLOv11, LightGlue, VLAD, TensorRT)
+├── database/         # HDF5 v2 + LanceDB (Builder, Loader, keyframe selector, spatial index)
+├── localization/     # Основний пайплайн (Localizer, matcher, retrieval, patchify, верифікація)
+├── geometry/         # Математика (Affine, Homography, pose_graph 5-DoF, UTM координати, GSD)
 ├── calibration/      # Управління GPS-якорями та пропагація координат
-├── tracking/         # Kalman Filter та Outlier Detector
+├── tracking/         # Kalman Filter, fixed-lag smoother, Outlier Detector, трекер об'єктів
 ├── depth/            # Монокулярна оцінка глибини (Depth-Anything-V2)
 ├── network/          # WebSocket сервер, REST API, брокер координат
+├── security/         # Шифрування at-rest, сканування проєкту
 ├── video/            # Декодування відео кадрів
-├── workers/          # QThread фонові потоки (трекінг, БД, калібрування, панорами)
+├── workers/          # QThread фонові потоки (трекінг, БД, пропагація, панорами, шифрування)
 ├── gui/              # PyQt6 інтерфейс (MainWindow, mixins, widgets, dialogs)
-└── utils/            # Логування (Loguru), конфігурація, CLAHE, телеметрія
+└── utils/            # Логування (Loguru), CLAHE, hardware profile, телеметрія, fault injection
+
+config/               # Pydantic-конфіг по доменах: models, database, localization, graph, app, access
 ```
+
+> Детальні діаграми потоків (build / calibration / localization) — у `docs/architecture.md`,
+> математика графа поз — у `docs/POSE_GRAPH_MATH.md`.
 
 ## 🔧 Розробка
 
@@ -178,6 +231,16 @@ ruff format src/
 
 ```powershell
 python scripts/compile_dinov2_trt.py
+```
+
+### Корисні скрипти
+
+```powershell
+python scripts/benchmark_hardware.py     # профіль заліза та рекомендовані параметри
+python scripts/build_vlad_vocab.py       # словник VLAD на референсних кадрах
+python scripts/encrypt_project.py        # шифрована копія проєкту
+python scripts/soak_test.py              # тривалий стрес-тест зі штучними збоями
+python scripts/validate_vs_ground_truth.py  # порівняння з ground truth симулятора
 ```
 
 ### Компіляція у .exe

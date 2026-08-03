@@ -140,6 +140,7 @@ flowchart TD
 | `src/workers/` | QThread-обгортки: database, calibration propagation, tracking, panorama, video decode |
 | `src/gui/` | `MainWindow`, mixins/controllers, widgets (map/video/control), dialogs |
 | `src/network/` | REST + WebSocket сервери телеметрії, coordinates broker |
+| `src/security/` | Шифрування at-rest (`at_rest.py`) і сканування проєкту на незашифровані артефакти (`project_scan.py`) |
 | `src/depth/`, `src/utils/`, `src/video/` | глибина, утиліти (I/O, логи, нормалізація, телеметрія), джерела відео |
 
 ---
@@ -147,7 +148,7 @@ flowchart TD
 ## Життєвий цикл моделей (VRAM)
 
 `ModelManager` (`src/models/model_manager.py`) — LRU-реєстр із бюджетом VRAM,
-евікшном і pinning'ом. Моделі великі (DINOv2 ~1.6GB, LightGlue ~0.8GB), тож на 8GB-картах
+евікшном і pinning'ом. Моделі великі (DINOv3/DINOv2 ~1.6GB, LightGlue ~0.8GB), тож на 4–8GB-картах
 одночасно тримається лише потрібний набір.
 
 ```mermaid
