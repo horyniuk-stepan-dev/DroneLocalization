@@ -13,7 +13,7 @@ import pytest
 
 from src.security.at_rest import decrypt_bytes, is_encrypted
 
-_REPO = Path(__file__).resolve().parent.parent
+_REPO = Path(__file__).resolve().parents[3]
 _spec = importlib.util.spec_from_file_location(
     "encrypt_project", _REPO / "scripts" / "encrypt_project.py"
 )

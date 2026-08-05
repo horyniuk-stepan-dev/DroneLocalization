@@ -16,12 +16,11 @@ from typing import Any
 import numpy as np
 import pytest
 
-# Import the fakes directly from tests/fixtures to avoid a name clash with the
-# stray site-packages ``tests`` package that ultralytics installs.
-sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+_TESTS = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_TESTS / "fixtures"))
 from localizer_fakes import build_localizer, synthetic_frame  # noqa: E402
 
-_BASELINE = Path(__file__).parent / "fixtures" / "localization_baseline.json"
+_BASELINE = _TESTS / "fixtures" / "localization_baseline.json"
 
 
 def _clean(obj: Any) -> Any:

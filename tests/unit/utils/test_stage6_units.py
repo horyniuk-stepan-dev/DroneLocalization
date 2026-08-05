@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from config.graph import GraphOptimizationConfig
 from scripts.validate_vs_telemetry import compute_report, mercator_y_to_lat

@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from scripts.validate_vs_telemetry import (  # noqa: E402
     affine_angle_deg,
     classify_slots,

@@ -277,7 +277,7 @@ def _load_summarize():
     import importlib.util
     from pathlib import Path
 
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parents[3]
     spec = importlib.util.spec_from_file_location("soak_test", root / "scripts" / "soak_test.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
