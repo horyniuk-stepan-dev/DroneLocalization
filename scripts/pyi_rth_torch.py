@@ -4,6 +4,7 @@ torch.__init__ uses sysconfig/sys.exec_prefix to locate its DLL directory,
 but these paths are wrong inside a PyInstaller bundle. This hook adds
 torch/lib to the DLL search path before torch gets imported.
 """
+
 import os
 import sys
 

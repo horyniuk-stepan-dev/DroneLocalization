@@ -1,21 +1,7 @@
-"""Запобіжники temporal-VO (сесія 2026-07-12).
+"""Temporal Visual Odometry (VO) guards.
 
-Ловлять два класи отруєних temporal-ребер, які резидуали оптимізатора
-НЕ бачать (див. docs/CALIBRATION_DEBUG_SESSION_2026-07-11.md):
-
-1. Дегенеративна H від хибного RANSAC-консенсусу (мало матчів на
-   повторюваній ріллі) → дикий зсув/масштаб/кут одного ребра —
-   ``temporal_edge_sane``.
-2. Консистентний аліасинг: цілий прогін ребер бреше ОДНАКОВО (зсув на
-   період ріллі), ланцюг внутрішньо узгоджений, тож у "апендикса" без
-   другого якоря резидуали малі, а траєкторія — на кілометри вбік.
-   Єдина незалежна опора — якорі: ``check_anchor_gaps`` компонує
-   temporal-ланцюг між сусідніми якорями і порівнює з дельтою самих
-   якорів; ``downweight_gap_edges`` глушить неузгоджені проміжки до
-   оптимізації; ``select_gap_fallback_frames`` після неї відмічає кадри
-   для перезаповнення штатною інтерполяцією (pchip/лінійною по якорях).
-
-Чисті функції без Qt/torch — тестуються в будь-якому середовищі.
+Sanity checks for temporal graph edges to detect degenerate transformations (wild rotation/scale/shifts)
+and consistent aliasing across un-anchored gaps. Pure Python functions without Qt/PyTorch dependencies.
 """
 
 from __future__ import annotations
@@ -39,21 +25,20 @@ def temporal_edge_sane(
     max_scale_ratio: float = 1.4,
     max_shift_frac: float = 1.2,
 ) -> tuple[bool, str]:
-    """Санітарні межі ОДНОГО temporal-ребра. Повертає (ok, причина).
-
-    Межі свідомо м'які: мета — відсікти лише дегенеративні трансформації
-    (масштаб ×2, поворот 90°, зсув на кілька кадрів), а не нормальний рух.
-    """
+    """Sanity bounds for a SINGLE temporal edge. Returns (ok, reason)."""
     M = np.asarray(similarity_2x3, dtype=np.float64)
     _, _, sx, sy, angle = decompose_affine_5dof(M)
 
     rot_deg = abs(float(np.degrees(angle)))
     if rot_deg > max_rotation_deg:
-        return False, f"поворот {rot_deg:.1f}° > {max_rotation_deg:.0f}°"
+        return False, f"rotation {rot_deg:.1f}° > {max_rotation_deg:.0f}°"
 
     max_log = float(np.log(max(max_scale_ratio, 1.0 + 1e-9)))
     if abs(np.log(max(sx, 1e-9))) > max_log or abs(np.log(max(sy, 1e-9))) > max_log:
-        return False, f"масштаб ({sx:.3f},{sy:.3f}) поза [1/{max_scale_ratio},{max_scale_ratio}]"
+        return (
+            False,
+            f"scale ({sx:.3f},{sy:.3f}) out of bounds [1/{max_scale_ratio},{max_scale_ratio}]",
+        )
 
     cx, cy = frame_w / 2.0, frame_h / 2.0
     dcx = M[0, 0] * cx + M[0, 1] * cy + M[0, 2] - cx
@@ -62,7 +47,7 @@ def temporal_edge_sane(
     diag = float(np.hypot(frame_w, frame_h))
     limit = max_shift_frac * diag * max(int(gap), 1)
     if shift > limit:
-        return False, f"|Δцентр| {shift:.0f}px > {limit:.0f}px (gap={gap})"
+        return False, f"|Δcenter| {shift:.0f}px > {limit:.0f}px (gap={gap})"
 
     return True, ""
 
@@ -73,22 +58,20 @@ def check_anchor_gaps(
     sign: float,
     max_dev_m: float = 150.0,
 ) -> dict[tuple[int, int], dict]:
-    """Звірка temporal-ланцюга кожного проміжку між СУСІДНІМИ якорями.
+    """Checks the temporal chain in gaps between ADJACENT anchors.
 
-    Для пари якорів (a, b): стартуємо зі стану якоря a, компонуємо
-    temporal-ребра (той самий предикт, що у BFS/LOO) до b і порівнюємо
-    передбачений центр із центром якоря b.
+    For anchor pair (a, b): starts from state of anchor a, composes
+    temporal edges to b and compares predicted center with anchor b's center.
 
-    Статуси: "ok" — розбіжність ≤ max_dev_m; "inconsistent" — ланцюг
-    повний, але бреше (консистентний аліасинг); "broken" — ланцюг
-    розірваний (нема ребра всередині проміжку).
+    Statuses: "ok" — deviation <= max_dev_m; "inconsistent" — chain
+    is complete but deviates; "broken" — missing edge inside gap.
     """
     ids = sorted(anchor_states)
     report: dict[tuple[int, int], dict] = {}
     if len(ids) < 2:
         return report
 
-    # Для кожного вузла — temporal-ребро вперед із мінімальним стрибком
+    # For each node — forward temporal edge with minimal jump
     fwd: dict[int, GraphEdge] = {}
     for e in edges:
         if e.edge_type != "temporal":
@@ -132,11 +115,7 @@ def downweight_gap_edges(
     gap_pairs: list[tuple[int, int]],
     factor: float = 0.05,
 ) -> int:
-    """Вага ×factor для temporal-ребер усередині зазначених проміжків.
-
-    Неузгоджений проміжок не має права торсіонити решту графа (LOO-конфлікт
-    якоря #286 на 294 м — саме цей механізм). Повертає кількість ребер.
-    """
+    """Applies weight factor to temporal edges within specified gaps."""
     if not gap_pairs:
         return 0
     n = 0
@@ -158,13 +137,7 @@ def select_gap_fallback_frames(
     flagged_gaps: list[tuple[int, int]],
     max_dev_m: float = 150.0,
 ) -> set[int]:
-    """Кадри позначених проміжків, чиї центри відхиляються від прямої
-    якір→якір понад поріг → кандидати на перезаповнення інтерполяцією.
-
-    ``results_centers`` МАЄ бути в тій самій (локальній) системі координат,
-    що й ``anchor_states``. Кадри без результату не повертаються — вони й
-    так невалідні та заповнюються інтерполяцією.
-    """
+    """Selects candidate frames in flagged gaps whose centers deviate beyond threshold."""
     out: set[int] = set()
     for a, b in flagged_gaps:
         if a not in anchor_states or b not in anchor_states or b - a < 2:

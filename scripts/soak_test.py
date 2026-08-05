@@ -149,7 +149,9 @@ class _StateMonitor(threading.Thread):
                 inl = lp.get("inliers")
                 conf = lp.get("confidence")
                 if inl is not None:
-                    self.min_inliers = inl if self.min_inliers is None else min(self.min_inliers, inl)
+                    self.min_inliers = (
+                        inl if self.min_inliers is None else min(self.min_inliers, inl)
+                    )
                 if conf is not None:
                     self.min_confidence = (
                         conf if self.min_confidence is None else min(self.min_confidence, conf)
@@ -214,19 +216,25 @@ def main() -> int:
     )
     parser.add_argument("--report", default="", help="Write the JSON report to this path")
     parser.add_argument(
-        "--degraded-min-inliers", type=int, default=0,
+        "--degraded-min-inliers",
+        type=int,
+        default=0,
         help="Flag a fix below this many inliers as DEGRADED (0 = off; tests the "
-             "state machine's DEGRADED branch against the content-blind gap)",
+        "state machine's DEGRADED branch against the content-blind gap)",
     )
     parser.add_argument(
-        "--degraded-min-confidence", type=float, default=0.0,
+        "--degraded-min-confidence",
+        type=float,
+        default=0.0,
         help="Flag a fix below this confidence as DEGRADED (0 = off)",
     )
     parser.add_argument(
-        "--propagation-stale-sec", type=float, default=0.0,
+        "--propagation-stale-sec",
+        type=float,
+        default=0.0,
         help="Flag TRACKING as DEGRADED after this many seconds with no fresh "
-             "keyframe anchor (0 = off; tests the §4a anchor-staleness gate that "
-             "closes the content-blind blackout gap)",
+        "keyframe anchor (0 = off; tests the §4a anchor-staleness gate that "
+        "closes the content-blind blackout gap)",
     )
     args = parser.parse_args()
 

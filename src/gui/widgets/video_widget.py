@@ -33,8 +33,8 @@ class VideoWidget(QGraphicsView):
 
     def display_frame(self, pixmap: QPixmap):
         self._video_item.setPixmap(pixmap)
-        # A7: fitInView — лише при зміні розміру контенту. Щокадровий виклик
-        # (30 разів/с) перераховував трансформацію в'ю і навантажував GUI-потік.
+        # fitInView is called only when the content size changes; calling it
+        # every frame (30×/s) would recalculate the view transform and stress the GUI thread.
         rect = self._video_item.boundingRect()
         if rect != getattr(self, "_last_scene_rect", None):
             self._scene.setSceneRect(rect)
@@ -50,7 +50,7 @@ class VideoWidget(QGraphicsView):
 
     def draw_numbered_point(self, x: float, y: float, label: str, color: QColor):
         """Draw a filled circle with a label at (x, y) in ACTUAL image pixel coordinates."""
-        # Конвертуємо з фактичних пікселів у логічні координати сцени
+        # Convert from actual pixels to logical scene coordinates
         dpr = self._dpr()
         lx, ly = x / dpr, y / dpr
 
@@ -150,20 +150,20 @@ class VideoWidget(QGraphicsView):
             pm_dpr = self._dpr()
             br = self._video_item.boundingRect()
 
-            # Screen devicePixelRatio — може відрізнятися від pixmap dpr
+            # Screen devicePixelRatio — may differ from pixmap dpr
             screen = self.screen()
             screen_dpr = screen.devicePixelRatio() if screen else 1.0
 
-            # Якщо boundingRect ≠ pixmap size, масштабуємо вручну
+            # If boundingRect ≠ pixmap size, scale manually
             if br.width() > 0 and br.height() > 0:
                 scale_x = pm.width() / br.width()
                 scale_y = pm.height() / br.height()
             else:
                 scale_x = scale_y = 1.0
 
-            # Множимо на pm_dpr (Device Pixel Ratio), оскільки Qt на High-DPI
-            # повертає "логічні" координати (напр. 1280 замість 1920).
-            # Нам потрібні ФІЗИЧНІ пікселі зображення для метчингу бази даних.
+            # Multiply by pm_dpr because Qt on High-DPI returns logical
+            # coordinates (e.g. 1280 instead of 1920).
+            # Physical pixels are required for feature matching against the database.
             actual_x = (item_pos.x() * scale_x * pm_dpr) + 0.5
             actual_y = (item_pos.y() * scale_y * pm_dpr) + 0.5
 

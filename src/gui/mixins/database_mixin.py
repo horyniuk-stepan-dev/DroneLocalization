@@ -27,14 +27,14 @@ logger = get_logger(__name__)
 
 
 class DatabaseMixin:
-    # ── Реєстр проєктів (ініціалізується один раз) ───────────────────────────
+    # ── Project registry (initialised once) ─────────────────────────────────────
 
     def _get_registry(self) -> ProjectRegistry:
         if not hasattr(self, "_project_registry"):
             self._project_registry = ProjectRegistry()
         return self._project_registry
 
-    # ── Нова місія ────────────────────────────────────────────────────────────
+    # ── New mission ────────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_new_mission(self):
@@ -49,12 +49,12 @@ class DatabaseMixin:
         if not workspace_dir or not video_path:
             return
 
-        # Створюємо структуру проєкту
+        # Create project directory structure
         if not self.project_manager.create_project(workspace_dir, mission_data):
             QMessageBox.critical(self, "Помилка", "Не вдалося створити проєкт!")
             return
 
-        # Реєструємо в реєстрі
+        # Register in the project registry
         self._get_registry().register(
             project_dir=str(self.project_manager.project_dir),
             name=self.project_manager.project_name,
@@ -64,7 +64,7 @@ class DatabaseMixin:
         self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
         self._start_database_generation(video_path, self.project_manager.database_path)
 
-    # ── Генерація бази ────────────────────────────────────────────────────────
+    # ── Database generation ────────────────────────────────────────────────────────
 
     def _find_source_id_by_db_path(self, db_path: str) -> str | None:
         """Знаходить source_id, чий database_file відповідає db_path."""
@@ -91,18 +91,12 @@ class DatabaseMixin:
         if self._refuse_if_encrypted_project("Генерація бази даних"):
             return
 
-        # ВИПРАВЛЕННЯ: НЕ ініціалізуємо WEB_MERCATOR при старті генерації бази.
-        # UTM-конвертер буде ініціалізований автоматично після отримання першого
-        # GPS-якоря у CalibrationMixin (через _on_first_gps_anchor або еквівалент),
-        # щоб забезпечити ізотропний евклідів простір для всієї геометричної математики.
-        # WEB_MERCATOR залишається лише як відображальний шар у MapWidget.
-        #
-        # Якщо якорів ще немає, залишаємо конвертер у стані "not initialized" (UTM, без ref),
-        # щоб перший GPS-якір автоматично зафіксував зону UTM.
+        # Do NOT initialize WEB_MERCATOR when starting database generation.
+        # UTM converter will be initialized automatically after first GPS anchor.
         if not self.calibration.is_calibrated:
             self.calibration.converter = CoordinateConverter(
                 "UTM"
-            )  # ref_gps=None → авто при першому якорі
+            )  # ref_gps=None → auto on first anchor
 
         self.control_panel.btn_new_mission.setEnabled(False)
         self.control_panel.btn_load_db.setEnabled(False)
@@ -118,9 +112,7 @@ class DatabaseMixin:
                 logger.warning(f"Could not close database: {e}")
         self.database = None
 
-        # CRITICAL: Вивантажуємо це джерело і з мульти-менеджера, інакше його
-        # retriever триматиме stale handle на vectors.lance, який зараз буде
-        # перезаписано (→ "LanceDB query failed: Not found" при трекінгу).
+        # Unload source from multi-manager before overwriting vectors.lance
         if getattr(self, "db_manager", None):
             sid = self._find_source_id_by_db_path(save_path)
             if sid:
@@ -165,9 +157,7 @@ class DatabaseMixin:
             self.database.close()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            # У мульти-режимі перезавантажуємо джерело всередині db_manager,
-            # щоб retriever отримав СВІЖИЙ LanceDB handle (stale handle після
-            # перезапису vectors.lance ламає весь vector search).
+            # Reload source in db_manager for fresh LanceDB handle
             reloaded = False
             if getattr(self, "db_manager", None):
                 sid = self._find_source_id_by_db_path(db_path)
@@ -190,7 +180,7 @@ class DatabaseMixin:
             f"Проєкт: {self.project_manager.project_name} | База: {db_path}"
         )
 
-        # Оновити реєстр та інфо-панель
+        # Update registry and info panel
         if self.project_manager.is_loaded:
             self._get_registry().refresh_status(str(self.project_manager.project_dir))
         self._update_project_info_panel()
@@ -212,7 +202,7 @@ class DatabaseMixin:
         self.control_panel.update_status("Генерацію скасовано користувачем")
         self.control_panel.update_progress(0)
 
-    # ── Відкриття проєкту ─────────────────────────────────────────────────────
+    # ── Project opening ────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_load_database(self):
@@ -227,18 +217,18 @@ class DatabaseMixin:
 
         self._open_project(path)
 
-    # ── Зашифрована копія проєкту ─────────────────────────────────────────────
+    # ── Encrypted project export ───────────────────────────────────────────────
 
     @pyqtSlot()
     def on_create_encrypted_copy(self):
-        """Побудувати зашифровану копію поточного проєкту (майстер не змінюється)."""
+        """Create an encrypted copy of the current project (master remains unchanged)."""
         if not self.project_manager.is_loaded:
-            QMessageBox.warning(self, "Увага", "Спочатку відкрийте проєкт!")
+            QMessageBox.warning(self, "Warning", "Please open the project first!")
             return
 
         src_dir = Path(self.project_manager.project_dir)
         parent_dir = QFileDialog.getExistingDirectory(
-            self, "Куди зберегти зашифровану копію", str(src_dir.parent)
+            self, "Save encrypted copy to", str(src_dir.parent)
         )
         if not parent_dir:
             return
@@ -246,7 +236,7 @@ class DatabaseMixin:
         dst_dir = Path(parent_dir) / f"{src_dir.name}_encrypted"
         if dst_dir.exists():
             QMessageBox.critical(
-                self, "Помилка", f"Тека вже існує (перезапис заборонено):\n{dst_dir}"
+                self, "Error", f"Directory already exists (overwriting not allowed):\n{dst_dir}"
             )
             return
 
@@ -254,7 +244,7 @@ class DatabaseMixin:
         if not dialog.exec() or not dialog.passphrase:
             return
 
-        self.status_bar.showMessage(f"Створення зашифрованої копії: {dst_dir.name}...")
+        self.status_bar.showMessage(f"Creating encrypted copy: {dst_dir.name}...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         self._encrypt_worker = EncryptCopyWorker(str(src_dir), str(dst_dir), dialog.passphrase)
@@ -266,28 +256,28 @@ class DatabaseMixin:
     @pyqtSlot(dict)
     def _on_encrypted_copy_done(self, summary: dict):
         QApplication.restoreOverrideCursor()
-        self.status_bar.showMessage("Зашифровану копію створено")
+        self.status_bar.showMessage("Encrypted copy created")
         if not summary["encrypted"]:
             QMessageBox.warning(
                 self,
-                "Увага",
-                "Копію створено, але вихідний проєкт порожній — нічого шифрувати.",
+                "Warning",
+                "Copy created, but source project is empty — nothing to encrypt.",
             )
             return
         QMessageBox.information(
             self,
-            "Готово",
-            f"Зашифровано файлів: {summary['total']} (усі, без винятків)\n\n"
-            f"Оригінал проєкту не змінено. Копія незмінна: застосунок відмовиться "
-            f"писати в неї — перебудову й калібрування робіть на майстрі.\n\n"
-            f"Пароль неможливо відновити — збережіть його в безпечному місці.",
+            "Done",
+            f"Encrypted files: {summary['total']} (all, without exceptions)\n\n"
+            f"Original project is not modified. Copy is immutable: application will refuse "
+            f"to write to it — rebuilds and calibration must be done on the master.\n\n"
+            f"Passphrase cannot be recovered — save it in a safe place.",
         )
 
     @pyqtSlot(str)
     def _on_encrypted_copy_error(self, message: str):
         QApplication.restoreOverrideCursor()
-        self.status_bar.showMessage("Помилка створення зашифрованої копії")
-        QMessageBox.critical(self, "Помилка", f"Не вдалося створити копію:\n{message}")
+        self.status_bar.showMessage("Encrypted copy creation failed")
+        QMessageBox.critical(self, "Error", f"Failed to create copy:\n{message}")
 
     def _refuse_if_encrypted_project(self, action: str) -> bool:
         """True (and shows why) if ``action`` would write into an encrypted copy.
@@ -299,10 +289,10 @@ class DatabaseMixin:
             return False
         QMessageBox.critical(
             self,
-            "Зашифрований проєкт",
-            f"{action} неможливо: це зашифрована копія для розгортання, "
-            f"вона незмінна.\n\nВиконайте цю дію на відкритому майстер-проєкті, "
-            f"а потім зберіть із нього нову зашифровану копію.",
+            "Encrypted project",
+            f"{action} is impossible: this is an encrypted copy for deployment, "
+            f"it is immutable.\n\nPerform this action on an open master project, "
+            f"and then create a new encrypted copy from it.",
         )
         return True
 
@@ -329,11 +319,11 @@ class DatabaseMixin:
             return True
 
         clear_passphrase()
-        self.status_bar.showMessage("Завантаження скасовано: потрібен пароль карти")
+        self.status_bar.showMessage("Loading cancelled: passphrase required")
         return False
 
     def _open_project(self, path: str):
-        """Завантажити проєкт за шляхом (використовується і для recent menu)."""
+        """Load project by path (used for recent menu as well)."""
         # A passphrase belongs to one project only — never let the previous one
         # silently decrypt (or fail against) the project being opened now.
         clear_passphrase()
@@ -344,20 +334,20 @@ class DatabaseMixin:
             return
 
         if not self.project_manager.load_project(path):
-            QMessageBox.critical(self, "Помилка", "Обрана папка не є валідним проєктом!")
+            QMessageBox.critical(self, "Error", "Selected folder is not a valid project!")
             return
 
         try:
             db_path = self.project_manager.database_path
 
-            # НОВЕ: Перевірка наявності бази даних
+            # Check whether the database file exists
             if not Path(db_path).exists():
                 video_path = self.project_manager.settings.video_path
                 reply = QMessageBox.question(
                     self,
-                    "База даних відсутня",
-                    f"Проєкт '{self.project_manager.project_name}' не має згенерованої бази даних.\n\n"
-                    f"Згенерувати базу зараз з відео:\n{Path(video_path).name}?",
+                    "Database missing",
+                    f"Project '{self.project_manager.project_name}' has no generated database.\n\n"
+                    f"Generate database now from video:\n{Path(video_path).name}?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.Yes:
@@ -367,16 +357,16 @@ class DatabaseMixin:
                     self._start_database_generation(video_path, db_path)
                     return
                 else:
-                    self.status_bar.showMessage("Завантаження скасовано: відсутня база даних")
+                    self.status_bar.showMessage("Loading cancelled: missing database")
                     return
 
             if self.database:
                 self.database.close()
-            # Закриваємо попередні мульти-менеджери
+            # Shut down previous multi-source managers
             if hasattr(self, "db_manager") and self.db_manager:
                 self.db_manager.close_all()
 
-            # Очищення стану попереднього проєкту
+            # Clear previous project state
             if hasattr(self, "calibration") and self.calibration:
                 self.calibration.clear()
 
@@ -388,44 +378,38 @@ class DatabaseMixin:
                 self._tracking_results = []
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                # Перевіряємо чи проєкт мультиджерельний
-                sources = self.project_manager.settings.get_enabled_sources()
-                is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
+            sources = self.project_manager.settings.get_enabled_sources()
+            is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
+            if is_multi and len(sources) > 0:
+                # Multi-source mode
+                project_dir = self.project_manager.project_dir
+                self.db_manager = MultiDatabaseManager(sources, project_dir, config=self.config)
+                self.calib_manager = MultiCalibrationManager()
+                self.calib_manager.load_all(sources, project_dir)
 
-                if is_multi and len(sources) > 0:
-                    # Мультиджерельний режим
-                    project_dir = self.project_manager.project_dir
-                    self.db_manager = MultiDatabaseManager(sources, project_dir, config=self.config)
-                    self.calib_manager = MultiCalibrationManager()
-                    self.calib_manager.load_all(sources, project_dir)
-
-                    # self.database — перше джерело для сумісності з UI
-                    first_id = (
-                        self.db_manager.all_source_ids[0]
-                        if self.db_manager.all_source_ids
-                        else None
-                    )
-                    if first_id:
-                        self.database = self.db_manager.get_database(first_id)
-                        self.calibration = self.calib_manager.get(first_id)
-                    else:
-                        raise RuntimeError("Мультиджерельний проєкт: жодна база не завантажена")
-
-                    logger.info(
-                        f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
-                        f"sources={self.db_manager.all_source_ids}"
-                    )
+                # self.database — first source for UI compatibility
+                first_id = (
+                    self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
+                )
+                if first_id:
+                    self.database = self.db_manager.get_database(first_id)
+                    self.calibration = self.calib_manager.get(first_id)
                 else:
-                    # Single-source режим (зворотна сумісність)
-                    self.db_manager = None
-                    self.calib_manager = None
-                    self.database = DatabaseLoader(db_path)
-            finally:
-                QApplication.restoreOverrideCursor()
+                    raise RuntimeError("Multi-source project: no databases loaded")
+
+                logger.info(
+                    f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
+                    f"sources={self.db_manager.all_source_ids}"
+                )
+            else:
+                # Single-source mode (backwards compatibility)
+                self.db_manager = None
+                self.calib_manager = None
+                self.database = DatabaseLoader(db_path)
+
             self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
 
-            # Оновити реєстр (завжди викликаємо register для збереження нових проєктів)
+            # Update registry
             registry = self._get_registry()
             registry.register(
                 project_dir=str(self.project_manager.project_dir),
@@ -435,63 +419,63 @@ class DatabaseMixin:
                 else "",
             )
 
-            # Завантажити калібрацію якщо є (single-mode)
+            # Load calibration if present (single mode)
             if self.calib_manager is None:
                 calib_path = self.project_manager.calibration_path
                 if calib_path and Path(calib_path).exists():
                     self.calibration.load(calib_path)
 
-            # Bug C: Синхронізація конвертера (пріоритет — БД, потім файл калібрації)
+            # Sync converter (DB priority, then calibration file)
             if self.database and self.database.converter is not None:
                 self.calibration.converter = self.database.converter
             elif self.calibration.converter and self.calibration.converter.is_initialized:
-                pass  # конвертер вже завантажений з calibration.json
+                pass  # converter loaded from calibration.json
 
-            if self.database.is_propagated:
+            if self.database and self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
                 self.status_bar.showMessage(
-                    f"Проєкт: {self.project_manager.project_name} (GPS: {n_valid}/{n_total} кадрів)"
+                    f"Project: {self.project_manager.project_name} (GPS: {n_valid}/{n_total} frames)"
                 )
             else:
                 self.status_bar.showMessage(
-                    f"Проєкт: {self.project_manager.project_name} (без GPS пропагації)"
+                    f"Project: {self.project_manager.project_name} (no GPS propagation)"
                 )
-            self.control_panel.update_status("Проєкт завантажено")
+            self.control_panel.update_status("Project loaded")
             self._update_project_info_panel()
 
         except Exception as e:
-            QMessageBox.critical(self, "Помилка", f"Не вдалося завантажити базу проєкту:\n{e}")
+            QMessageBox.critical(self, "Error", f"Failed to load project database:\n{e}")
+        finally:
+            QApplication.restoreOverrideCursor()
 
-    # ── Перевірка пропагації ─────────────────────────────────────────────────
+    # ── Propagation check ───────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_verify_propagation(self):
         if not self.database or not self.database.is_propagated:
-            QMessageBox.warning(
-                self, "Увага", "Дані пропагації відсутні або проєкт не завантажено!"
-            )
+            QMessageBox.warning(self, "Warning", "Propagation data missing or project not loaded!")
             return
 
         num_frames = self.database.get_num_frames()
         frame_valid = self.database.frame_valid
         frame_affine = self.database.frame_affine
 
-        # Отримуємо розміри кадру з метаданих
+        # Get frame dimensions from metadata
         width = self.database.metadata.get("frame_width", 1920)
         height = self.database.metadata.get("frame_height", 1080)
 
-        # Центр кадру в пікселях
+        # Frame centre in pixels
         center_px = np.array([[width / 2, height / 2]], dtype=np.float32)
 
         points_to_show = []
 
-        # Збираємо тільки валідні кадри (з кроком 5 для продуктивності на карті)
-        step = max(1, num_frames // 200)  # Максимум ~200 точок щоб не гальмував біндер
+        # Collect valid frames only (stride-5 for map rendering performance)
+        step = max(1, num_frames // 200)  # Max ~200 points to avoid slowing down the binder
 
         for i in range(0, num_frames, step):
             if frame_valid[i]:
-                # Приміняємо афінну матрицю (2x3)
+                # Apply affine matrix (2x3)
                 M = frame_affine[i]
                 # Metric = M * [x, y, 1]^T
                 metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
@@ -503,50 +487,48 @@ class DatabaseMixin:
                 points_to_show.append({"lat": float(lat), "lon": float(lon), "label": str(i)})
 
         if not points_to_show:
-            QMessageBox.information(
-                self, "Інформація", "Не знайдено жодного кадру з валідними координатами."
-            )
+            QMessageBox.information(self, "Information", "No frames with valid coordinates found.")
             return
 
         self.map_widget.show_verification_markers(points_to_show)
-        self.status_bar.showMessage(f"Відображено {len(points_to_show)} точок перевірки на карті.")
+        self.status_bar.showMessage(f"Displayed {len(points_to_show)} verification points on map.")
 
-    # ── Перегенерація бази ────────────────────────────────────────────────────
+    # ── Database regeneration ────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_rebuild_database(self):
         if not self.project_manager.is_loaded:
-            QMessageBox.warning(self, "Увага", "Спочатку завантажте проєкт!")
+            QMessageBox.warning(self, "Warning", "Please load the project first!")
             return
 
         # Before the confirmation prompt AND before the calibration save below —
         # that save is a write into the project and would otherwise raise.
-        if self._refuse_if_encrypted_project("Перегенерація бази даних"):
+        if self._refuse_if_encrypted_project("Database rebuild"):
             return
 
         video_path = self.project_manager.settings.video_path
         if not video_path or not Path(video_path).exists():
             QMessageBox.warning(
                 self,
-                "Увага",
-                f"Відео проєкту не знайдено:\n{video_path}\n\n"
-                "Перевірте шлях до відео у налаштуваннях проєкту.",
+                "Warning",
+                f"Project video not found:\n{video_path}\n\n"
+                "Check the video path in project settings.",
             )
             return
 
         reply = QMessageBox.question(
             self,
-            "Перегенерація бази",
-            f"Базу даних буде перезаписано!\n\n"
-            f"Відео: {Path(video_path).name}\n"
-            f"Калібрація буде збережена.\n\n"
-            f"Продовжити?",
+            "Database rebuild",
+            f"The database will be overwritten!\n\n"
+            f"Video: {Path(video_path).name}\n"
+            f"Calibration will be saved.\n\n"
+            f"Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Зберігаємо калібрацію перед перегенерацією
+        # Save calibration before regeneration
         if self.calibration.is_calibrated:
             calib_path = (
                 self._get_calibration_save_path()
@@ -559,19 +541,17 @@ class DatabaseMixin:
 
         self._start_database_generation(video_path, self.project_manager.database_path)
 
-    # ── Експорт результатів ───────────────────────────────────────────────────
+    # ── Results export ───────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_export_results(self):
         if not hasattr(self, "_tracking_results") or not self._tracking_results:
-            QMessageBox.warning(
-                self, "Увага", "Немає результатів для експорту!\n\nСпочатку виконайте відстеження."
-            )
+            QMessageBox.warning(self, "Warning", "No results to export!\n\nPerform tracking first.")
             return
 
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Експорт результатів",
+            "Export results",
             "tracking_results",
             "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
         )
@@ -584,9 +564,9 @@ class DatabaseMixin:
         if export_root is not None and project_is_encrypted(export_root):
             QMessageBox.critical(
                 self,
-                "Зашифрований проєкт",
-                "Експорт у зашифровану копію неможливий: трек місії потрапив би "
-                "туди у відкритому вигляді.\n\nОберіть теку поза проєктом.",
+                "Encrypted project",
+                "Export into an encrypted copy is impossible: the mission track would "
+                "be stored there in plain text.\n\nChoose a directory outside the project.",
             )
             return
 
@@ -615,17 +595,17 @@ class DatabaseMixin:
                 )
                 ResultExporter.export_kml(self._tracking_results, path, name=name)
 
-            self.status_bar.showMessage(f"Результати експортовано: {path}")
+            self.status_bar.showMessage(f"Results exported: {path}")
             QMessageBox.information(
-                self, "Успіх", f"Експортовано {len(self._tracking_results)} точок\n\n{path}"
+                self, "Success", f"Exported {len(self._tracking_results)} points\n\n{path}"
             )
         except Exception as e:
-            QMessageBox.critical(self, "Помилка", f"Помилка експорту:\n{e}")
+            QMessageBox.critical(self, "Error", f"Export error:\n{e}")
 
-    # ── Інфо-панель ───────────────────────────────────────────────────────────
+    # ── Info panel ──────────────────────────────────────────────────────────────
 
     def _update_project_info_panel(self):
-        """Оновити інформаційну панель проєкту у control_panel."""
+        """Update the project info panel in control_panel."""
         if not self.project_manager.is_loaded:
             self.control_panel.update_project_info()
             return
@@ -653,11 +633,11 @@ class DatabaseMixin:
             db_size_mb=db_size_mb,
         )
 
-        # Оновлюємо панель відеоджерел
+        # Update video sources panel
         self._refresh_sources_panel()
 
     def _refresh_sources_panel(self):
-        """Оновлює таблицю відеоджерел та бейдж активного джерела у ControlPanel."""
+        """Updates video sources table and active source badge in ControlPanel."""
         if not self.project_manager.is_loaded or not self.project_manager.settings:
             return
         sources_raw = self.project_manager.settings.video_sources or []
@@ -665,24 +645,23 @@ class DatabaseMixin:
             str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
         )
 
-        # Визначаємо активне джерело
+        # Get active source ID
         active_id = self._get_current_source_id()
 
-        # Отримуємо video_path для активного джерела
+        # Get video_path for active source
         video_path = ""
         for src_dict in sources_raw:
             if src_dict.get("source_id") == active_id:
                 video_path = src_dict.get("video_path", "")
                 break
 
-        # Якщо в settings не знайдено, fallback на загальний video_path
+        # Fallback to default video_path if missing
         if not video_path and self.project_manager.settings:
             video_path = self.project_manager.settings.video_path
 
         self.control_panel.set_active_source(active_id, video_path or "")
 
-        # Визначаємо які джерела вже мають пропагацію в HDF5
-        # (калібрування може бути вбудоване в HDF5 без окремого calibration.json)
+        # Check which sources are propagated
         propagated_ids: set[str] = set()
         if hasattr(self, "db_manager") and self.db_manager:
             for sid in self.db_manager.all_source_ids:
@@ -699,18 +678,18 @@ class DatabaseMixin:
             propagated_source_ids=propagated_ids,
         )
 
-    # ── Мультиджерельні слоти ─────────────────────────────────────────────────
+    # ── Multi-source slots ────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_add_video_source(self):
-        """Слот для кнопки 'Додати джерело'."""
+        """Slot for 'Add Source' button."""
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Помилка", "Спочатку відкрийте або створіть проєкт!")
             return
 
         from src.gui.dialogs.add_video_source_dialog import AddVideoSourceDialog
 
-        # Збираємо існуючі area_id
+        # Collect existing area_ids
         existing_areas = set()
         for src in self.project_manager.settings.video_sources or []:
             area = src.get("area_id", "")
@@ -723,18 +702,18 @@ class DatabaseMixin:
 
         new_source = dialog.get_source_config()
 
-        # Перевірка на дублікат
+        # Duplicate check
         if self.project_manager.settings.get_source(new_source.source_id) is not None:
             QMessageBox.warning(
                 self, "Помилка", f"Джерело з ID '{new_source.source_id}' вже існує в проєкті!"
             )
             return
 
-        # Додаємо до проєкту
+        # Add to project
         self.project_manager.settings.add_source(new_source)
         self.project_manager.save_project()
 
-        # Створюємо директорію для джерела
+        # Create directory for this source
         source_dir = self.project_manager.project_dir / "sources" / new_source.source_id
         source_dir.mkdir(parents=True, exist_ok=True)
 
@@ -756,7 +735,7 @@ class DatabaseMixin:
             return
 
         if source_id not in self.db_manager.all_source_ids:
-            # Джерело вимкнено або не має БД
+            # Source is disabled or has no database
             self.database = None
             self.calibration = None
             self.status_bar.showMessage(f"Джерело '{source_id}' вимкнено або недоступне")
@@ -784,7 +763,7 @@ class DatabaseMixin:
             return
 
         if action == "build_db":
-            # Генерація БД для конкретного джерела
+            # Generate database for this specific source
             video_path = source.video_path
             db_path = str(self.project_manager.project_dir / source.database_file)
             db_dir = Path(db_path).parent
@@ -792,7 +771,7 @@ class DatabaseMixin:
             self._start_database_generation(video_path, db_path)
 
         elif action == "calibrate":
-            # Поки що — відкриваємо стандартний калібрувальний діалог
+            # For now: open the standard calibration dialog
             self.status_bar.showMessage(
                 f"Для калібрування '{source_id}' використовуйте стандартний калібрувальний інструмент."
             )
@@ -805,7 +784,7 @@ class DatabaseMixin:
             if hasattr(self, "db_manager") and self.db_manager:
                 self.db_manager.toggle_source(source)
 
-                # Якщо вимкнули поточне джерело — перемикаємось на перше доступне
+                # If the currently active source was disabled, switch to the first available one
                 if not source.enabled and self._get_current_source_id() == source_id:
                     avail = self.db_manager.all_source_ids
                     if avail:

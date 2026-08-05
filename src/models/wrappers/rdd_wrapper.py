@@ -7,17 +7,17 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-# Lazy import RDD — потребує git clone https://github.com/xtcpete/rdd
+# Lazy import RDD — requires: git clone https://github.com/xtcpete/rdd
 _RDD_BUILD = None
 
 
 def _import_rdd():
-    """Lazy import RDD з third-party або models/rdd."""
+    """Lazy import RDD from third-party or models/rdd."""
     global _RDD_BUILD
     if _RDD_BUILD is not None:
         return _RDD_BUILD
 
-    # Пошук RDD пакету у кількох місцях
+    # Search for RDD package in multiple paths
     search_paths = [
         Path(__file__).resolve().parents[3] / "third_party" / "rdd",  # <project>/third_party/rdd
         Path(__file__).resolve().parents[3] / "models" / "rdd",  # <project>/models/rdd
@@ -49,17 +49,12 @@ def _import_rdd():
 
 
 class RDDWrapper:
-    """RDD (Robust Deformable Detector) wrapper — drop-in замість ALIKED.
+    """RDD (Robust Deformable Detector) wrapper — drop-in replacement for ALIKED.
 
-    RDD використовує deformable transformers для scale-invariant
-    детекції keypoints та побудови дескрипторів.
+    Uses deformable transformers for scale-invariant keypoint detection and description.
 
-    Output format ідентичний ALIKED:
+    Output format matches ALIKED:
         {"keypoints": (1, N, 2), "descriptors": (1, N, D)}
-
-    Usage:
-        wrapper = RDDWrapper(weights_path="models/rdd.pth", device="cuda")
-        model = wrapper.model  # Pass to FeatureExtractor as local_model
     """
 
     def __init__(self, weights_path: str = None, device: str = "cuda", max_keypoints: int = 4096):
@@ -90,7 +85,7 @@ class RDDWrapper:
         self.model.eval()
         self.model.to(device)
 
-        # Визначаємо descriptor dim
+        # Detect descriptor dim
         self._desc_dim = self._detect_desc_dim()
         logger.info(
             f"RDD initialized: desc_dim={self._desc_dim}, max_kpts={max_keypoints}, device={device}"
@@ -114,10 +109,10 @@ class RDDWrapper:
 
     @torch.no_grad()
     def __call__(self, input_dict: dict) -> dict:
-        """ALIKED-compatible interface: input_dict = {\"image\": tensor (B,3,H,W)}.
+        """ALIKED-compatible interface: input_dict = {"image": tensor (B,3,H,W)}.
 
         Returns:
-            dict with \"keypoints\" (B, N, 2) and \"descriptors\" (B, N, D)
+            dict with "keypoints" (B, N, 2) and "descriptors" (B, N, D)
         """
         if isinstance(input_dict, dict):
             image = input_dict["image"]
@@ -131,16 +126,16 @@ class RDDWrapper:
         for i in range(B):
             out_list = self.model.extract(image[i : i + 1])
             out = out_list[0]
-            kpts = out["keypoints"]  # (1, N, 2) або (N, 2)
-            descs = out["descriptors"]  # (1, N, D) або (N, D)
+            kpts = out["keypoints"]
+            descs = out["descriptors"]
 
-            # Нормалізація формату до (1, N, D)
+            # Normalize shape to (1, N, D)
             if kpts.dim() == 2:
                 kpts = kpts.unsqueeze(0)
             if descs.dim() == 2:
                 descs = descs.unsqueeze(0)
 
-            # Обмеження кількості keypoints
+            # Cap keypoints count
             if kpts.shape[1] > self.max_keypoints:
                 kpts = kpts[:, : self.max_keypoints]
                 descs = descs[:, : self.max_keypoints]
@@ -148,7 +143,7 @@ class RDDWrapper:
             all_kpts.append(kpts)
             all_descs.append(descs)
 
-        # Pad до однакової довжини для batch
+        # Pad to max length for batching
         max_n = max(k.shape[1] for k in all_kpts)
         padded_kpts = []
         padded_descs = []
@@ -166,5 +161,5 @@ class RDDWrapper:
         }
 
     def parameters(self):
-        """Для сумісності з FeatureExtractor (перевірка is_xfeat)."""
+        """Compatibility method for model parameters access."""
         return self.model.parameters()

@@ -1,9 +1,9 @@
 """
-Утиліти декомпозиції/складання ізотропних афінних матриць.
+Decomposition and composition utilities for isotropic affine matrices.
 
-Єдине джерело істини для decompose/compose — використовується в:
+Single source of truth for decompose/compose — used in:
   - src.calibration.multi_anchor_calibration
-  - src.workers.calibration_propagation_worker (графова оптимізація)
+  - src.workers.calibration_propagation_worker (graph optimization)
   - src.geometry.pose_graph_optimizer
 """
 
@@ -17,15 +17,15 @@ from numpy.typing import NDArray
 
 def decompose_affine(M: NDArray[np.float64]) -> tuple[float, float, float, float]:
     """
-    Розкладає афінну матрицю 2x3 на компоненти:
+    Decomposes a 2x3 affine matrix into components:
     (tx, ty, scale, angle_rad).
 
-    Для афінної матриці вигляду:
+    For an affine matrix of form:
         [s*cos(a)  -s*sin(a)  tx]
         [s*sin(a)   s*cos(a)  ty]
     scale = sqrt(det(R_part)), angle = atan2(M[1,0], M[0,0]).
-    При наявності шуму (незначний зсув / анізотропний масштаб)
-    беремо ізотропне наближення через норму першого стовпця.
+    In case of noise (slight shear / anisotropic scale),
+    takes isotropic approximation via norm of the first column.
     """
     tx = float(M[0, 2])
     ty = float(M[1, 2])
@@ -39,20 +39,20 @@ def decompose_affine(M: NDArray[np.float64]) -> tuple[float, float, float, float
 
 
 def compose_affine(tx: float, ty: float, scale: float, angle: float) -> NDArray[np.float64]:
-    """Збирає афінну матрицю 2x3 з компонентів перенесення, масштабу та кута (рад)."""
+    """Composes a 2x3 affine matrix from translation, scale, and angle (rad) components."""
     c = np.cos(angle) * scale
     s = np.sin(angle) * scale
     return np.array([[c, -s, tx], [s, c, ty]], dtype=np.float64)
 
 
 def unwrap_angles(angles: NDArray[np.floating[Any]]) -> NDArray[np.floating[Any]]:
-    """Розгортає масив кутів (рад) для уникнення стрибків ±π при інтерполяції."""
+    """Unwraps angle array (rad) to avoid +/- pi jumps during interpolation."""
     return np.unwrap(angles)
 
 
 def decompose_affine_5dof(M: NDArray[np.float64]) -> tuple[float, float, float, float, float]:
     """
-    Розкладає афінну матрицю 2x3 на 5 компонентів для збереження анізотропії:
+    Decomposes a 2x3 affine matrix into 5 components preserving anisotropy:
     (tx, ty, sx, sy, angle_rad).
     """
     tx = float(M[0, 2])
@@ -67,34 +67,35 @@ def compose_affine_5dof(
     tx: float, ty: float, sx: float, sy: float, angle: float, sign: float = 1.0
 ) -> NDArray[np.float64]:
     """
-    Збирає афінну матрицю 2x3 з незалежними масштабами X та Y.
-    sign = -1.0 додає відображення по осі Y (необхідно для систем координат де Y-вниз мапиться на Y-вверх).
+    Composes a 2x3 affine matrix with independent X and Y scales.
+    sign = -1.0 adds Y-axis reflection (needed when mapping Y-down to Y-up).
     """
     c = np.cos(angle)
     s = np.sin(angle)
     return np.array([[c * sx, -s * sign * sy, tx], [s * sx, c * sign * sy, ty]], dtype=np.float64)
 
 
-# ── Центр-базова 5-DoF PCHIP-інтерполяція (Етап 4) ───────────────────────────
-# Єдине джерело форми, яку використовують MultiAnchorCalibration (інтерполяція
-# між якорями) та CalibrationPropagationWorker (заповнення пропущених кадрів).
-# Інтерполюється (rx, ry, sx, sy, angle), де (rx, ry) — МЕТРИЧНА позиція опорного
-# пікселя (центр кадру), а знак det зберігається окремо: пряма інтерполяція
-# tx/ty при зміні кута дає «гойдання» центру, тому кодуємо саме центр.
+# ── Centre-based 5-DoF PCHIP interpolation ────────────────────────────────────────
+# Single source of shape used by MultiAnchorCalibration (interpolation between
+# anchors) and CalibrationPropagationWorker (filling missing frames).
+# Interpolated: (rx, ry, sx, sy, angle), where (rx, ry) is the METRIC position
+# of the reference pixel (frame centre). det sign is stored separately: direct
+# tx/ty interpolation with a changing angle causes centre drift, so the centre
+# itself is encoded instead.
 
 
 def build_5dof_pchip(
     ids: Any, affines: Any, ref_px: tuple[float, float], log_scale: bool = False
 ) -> tuple[Any, float, tuple[float, float] | None]:
-    """Будує shape-preserving PCHIP над (rx, ry, sx, sy, angle) валідних матриць.
+    """Constructs shape-preserving PCHIP over (rx, ry, sx, sy, angle) of valid matrices.
 
-    Повертає (interp, sign, (lo, hi)). interp=None, якщо <2 вузлів. sign — знак det
-    більшості матриць (Y-flip), що відновлюється при композиції.
+    Returns (interp, sign, (lo, hi)). interp=None if <2 nodes. sign is the det sign
+    of majority of matrices (Y-flip), restored upon composition.
 
-    log_scale=True (RESEARCH_INTEGRATION_PLAN 1.3): інтерполюються log(sx), log(sy)
-    замість sx, sy — геодезично коректна форма для масштабу (лінійна інтерполяція
-    масштабу не є геодезичною у групі подібностей). sample_5dof_pchip МУСИТЬ бути
-    викликаний з тим самим значенням log_scale.
+    log_scale=True (RESEARCH_INTEGRATION_PLAN 1.3): interpolates log(sx), log(sy)
+    instead of sx, sy — geodesically correct form for scale (linear interpolation
+    of scale is not geodesic in similarity group). sample_5dof_pchip MUST be
+    called with the same log_scale value.
     """
     from scipy.interpolate import PchipInterpolator
 
@@ -135,9 +136,9 @@ def sample_5dof_pchip(
     frame_id: float,
     log_scale: bool = False,
 ) -> NDArray[np.float64] | None:
-    """Афінна 2x3 для frame_id із PCHIP (clamp за межами діапазону вузлів).
+    """2x3 affine matrix for frame_id from PCHIP (clamped outside node range).
 
-    log_scale має збігатися зі значенням, переданим у build_5dof_pchip.
+    log_scale must match the value passed to build_5dof_pchip.
     """
     if interp is None or rng is None:
         return None

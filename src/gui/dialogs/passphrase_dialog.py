@@ -1,16 +1,7 @@
-"""HARDENING P1-6: passphrase prompts for encryption-at-rest, GUI side.
+"""Passphrase input dialogs for project artifact encryption (PassphraseDialog).
 
-Two dialogs:
-
-* ``PassphraseDialog`` — asks for the passphrase of an encrypted project at load
-  time, verifies it against a real artifact, and injects it into the at-rest
-  cache only once it is known to be correct.
-* ``NewPassphraseDialog`` — asks (twice) for the passphrase of a new encrypted
-  copy.
-
-The GUI must inject explicitly: ``at_rest.get_passphrase`` falls back to
-``getpass`` when stdin looks like a TTY, which under a GUI launch blocks the
-process on a prompt the operator cannot see.
+Prompts operator for passphrase when opening encrypted project and confirms
+new passphrase when creating an encrypted copy.
 """
 
 from __future__ import annotations

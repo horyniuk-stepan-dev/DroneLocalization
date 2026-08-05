@@ -29,7 +29,9 @@ def migrate(h5_path: str, batch_size: int = 128, min_index_frames: int = 256):
 
         grp = f["global_descriptors"]
         if "descriptors" not in grp:
-            logger.error("No 'descriptors' dataset found in 'global_descriptors'. Already migrated?")
+            logger.error(
+                "No 'descriptors' dataset found in 'global_descriptors'. Already migrated?"
+            )
             return
 
         descriptors = grp["descriptors"]
@@ -43,10 +45,9 @@ def migrate(h5_path: str, batch_size: int = 128, min_index_frames: int = 256):
         logger.info("Initializing LanceDB...")
         db = lancedb.connect(str(lance_dir))
 
-        schema = pa.schema([
-            pa.field("frame_id", pa.int32()),
-            pa.field("vector", pa.list_(pa.float32(), dim))
-        ])
+        schema = pa.schema(
+            [pa.field("frame_id", pa.int32()), pa.field("vector", pa.list_(pa.float32(), dim))]
+        )
 
         table = db.create_table("global_vectors", schema=schema, mode="create")
 
@@ -61,10 +62,7 @@ def migrate(h5_path: str, batch_size: int = 128, min_index_frames: int = 256):
                 # Check for zero vectors (unfilled slots if pre-allocated but unfilled)
                 if np.sum(np.abs(subset[j])) < 1e-6:
                     continue
-                batch.append({
-                    "frame_id": frame_id,
-                    "vector": subset[j]
-                })
+                batch.append({"frame_id": frame_id, "vector": subset[j]})
 
             if batch:
                 table.add(batch)
@@ -77,9 +75,7 @@ def migrate(h5_path: str, batch_size: int = 128, min_index_frames: int = 256):
         if actual_count >= min_index_frames:
             logger.info("Building LanceDB IVF-PQ index...")
             table.create_index(
-                metric="cosine",
-                num_partitions=min(256, actual_count // 8),
-                num_sub_vectors=32
+                metric="cosine", num_partitions=min(256, actual_count // 8), num_sub_vectors=32
             )
             logger.info("Index built successfully.")
         else:
@@ -87,7 +83,10 @@ def migrate(h5_path: str, batch_size: int = 128, min_index_frames: int = 256):
 
         logger.info(f"Migration complete! Lance database stored safely in {lance_dir}.")
         logger.info("Note: The old descriptors were kept in the HDF5 file for safety.")
-        logger.info("You can repack the HDF5 manually using 'h5repack' if disk space is critical, or leave it as is.")
+        logger.info(
+            "You can repack the HDF5 manually using 'h5repack' if disk space is critical, or leave it as is."
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Migrate HDF5 descriptors to LanceDB.")

@@ -1,7 +1,7 @@
-# src/models/wrappers/trt_dinov2_wrapper.py
-#
-# TensorRT runtime wrapper для DINOv2 ViT-L/14.
-# Завантажує скомпільований .engine файл та виконує інференс без PyTorch overhead.
+"""TensorRT runtime wrapper for DINOv2 ViT-L/14.
+
+Loads compiled .engine file and runs inference without PyTorch overhead.
+"""
 
 from pathlib import Path
 
@@ -11,9 +11,9 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-# TensorRT доступний не на всіх системах
+# TensorRT is not available on all systems
 try:
-    import pycuda.autoinit  # noqa: F401 — ініціалізує CUDA context
+    import pycuda.autoinit  # noqa: F401 — initializes CUDA context
     import pycuda.driver as cuda
     import tensorrt as trt
 
@@ -23,19 +23,15 @@ except Exception:
 
 
 def is_trt_available() -> bool:
-    """Перевіряє чи TensorRT runtime доступний."""
+    """Checks whether TensorRT runtime is available."""
     return _TRT_AVAILABLE
 
 
 class TensorRTDINOv2Wrapper:
-    """Runtime wrapper для TensorRT DINOv2 engine.
+    """Runtime wrapper for TensorRT DINOv2 engine.
 
-    Забезпечує інтерфейс forward(image_tensor) -> np.ndarray (1024-dim)
-    сумісний із PyTorch DINOv2 wrapper.
-
-    Використання:
-        wrapper = TensorRTDINOv2Wrapper("models/engines/dinov2_vitl14_fp16.engine")
-        descriptor = wrapper.forward(image_np)  # (1024,) float32
+    Provides forward(image_tensor) -> np.ndarray (1024-dim) interface
+    compatible with PyTorch DINOv2 wrapper.
     """
 
     def __init__(self, engine_path: str, input_size: int = 336):
@@ -54,7 +50,7 @@ class TensorRTDINOv2Wrapper:
         logger.success(f"TensorRT DINOv2 engine loaded: {engine_path}")
 
     def _load_engine(self, engine_path: str):
-        """Завантажує TensorRT engine та виділяє GPU пам'ять."""
+        """Loads TensorRT engine and allocates GPU memory."""
         trt_logger = trt.Logger(trt.Logger.SEVERE)
         runtime = trt.Runtime(trt_logger)
 
@@ -63,18 +59,18 @@ class TensorRTDINOv2Wrapper:
 
         self.context = self.engine.create_execution_context()
 
-        # Виділення пам'яті для input та output
+        # Input / output memory allocation
         self.input_shape = (1, 3, self.input_size, self.input_size)
         self.output_shape = (1, 1024)  # DINOv2 ViT-L/14 output dim
 
         input_nbytes = int(np.prod(self.input_shape) * np.float32(0).nbytes)
         output_nbytes = int(np.prod(self.output_shape) * np.float32(0).nbytes)
 
-        # GPU буфери
+        # GPU buffers
         self.d_input = cuda.mem_alloc(input_nbytes)
         self.d_output = cuda.mem_alloc(output_nbytes)
 
-        # CPU буфери (page-locked для швидкого копіювання)
+        # CPU buffers (page-locked for fast transfer)
         self.h_input = cuda.pagelocked_empty(self.input_shape, dtype=np.float32)
         self.h_output = cuda.pagelocked_empty(self.output_shape, dtype=np.float32)
 
@@ -82,28 +78,28 @@ class TensorRTDINOv2Wrapper:
         logger.debug(f"TRT buffers allocated: input={input_nbytes}B, output={output_nbytes}B")
 
     def forward(self, image_chw: np.ndarray) -> np.ndarray:
-        """Виконує інференс TensorRT engine.
+        """Runs TensorRT engine inference.
 
         Args:
-            image_chw: нормалізоване зображення (3, H, W) float32
+            image_chw: normalized image tensor (3, H, W) float32
                        (ImageNet normalization: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         Returns:
             global_descriptor: (1024,) float32
         """
-        # Копіюємо дані у page-locked буфер
+        # Copy data to page-locked buffer
         np.copyto(self.h_input, image_chw.reshape(self.input_shape).astype(np.float32))
 
-        # Host → Device
+        # Host -> Device
         cuda.memcpy_htod_async(self.d_input, self.h_input, self.stream)
 
-        # Інференс
+        # Inference
         self.context.execute_async_v2(
             bindings=[int(self.d_input), int(self.d_output)],
             stream_handle=self.stream.handle,
         )
 
-        # Device → Host
+        # Device -> Host
         cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.stream)
         self.stream.synchronize()
 
@@ -111,15 +107,15 @@ class TensorRTDINOv2Wrapper:
 
     @property
     def output_dim(self) -> int:
-        """Повертає розмірність вихідного дескриптора."""
+        """Returns dimensionality of output global descriptor."""
         return self.output_shape[-1]
 
     def __del__(self):
-        """Звільнює GPU ресурси."""
+        """Frees GPU resources."""
         try:
             if hasattr(self, "d_input"):
                 self.d_input.free()
             if hasattr(self, "d_output"):
                 self.d_output.free()
         except Exception:
-            pass  # Ігноруємо помилки при garbage collection
+            pass

@@ -10,11 +10,10 @@ logger = get_logger(__name__)
 
 
 class WebSocketServer:
-    """Асинхронний WebSocket-сервер для розсилки координат.
+    """Asynchronous WebSocket server for coordinates telemetry broadcasting.
 
-    Безпека: дефолт — 127.0.0.1 (лише локальні клієнти). Для доступу з мережі
-    задайте host="0.0.0.0" явно та api_token — телеметрія дрона не має бути
-    відкритою в чужому Wi-Fi.
+    Security: default host is 127.0.0.1 (local clients only). To allow external
+    network access, specify host="0.0.0.0" and an api_token explicitly.
     """
 
     def __init__(
@@ -33,12 +32,8 @@ class WebSocketServer:
         self.clients: set[WebSocketServerProtocol] = set()
         self.server = None
 
-        # HARDENING P0-4: fail closed. Binding drone telemetry to a routable
-        # host without a token would leave position readable by anyone on the
-        # network — refuse instead of merely warning. Localhost stays
-        # frictionless (no token required). Normal startup never hits this
-        # because CoordinatesBroker auto-generates a token for remote hosts;
-        # this guards direct/headless/test instantiation.
+        # Telemetry protection: require authentication token when binding to
+        # routable network interfaces (non-loopback host).
         if host not in ("127.0.0.1", "localhost", "::1") and not api_token:
             raise ValueError(
                 f"Refusing to start WebSocket server on routable host '{host}' "
@@ -52,7 +47,7 @@ class WebSocketServer:
             await websocket.close()
             return
 
-        # Токен: ?token=... у query або заголовок Authorization: Bearer ...
+        # Token authentication: ?token=... query parameter or Authorization: Bearer ... header
         if self.api_token:
             supplied = None
             if "token=" in path:
@@ -70,7 +65,7 @@ class WebSocketServer:
         self.clients.add(websocket)
         try:
             async for message in websocket:
-                # Наразі клієнти тільки слухають, але тут можна додати обробку команд
+                # Currently clients are read-only listeners, but command handling can be added here
                 logger.debug(f"Received message from client: {message}")
         except websockets.exceptions.ConnectionClosed:
             pass
@@ -79,11 +74,7 @@ class WebSocketServer:
             logger.info(f"WebSocket client disconnected: {websocket.remote_address}")
 
     def _build_ssl_context(self):
-        """HARDENING P1-7: build a TLS context, or None for plaintext.
-
-        Fail closed: if a cert/key pair is supplied it must load, otherwise we
-        refuse to start rather than silently falling back to plaintext ws://.
-        """
+        """Creates and configures SSLContext for encrypted WSS connections."""
         if not (self.certfile and self.keyfile):
             return None
         import ssl
@@ -110,7 +101,7 @@ class WebSocketServer:
 
         try:
             msg_str = json.dumps(message)
-            # Розсилаємо повідомлення всім підключеним клієнтам
+            # Broadcast message to all connected clients
             await asyncio.gather(
                 *[client.send(msg_str) for client in self.clients], return_exceptions=True
             )

@@ -72,8 +72,8 @@ class GeometricVerifier:
 
         early_stop = self.early_stop_inliers
 
-        # ADDENDUM §1: дешевий MNN-скоринг усіх кандидатів, LightGlue — лише
-        # на найкращих. ref_cache уникає повторного читання фіч із БД.
+        # ADDENDUM item 1: cheap MNN-scoring of all candidates, LightGlue — only
+        # on top ones. ref_cache avoids redundant DB feature reading.
         ref_cache = {} if ref_cache is None else ref_cache
         if self.prefilter_enabled and len(candidates) > self.prefilter_keep:
             candidates = self._prefilter(query_features, candidates, database, ref_cache)
@@ -144,7 +144,7 @@ class GeometricVerifier:
             rmse=best_rmse,
         )
 
-    # ── ADDENDUM §1: MNN-передфільтр кандидатів ──────────────────────────
+    # -- ADDENDUM item 1: candidate MNN-prefilter --------------------------
 
     def mnn_counts(
         self,
@@ -153,7 +153,7 @@ class GeometricVerifier:
         database: Any,
         ref_cache: dict | None = None,
     ) -> list[tuple[int, int, float]] | None:
-        """Кількість mutual-NN пар (з Lowe ratio) між query і кожним кандидатом.
+        """Number of mutual-NN pairs (with Lowe ratio) between query and each candidate.
 
         Повертає ``[(пар, candidate_id, score), ...]`` або ``None``, якщо
         дескриптори query вироджені. Два споживачі:
@@ -204,9 +204,9 @@ class GeometricVerifier:
                     idx = torch.arange(sim.shape[0], device=sim.device)
                     return int(((nn21[nn12] == idx) & ratio_ok).sum().item())
                 except Exception as e:  # noqa: BLE001 — OOM тощо → numpy
-                    # Тихий фолбек на numpy — це перформанс-обрив, який раніше
-                    # не було видно взагалі. Вимикаємо GPU-шлях на решту
-                    # виклику і повідомляємо один раз.
+                    # Silent fallback to numpy is a performance drop that
+                    # was completely hidden before. Disable GPU path for remaining
+                    # call and report once.
                     if not gpu_failed:
                         gpu_failed = True
                         logger.warning(
@@ -232,8 +232,8 @@ class GeometricVerifier:
                     try:
                         ref = database.get_local_features(candidate_id)
                     except (ValueError, KeyError) as e:
-                        # Темпоральний prior пропонує сусідів за індексом —
-                        # частина з них може бути відсутня у БД. Це не помилка.
+                        # Temporal prior suggests neighbors by index —
+                        # some of them may be missing in DB. This is not an error.
                         logger.debug(f"MNN probe: candidate {candidate_id} unreadable ({e})")
                         scored.append((0, candidate_id, score))
                         continue
@@ -249,7 +249,7 @@ class GeometricVerifier:
     def _prefilter(
         self, query_features: dict, candidates: list, database: Any, ref_cache: dict
     ) -> list:
-        """Ранжує кандидатів за кількістю MNN-пар і лишає ``prefilter_keep``
+        """Ranks candidates by MNN match count and keeps top ``prefilter_keep``
         найкращих (LightGlue далі йде лише по них).
 
         Консервативність: якщо жоден кандидат не набрав жодної MNN-пари

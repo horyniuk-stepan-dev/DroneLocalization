@@ -1,7 +1,7 @@
 """Per-frame processing for the database build.
 
 Extracted verbatim from the ``_process_single_frame`` closure inside
-``DatabaseBuilder.build_from_video`` (IMPROVEMENT_PLAN п.1.3, розбиття
+``DatabaseBuilder.build_from_video`` (IMPROVEMENT_PLAN item 1.3, splitting
 ``db_builder``). Owns everything that happens to ONE already-decoded, already-
 masked frame: feature extraction, patch descriptors, depth scale, keypoint
 video, the pose chain and the keyframe decision — then hands the result to the
@@ -76,8 +76,8 @@ class FrameProcessor:
         self.kp_writer = kp_writer
         self.kp_scale = kp_scale
         self.use_keyframe_selection = use_keyframe_selection
-        # database.keyframe_always_save_first: до цього ключ існував у конфігу,
-        # але ніде не читався — перший кадр зберігався беззастережно.
+        # database.keyframe_always_save_first: the config key existed before
+        # but was never read — the first frame was always saved unconditionally.
         self.always_save_first = always_save_first
         # "step" = legacy adjacent-frame motion; "overlap" = displacement
         # accumulated since the last KEPT keyframe (config keyframe_criterion).
@@ -101,18 +101,15 @@ class FrameProcessor:
         self._frames_since_keyframe = 0
 
     def process(self, p_idx: int, p_frame, p_frame_rgb, p_static_mask) -> None:
-        """Обробляє один кадр після YOLO: feature extraction, pose, keyframe selection."""
+        """Processes one frame: feature extraction, pose calculation, keyframe selection."""
         features = self.feature_extractor.extract_features(p_frame_rgb, p_static_mask)
         features["coords_2d"] = features["keypoints"]
 
-        # Patchify: витягуємо патч-дескриптори
+        # Patchify descriptors
         if self.patchify is not None:
             features["patch_descriptors"] = self.patchify.compute_patch_descriptors(p_frame_rgb)
 
-        # Phase 2.2: Depth estimation for scale recovery
-        # A6: скаляр depth_scale змінюється повільно (висота польоту) —
-        # повний інференс Depth-Anything на КОЖНОМУ кадрі був марнотратним.
-        # Рахуємо кожен depth_every_n-й кадр, між ними реюзаємо останнє значення.
+        # Depth scale estimation (reuse scale across interval to save compute)
         features["depth_scale"] = np.float32(
             self._last_depth_scale if self._last_depth_scale is not None else 1.0
         )
@@ -139,8 +136,6 @@ class FrameProcessor:
 
         if p_idx == 0 or self.prev_features is None:
             self.current_pose = np.eye(3, dtype=np.float64)
-            # Порівнювати нема з чим (немає попереднього кадру), тож рішення
-            # приймає прапорець, а не критерій руху.
             save_this_frame = self.always_save_first
         else:
             H_step = self.compute_inter_frame_h(self.prev_features, features)
@@ -154,22 +149,17 @@ class FrameProcessor:
                     save_this_frame = self.is_significant_motion(H_step, self.width, self.height)
             else:
                 logger.warning(f"Frame {p_idx}: inter-frame match failed, reusing previous pose")
-                save_this_frame = True  # Or False? Usually better to keep it if tracking fails
+                save_this_frame = True
 
         self.prev_features = features
 
-        # ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації,
-        # навіть якщо кадр не є keyframe (пропущений через малий рух).
-        # Без цього frame_poses[frame_id] = zeros → пропагація ламається.
+        # Always write pose for full propagation chain
         self.db_writer.write_pose(p_idx, self.current_pose)
 
         if save_this_frame:
-            # RESEARCH 2.2: SIFT рахуємо лише для кадрів, що реально
-            # зберігаються (keyframe-ів) — на пропущених це марна робота
+            # SIFT features extracted only for keyframes being saved
             if self.store_sift:
                 try:
-                    # Lazy: src.localization.matcher pulls in faiss/torch, which
-                    # this module otherwise does not need (keeps it headless).
                     from src.localization.matcher import extract_sift_features
 
                     sift_feats = extract_sift_features(
@@ -180,12 +170,9 @@ class FrameProcessor:
                 except Exception as e:
                     logger.warning(f"SIFT extraction failed for frame {p_idx}: {e}")
             self.frame_index_map.append(p_idx)
-            # Зберігаємо за ОРИГІНАЛЬНИМ індексом p_idx, а не послідовним
-            # Це зберігає frame_id ↔ slot identity для калібрування/пропагації
+            # Save using original frame index p_idx for calibration mapping
             self.db_writer.save_frame_data(p_idx, features, self.current_pose)
             self.saved_count += 1
-            # Overlap criterion bookkeeping: the reference for the next
-            # comparison is the pose of the frame we just kept.
             self._pose_at_last_keyframe = self.current_pose.copy()
             self._frames_since_keyframe = 0
 
@@ -203,19 +190,7 @@ class FrameProcessor:
             self.progress_callback(progress_percent)
 
     def _overlap_says_keyframe(self, p_idx: int) -> bool:
-        """Keyframe, коли перекриття з ОСТАННІМ ЗБЕРЕЖЕНИМ keyframe впало до порога.
-
-        Відносна гомографія береться з ланцюга поз: ``inv(pose_keyframe) @
-        current_pose`` переводить координати поточного кадру в координати
-        keyframe-а. Це той самий накопичений рух, що й добуток покрокових H,
-        але без окремого акумулятора, який міг би розійтися з ланцюгом поз.
-
-        Запобіжник ``keyframe_max_gap_frames`` (N підряд пропущених кадрів →
-        примусовий keyframe, тобто keyframe-и не далі ніж N+1 кадр один від
-        одного): якщо матчинг деградує, накопичена
-        H дрейфує і перекриття може лишатись оптимістично високим — тоді anchor-
-        розрив росте необмежено (та сама діра, що ламала карту у stage 8).
-        """
+        """Determines if frame is a keyframe based on overlap with last saved keyframe."""
         if self._pose_at_last_keyframe is None or self.overlap_gate is None:
             return True
 

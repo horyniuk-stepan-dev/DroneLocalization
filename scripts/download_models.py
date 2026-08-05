@@ -12,6 +12,7 @@ try:
 except ImportError:
     print("Встановлення tqdm для відображення прогресу...")
     import subprocess
+
     subprocess.check_call([sys.executable, "-m", "pip", "install", "tqdm"])
     from tqdm import tqdm
 
@@ -65,7 +66,9 @@ def download_models():
             print("Будь ласка, перевірте з'єднання з інтернетом або завантажте файл вручну.")
 
     print("\nПроцес перевірки та завантаження моделей завершено!")
-    print("Примітка: для моделей RDD та CESP може знадобитися ручне завантаження з Google Drive (див. документацію).")
+    print(
+        "Примітка: для моделей RDD та CESP може знадобитися ручне завантаження з Google Drive (див. документацію)."
+    )
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from loguru import logger
 
 
 def setup_logging(log_level: str = "INFO", log_file: str = "logs/app.log") -> None:
-    """Налаштування системи логування для всієї програми."""
+    """Configure the logging system for the whole application."""
     logger.remove()
 
     # Standart output (pretty console). In a --windowed PyInstaller build there
@@ -47,7 +47,7 @@ def setup_logging(log_level: str = "INFO", log_file: str = "logs/app.log") -> No
 
 
 def get_logger(name: str | None = None) -> Any:
-    """Отримання екземпляра логера."""
+    """Return a logger instance bound to the given name."""
     if name:
         return logger.bind(name=name)
     return logger
@@ -59,13 +59,7 @@ _FAULT_LOG_FH = None
 
 
 def enable_crash_handler(log_dir: Any) -> None:
-    """Capture native (CUDA/cv2/torch) crashes that ``sys.excepthook`` cannot.
-
-    HARDENING P0-2. A segfault or native abort kills the process before Python's
-    exception hook runs, leaving no trace. ``faulthandler`` dumps the C-level
-    traceback of all threads to a breadcrumb file so a field crash is
-    diagnosable. Best-effort: diagnostics setup never breaks startup.
-    """
+    """Enable faulthandler to intercept OS-level crashes and segfaults."""
     global _FAULT_LOG_FH
     import faulthandler
 
@@ -96,15 +90,7 @@ def enable_crash_handler(log_dir: Any) -> None:
 
 
 def fmt_coord(lat: float, lon: float, precision: int = 6) -> str:
-    """Format a lat/lon pair for logging, honoring the redaction flag.
-
-    HARDENING P0-5. When ``models.performance.redact_coords_in_logs`` is True,
-    coordinates are masked so a captured ``app.log`` does not reveal the mission
-    route. Default (flag False) preserves full precision — current behavior.
-
-    Reads the flag defensively (like ``silent_output``): any config-access
-    failure degrades to full precision rather than crashing the caller.
-    """
+    """Formats coordinate pairs for logging with optional masking when enabled."""
     redact = False
     try:
         from config import APP_SETTINGS

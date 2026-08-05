@@ -6,10 +6,10 @@ logger = get_logger(__name__)
 
 
 class RestApiServer:
-    """Легкий HTTP-сервер для REST API координат.
+    """Lightweight HTTP server for coordinates REST API.
 
-    Безпека: дефолт — 127.0.0.1. Для доступу з мережі задайте host="0.0.0.0"
-    явно та api_token (перевіряється заголовок Authorization: Bearer <token>).
+    Security: default host is 127.0.0.1. To allow external network access,
+    specify host="0.0.0.0" and an api_token explicitly (verified via Authorization: Bearer <token>).
     """
 
     def __init__(
@@ -31,7 +31,7 @@ class RestApiServer:
         self.runner = None
         self.site = None
 
-        # HARDENING P0-4: fail closed (see WebSocketServer for rationale).
+        # Security: require API token when binding to routable network interfaces
         if host not in ("127.0.0.1", "localhost", "::1") and not api_token:
             raise ValueError(
                 f"Refusing to start REST API server on routable host '{host}' "
@@ -80,13 +80,13 @@ class RestApiServer:
             "state": "tracking" if self.broker.is_tracking_active else "idle",
             "uptime_sec": self.broker.get_uptime(),
         }
-        # HARDENING P1-9/10: additive, flag-gated operating-state + stall info.
+        # Add operating state and freeze diagnostics when flag is enabled
         if getattr(self.broker.config, "expose_operating_state", False):
             resp.update(self.broker.get_operating_state())
         return web.json_response(resp)
 
     def _build_ssl_context(self):
-        """HARDENING P1-7: TLS context or None (see WebSocketServer). Fail closed."""
+        """Creates SSL/TLS context for HTTPS server or returns None for HTTP."""
         if not (self.certfile and self.keyfile):
             return None
         import ssl

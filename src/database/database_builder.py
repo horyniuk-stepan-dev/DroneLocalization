@@ -37,17 +37,13 @@ class DatabaseBuilder:
     """
 
     def __init__(self, output_path, matcher=None, config=None):
-        # HARDENING P1-6: refuse up front — a build writes the database, the lance
-        # index and the keypoint video, all in plaintext, and an encrypted
-        # deployment copy must stay immutable.
+        # Protection against writing into an encrypted project.
         assert_project_writable(output_path)
         self.output_path = output_path
         self.config = config or {}
         self.matcher = matcher
         self.descriptor_dim = get_active_descriptor_cfg(self.config).descriptor_dim
-        # RESEARCH 2.1: VLAD змінює розмірність глобального дескриптора —
-        # читаємо out_dim зі словника, щоб HDF5/LanceDB схема збігалася з
-        # тим, що реально видаватиме FeatureExtractor.
+        # Global descriptor dimension from VLAD dictionary when enabled.
         if get_cfg(self.config, "models.vlad.enabled", False):
             _vocab = get_cfg(self.config, "models.vlad.vocab_path", None)
             if _vocab and Path(_vocab).exists():
@@ -60,14 +56,14 @@ class DatabaseBuilder:
                     f"models.vlad.enabled=True but vocab not found ({_vocab!r}) — "
                     f"building with CLS descriptors (dim={self.descriptor_dim})"
                 )
-        # RESEARCH 2.2: SIFT-ознаки для аварійного фолбека
+        # Store extra SIFT features for fallback matching
         self.store_sift = get_cfg(self.config, "database.store_sift_features", False)
         self.sift_max_kps = get_cfg(self.config, "database.sift_max_keypoints", 2048)
         self.prefetch_size = get_cfg(self.config, "database.prefetch_queue_size", 32)
         self.kp_scale_cfg = get_cfg(self.config, "database.keypoint_video_scale", 0.5)
         self.use_lancedb = get_cfg(self.config, "database.use_lancedb", True)
 
-        # DbWriter owns HDF5 + LanceDB end-to-end (locked decomposition decision).
+        # DbWriter owns creation and writing of HDF5 + LanceDB structures.
         self.writer = DbWriter(output_path, config=self.config, descriptor_dim=self.descriptor_dim)
 
         logger.info(f"DatabaseBuilder initialized with output: {output_path}")
@@ -120,7 +116,7 @@ class DatabaseBuilder:
         self._project_manager = project_manager
         logger.info(f"Starting database build from video: {video_path}")
 
-        # --- Phase 1: video source ------------------------------------
+        # Initialise the video-frame source (VideoFrameSource)
         source = VideoFrameSource(
             video_path,
             frame_step=get_cfg(self.config, "database.frame_step", 3),
@@ -131,7 +127,7 @@ class DatabaseBuilder:
         width, height = source.width, source.height
         num_frames = source.num_frames
 
-        # Зберігаємо еталонну роздільну здатність у проєкт
+        # Save the reference resolution to the project
         if (
             self._project_manager
             and hasattr(self._project_manager, "settings")
@@ -142,13 +138,13 @@ class DatabaseBuilder:
             self._project_manager.save_project()
             logger.info(f"Reference resolution saved to project: {width}x{height}")
 
-        # Ініціалізуємо запис відео з keypoints
-        kp_scale = 1.0  # ЗАВЖДИ 1.0, щоб координати відео і бази HDF5 збігалися (виправлення багу масштабу)
+        # Initialise the keypoint-overlay video writer
+        kp_scale = 1.0  # ALWAYS 1.0 so video coordinates match HDF5 DB coordinates (scale bug fix)
         kp_writer = self._open_keypoint_writer(
             save_keypoint_video, width, height, kp_scale, source.effective_fps
         )
 
-        # Ініціалізуємо стратегію маскування (YOLO / none / ...)
+        # Initialise the masking strategy (YOLO / none / ...)
         masking_strategy_name = get_cfg(self.config, "preprocessing.masking_strategy", "yolo")
         logger.info(f"Loading masking strategy: {masking_strategy_name}")
         masking_strategy = create_masking_strategy(
@@ -175,7 +171,7 @@ class DatabaseBuilder:
         )
         logger.success("All models loaded successfully")
 
-        # Patchify: мультимасштабні патч-дескриптори
+        # Patchify: multi-scale patch descriptors
         use_patchify = get_cfg(self.config, "localization.use_patchify", False)
         patchify = None
         if use_patchify:
@@ -225,7 +221,7 @@ class DatabaseBuilder:
             source_total_frames=source.total_frames,
         )
 
-        # Adaptive Keyframe Selection (П4)
+        # Adaptive Keyframe Selection
         keyframe_criterion = get_cfg(self.config, "database.keyframe_criterion", "step")
         max_overlap = get_cfg(self.config, "database.keyframe_max_overlap", 0.5)
         max_gap_frames = get_cfg(self.config, "database.keyframe_max_gap_frames", 0)
@@ -279,14 +275,14 @@ class DatabaseBuilder:
         try:
             self.writer.open()
 
-            # YOLO micro-batching (П8)
+            # YOLO micro-batching
             yolo_batch_size = get_cfg(self.config, "database.yolo_batch_size", 1)
             if yolo_batch_size > 1:
                 logger.info(f"YOLO micro-batching ENABLED (batch_size={yolo_batch_size})")
-            pending_frames: list[tuple] = []  # буфер (idx, frame, frame_rgb)
+            pending_frames: list[tuple] = []  # buffer (idx, frame, frame_rgb)
 
             def _flush_mask_batch(batch: list) -> list:
-                """Обробляє батч через MaskingStrategy, повертає (idx, frame, frame_rgb, static_mask)."""
+                """Processes batch through MaskingStrategy, returns (idx, frame, frame_rgb, static_mask)."""
                 images_rgb = [b[2] for b in batch]
                 with Telemetry.profile("yolo"):
                     masks_list = masking_strategy.get_mask_batch(images_rgb)
@@ -300,9 +296,9 @@ class DatabaseBuilder:
                         frame, frame_rgb = data
                         pending_frames.append((idx, frame, frame_rgb))
                         if len(pending_frames) < yolo_batch_size:
-                            continue  # накопичуємо батч
+                            continue  # accumulate batch
 
-                    # Якщо EOF або батч повний — обробляємо все накопичене
+                    # If EOF or batch full — process all accumulated
                     if not pending_frames:
                         break
 
@@ -311,9 +307,9 @@ class DatabaseBuilder:
 
                     for p_idx, p_frame, p_frame_rgb, p_static_mask in processed:
                         processor.process(p_idx, p_frame, p_frame_rgb, p_static_mask)
-                        # A1: empty_cache() після КОЖНОГО кадру синхронізував GPU і
-                        # змушував наступні алокації йти повільним cudaMalloc —
-                        # головний гальмівний фактор збудови. Гігієнічно чистимо рідко.
+                        # empty_cache() after every frame synchronised the GPU and
+                        # forced subsequent allocations through slow cudaMalloc —
+                        # the main build bottleneck. Flush infrequently for hygiene.
                         if torch.cuda.is_available() and p_idx % 500 == 0 and p_idx > 0:
                             torch.cuda.empty_cache()
                     if idx == EOF_INDEX:
@@ -330,7 +326,7 @@ class DatabaseBuilder:
         finally:
             self.writer.finalize_vectors(processor.saved_count)
 
-            # Зберігаємо frame_index_map і actual_num_frames у metadata
+            # Save frame_index_map and actual_num_frames to metadata
             self.writer.write_frame_index_map(
                 processor.saved_count,
                 processor.frame_index_map,
@@ -371,18 +367,18 @@ class DatabaseBuilder:
             kp_height = int(height * kp_scale)
             kp_video_path = str(Path(self.output_path).with_suffix("")) + "_keypoints.mp4"
 
-            # Порядок кодеків:
-            # - Windows: avc1 потребує openh264.dll → пропускаємо, щоб уникнути FFmpeg-шуму
-            # - XVID: надійний cross-platform без сторонніх DLL
-            # - mp4v: абсолютний fallback
+            # Codec order:
+            # - Windows: avc1 requires openh264.dll — skip to avoid FFmpeg noise
+            # - XVID: reliable cross-platform without third-party DLLs
+            # - mp4v: absolute fallback
             codecs = []
             if sys.platform != "win32":
-                codecs.append("avc1")  # H.264 — тільки на Linux/macOS де є нативна підтримка
+                codecs.append("avc1")  # H.264 — only on Linux/macOS with native support
             codecs += ["XVID", "mp4v"]
 
             for codec_name in codecs:
                 fourcc = cv2.VideoWriter_fourcc(*codec_name)
-                # Пригнічуємо C-рівневий stderr від FFmpeg (fd=2) щоб уникнути OpenH264-шуму
+                # Suppress C-level stderr from FFmpeg (fd=2) to avoid OpenH264 noise
                 devnull_fd = os.open(os.devnull, os.O_WRONLY)
                 old_stderr_fd = os.dup(2)
                 os.dup2(devnull_fd, 2)
@@ -425,10 +421,10 @@ class DatabaseBuilder:
 
             logger.info("Detecting descriptor dimension...")
             if feature_extractor.vlad_aggregator is not None:
-                # RESEARCH 2.1: при VLAD розмірність задає словник (out_dim),
-                # а не бекбон. Пробінг nv_model повернув би розмір CLS (1024),
-                # і схема LanceDB/HDF5 розійшлася б із тим, що реально пише
-                # FeatureExtractor (256) → Arrow cast error на першому флаші.
+                # With VLAD the dimension is set by the codebook (out_dim),
+                # not the backbone. Probing nv_model would return the CLS size (1024),
+                # and the LanceDB/HDF5 schema would diverge from what FeatureExtractor
+                # actually writes (256) → Arrow cast error on the first flush.
                 self.descriptor_dim = int(feature_extractor.global_descriptor_dim)
             elif hasattr(nv_model, "embed_dim"):
                 self.descriptor_dim = int(nv_model.embed_dim)
@@ -441,7 +437,7 @@ class DatabaseBuilder:
                     if cesp is not None:
                         features = nv_model.forward_features(dummy_input)
                         patch_tokens = features["x_norm_patchtokens"]
-                        # Сітка з фактичної кількості токенів (DINOv3 patch=16, не 14)
+                        # Grid from the actual token count (DINOv3 patch=16, not 14)
                         side = int(math.isqrt(int(patch_tokens.shape[1])))
                         h_patches, w_patches = side, side
                         dummy_out = cesp(patch_tokens, h_patches, w_patches)[0]
@@ -492,13 +488,12 @@ class DatabaseBuilder:
         )
 
     def _compute_inter_frame_H(self, fa: dict, fb: dict) -> np.ndarray | None:
-        """H(fb → fa): гомографія з поточного кадру в попередній.
-
-        Обчислення винесене в ``keyframe_selector.compute_inter_frame_homography``
-        (headless-тестоване); тут лишається лише лінива ініціалізація матчера.
+        """H(fb -> fa): homography from current frame to previous.
+        Calculation moved to ``keyframe_selector.compute_inter_frame_homography``
+        (headless-tested); only lazy matcher initialization remains here.
         """
         if self.matcher is None:
-            # Спробуємо отримати model_manager з контексту, якщо він є
+            # Try to get model_manager from context if available
             mm = getattr(self, "_temp_model_manager", None)
             self.matcher = FeatureMatcher(model_manager=mm, config=self.config)
 
@@ -514,10 +509,9 @@ class DatabaseBuilder:
         )
 
     def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:
-        """True, якщо H відповідає значному руху (вибір keyframe).
-
-        Логіка винесена в ``keyframe_selector.is_significant_motion``
-        (headless-тестована); тут лишається лише читання порогів із config.
+        """True if H corresponds to significant motion (keyframe selection).
+        Logic moved to ``keyframe_selector.is_significant_motion``
+        (headless-tested); only reading thresholds from config remains here.
         """
         return keyframe_selector.is_significant_motion(
             H,

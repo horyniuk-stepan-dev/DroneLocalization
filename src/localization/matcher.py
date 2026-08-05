@@ -1,12 +1,9 @@
 """
-matcher.py — ВИПРАВЛЕНА ВЕРСІЯ
+matcher.py — Feature matching module.
 
-Ключові зміни:
-- ВИПРАВЛЕННЯ БАГ 4: значення за замовчуванням ratio_threshold знижено з 0.95 до 0.75.
-  Попереднє значення 0.95 пропускало колосальну кількість хибних збігів (false positives),
-  особливо на однорідних текстурах (поля, ліси, дахи будівель). Це призводило до
-  вироджених гомографій та мікрострибків координат між сусідніми кадрами.
-  Значення 0.75 відповідає рекомендаціям Lowe's ratio test для нормалізованих дескрипторів.
+Key fixes:
+- ratio_threshold default set to 0.75 per Lowe's ratio test for normalized descriptors,
+  preventing false positive matches on homogeneous textures.
 """
 
 import faiss
@@ -22,12 +19,12 @@ logger = get_logger(__name__)
 def extract_sift_features(
     image: np.ndarray, static_mask: np.ndarray | None = None, max_keypoints: int = 2048
 ) -> dict:
-    """RESEARCH 2.2: SIFT-ознаки у форматі, сумісному з LightGlue(features="sift").
+    """RESEARCH 2.2: SIFT features in a format compatible with LightGlue(features="sift").
 
-    Використовується і DatabaseBuilder-ом (offline, збереження у БД), і
-    Localizer-ом (online, аварійний фолбек) — ідентичний пайплайн гарантує
-    сумісність дескрипторів. Дескриптори — rootSIFT (L1-норм + sqrt), як в
-    екстракторі бібліотеки lightglue, на якому натреновані ваги sift-матчера.
+    Used by both DatabaseBuilder (offline, database storage) and
+    Localizer (online, emergency fallback) — an identical pipeline guarantees
+    descriptor compatibility. Descriptors are rootSIFT (L1-norm + sqrt), like in
+    the lightglue library extractor, on which the sift-matcher weights were trained.
     """
     import cv2
 
@@ -45,7 +42,7 @@ def extract_sift_features(
             "image_size": np.array(gray.shape[:2], dtype=np.int32),
         }
 
-    # rootSIFT: L1-нормалізація + поелементний sqrt → L2-норм ~1
+    # rootSIFT: L1-normalise + elementwise sqrt → L2-norm ≈1
     descs = descs.astype(np.float32)
     descs /= np.maximum(descs.sum(axis=1, keepdims=True), 1e-12)
     descs = np.sqrt(descs)
@@ -67,11 +64,11 @@ class FastRetrieval:
         )
         self.dim = global_descriptors.shape[1]
 
-        # Inner Product index (для косинусної схожості нормалізованих векторів)
+        # Inner Product index for cosine similarity of normalised vectors
         base_index = faiss.IndexFlatIP(self.dim)
         self.index = faiss.IndexIDMap(base_index)
 
-        # Нормалізуємо і додаємо в індекс
+        # Normalise and add to index
         normed = self.normalize_vectors(global_descriptors)
         ids = np.arange(len(global_descriptors), dtype=np.int64)
         self.index.add_with_ids(normed.astype(np.float32), ids)
@@ -84,7 +81,7 @@ class FastRetrieval:
         return vectors / (norms + 1e-8)
 
     def add_descriptor(self, query_desc: np.ndarray, frame_id: int):
-        """Інкрементально додає новий дескриптор до FAISS індексу."""
+        """Incrementally adds a new descriptor to FAISS index."""
         normed = self.normalize_vectors(query_desc)
         if normed.ndim == 1:
             normed = normed[None]
@@ -128,7 +125,7 @@ class LanceDBRetrieval:
                 .select(["frame_id", "_distance"])
                 .to_list()
             )
-            # повертає [(frame_id, similarity)]
+            # Returns [(frame_id, similarity)]
             return [(int(r["frame_id"]), float(max(0.0, 1.0 - r["_distance"]))) for r in res]
         except Exception as e:
             logger.error(f"LanceDB query failed: {e}")
@@ -142,14 +139,14 @@ class FeatureMatcher:
         self.config = config or {}
         self.model_manager = model_manager
 
-        # ВИПРАВЛЕННЯ БАГ 4: знижено з 0.95 до 0.75.
-        # Значення 0.95 допускало занадто багато хибних збігів на однорідних текстурах
-        # (поля, ліси, дахи), що призводило до вироджених гомографій у MAGSAC++/LMEDS
-        # та мікрострибків координат між сусідніми кадрами.
-        # 0.75 — стандартне значення Lowe's ratio test для нормалізованих L2-дескрипторів.
+        # Ratio threshold lowered from 0.95 to 0.75.
+        # 0.95 allowed too many false matches on homogeneous textures
+        # (fields, forests, rooftops), causing degenerate homographies in MAGSAC++/LMEDS
+        # and coordinate micro-jumps between adjacent frames.
+        # 0.75 is the standard Lowe's ratio test value for normalised L2 descriptors.
         self.ratio_threshold = get_cfg(self.config, "localization.ratio_threshold", 0.75)
 
-        # Завантажуємо LightGlue (ALIKED/RDD) через ModelManager
+        # Load LightGlue (ALIKED/RDD) via ModelManager
         self.lightglue = None
         if self.model_manager:
             local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
@@ -169,11 +166,11 @@ class FeatureMatcher:
 
         logger.info(f"FeatureMatcher ratio_threshold = {self.ratio_threshold:.2f}")
 
-        # Для warn-once логування несумісних розмірностей дескрипторів
+        # For warn-once logging of incompatible descriptor dimensions
         self._dim_mismatch_warned: set = set()
 
-        # RESEARCH 2.2: LightGlue(sift) вантажиться ліниво — лише коли
-        # аварійний фолбек реально спрацював уперше (VRAM не витрачається дарма)
+        # LightGlue(sift) loaded lazily — only when the emergency fallback fires
+        # for the first time (VRAM is not wasted otherwise)
         self._lightglue_sift = None
         self._lightglue_sift_failed = False
 
@@ -189,10 +186,10 @@ class FeatureMatcher:
             ref_features["descriptors"].shape[1] if len(ref_features["descriptors"]) > 0 else 0
         )
 
-        # ЗАХИСТ: різні розмірності дескрипторів (напр. query=128 ALIKED,
-        # ref=256 RDD/SuperPoint зі старої бази) неможливо матчити взагалі —
-        # ні LightGlue, ні L2. База цього джерела збудована іншим екстрактором
-        # і потребує перегенерації.
+        # Guard: mismatched descriptor dimensions (e.g. query=128-dim ALIKED,
+        # ref=256-dim RDD/SuperPoint from an old database) cannot be matched at all —
+        # neither LightGlue nor L2. That source's database was built with a
+        # different extractor and must be regenerated.
         if desc_dim and ref_dim and desc_dim != ref_dim:
             key = (desc_dim, ref_dim)
             if key not in self._dim_mismatch_warned:
@@ -205,7 +202,7 @@ class FeatureMatcher:
                 )
             return np.empty((0, 2)), np.empty((0, 2))
 
-        # Якщо є LightGlue і розмірність дескриптора 128 (ALIKED) або 256 (RDD/SuperPoint)
+        # Use LightGlue if available and descriptor dim is 128 (ALIKED) or 256 (RDD/SuperPoint)
         if self.lightglue is not None and desc_dim in (128, 256):
             return self._lightglue_match(query_features, ref_features)
 
@@ -215,7 +212,7 @@ class FeatureMatcher:
                 f"Using Numpy L2 matching instead."
             )
 
-        # Fallback (якщо немає LightGlue або інші ознаки)
+        # Fallback (no LightGlue or unsupported descriptor)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def _fast_numpy_match(
@@ -236,14 +233,14 @@ class FeatureMatcher:
             )
             return np.empty((0, 2)), np.empty((0, 2))
 
-        # 1. Нормалізація дескрипторів
+        # 1. Normalise descriptors
         desc_q_n = desc_q / (np.linalg.norm(desc_q, axis=1, keepdims=True) + 1e-8)
         desc_r_n = desc_r / (np.linalg.norm(desc_r, axis=1, keepdims=True) + 1e-8)
 
-        # 2. Розрахунок косинусної схожості через швидке матричне множення
+        # 2. Cosine similarity via fast matrix multiplication
         sim = np.dot(desc_q_n, desc_r_n.T)
 
-        # 3. Lowe's Ratio Test — argpartition O(n) замість argsort O(n log n)
+        # 3. Lowe's Ratio Test — argpartition O(n) instead of argsort O(n log n)
         top2_idx = np.argpartition(-sim, kth=1, axis=1)[:, :2]
         top2_sim = np.take_along_axis(sim, top2_idx, axis=1)
         order = np.argsort(-top2_sim, axis=1)
@@ -254,7 +251,7 @@ class FeatureMatcher:
         second_best_sim = top2_sim[:, 1]
         best_matches_indices = top2_idx[:, 0]
 
-        # Переводимо схожість у L2-відстань: D = sqrt(2 - 2*sim)
+        # Convert similarity to L2 distance: D = sqrt(2 − 2*sim)
         best_dist = np.sqrt(np.clip(2.0 - 2.0 * best_sim, 0, None))
         second_best_dist = np.sqrt(np.clip(2.0 - 2.0 * second_best_sim, 0, None))
 
@@ -272,7 +269,7 @@ class FeatureMatcher:
         return mkpts_q, mkpts_r
 
     def match_mnn(self, query_features: dict, ref_features: dict) -> tuple:
-        """Детермінований mutual-NN (L2) матчинг ПОВЗ LightGlue (Етап 8, 2026-07-12).
+        """Deterministic mutual-NN (L2) matching BYPASSING LightGlue.
 
         Фолбек для temporal-ребер пропагації: на повторюваній ріллі LightGlue
         місцями віддає 12–28 матчів там, де MNN по тих самих дескрипторах
@@ -281,7 +278,7 @@ class FeatureMatcher:
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
     def match_sift(self, query_features: dict, ref_features: dict) -> tuple:
-        """RESEARCH 2.2: матчинг SIFT-ознак через LightGlue(features="sift").
+        """RESEARCH 2.2: SIFT feature matching via LightGlue(features="sift").
 
         Окремий метод (не через match()): SIFT-дескриптори 128-вимірні, як
         ALIKED, тож маршрутизація за розмірністю відправила б їх у
@@ -317,8 +314,8 @@ class FeatureMatcher:
 
             device = next(model.parameters()).device
 
-            # image_size для коректної нормалізації координат [-1, 1] у LightGlue.
-            # Без цього крос-роздільні пари (4K query vs 1080p ref) дають ~0 matches.
+            # image_size needed for correct [-1, 1] coordinate normalisation in LightGlue.
+            # Without it, cross-resolution pairs (4K query vs 1080p ref) produce ~0 matches.
             image0_data = {
                 "keypoints": torch.from_numpy(query_features["keypoints"]).float()[None].to(device),
                 "descriptors": torch.from_numpy(query_features["descriptors"])
@@ -335,7 +332,7 @@ class FeatureMatcher:
             q_size = query_features.get("image_size")
             r_size = ref_features.get("image_size")
             if q_size is not None:
-                # image_size очікується як (W, H) у LightGlue
+                # image_size expected as (W, H) in LightGlue
                 image0_data["image_size"] = torch.tensor(
                     [[int(q_size[1]), int(q_size[0])]], device=device
                 )

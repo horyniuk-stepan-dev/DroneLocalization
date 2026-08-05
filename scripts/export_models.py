@@ -19,6 +19,7 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
 def export_all_models():
     """Експортує всі підтримувані моделі."""
     logger.info("Starting manual model export sequence...")
@@ -33,7 +34,7 @@ def export_all_models():
         # Для цього тимчасово змінимо конфіг
         original_backend = APP_SETTINGS.models.lightglue.backend
         APP_SETTINGS.models.lightglue.backend = "git"
-        APP_SETTINGS.models.lightglue.auto_convert = True # Щоб спрацював _auto_export
+        APP_SETTINGS.models.lightglue.auto_convert = True  # Щоб спрацював _auto_export
 
         manager.load_lightglue(features="aliked")
 
@@ -65,8 +66,11 @@ def export_all_models():
 
     logger.success("Model export sequence complete!")
 
+
 if __name__ == "__main__":
     if torch.cuda.is_available():
         export_all_models()
     else:
-        logger.error("CUDA is required for model export (to ensure FP16 and TensorRT compatibility).")
+        logger.error(
+            "CUDA is required for model export (to ensure FP16 and TensorRT compatibility)."
+        )

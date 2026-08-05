@@ -1,34 +1,30 @@
-"""Рендер debug-каналів (вікна «очима моделей») — чистий cv2/numpy.
+"""Render debug channels using pure OpenCV and NumPy.
 
-Викликається у worker-потоці ПІСЛЯ localize_frame. Кожна функція повертає
-готове BGR-зображення (для opencv_to_qpixmap, який чекає BGR), вже
-downscale-нуте до max_width. Жодних PyQt/torch-залежностей тут немає — модуль
-можна тестувати ізольовано.
-
-Увага: cv2.putText не рендерить кирилицю → усі підписи латиницею.
+Executed in worker thread after localize_frame. Each function returns
+a ready BGR image downscaled to max_width.
 """
 
 import cv2
 import numpy as np
 
-# COCO-класи, які маскує YOLO (person, bicycle, car, motorcycle, bus, truck)
+# COCO classes masked by YOLO (person, bicycle, car, motorcycle, bus, truck)
 COCO_NAMES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
-# Кольори bbox у BGR
+# Class bbox colors in BGR
 _CLASS_BGR = {
-    0: (100, 100, 255),  # person — червоний
+    0: (100, 100, 255),  # person — red
     1: (255, 200, 100),  # bicycle
-    2: (255, 200, 100),  # car — блакитний
-    3: (50, 200, 255),  # motorcycle — жовтогарячий
-    5: (100, 255, 50),  # bus — зелений
-    7: (50, 150, 255),  # truck — помаранчевий
+    2: (255, 200, 100),  # car — light blue
+    3: (50, 200, 255),  # motorcycle — orange
+    5: (100, 255, 50),  # bus — green
+    7: (50, 150, 255),  # truck — orange
 }
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def _downscale(img: np.ndarray, max_width: int) -> np.ndarray:
-    """Downscale до max_width зі збереженням співвідношення. Повертає contiguous."""
+    """Downscales to max_width while preserving aspect ratio. Returns contiguous array."""
     h, w = img.shape[:2]
     if max_width and w > max_width:
         nh = max(1, int(round(h * max_width / float(w))))
@@ -37,7 +33,7 @@ def _downscale(img: np.ndarray, max_width: int) -> np.ndarray:
 
 
 def _text(img, text, org, color=(255, 255, 255), scale=0.5, bg=(0, 0, 0)):
-    """Текст з непрозорою підкладкою для читабельності на будь-якому фоні."""
+    """Draws text with solid background for readability."""
     (tw, th), bl = cv2.getTextSize(text, _FONT, scale, 1)
     x, y = org
     cv2.rectangle(img, (x, y), (x + tw + 6, y + th + bl + 6), bg, -1)
@@ -45,7 +41,7 @@ def _text(img, text, org, color=(255, 255, 255), scale=0.5, bg=(0, 0, 0)):
 
 
 def _panel(img, lines, scale=0.45):
-    """Лівий-верхній багаторядковий блок (retrieval-панель тощо)."""
+    """Draws top-left multi-line overlay panel."""
     y = 2
     for ln in lines:
         (tw, th), bl = cv2.getTextSize(ln, _FONT, scale, 1)
@@ -55,13 +51,13 @@ def _panel(img, lines, scale=0.45):
 
 
 def render_yolo(frame_rgb, detections, static_mask, max_width) -> np.ndarray:
-    """Кадр + напівпрозорий static_mask (динаміка) + bbox класу і confidence."""
+    """Renders frame + semi-transparent static_mask (dynamic objects) + bbox class & confidence."""
     bgr = cv2.cvtColor(np.ascontiguousarray(frame_rgb), cv2.COLOR_RGB2BGR)
     if static_mask is not None:
-        dyn = static_mask < 128  # 0 = динамічний об'єкт (замаскований)
+        dyn = static_mask < 128  # 0 = dynamic object (masked)
         if bool(dyn.any()):
             overlay = bgr.copy()
-            overlay[dyn] = (0, 0, 255)  # червоний BGR
+            overlay[dyn] = (0, 0, 255)  # red BGR
             bgr = cv2.addWeighted(overlay, 0.35, bgr, 0.65, 0)
     n = 0
     for det in detections or []:
@@ -82,7 +78,7 @@ def render_yolo(frame_rgb, detections, static_mask, max_width) -> np.ndarray:
 
 
 def render_matches(collector, max_width) -> np.ndarray:
-    """Query keypoints сірим, inliers зеленим, disparity-вектори q->r; лічильники."""
+    """Renders query keypoints (grey), inliers (green), disparity vectors q->r, and counters."""
     bgr = cv2.cvtColor(np.ascontiguousarray(collector.rotated_frame), cv2.COLOR_RGB2BGR)
     qf = collector.query_features or {}
     kpts = qf.get("keypoints")
@@ -112,7 +108,7 @@ def render_matches(collector, max_width) -> np.ndarray:
 
 
 def _pca_rgb(tokens, h_p, w_p) -> np.ndarray:
-    """3 головні компоненти патч-токенів -> RGB (h_p, w_p, 3) uint8."""
+    """3 principal components of patch tokens -> RGB (h_p, w_p, 3) uint8."""
     X = np.asarray(tokens, dtype=np.float32)
     X = X - X.mean(axis=0, keepdims=True)
     try:
@@ -127,7 +123,7 @@ def _pca_rgb(tokens, h_p, w_p) -> np.ndarray:
 
 
 def render_dino(collector, max_width, pca_enabled) -> np.ndarray:
-    """PCA патч-токенів поверх кадру + панель retrieval (top-k id/score, кут, масштаб)."""
+    """Renders PCA patch tokens overlay + retrieval panel (top-k id/score, angle, scale)."""
     bgr = cv2.cvtColor(np.ascontiguousarray(collector.rotated_frame), cv2.COLOR_RGB2BGR)
     if pca_enabled and collector.patch_tokens is not None and collector.patch_grid is not None:
         try:
@@ -154,7 +150,7 @@ def render_dino(collector, max_width, pca_enabled) -> np.ndarray:
 
 
 def render_depth(collector, max_width) -> np.ndarray:
-    """Colormap (INFERNO) відносної depth-мапи + значення relative scale."""
+    """Renders colormap (INFERNO) of relative depth map + relative scale value."""
     d = np.asarray(collector.depth_map, dtype=np.float32)
     mn = float(np.nanmin(d))
     mx = float(np.nanmax(d))

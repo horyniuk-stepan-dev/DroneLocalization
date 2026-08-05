@@ -35,9 +35,8 @@ SCHEMA_FIELDS: tuple[str, ...] = (
     "frame_step",
     "store_sift_features",
     "sift_max_keypoints",
-    # Аудит §2.1: CPU-resize перед входом DINO використовує cv2.INTER_AREA
-    # замість torchvision Resize(antialias) — інший фільтр, отже інші значення
-    # дескрипторів. Бази з різним значенням цього ключа НЕ взаємозамінні.
+    # CPU-resize before DINO uses cv2.INTER_AREA instead of torchvision Resize(antialias)
+    # Different filter creates different descriptor values -> databases are not interchangeable.
     "dino_cpu_resize",
 )
 

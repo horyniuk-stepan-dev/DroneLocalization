@@ -1,57 +1,56 @@
-"""Просторовий розкид відповідностей — обумовленість геометричної оцінки.
+"""Spatial spread of correspondences — ill-conditioning of geometric estimation.
 
-Мотивація (OrthoTrack §3.4, `docs/RESEARCH_ADDENDUM_2026-07.md` п.1): інлаєрів
-може бути формально досить, але якщо всі вони скупчилися в одному куті кадру,
-гомографія/афінна оцінка ill-conditioned — модель екстраполюється на решту
-кадру, а саме центр кадру далі йде в координату. Кількість інлаєрів цього не
-бачить; RANSAC теж — локально узгоджений кластер є валідним консенсусом.
+Motivation (OrthoTrack §3.4, `docs/RESEARCH_ADDENDUM_2026-07.md` item 1): inliers
+may be formally sufficient in count, but if all of them are clustered in one corner,
+the homography/affine estimation is ill-conditioned — the model extrapolates onto the rest
+of the frame, sending the frame center to a bad coordinate. Inlier count cannot detect this,
+nor can RANSAC — a locally consistent cluster is a valid consensus.
 
-Чисті функції (лише numpy) — тестуються в будь-якому середовищі і викликаються
-з обох сторін: live (`ResultBuilder.compute_confidence`) і offline
+Pure functions (numpy only) — testable in any environment and called
+from both sides: live (`ResultBuilder.compute_confidence`) and offline
 (`PropagationPipeline._match_and_build_edge`).
 
-ВАЖЛИВО про семантику: низький розкид — це НЕ автоматично помилка. На межі
-покриття БД query-кадр легітимно перетинається з референсом лише кутом, і
-скупчення там правильне. Тому метрика входить у пайплайн неперервно (множник
-до confidence / до ваги ребра), а жорсткий гейт лишається тільки на екстремумі.
+IMPORTANT semantics: low spread is NOT automatically an error. At the boundary of DB
+coverage, query frame legitimately overlaps with reference only by a corner, and clustering
+there is correct. Therefore, the metric enters the pipeline continuously (multiplier to
+confidence / edge weight), while a hard gate remains only at the extreme.
 
-ВАЖЛИВО про None: ``None`` означає «сигнал недоступний» (мало точок, битий
-кадр), а ``0.0`` — «розкид справді нульовий» (всі точки на одній прямій —
-найгірший можливий випадок). Плутати їх не можна: перше не має штрафуватись,
-друге має штрафуватись максимально.
+IMPORTANT about None: ``None`` means "signal unavailable" (too few points, corrupted
+frame), whereas ``0.0`` means "spread is truly zero" (all points on a single line —
+worst possible case). Do not confuse them: the former should not be penalized,
+the latter should be penalized maximally.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-# Розкид рівномірного розподілу по стороні L: σ = L/√12 ≈ 0.2887·L.
-# Тобто здоровий надирний кадр з рівномірним покриттям дає spread ≈ 0.29.
+# Spread of a uniform distribution over side L: σ = L/√12 ≈ 0.2887·L.
+# So a healthy nadir frame with uniform coverage gives spread ≈ 0.29.
 UNIFORM_SPREAD = float(1.0 / np.sqrt(12.0))
 
 
 def inlier_spread(points: np.ndarray, frame_w: float, frame_h: float) -> float | None:
-    """min(σx, σy) / min(W, H) — безрозмірний просторовий розкид точок.
+    """min(sigma_x, sigma_y) / min(W, H) — dimensionless spatial point spread.
 
-    Нормування на ``min(W, H)`` робить метрику інваріантною і до роздільності,
-    і до співвідношення сторін: для рівномірного покриття σx = 0.2887·W,
-    σy = 0.2887·H, тож min(σx, σy) = 0.2887·min(W, H) → spread ≈ 0.289 за
-    будь-якого аспекту.
+    Normalizing by ``min(W, H)`` makes the metric invariant to both resolution and
+    aspect ratio: for uniform coverage sigma_x = 0.2887*W, sigma_y = 0.2887*H,
+    so min(sigma_x, sigma_y) = 0.2887*min(W, H) -> spread ≈ 0.289 for any aspect.
 
-    Береться саме ``min`` двох осей, а не площа хмари: типовий режим відмови —
-    точки вздовж однієї борозни/лінії, де один із σ великий, а другий ≈ 0.
-    Добуток σx·σy теж це ловить, але ``min`` дає лінійну шкалу в тих самих
-    одиницях, що й сторона кадру, і легше калібрується порогами.
+    Specifically takes ``min`` of the two axes rather than cloud area: typical failure
+    mode is points along a single line/furrow where one sigma is large while the second ≈ 0.
+    The product sigma_x*sigma_y catches this too, but ``min`` gives a linear scale in the
+    same units as frame side, making threshold calibration simpler.
 
     Args:
-        points: (N, 2) координати у пікселях кадру (query-сторона).
-        frame_w: ширина кадру в тих самих пікселях, що й ``points``.
-        frame_h: висота кадру.
+        points: (N, 2) pixel coordinates in query frame.
+        frame_w: frame width in the same pixels as ``points``.
+        frame_h: frame height.
 
     Returns:
-        Розкид у [0, ~0.5], або ``None``, якщо метрику неможливо порахувати
-        (< 2 валідних точок, нульовий/нечисловий розмір кадру). Нуль — це
-        валідне значення «повністю вироджена хмара», а не відсутність сигналу.
+        Spread in [0, ~0.5], or ``None`` if metric cannot be computed
+        (< 2 valid points, zero/non-finite frame dimensions). Zero is a
+        valid value ("completely degenerate cloud"), not signal absence.
     """
     if points is None:
         return None
@@ -76,15 +75,15 @@ def inlier_spread(points: np.ndarray, frame_w: float, frame_h: float) -> float |
 def spread_confidence_factor(
     spread: float | None, spread_ref: float = 0.15, floor: float = 0.35
 ) -> float:
-    """Множник до confidence живої локалізації: clip(spread/ref, floor, 1.0).
+    """Multiplier for live localization confidence: clip(spread/ref, floor, 1.0).
 
-    ``spread_ref`` = 0.15 — приблизно половина рівномірного покриття (0.289):
-    вище нього штрафу нема взагалі. ``floor`` не дає confidence обнулитись —
-    скупчений фікс лишається вимірюванням із більшим R у Калмані, а не
-    відкинутим кадром (це і є різниця з жорстким порогом OrthoTrack).
+    ``spread_ref`` = 0.15 — approximately half of uniform coverage (0.289):
+    above this there is no penalty at all. ``floor`` prevents confidence from zeroing out —
+    a clustered fix remains a measurement with larger R in Kalman, rather than
+    a discarded frame (which is the difference from OrthoTrack hard threshold).
 
-    ``None`` (сигнал недоступний) → 1.0, без штрафу. ``0.0`` (вироджена
-    хмара) → ``floor``, тобто максимальний штраф.
+    ``None`` (signal unavailable) -> 1.0, no penalty. ``0.0`` (degenerate
+    cloud) -> ``floor``, maximum penalty.
     """
     if spread is None or not np.isfinite(spread):
         return 1.0
@@ -93,14 +92,14 @@ def spread_confidence_factor(
 
 
 def spread_weight_factor(spread: float | None, spread_ref: float = 0.15, k: float = 10.0) -> float:
-    """Множник до ваги ребра графа: 1 / (1 + k·max(0, ref − spread)).
+    """Multiplier to graph edge weight: 1 / (1 + k*max(0, ref - spread)).
 
-    Та сама форма, що вже вживається для якості афінного фіту
-    (``temporal_weight_use_fit_quality``), тож ваги лишаються в одній шкалі.
-    Дефіцит розкиду обмежений зверху величиною ``ref`` (0.15), тому k має бути
-    порядку 10, щоб штраф був відчутним: spread 0.05 → ×0.50, spread 0 → ×0.40.
+    Same form as used for affine fit quality (``temporal_weight_use_fit_quality``),
+    so weights stay on the same scale.
+    Spread deficit is bounded above by ``ref`` (0.15), so k should be around 10
+    for penalty to be noticeable: spread 0.05 -> x0.50, spread 0 -> x0.40.
 
-    ``None`` (сигнал недоступний) → 1.0, без штрафу.
+    ``None`` (signal unavailable) -> 1.0, no penalty.
     """
     if spread is None or not np.isfinite(spread):
         return 1.0

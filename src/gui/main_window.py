@@ -233,9 +233,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         except Exception as e:
             logger.debug(f"Failed to persist debug view visibility: {e}")
 
-        # HARDENING P1-6 SP3: closing the databases is what wipes the decrypted
-        # LanceDB temp directory. Without this a clean exit leaves the plaintext
-        # global descriptors on the temp disk until the OS cleans it up.
+        # Закриття баз даних та очищення тимчасових розшифрованих каталогів при виході з програми.
         try:
             if getattr(self, "db_manager", None) is not None:
                 self.db_manager.close_all()

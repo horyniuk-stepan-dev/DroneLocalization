@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 
 
 class CoordinatesBroker(QObject):
-    """Централізований брокер координат для всіх споживачів."""
+    """Centralized coordinates broker for all downstream consumers."""
 
     def __init__(self, config: NetworkApiConfig):
         super().__init__()
@@ -28,13 +28,9 @@ class CoordinatesBroker(QObject):
         self._tracking_start_time: float = 0.0
         self.is_tracking_active: bool = False
 
-        # HARDENING P1-9/10: monotonic timestamp of the last successful fix,
-        # drives the operating-state machine and stall detector. None = no fix
-        # since the current tracking session began.
+        # Monotonic timestamp of the last received fix (for state tracking and timeouts).
         self._last_fix_mono: float | None = None
-        # HARDENING §4a: monotonic timestamp of the last *fresh keyframe anchor*
-        # (a real re-localization, not an optical-flow-propagated fix). Drives
-        # the anchor-staleness DEGRADED branch. None = no anchor yet this session.
+        # Monotonic timestamp of the last keyframe localization (not optical flow).
         self._last_anchor_mono: float | None = None
 
         self._ws_server = None
@@ -47,7 +43,7 @@ class CoordinatesBroker(QObject):
             self._start_network_services()
 
     def _start_network_services(self):
-        """Запускає asyncio event loop у фоновому потоці для WS/REST."""
+        """Starts asyncio event loop in a background thread for WS/REST."""
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
         self._loop_thread.start()
@@ -57,9 +53,7 @@ class CoordinatesBroker(QObject):
 
         token = getattr(self.config, "api_token", "") or None
 
-        # HARDENING P0-4: if any server would bind a routable host without a
-        # token, self-heal to secure rather than crash — generate one and log
-        # it so the operator can hand it to clients. Localhost stays tokenless.
+        # Automatically generate security token for public IP bindings if unconfigured
         _local = ("127.0.0.1", "localhost", "::1")
         _remote_ws = self.config.ws_enabled and self.config.ws_host not in _local
         _remote_rest = self.config.rest_enabled and self.config.rest_host not in _local
@@ -73,8 +67,7 @@ class CoordinatesBroker(QObject):
                 "Set network.api_token in user_config.json to pin a fixed token."
             )
 
-        # HARDENING P1-7: resolve optional TLS. Fail closed — if TLS is enabled
-        # but the cert/key pair is missing, do NOT silently serve plaintext.
+        # Initialize TLS context if encryption is enabled
         certfile = keyfile = None
         if getattr(self.config, "tls_enabled", False):
             certfile = getattr(self.config, "tls_certfile", "") or ""
@@ -110,18 +103,16 @@ class CoordinatesBroker(QObject):
 
         if tasks:
             self._loop.run_until_complete(asyncio.gather(*tasks))
-            # HARDENING P1-10: liveness heartbeat over WS, flag-gated.
+            # Background heartbeat task to broadcast system state over WS
             if getattr(self.config, "expose_operating_state", False):
                 self._loop.create_task(self._heartbeat_loop())
-            # Запускаємо безкінечний цикл для обробки підключень
+            # Run event loop forever
             self._loop.run_forever()
 
     def stop(self):
         self.is_tracking_active = False
         if self._loop and self._loop.is_running():
-            # Запускаємо зупинку серверів асинхронно
             asyncio.run_coroutine_threadsafe(self._stop_servers(), self._loop)
-            # Чекаємо трохи і зупиняємо loop
             time.sleep(0.5)
             self._loop.call_soon_threadsafe(self._loop.stop)
 
@@ -135,7 +126,6 @@ class CoordinatesBroker(QObject):
         self.is_tracking_active = active
         if active:
             self._tracking_start_time = time.time()
-            # New session starts in ACQUIRING until the first fix arrives.
             self._last_fix_mono = None
             self._last_anchor_mono = None
 
@@ -145,13 +135,13 @@ class CoordinatesBroker(QObject):
         return 0.0
 
     def get_operating_state(self) -> dict:
-        """HARDENING P1-9/10: honest operating state + stall info.
+        """Returns detailed operating state of the navigation broker.
 
-        IDLE       — tracking not active.
-        ACQUIRING  — tracking active, no fix yet this session.
-        LOST       — tracking active, last fix older than fix_stale_sec (stall).
-        DEGRADED   — recent fix but below configured inlier/confidence floor.
-        TRACKING   — recent, healthy fix.
+        IDLE       — tracking inactive.
+        ACQUIRING  — tracking active, awaiting initial position fix.
+        LOST       — tracking active, but no position fix for longer than fix_stale_sec.
+        DEGRADED   — current fix has low confidence/inliers or stale anchor.
+        TRACKING   — stable high-confidence tracking.
         """
         stale_sec = getattr(self.config, "fix_stale_sec", 3.0)
         min_inl = getattr(self.config, "degraded_min_inliers", 0)
@@ -177,10 +167,6 @@ class CoordinatesBroker(QObject):
                 if (min_inl and inl < min_inl) or (min_conf and conf < min_conf):
                     state = "DEGRADED"
                 elif prop_stale and (self._last_anchor_mono is None or anchor_age > prop_stale):
-                    # HARDENING §4a: tracking is coasting on optical-flow
-                    # propagation with no fresh keyframe anchor for too long —
-                    # honest DEGRADED even though the (propagated) fix clock is
-                    # still fresh. Closes the content-blind gap.
                     state = "DEGRADED"
                 else:
                     state = "TRACKING"
@@ -193,8 +179,7 @@ class CoordinatesBroker(QObject):
         }
 
     async def _heartbeat_loop(self):
-        """HARDENING P1-10: periodic liveness beacon so consumers detect a hung
-        pipeline even when no position is being produced (i.e. LOST)."""
+        """Periodic heartbeat broadcast to report state availability."""
         interval = getattr(self.config, "heartbeat_interval_sec", 1.0)
         try:
             while True:
@@ -217,7 +202,7 @@ class CoordinatesBroker(QObject):
         history_list = list(self._history)
         return history_list[-limit:]
 
-    # Слоти для підключення до RealtimeTrackingWorker
+    # Slots for RealtimeTrackingWorker connections
 
     @pyqtSlot(float, float, float, int)
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
@@ -230,15 +215,13 @@ class CoordinatesBroker(QObject):
             "timestamp": time.time(),
         }
         self._last_position = msg
-        self._last_fix_mono = time.monotonic()  # HARDENING P1-9/10: stall clock
+        self._last_fix_mono = time.monotonic()  # Timestamp of last position fix
         self._history.append(msg)
         self._broadcast(msg)
 
     @pyqtSlot()
     def on_anchor_fix(self):
-        """HARDENING §4a: a fresh keyframe anchor landed (a real re-localization,
-        not an optical-flow-propagated fix). Refreshes the anchor-staleness clock
-        the DEGRADED branch watches. Wired to the worker's ``anchor_fix`` signal."""
+        """Updates keyframe localization timer on anchor_fix signal."""
         self._last_anchor_mono = time.monotonic()
 
     @pyqtSlot(object)

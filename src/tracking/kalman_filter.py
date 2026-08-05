@@ -14,15 +14,15 @@ class TrajectoryFilter:
         # Filter state: [x, y, vx, vy]
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
 
-        # Збільшений шум процесу та зменшений шум вимірювання
-        # дозволяють фільтру швидше реагувати на зміни курсу на високих швидкостях
+        # Elevated process noise and reduced measurement noise
+        # let the filter react faster to heading changes at high speeds
         self.process_noise = process_noise
         self.is_initialized = False
-        # Two-point velocity seed (живий інцидент 2026-07-18): перше update()
-        # після ініціалізації задає vx/vy з різниці перших двох сирих точок
-        # замість v=0 — без цього на траєкторіях зі сталою високою швидкістю
-        # (виміряно ~150 м/с на симуляторному польоті) filtered-позиція кілька
-        # кроків відстає від сирих фіксів, поки KF "вивчає" швидкість із нуля.
+        # Two-point velocity seed: the first update() after initialisation
+        # seeds vx/vy from the difference of the first two raw fixes instead of
+        # v=0. Without this, trajectories with sustained high speed (~150 m/s
+        # measured on simulator flight) cause the filtered position to lag
+        # behind raw fixes for several steps while the KF learns velocity.
         self._prev_raw: tuple[float, float] | None = None
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
@@ -44,7 +44,7 @@ class TrajectoryFilter:
         self.kf.H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
 
         self.kf.R = np.array([[measurement_noise, 0.0], [0.0, measurement_noise]])
-        # Базовий R для адаптивного масштабування за confidence локалізації
+        # Base R for adaptive scaling by localisation confidence
         self._base_R = self.kf.R.copy()
 
         self._update_matrices_for_dt(dt)
@@ -56,36 +56,36 @@ class TrajectoryFilter:
         q_var = Q_discrete_white_noise(dim=2, dt=dt, var=self.process_noise)
         self.kf.Q = np.zeros((4, 4))
 
-        # Блок осі X (позиція X та швидкість VX)
-        self.kf.Q[0, 0] = q_var[0, 0]  # Дисперсія позиції X
-        self.kf.Q[0, 2] = q_var[0, 1]  # Коваріація X та VX
-        self.kf.Q[2, 0] = q_var[1, 0]  # Коваріація VX та X
-        self.kf.Q[2, 2] = q_var[1, 1]  # Дисперсія швидкості VX
+        # X-axis block (X position and VX velocity)
+        self.kf.Q[0, 0] = q_var[0, 0]  # X position variance
+        self.kf.Q[0, 2] = q_var[0, 1]  # X / VX covariance
+        self.kf.Q[2, 0] = q_var[1, 0]  # VX / X covariance
+        self.kf.Q[2, 2] = q_var[1, 1]  # VX velocity variance
 
-        # Блок осі Y (позиція Y та швидкість VY)
-        self.kf.Q[1, 1] = q_var[0, 0]  # Дисперсія позиції Y
-        self.kf.Q[1, 3] = q_var[0, 1]  # Коваріація Y та VY
-        self.kf.Q[3, 1] = q_var[1, 0]  # Коваріація VY та Y
-        self.kf.Q[3, 3] = q_var[1, 1]  # Дисперсія швидкості VY
+        # Y-axis block (Y position and VY velocity)
+        self.kf.Q[1, 1] = q_var[0, 0]  # Y position variance
+        self.kf.Q[1, 3] = q_var[0, 1]  # Y / VY covariance
+        self.kf.Q[3, 1] = q_var[1, 0]  # VY / Y covariance
+        self.kf.Q[3, 3] = q_var[1, 1]  # VY velocity variance
 
     def mahalanobis_sq(
         self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0
     ) -> float | None:
-        """d² = yᵀ S⁻¹ y для вимірювання ``measurement`` — БЕЗ зміни стану фільтра.
+        """d^2 = y^T S^-1 y for measurement ``measurement`` — WITHOUT modifying filter state.
 
-        y — інновація (вимір мінус прогноз), S = H·P_pred·Hᵀ + R — її коваріація.
-        На відміну від Z-score за швидкістю, ця відстань нормується власною
-        невизначеністю фільтра: після довгої серії узгоджених фіксів P мала і
-        гейт жорсткий, після зриву/скидання P велика і гейт сам себе відпускає.
-        Саме тому вона не має самопідтримної петлі, яку має Z-score (вікно
-        швидкостей там і фільтрується, і формує поріг).
+        y — innovation (measurement minus prediction), S = H*P_pred*H^T + R — its covariance.
+        Unlike speed-based Z-score, this distance is normalized by the filter's own
+        uncertainty: after a long series of consistent fixes P is small and
+        gate is strict; after a loss/reset P is large and gate relaxes itself.
+        That is why it has no self-sustaining loop present in Z-score (where speed
+        window is both filtered and forms the threshold).
 
-        Повертає None, якщо фільтр ще не ініціалізований (гейтити нема від чого)
-        або S вироджена — виклик тоді має пропустити вимір, а не відкинути.
+        Returns None if filter is not yet initialized (nothing to gate against)
+        or S is degenerate — caller should skip measurement, not discard it.
 
-        Обчислення дублює predict-крок на ЛОКАЛЬНИХ копіях F/Q/P: filterpy
-        ``kf.predict()`` мутує стан, а гейт зобов'язаний бути чистим — інакше
-        відкинуте вимірювання все одно зсуне фільтр.
+        Calculation duplicates predict-step on LOCAL copies of F/Q/P: filterpy
+        ``kf.predict()`` mutates state, whereas gate must be side-effect-free — otherwise
+        a discarded measurement would still shift the filter.
         """
         if not self.is_initialized:
             return None
@@ -115,7 +115,7 @@ class TrajectoryFilter:
         y = z - H @ x_pred
 
         try:
-            # [0, 0]: результат — матриця 1×1; float() від неї застаріле в numpy
+            # [0, 0]: result is a 1×1 matrix; float() on it is deprecated in numpy
             d2 = float((y.T @ np.linalg.inv(S) @ y)[0, 0])
         except np.linalg.LinAlgError:
             return None
@@ -125,9 +125,10 @@ class TrajectoryFilter:
         return d2
 
     def update(self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0) -> tuple:
-        """noise_scale — адаптивний множник шуму вимірювання (B2):
-        > 1 для слабких/відносних вимірювань (низький confidence, optical flow),
-        1.0 для впевнених. Дозволяє фільтру менше довіряти поганим вимірюванням.
+        """noise_scale — adaptive measurement noise multiplier:
+        > 1 for weak/relative measurements (low confidence, optical flow),
+        1.0 for confident measurements. Allows the filter to trust poor
+        measurements less.
         """
         z = np.array([[measurement[0]], [measurement[1]]])
 
@@ -139,9 +140,10 @@ class TrajectoryFilter:
             return measurement
 
         if self._prev_raw is not None:
-            # Two-point seed: рахуємо швидкість з ПЕРШОЇ пари сирих точок і
-            # підставляємо в стан ДО predict/update цього кроку. Лише один раз
-            # (одразу після ініціалізації) — далі фільтр веде швидкість сам.
+            # Two-point seed: compute velocity from the FIRST pair of raw fixes
+            # and set it in the state BEFORE predict/update of this step. Applied
+            # only once (immediately after initialisation) — afterwards the filter
+            # tracks velocity on its own.
             safe_seed_dt = max(dt, 0.01)
             vx = (measurement[0] - self._prev_raw[0]) / safe_seed_dt
             vy = (measurement[1] - self._prev_raw[1]) / safe_seed_dt
@@ -165,9 +167,9 @@ class TrajectoryFilter:
         return filtered_x, filtered_y
 
     def shift(self, dx: float, dy: float) -> None:
-        """Зсув позиційної частини стану (корекція від back-end smoother'а,
-        RESEARCH 3.1). Швидкості та коваріація не чіпаються: корекція — це
-        зсув системи відліку оцінки, а не нове вимірювання.
+        """Shift positional component of state (correction from back-end smoother).
+        Velocities and covariance are untouched: correction is a reference-frame shift,
+        not a new measurement.
         """
         if not self.is_initialized:
             return
@@ -175,10 +177,9 @@ class TrajectoryFilter:
         self.kf.x[1, 0] += dy
 
     def reset(self) -> None:
-        """
-        Скидає фільтр до початкового стану.
-        Викликати при кожному новому старті трекінгу, щоб уникнути
-        хибних передбачень на основі швидкості попередньої сесії.
+        """Resets filter to initial state.
+        Call on every new tracking start to avoid false predictions
+        based on previous session's velocity.
         """
         self.is_initialized = False
         self._prev_raw = None

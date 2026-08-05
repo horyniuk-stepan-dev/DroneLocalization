@@ -8,10 +8,7 @@ logger = get_logger(__name__)
 
 
 class ProjectRegistry:
-    """
-    Централізований реєстр усіх проєктів.
-    Зберігає шляхи та метадані в JSON файлі у домашній директорії.
-    """
+    """Centralized project registry storing metadata in JSON file under home directory."""
 
     def __init__(self):
         self._registry_dir = Path.home() / ".drone_localizer"
@@ -20,7 +17,7 @@ class ProjectRegistry:
         self._load()
 
     def _load(self):
-        """Завантажити реєстр з диска."""
+        """Load registry from disk."""
         if self._registry_path.exists():
             try:
                 with open(self._registry_path, encoding="utf-8") as f:
@@ -38,7 +35,7 @@ class ProjectRegistry:
             self._projects = []
 
     def _save(self):
-        """Зберегти реєстр на диск."""
+        """Save registry to disk."""
         try:
             from src.utils.atomic_io import atomic_write_text
 
@@ -56,7 +53,7 @@ class ProjectRegistry:
             )
 
     def _find_index(self, project_dir: str) -> int:
-        """Знайти індекс проєкту за шляхом."""
+        """Find project index by path."""
         norm = str(Path(project_dir).resolve())
         for i, p in enumerate(self._projects):
             if str(Path(p["path"]).resolve()) == norm:
@@ -64,7 +61,7 @@ class ProjectRegistry:
         return -1
 
     def register(self, project_dir: str, name: str, video_path: str = ""):
-        """Додати або оновити проєкт у реєстрі."""
+        """Register or update a project in registry."""
         idx = self._find_index(project_dir)
         now = datetime.now().isoformat()
         p = Path(project_dir)
@@ -80,7 +77,7 @@ class ProjectRegistry:
         }
 
         if idx >= 0:
-            # Зберігаємо оригінальну дату створення
+            # Preserve original creation date
             entry["created_at"] = self._projects[idx].get("created_at", now)
             self._projects[idx] = entry
         else:
@@ -90,7 +87,7 @@ class ProjectRegistry:
         logger.info(f"Project registered: {name} at {project_dir}")
 
     def unregister(self, project_dir: str):
-        """Видалити проєкт з реєстру (файли НЕ видаляються)."""
+        """Unregister a project from registry (files are preserved)."""
         idx = self._find_index(project_dir)
         if idx >= 0:
             removed = self._projects.pop(idx)
@@ -98,14 +95,14 @@ class ProjectRegistry:
             logger.info(f"Project unregistered: {removed['name']}")
 
     def update_last_opened(self, project_dir: str):
-        """Оновити дату останнього відкриття."""
+        """Update last opened timestamp."""
         idx = self._find_index(project_dir)
         if idx >= 0:
             self._projects[idx]["last_opened"] = datetime.now().isoformat()
             self._save()
 
     def refresh_status(self, project_dir: str):
-        """Оновити статус наявності БД та калібрації."""
+        """Refresh database and calibration existence status."""
         idx = self._find_index(project_dir)
         if idx >= 0:
             p = Path(project_dir)
@@ -115,7 +112,7 @@ class ProjectRegistry:
 
     @staticmethod
     def _check_has_database(project_dir: Path) -> bool:
-        """Перевіряє наявність БД: у корені (legacy) або в sources/{id}/."""
+        """Checks for database presence in project root or sources subdirectories."""
         if (project_dir / "database.h5").exists():
             return True
         sources_dir = project_dir / "sources"
@@ -127,7 +124,7 @@ class ProjectRegistry:
 
     @staticmethod
     def _check_has_calibration(project_dir: Path) -> bool:
-        """Перевіряє наявність калібрації: у корені (legacy) або в sources/{id}/."""
+        """Checks for calibration presence in project root or sources subdirectories."""
         if (project_dir / "calibration.json").exists():
             return True
         sources_dir = project_dir / "sources"
@@ -138,11 +135,11 @@ class ProjectRegistry:
         return False
 
     def get_recent(self, limit: int = 10) -> list[dict]:
-        """Повернути останні відкриті проєкти (відсортовані за датою)."""
+        """Returns recent projects sorted by last opened date."""
         valid = [p for p in self._projects if Path(p["path"]).is_dir()]
         valid.sort(key=lambda p: p.get("last_opened", ""), reverse=True)
         return valid[:limit]
 
     def get_all(self) -> list[dict]:
-        """Повернути всі зареєстровані проєкти."""
+        """Returns all registered projects."""
         return list(self._projects)

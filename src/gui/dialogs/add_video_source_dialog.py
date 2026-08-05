@@ -1,8 +1,7 @@
-"""
-add_video_source_dialog.py — Діалог додавання нового відеоджерела до проєкту.
+"""add_video_source_dialog.py — Dialog for adding a new video source to the project.
 
-Дозволяє вибрати відео, вказати source_id, area_id, режим (шар/зона),
-та опціонально geo_bounds.
+Allows selecting a video, specifying source_id, area_id, mode (layer/zone),
+and optional geo_bounds.
 """
 
 from PyQt6.QtCore import pyqtSlot
@@ -29,7 +28,7 @@ logger = get_logger(__name__)
 
 
 class AddVideoSourceDialog(QDialog):
-    """Діалог для додавання нового відеоджерела до мультиджерельного проєкту."""
+    """Dialog for adding a new video source to a multi-source project."""
 
     def __init__(self, existing_area_ids: list[str] | None = None, parent=None):
         super().__init__(parent)
@@ -41,7 +40,7 @@ class AddVideoSourceDialog(QDialog):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # ── Основні параметри ────────────────────────────────────────────────
+        # Basic Parameters
         basic_group = QGroupBox("Основні параметри")
         form = QFormLayout(basic_group)
 
@@ -53,7 +52,7 @@ class AddVideoSourceDialog(QDialog):
         self.description_edit.setPlaceholderText("Опис (зима 2025, ранковий політ, тощо)")
         form.addRow("Опис:", self.description_edit)
 
-        # Відео
+        # Video
         video_row = QHBoxLayout()
         self.video_path_edit = QLineEdit()
         self.video_path_edit.setReadOnly(True)
@@ -64,7 +63,7 @@ class AddVideoSourceDialog(QDialog):
         video_row.addWidget(btn_browse)
         form.addRow("Відеофайл:", video_row)
 
-        # Режим
+        # Mode
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("📊 Новий шар (overlay поверх існуючої зони)", "layer")
         self.mode_combo.addItem("🗺 Нова географічна зона", "zone")
@@ -81,18 +80,18 @@ class AddVideoSourceDialog(QDialog):
         self.area_combo.lineEdit().setPlaceholderText("Виберіть або введіть area_id")
         form.addRow("Area ID:", self.area_combo)
 
-        # Пріоритет
+        # Priority
         self.priority_spin = QSpinBox()
         self.priority_spin.setRange(0, 100)
         self.priority_spin.setValue(0)
         self.priority_spin.setToolTip(
-            "0 = найвищий пріоритет. При рівних cosine — вибирається джерело з нижчим priority."
+            "0 = highest priority. When cosine scores match, source with lower priority is chosen."
         )
         form.addRow("Пріоритет:", self.priority_spin)
 
         layout.addWidget(basic_group)
 
-        # ── Параметри камери ───────────────────────────────────────────────────
+        # Camera Parameters
         camera_group = QGroupBox("Параметри камери")
         cam_form = QFormLayout(camera_group)
 
@@ -122,7 +121,7 @@ class AddVideoSourceDialog(QDialog):
 
         layout.addWidget(camera_group)
 
-        # ── Geo Bounds (опційно) ─────────────────────────────────────────────
+        # Geo Bounds (optional)
         self.geo_group = QGroupBox("Географічні межі (опційно)")
         self.geo_group.setCheckable(True)
         self.geo_group.setChecked(False)
@@ -156,15 +155,13 @@ class AddVideoSourceDialog(QDialog):
 
         layout.addWidget(self.geo_group)
 
-        # ── Buttons ──────────────────────────────────────────────────────────
+        # Buttons
         btn_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         btn_box.accepted.connect(self._on_accept)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
-
-    # ── Slots ────────────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def _browse_video(self):
@@ -181,10 +178,8 @@ class AddVideoSourceDialog(QDialog):
     def _on_mode_changed(self, idx):
         mode = self.mode_combo.currentData()
         if mode == "layer" and self._existing_areas:
-            # Для шару — пропонуємо вибрати існуючу area
             self.area_combo.setCurrentText(self._existing_areas[0])
         else:
-            # Для зони — пропонуємо нову area
             self.area_combo.setCurrentText("")
 
     @pyqtSlot()
@@ -219,10 +214,8 @@ class AddVideoSourceDialog(QDialog):
 
         self.accept()
 
-    # ── Data ─────────────────────────────────────────────────────────────────
-
     def get_source_config(self) -> ProjectVideoSource:
-        """Повертає заповнений ProjectVideoSource."""
+        """Returns populated ProjectVideoSource."""
         source_id = self.source_id_edit.text().strip()
 
         geo_bounds = None

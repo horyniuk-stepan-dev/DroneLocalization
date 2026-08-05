@@ -63,14 +63,14 @@ def test_wild_rotation_rejected():
         [[np.cos(ang), -np.sin(ang), 0.0], [np.sin(ang), np.cos(ang), 0.0]], dtype=np.float64
     )
     ok, reason = temporal_edge_sane(M, 1, W, H, max_rotation_deg=30.0)
-    assert not ok and "поворот" in reason
+    assert not ok and "rotation" in reason
 
 
 def test_wild_scale_rejected():
-    # масштаб 0.7 за межею 1/1.4 — реальний кейс: дегенеративна H від 4 інлаєрів
+    # scale 0.7 outside bound 1/1.4 — degenerate H from 4 inliers
     M = np.array([[0.7, 0.0, 0.0], [0.0, 0.7, 100.0]], dtype=np.float64)
     ok, reason = temporal_edge_sane(M, 1, W, H, max_scale_ratio=1.4)
-    assert not ok and "масштаб" in reason
+    assert not ok and "scale" in reason
 
 
 def test_wild_shift_rejected_but_scales_with_gap():

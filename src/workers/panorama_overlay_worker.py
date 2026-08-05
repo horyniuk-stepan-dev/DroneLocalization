@@ -9,7 +9,7 @@ logger = get_logger(__name__)
 
 
 class PanoramaOverlayWorker(QThread):
-    """Фоновий потік для локалізації та підготовки панорами до відображення на карті"""
+    """Background thread for localizing and preparing panorama for map display."""
 
     success = pyqtSignal(str, float, float, float, float, float, float, float, float)
     error = pyqtSignal(str)
@@ -25,8 +25,8 @@ class PanoramaOverlayWorker(QThread):
             img = cv2.imread(self.image_path)
             if img is None:
                 raise ValueError(
-                    f"Не вдалося прочитати файл панорами: {self.image_path}. "
-                    f"Переконайтеся, що файл існує та має підтримуваний формат (PNG, JPEG, TIFF)."
+                    f"Failed to read panorama file: {self.image_path}. "
+                    f"Ensure file exists and is in a supported format (PNG, JPEG, TIFF)."
                 )
 
             logger.info(f"Panorama image loaded: {img.shape[1]}x{img.shape[0]} px")
@@ -35,18 +35,16 @@ class PanoramaOverlayWorker(QThread):
             loc_result = self.localizer.localize_frame(img_rgb)
 
             if not loc_result.get("success"):
-                error_reason = loc_result.get("error", "Невідома причина")
+                error_reason = loc_result.get("error", "Unknown error")
                 raise RuntimeError(
-                    f"Не вдалося локалізувати панораму: {error_reason}. "
-                    f"Переконайтесь, що база даних калібрована і панорама відповідає району бази."
+                    f"Failed to localize panorama: {error_reason}. "
+                    f"Ensure database is calibrated and panorama overlaps with database area."
                 )
 
             fov = loc_result.get("fov_polygon")
             if not fov or len(fov) != 4:
                 raise RuntimeError(
-                    f"Локалізатор не повернув коректні кути (FOV) для панорами. "
-                    f"Отримано fov={fov} (очікується 4 кути). "
-                    f"Можливо, гомографія виродилася через недостатню кількість inliers."
+                    f"Localizer returned invalid FOV polygon for panorama: {fov} (expected 4 corners)."
                 )
 
             h, w = img.shape[:2]

@@ -1,27 +1,7 @@
-"""HARDENING P3-15 (first slice): deterministic fault injection for the
-soak / fault-injection harness.
+"""Fault injection and stress-testing module.
 
-The payload runs unattended for hours in a contested environment; the failure
-modes that matter are *runtime* ones the unit suite never sees — a decoder
-handing back a garbled frame, a link stall that freezes the stream, a mid-flight
-end-of-stream, a decode exception. This module manufactures those on demand so
-``scripts/soak_test.py`` can drive the real pipeline through them and watch the
-operating-state machine (P1-9/10) and latency tracker (P1-8) react.
-
-Two layers, deliberately split:
-
-* ``FaultInjector`` — pure logic. Given ``(ret, frame, frame_idx)`` it returns a
-  possibly-transformed ``(ret, frame)`` plus an injected ``delay_sec``. Seeded
-  RNG makes a run byte-for-byte reproducible. No cv2, no I/O — unit-testable
-  anywhere numpy is available.
-* ``FaultInjectingVideoSource`` — a thin ``VideoSource`` subclass that reads a
-  real clip (optionally looping it for a long soak) and pipes each frame through
-  a ``FaultInjector``. It plugs into the existing seam: ``RealtimeTrackingWorker``
-  already accepts a pre-built ``VideoSource`` object, so nothing on the
-  production hot path changes.
-
-Nothing here is wired into the application. It is a test tool, invoked only by
-the harness — so it needs no config flag and carries no risk to a stock run.
+Allows artificially simulating decode delays, frame corruption, video-stream
+stalls, and exceptions to test localizer resilience under failure conditions.
 """
 
 from __future__ import annotations

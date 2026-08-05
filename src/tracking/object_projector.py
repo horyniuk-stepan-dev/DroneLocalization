@@ -16,7 +16,7 @@ class ObjectGPS:
 
 
 class ObjectProjector:
-    """Проєктує піксельні координати об'єктів у GPS через наявні H та affine матриці."""
+    """Projects object pixel coordinates to GPS via available H and affine matrices."""
 
     def __init__(self, calibration_manager):
         self.calibration_manager = calibration_manager
@@ -24,7 +24,7 @@ class ObjectProjector:
     def _apply_rotation(
         self, px_x: float, px_y: float, angle: int, frame_w: int, frame_h: int
     ) -> tuple[float, float]:
-        """Обертає координати відповідно до повороту кадру (0, 90, 180, 270)."""
+        """Rotates coordinates according to frame orientation (0, 90, 180, 270)."""
         if angle == 0:
             return px_x, px_y
         elif angle == 90:
@@ -40,11 +40,11 @@ class ObjectProjector:
         objects: list[TrackedObject],
         H: np.ndarray,  # Homography query->ref
         affine: np.ndarray,  # Affine ref->metric
-        rotation_angle: int,  # Кут обертання кадру
+        rotation_angle: int,  # Frame rotation angle
         frame_w: int,
         frame_h: int,
     ) -> list[ObjectGPS]:
-        """Трансформує центри bbox: Query px -> Ref px (H) -> Metric (Affine) -> GPS."""
+        """Transforms bbox centres: Query px -> Ref px (H) -> Metric (Affine) -> GPS."""
 
         if not objects or H is None or affine is None:
             return []
@@ -57,7 +57,7 @@ class ObjectProjector:
         for obj in objects:
             px_x, px_y = obj.center_px
 
-            # 1. Враховуємо обертання кадру
+            # 1. Apply frame rotation
             rx, ry = self._apply_rotation(px_x, px_y, rotation_angle, frame_w, frame_h)
 
             # 2. Query pixels -> Reference pixels (Homography)
@@ -83,7 +83,7 @@ class ObjectProjector:
                     )
                 )
             except Exception as e:
-                # В разі виродженої матриці або інших помилок математики
+                # Degenerate matrix or other math error — skip this object
                 continue
 
         return objects_gps

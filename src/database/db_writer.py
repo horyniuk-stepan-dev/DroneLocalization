@@ -1,6 +1,6 @@
 """HDF5 + LanceDB persistence for the database build.
 
-Extracted verbatim from ``DatabaseBuilder`` (IMPROVEMENT_PLAN п.1.3, розбиття
+Extracted verbatim from ``DatabaseBuilder`` (IMPROVEMENT_PLAN item 1.3, splitting
 ``db_builder``). Per the locked decomposition decision, ``DbWriter`` owns the
 storage end-to-end: it creates the schema, holds the open ``h5py.File`` and the
 LanceDB table, writes per-frame data, flushes the vector batch, builds the index
@@ -122,7 +122,7 @@ class DbWriter:
                 chunks=(min(256, num_frames), 3, 3),
             )
 
-            # --- local_features: PRE-ALLOCATED chunked arrays (НОВА СХЕМА v2) ---
+            # --- local_features: PRE-ALLOCATED chunked arrays (schema v2) ---
             lf = f.create_group("local_features")
             lf.create_dataset(
                 "keypoints",
@@ -137,7 +137,7 @@ class DbWriter:
                 "descriptors",
                 shape=(num_frames, max_kps, local_desc_dim),
                 maxshape=(None, max_kps, local_desc_dim),
-                dtype="float16",  # float16: -50% розміру (П2)
+                dtype="float16",  # float16: -50% size
                 compression=compression,
                 chunks=(min(chunk_f, num_frames), max_kps, local_desc_dim),
                 fillvalue=0.0,
@@ -152,7 +152,7 @@ class DbWriter:
                 fillvalue=0.0,
             )
             lf.create_dataset(
-                "kp_counts",  # скільки keypoints у кожному кадрі
+                "kp_counts",  # keypoint count per frame
                 shape=(num_frames,),
                 maxshape=(None,),
                 dtype="int16",
@@ -160,11 +160,11 @@ class DbWriter:
                 chunks=(min(num_frames, 4096),),
                 fillvalue=0,
             )
-            # Розміри кадру — зберігаємо ОДИН РАЗ у групі
+            # Frame dimensions stored once in group metadata
             lf.attrs["frame_width"] = width
             lf.attrs["frame_height"] = height
 
-            # --- RESEARCH 2.2: SIFT-ознаки для аварійного фолбека ---
+            # --- SIFT features for fallback matching ---
             if self.store_sift:
                 sf = f.create_group("sift_features")
                 sf.create_dataset(
@@ -180,7 +180,7 @@ class DbWriter:
                     "descriptors",
                     shape=(num_frames, self.sift_max_kps, 128),
                     maxshape=(None, self.sift_max_kps, 128),
-                    dtype="float16",  # rootSIFT ∈ [0,1] — f16 безпечний
+                    dtype="float16",  # rootSIFT ∈ [0,1] - f16 safe
                     compression=compression,
                     chunks=(min(chunk_f, num_frames), self.sift_max_kps, 128),
                     fillvalue=0.0,
@@ -202,10 +202,9 @@ class DbWriter:
             g3.attrs["frame_width"] = width
             g3.attrs["frame_height"] = height
             g3.attrs["descriptor_dim"] = self.descriptor_dim
-            g3.attrs["hdf5_schema"] = "v2"  # версія схеми для зворотної сумісності
+            g3.attrs["hdf5_schema"] = "v2"  # Schema version for backward compatibility
             g3.attrs["max_keypoints"] = max_kps
-            # Крок семплінгу відео: DB slot i = кадр відео i * frame_step.
-            # Критично для калібрування — діалог конвертує номери кадрів відео у слоти БД.
+            # Frame sampling step: DB slot i = video frame i * frame_step
             g3.attrs["frame_step"] = int(frame_step)
             g3.attrs["source_total_frames"] = int(source_total_frames)
 
@@ -244,7 +243,7 @@ class DbWriter:
                 fillvalue=1.0,
             )
 
-            # --- Patchify: мультимасштабні патч-дескриптори ---
+            # --- Patchify descriptors ---
             if use_patchify and num_patches > 0:
                 pf = f.create_group("patch_descriptors")
                 pf.create_dataset(
@@ -276,12 +275,7 @@ class DbWriter:
         logger.info(f"Opened HDF5 file for writing: {self.output_path}")
 
     def write_pose(self, frame_id: int, pose_2d: np.ndarray) -> None:
-        """Writes the pose for a slot regardless of keyframe status.
-
-        ЗАВЖДИ зберігаємо pose для повного ланцюга пропагації, навіть якщо кадр
-        не є keyframe (пропущений через малий рух). Без цього
-        frame_poses[frame_id] = zeros → пропагація ламається.
-        """
+        """Writes the pose for a slot regardless of keyframe status."""
         if self.db_file:
             self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
@@ -300,7 +294,6 @@ class DbWriter:
 
             self.db_file["global_descriptors"]["frame_poses"][frame_id] = pose_2d
 
-            # local — slice assignment замість create_group + create_dataset
             kps = features["keypoints"]
             descs = features["descriptors"]
             c2d = features["coords_2d"]
@@ -320,7 +313,7 @@ class DbWriter:
                     "patch_descriptors"
                 ]
 
-            # RESEARCH 2.2: SIFT-ознаки
+            # SIFT features
             if "sift_keypoints" in features and "sift_features" in self.db_file:
                 sf = self.db_file["sift_features"]
                 s_kps = features["sift_keypoints"]

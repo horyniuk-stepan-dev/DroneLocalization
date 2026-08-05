@@ -25,12 +25,11 @@ class ProjectSettings:
     created_at: str
     video_path: str
 
-    # Відносні шляхи файлів джерела 'main'
-    # Нові проєкти: sources/main/ — всі джерела в єдиній структурі
+    # Relative paths for main source files (sources/main/)
     database_filename: str = "sources/main/database.h5"
     calibration_filename: str = "sources/main/calibration.json"
 
-    # Мультиджерельна конфігурація (список dict для JSON-серіалізації)
+    # Multi-source configuration (list of dicts for JSON serialization)
     video_sources: list[dict[str, Any]] = field(default_factory=list)
 
     # Optional mission parameters inherited from NewMissionDialog
@@ -39,22 +38,20 @@ class ProjectSettings:
     sensor_width_mm: float = 8.8
     image_width_px: int = 4000
 
-    # Еталонна роздільність відео, з якого побудована БД.
-    # Заповнюється автоматично при побудові бази даних.
-    # 0 означає "не встановлено".
+    # Reference video resolution used during database construction (0 = unassigned)
     ref_frame_width: int = 0
     ref_frame_height: int = 0
 
     @classmethod
     def from_dict(cls, data: dict):
-        # Фільтруємо тільки відомі поля
+        # Filter known dataclass fields
         import dataclasses
 
         known_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known_fields}
         instance = cls(**filtered)
 
-        # Авто-міграція: якщо немає video_sources — створюємо з поточних полів
+        # Auto-migration: if video_sources is empty, populate from current fields
         if not instance.video_sources and instance.video_path:
             instance.video_sources = [
                 ProjectVideoSource(
@@ -75,15 +72,15 @@ class ProjectSettings:
         return instance
 
     def source_configs(self) -> list[ProjectVideoSource]:
-        """Повертає список ProjectVideoSource з серіалізованих dicts."""
+        """Returns list of ProjectVideoSource objects from serialized dicts."""
         return [ProjectVideoSource.from_dict(d) for d in self.video_sources]
 
     def get_enabled_sources(self) -> list[ProjectVideoSource]:
-        """Повертає тільки enabled джерела."""
+        """Returns only enabled sources."""
         return [s for s in self.source_configs() if s.enabled]
 
     def add_source(self, source: ProjectVideoSource) -> None:
-        """Додає нове джерело. Перевіряє унікальність source_id."""
+        """Adds a new video source while validating source_id uniqueness."""
         existing_ids = {s["source_id"] for s in self.video_sources}
         if source.source_id in existing_ids:
             raise ValueError(f"Source ID '{source.source_id}' already exists in project")
@@ -91,7 +88,7 @@ class ProjectSettings:
         logger.info(f"Added video source: {source.source_id} (area: {source.area_id})")
 
     def remove_source(self, source_id: str) -> bool:
-        """Видаляє джерело за source_id. Повертає True якщо знайдено."""
+        """Removes a video source by source_id. Returns True if found."""
         before = len(self.video_sources)
         self.video_sources = [s for s in self.video_sources if s.get("source_id") != source_id]
         removed = len(self.video_sources) < before
@@ -100,14 +97,14 @@ class ProjectSettings:
         return removed
 
     def get_source(self, source_id: str) -> ProjectVideoSource | None:
-        """Повертає конфіг за source_id або None."""
+        """Returns source config by source_id or None if missing."""
         for d in self.video_sources:
             if d.get("source_id") == source_id:
                 return ProjectVideoSource.from_dict(d)
         return None
 
     def update_source(self, source: ProjectVideoSource) -> None:
-        """Оновлює існуюче джерело (шукає за source_id)."""
+        """Updates an existing source matching source_id."""
         for i, d in enumerate(self.video_sources):
             if d.get("source_id") == source.source_id:
                 self.video_sources[i] = source.to_dict()
@@ -125,8 +122,7 @@ class ProjectManager:
     def __init__(self):
         self.project_dir: Path | None = None
         self.settings: ProjectSettings | None = None
-        # HARDENING P1-6: True when project.json itself is encrypted, i.e. this is
-        # an immutable deployment copy. Write paths must refuse to touch it.
+        # Encrypted project flag (True for encrypted deployment copies).
         self.is_encrypted: bool = False
 
     @property
@@ -163,7 +159,7 @@ class ProjectManager:
             # Ensure the directory exists
             self.project_dir.mkdir(parents=True, exist_ok=True)
 
-            # Створюємо стандартні підпапки
+            # Create default subdirectories
             (self.project_dir / "sources" / "main").mkdir(parents=True, exist_ok=True)
             (self.project_dir / "panoramas").mkdir(exist_ok=True)
             (self.project_dir / "test_photos").mkdir(exist_ok=True)
@@ -177,10 +173,9 @@ class ProjectManager:
                 focal_length_mm=mission_data.get("focal_length_mm", 13.2),
                 sensor_width_mm=mission_data.get("sensor_width_mm", 8.8),
                 image_width_px=mission_data.get("image_width_px", 4000),
-                # Залишаємо значення за замовчуванням (вже sources/main/)
             )
 
-            # Авто-створюємо video_sources для джерела main
+            # Auto-create video_sources for main source
             self.settings.video_sources = [
                 ProjectVideoSource(
                     source_id="main",
@@ -229,9 +224,7 @@ class ProjectManager:
                 )
                 return False
 
-            # HARDENING P1-6: an encrypted copy encrypts the manifest too, so it
-            # is decrypted here before parsing. The passphrase must already be
-            # resolved (the GUI prompts before calling this).
+            # Decrypt manifest project.json if project is encrypted.
             content = json_file.read_bytes()
             manifest_encrypted = is_encrypted(content)
             if manifest_encrypted:

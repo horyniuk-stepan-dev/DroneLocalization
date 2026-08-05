@@ -165,9 +165,7 @@ def warp_frame(img: np.ndarray, seed: int = SEED) -> np.ndarray:
     """Невеликий зсув+поворот+масштаб — «сусідній кадр» для матчингу."""
     rng = np.random.default_rng(seed + 1)
     h, w = img.shape[:2]
-    m = cv2.getRotationMatrix2D(
-        (w / 2, h / 2), rng.uniform(3, 8), rng.uniform(0.95, 1.05)
-    )
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), rng.uniform(3, 8), rng.uniform(0.95, 1.05))
     m[:, 2] += rng.uniform(-40, 40, 2)
     return cv2.warpAffine(img, m, (w, h))
 
@@ -219,9 +217,7 @@ def run_micro(results: dict) -> None:
     pts_real = np.ascontiguousarray(pts[:OF_REAL_POINTS])
 
     def of_real(g0=prev_g, g1=curr_g, p0=pts_real):
-        nxt, st, _ = cv2.calcOpticalFlowPyrLK(
-            g0, g1, p0, None, winSize=(15, 15), maxLevel=2
-        )
+        nxt, st, _ = cv2.calcOpticalFlowPyrLK(g0, g1, p0, None, winSize=(15, 15), maxLevel=2)
         cv2.calcOpticalFlowPyrLK(g1, g0, nxt, None, winSize=(15, 15), maxLevel=2)
 
     results[f"of_pyrlk_fb_{OF_REAL_POINTS}pts"] = bench(of_real, warmup=2, iters=15)
@@ -259,9 +255,7 @@ def run_micro(results: dict) -> None:
     # тому пишемо і перший, і кешований час.
     models_dir = _ROOT / "models"
     if models_dir.exists():
-        files = [
-            p for p in models_dir.rglob("*") if p.is_file() and p.stat().st_size > 2**20
-        ]
+        files = [p for p in models_dir.rglob("*") if p.is_file() and p.stat().st_size > 2**20]
         if files:
             big = max(files, key=lambda p: p.stat().st_size)
             read_mb = min(big.stat().st_size, 512 * 2**20) / 2**20
@@ -313,20 +307,16 @@ def run_micro(results: dict) -> None:
     for dtype, name in [(torch.float32, "f32"), (torch.float16, "f16")]:
         x = torch.randn(4096, 4096, device=dev, dtype=dtype)
         y = torch.randn(4096, 4096, device=dev, dtype=dtype)
-        r = bench(lambda: x @ y, warmup=5, iters=20, sync=sync)
+        r = bench(lambda x=x, y=y: x @ y, warmup=5, iters=20, sync=sync)
         r["tflops"] = round(2 * 4096**3 / (r["median_ms"] / 1000.0) / 1e12, 2)
         results[f"gpu_matmul_4096_{name}"] = r
 
     host = torch.empty(64 * 2**20 // 4, dtype=torch.float32, pin_memory=True)  # 64 MB
     devt = torch.empty_like(host, device=dev)
-    r = bench(
-        lambda: devt.copy_(host, non_blocking=True), warmup=3, iters=15, sync=sync
-    )
+    r = bench(lambda: devt.copy_(host, non_blocking=True), warmup=3, iters=15, sync=sync)
     r["gb_s"] = round(64 / 1024 / (r["median_ms"] / 1000.0), 2)
     results["gpu_h2d_64mb"] = r
-    r = bench(
-        lambda: host.copy_(devt, non_blocking=True), warmup=3, iters=15, sync=sync
-    )
+    r = bench(lambda: host.copy_(devt, non_blocking=True), warmup=3, iters=15, sync=sync)
     r["gb_s"] = round(64 / 1024 / (r["median_ms"] / 1000.0), 2)
     results["gpu_d2h_64mb"] = r
     torch.cuda.empty_cache()
@@ -359,18 +349,14 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
             "max_keypoints": get_cfg(APP_CONFIG, "models.aliked.max_keypoints", None),
             "max_local_edge": get_cfg(APP_CONFIG, "localization.max_local_edge", 1600),
             "retrieval_top_k": get_cfg(APP_CONFIG, "localization.retrieval_top_k", 12),
-            "torch_compile": get_cfg(
-                APP_CONFIG, "models.performance.torch_compile", False
-            ),
+            "torch_compile": get_cfg(APP_CONFIG, "models.performance.torch_compile", False),
             "keyframe_interval": get_cfg(APP_CONFIG, "tracking.keyframe_interval", 30),
             "of_stride": get_cfg(APP_CONFIG, "tracking.of_stride", 1),
             "of_half_res": get_cfg(APP_CONFIG, "tracking.of_half_res", False),
             "temporal_candidate_prior": get_cfg(
                 APP_CONFIG, "localization.temporal_candidate_prior", False
             ),
-            "candidate_prefilter": get_cfg(
-                APP_CONFIG, "localization.candidate_prefilter", False
-            ),
+            "candidate_prefilter": get_cfg(APP_CONFIG, "localization.candidate_prefilter", False),
             "fp16_enabled": get_cfg(APP_CONFIG, "models.performance.fp16_enabled", True),
         }
     )
@@ -389,19 +375,13 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
     # Холодне завантаження (= внесок у час старту апки)
     t0 = time.perf_counter()
     local_model = mm.load_local_extractor()
-    results["load_local_extractor"] = {
-        "first_call_ms": round((time.perf_counter() - t0) * 1e3, 1)
-    }
+    results["load_local_extractor"] = {"first_call_ms": round((time.perf_counter() - t0) * 1e3, 1)}
     t0 = time.perf_counter()
     global_model = mm.load_dinov2()
-    results["load_dinov2"] = {
-        "first_call_ms": round((time.perf_counter() - t0) * 1e3, 1)
-    }
+    results["load_dinov2"] = {"first_call_ms": round((time.perf_counter() - t0) * 1e3, 1)}
     t0 = time.perf_counter()
     matcher = FeatureMatcher(model_manager=mm, config=APP_CONFIG)
-    results["load_lightglue"] = {
-        "first_call_ms": round((time.perf_counter() - t0) * 1e3, 1)
-    }
+    results["load_lightglue"] = {"first_call_ms": round((time.perf_counter() - t0) * 1e3, 1)}
 
     fe = FeatureExtractor(local_model, global_model, mm.device, config=APP_CONFIG)
 
@@ -444,9 +424,7 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
         results["match_lightglue"]["peak_vram_mb"] = vram_peak_mb()
     else:
         print("[models] LightGlue unavailable - match_lightglue skipped")
-    results["match_mnn"] = bench(
-        lambda: matcher.match_mnn(qf, rf_trim), warmup=2, iters=10
-    )
+    results["match_mnn"] = bench(lambda: matcher.match_mnn(qf, rf_trim), warmup=2, iters=10)
 
     # Retrieval-проксі: brute force по 8192 дескрипторах реальної розмірності
     gd = fe.extract_global_descriptor(frame)
@@ -466,9 +444,7 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
         t = t.permute(2, 0, 1).unsqueeze(0).to(mm.device, non_blocking=True)
         fe.dinov2_transform(t)
 
-    results["preprocess_global_1080p"] = bench(
-        prep_global, warmup=3, iters=15, sync=sync
-    )
+    results["preprocess_global_1080p"] = bench(prep_global, warmup=3, iters=15, sync=sync)
 
     # YOLO11n-seg: маскування динаміки на КОЖНОМУ keyframe
     # (preprocessing.masking_strategy = "yolo"), теж поза старим ланцюгом.
@@ -511,9 +487,7 @@ def run_video(results: dict, video_path: str, n_frames: int) -> None:
     sync = torch.cuda.synchronize if torch.cuda.is_available() else None
 
     mm = ModelManager(config=APP_CONFIG)
-    fe = FeatureExtractor(
-        mm.load_local_extractor(), mm.load_dinov2(), mm.device, config=APP_CONFIG
-    )
+    fe = FeatureExtractor(mm.load_local_extractor(), mm.load_dinov2(), mm.device, config=APP_CONFIG)
     matcher = FeatureMatcher(model_manager=mm, config=APP_CONFIG)
 
     stages: dict[str, list] = {"global": [], "local": [], "match": []}
@@ -633,9 +607,7 @@ def print_report(report: dict) -> None:
             continue
         if "median_ms" not in r:
             if "first_call_ms" in r:  # холодні завантаження моделей
-                print(
-                    f"{name:38s} {'-':>9s} {'-':>9s} {round(r['first_call_ms']):>8d}ms"
-                )
+                print(f"{name:38s} {'-':>9s} {'-':>9s} {round(r['first_call_ms']):>8d}ms")
             continue
         cold = r.get("first_call_ms")
         extra = ""
@@ -665,9 +637,7 @@ def compare_reports(path_a: str, path_b: str) -> None:
     with open(path_b, encoding="utf-8") as f:
         b = json.load(f)
     ea, eb = a["env"], b["env"]
-    print(
-        f"\nA = {ea['hostname']} ({ea.get('gpu')})   B = {eb['hostname']} ({eb.get('gpu')})"
-    )
+    print(f"\nA = {ea['hostname']} ({ea.get('gpu')})   B = {eb['hostname']} ({eb.get('gpu')})")
     for key in ("torch", "cuda", "opencv", "numpy", "nvidia_driver"):
         if ea.get(key) != eb.get(key):
             print(
@@ -698,19 +668,13 @@ def compare_reports(path_a: str, path_b: str) -> None:
         if va and vb:
             print(f"{k:38s} {va:>8.1f}   {vb:>8.1f}   {vb / va:.2f}x")
     budget = b.get("aggregates", {})
-    if (
-        budget.get("worst_keyframe_ms")
-        and budget["worst_keyframe_ms"] > KEYFRAME_BUDGET_MS
-    ):
+    if budget.get("worst_keyframe_ms") and budget["worst_keyframe_ms"] > KEYFRAME_BUDGET_MS:
         print(
             f"\nVERDICT: worst-case keyframe {budget['worst_keyframe_ms']:.0f}ms > "
             f"budget {KEYFRAME_BUDGET_MS:.0f}ms on B - "
             f"apply EFFICIENCY_OPTIONS.md knobs (top-k gating, MNN prefilter, 2048 kpts)"
         )
-    if (
-        budget.get("tracking_frame_ms")
-        and budget["tracking_frame_ms"] > TRACKING_BUDGET_MS
-    ):
+    if budget.get("tracking_frame_ms") and budget["tracking_frame_ms"] > TRACKING_BUDGET_MS:
         print(
             f"VERDICT: tracking {budget['tracking_frame_ms']:.1f}ms > {TRACKING_BUDGET_MS}ms "
             f"budget on B - real-time tracking at risk"
@@ -727,22 +691,12 @@ def compare_reports(path_a: str, path_b: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Hardware/pipeline benchmark (A/B two machines)"
-    )
-    ap.add_argument(
-        "--skip-models", action="store_true", help="only tiers 0-1 (no weights needed)"
-    )
-    ap.add_argument(
-        "--video", type=str, default=None, help="optional real video for tier 3"
-    )
-    ap.add_argument(
-        "--frames", type=int, default=60, help="frames to process from --video"
-    )
+    ap = argparse.ArgumentParser(description="Hardware/pipeline benchmark (A/B two machines)")
+    ap.add_argument("--skip-models", action="store_true", help="only tiers 0-1 (no weights needed)")
+    ap.add_argument("--video", type=str, default=None, help="optional real video for tier 3")
+    ap.add_argument("--frames", type=int, default=60, help="frames to process from --video")
     ap.add_argument("--output", type=str, default=None, help="output json path")
-    ap.add_argument(
-        "--compare", nargs=2, metavar=("OLD", "NEW"), help="compare two reports"
-    )
+    ap.add_argument("--compare", nargs=2, metavar=("OLD", "NEW"), help="compare two reports")
     args = ap.parse_args()
 
     if args.compare:
@@ -774,9 +728,7 @@ def main() -> None:
         print(f"[tier 3] real video pass: {args.video}")
         run_video(report["results"], args.video, args.frames)
 
-    report["aggregates"] = compute_aggregates(
-        report["results"], report["config_snapshot"]
-    )
+    report["aggregates"] = compute_aggregates(report["results"], report["config_snapshot"])
 
     out_dir = _ROOT / "benchmarks"
     out_dir.mkdir(exist_ok=True)
@@ -791,9 +743,7 @@ def main() -> None:
 
     print_report(report)
     print(f"\nSaved: {out_path}")
-    print(
-        "Compare: python scripts/benchmark_hardware.py --compare <old.json> <new.json>"
-    )
+    print("Compare: python scripts/benchmark_hardware.py --compare <old.json> <new.json>")
 
 
 if __name__ == "__main__":

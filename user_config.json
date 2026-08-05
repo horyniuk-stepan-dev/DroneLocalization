@@ -192,6 +192,8 @@
         "of_outlier_gate": true,
         "of_local_speed": true,
         "outlier_zscore_enabled": false,
+        "outlier_mahalanobis_enabled": false,
+        "outlier_chi2_threshold": 13.816,
         "outlier_trust_strong_evidence": true,
         "outlier_trust_min_inliers": 100,
         "outlier_trust_min_flow_quality": 0.5,

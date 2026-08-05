@@ -1,7 +1,7 @@
 """Debug keypoint-overlay rendering for DB builds (pure, no torch/self state).
 
 Extracted verbatim from ``DatabaseBuilder._draw_keypoints_frame``
-(IMPROVEMENT_PLAN п.1.3, splitting ``database_builder`` into modules). The
+(IMPROVEMENT_PLAN item 1.3, splitting ``database_builder`` into modules). The
 function draws detected keypoints, the YOLO dynamic-zone overlay, an info panel
 and a legend onto a copy of the BGR frame — it depends only on its arguments,
 so it is headless-testable and reusable by the optional keypoint-preview video.

@@ -1,1 +1,1 @@
-"""HARDENING P1-6: encryption-at-rest primitives (passphrase-derived AES-256-GCM)."""
+"""Security and at-rest data encryption package (AES-256-GCM)."""

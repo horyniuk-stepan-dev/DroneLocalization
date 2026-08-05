@@ -19,6 +19,7 @@ Read-only: не гейт, нічого не пише в конфіг. Парси
   python scripts/ab_localization.py logs/app_baseline.log logs/app_a1.log
   python scripts/ab_localization.py logs/app.log            # лише зведення
 """
+
 from __future__ import annotations
 
 import math
@@ -43,16 +44,14 @@ _FAILS = (
 
 
 def parse(path: str) -> dict:
-    recs: list[tuple] = []          # (lat, lon, frame, inliers, conf)
+    recs: list[tuple] = []  # (lat, lon, frame, inliers, conf)
     fails: Counter = Counter()
     tp = None
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = _LOC.search(line)
             if m:
-                recs.append(
-                    (float(m[1]), float(m[2]), int(m[3]), int(m[4]), float(m[5]))
-                )
+                recs.append((float(m[1]), float(m[2]), int(m[3]), int(m[4]), float(m[5])))
                 continue
             for key in _FAILS:
                 if key in line:
@@ -91,14 +90,15 @@ def summarize(name: str, d: dict) -> None:
     total = n_ok + n_fail
     print(f"\n=== {name} ===")
     print(f"  keyframe успіхів : {n_ok}")
-    print(f"  невдач           : {n_fail}"
-          + (f"  ({total and 100 * n_ok / total:.1f}% success)" if total else ""))
+    print(
+        f"  невдач           : {n_fail}"
+        + (f"  ({total and 100 * n_ok / total:.1f}% success)" if total else "")
+    )
     for k, v in d["fails"].most_common():
         print(f"      {k:<28} {v}")
     if inl:
-        print(f"  inliers  median={median(inl):.0f}  p10={_pct(inl,10):.0f}  "
-              f"min={min(inl)}")
-        print(f"  conf     median={median(conf):.3f}  p10={_pct(conf,10):.3f}")
+        print(f"  inliers  median={median(inl):.0f}  p10={_pct(inl, 10):.0f}  min={min(inl)}")
+        print(f"  conf     median={median(conf):.3f}  p10={_pct(conf, 10):.3f}")
     if d["tp"]:
         tries, hits = d["tp"]
         rate = 100.0 * hits / tries if tries else 0.0
@@ -121,8 +121,10 @@ def compare(a: dict, b: dict) -> None:
     inl_a = [r[3] for r in ra]
     inl_b = [r[3] for r in rb]
     if inl_a and inl_b:
-        print(f"inliers median: A={median(inl_a):.0f}  B={median(inl_b):.0f}  "
-              f"Δ={median(inl_b) - median(inl_a):+.0f}")
+        print(
+            f"inliers median: A={median(inl_a):.0f}  B={median(inl_b):.0f}  "
+            f"Δ={median(inl_b) - median(inl_a):+.0f}"
+        )
 
     # ── Головний сигнал §A1: перетин МНОЖИН matched-frame (не залежить від
     #    вирівнювання). Якщо prior зводить локалізацію на ті самі кадри БД —
@@ -133,12 +135,15 @@ def compare(a: dict, b: dict) -> None:
         inter = len(set_a & set_b)
         union = len(set_a | set_b)
         jac = inter / union if union else 1.0
-        print(f"matched-frame множини: |A|={len(set_a)} |B|={len(set_b)} "
-              f"спільних={inter}  Jaccard={jac:.3f}")
+        print(
+            f"matched-frame множини: |A|={len(set_a)} |B|={len(set_b)} "
+            f"спільних={inter}  Jaccard={jac:.3f}"
+        )
         only_b = sorted(set_b - set_a)
         if only_b:
-            print(f"  кадри лише в B ({len(only_b)}): "
-                  f"{only_b[:12]}{' …' if len(only_b) > 12 else ''}")
+            print(
+                f"  кадри лише в B ({len(only_b)}): {only_b[:12]}{' …' if len(only_b) > 12 else ''}"
+            )
 
     # ── Вторинно: індексне парування лише за РІВНОЇ кількості успіхів ──────
     if na == nb and na > 0:
@@ -147,12 +152,16 @@ def compare(a: dict, b: dict) -> None:
         dinl = [rb[i][3] - ra[i][3] for i in range(na)]
         print("[рівні лічильники → парування по індексу валідне]")
         print(f"  збіг frame по парах: {same}/{na} ({100.0 * same / na:.1f}%)")
-        print(f"  зсув позиції: median={median(dpos):.2f} м  p90={_pct(dpos,90):.2f} м  "
-              f"max={max(dpos):.2f} м")
-        print(f"  Δinliers (B−A): median={median(dinl):+.0f}  p10={_pct(dinl,10):+.0f}")
+        print(
+            f"  зсув позиції: median={median(dpos):.2f} м  p90={_pct(dpos, 90):.2f} м  "
+            f"max={max(dpos):.2f} м"
+        )
+        print(f"  Δinliers (B−A): median={median(dinl):+.0f}  p10={_pct(dinl, 10):+.0f}")
     else:
-        print("[різні лічильники успіхів → парування по індексу пропущено "
-              "(ненадійне); дивись Jaccard і агрегати вище]")
+        print(
+            "[різні лічильники успіхів → парування по індексу пропущено "
+            "(ненадійне); дивись Jaccard і агрегати вище]"
+        )
 
     # ── Вердикт з alignment-free сигналів ─────────────────────────────────
     v = []
@@ -167,12 +176,13 @@ def compare(a: dict, b: dict) -> None:
             v.append(f"matched-frame Jaccard {jac:.2f} < 0.90 — prior зводить на інші кадри")
     if inl_a and inl_b and median(inl_b) < median(inl_a) - 50:
         v.append(f"медіанний inliers впав на {median(inl_a) - median(inl_b):.0f}")
-    print("  вердикт: " + ("; ".join(v) if v else
-                            "суттєвих розбіжностей якості не видно"))
+    print("  вердикт: " + ("; ".join(v) if v else "суттєвих розбіжностей якості не видно"))
     if b["tp"]:
         tries, hits = b["tp"]
-        print(f"  temporal-prior у B: {hits}/{tries} "
-              f"({100.0 * hits / tries if tries else 0:.0f}% hit-rate)")
+        print(
+            f"  temporal-prior у B: {hits}/{tries} "
+            f"({100.0 * hits / tries if tries else 0:.0f}% hit-rate)"
+        )
 
 
 def main(argv: list[str]) -> int:

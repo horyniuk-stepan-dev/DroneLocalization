@@ -1,8 +1,7 @@
-"""
-multi_database_manager.py — Менеджер множинних баз даних.
+"""Multi-database manager.
 
-Координує завантаження DatabaseLoader для кожного джерела,
-просторову фільтрацію активних джерел та вибір найкращого збігу.
+Coordinates DatabaseLoader instances for multiple video sources,
+spatial filtering of active sources, and multi-source vector retrieval.
 """
 
 from __future__ import annotations
@@ -24,16 +23,7 @@ logger = get_logger(__name__)
 
 
 class MultiDatabaseManager:
-    """
-    Центральний координаційний клас.
-    Замінює прямий доступ до одного DatabaseLoader.
-
-    Відповідає за:
-    - Завантаження баз для enabled джерел
-    - Створення retrievers (FAISS або LanceDB)
-    - Просторову фільтрацію активних джерел
-    - Вибір найкращого збігу через get_best_match
-    """
+    """Central coordination class managing multiple databases for video sources."""
 
     def __init__(
         self,
@@ -50,10 +40,10 @@ class MultiDatabaseManager:
 
         self._load_sources(sources)
 
-    # ── Ініціалізація ────────────────────────────────────────────────────────
+    # ── Initialization ───────────────────────────────────────────────────────
 
     def _load_sources(self, sources: list[ProjectVideoSource]) -> None:
-        """Завантажує DatabaseLoader та створює retriever для кожного enabled джерела."""
+        """Loads DatabaseLoader and creates retriever for each enabled source."""
         for src in sources:
             if not src.enabled:
                 logger.debug(f"Skipping disabled source '{src.source_id}'")
@@ -72,7 +62,7 @@ class MultiDatabaseManager:
                 self._databases[src.source_id] = loader
                 self._sources[src.source_id] = src
 
-                # Створюємо retriever (пріоритет LanceDB → GeoAware → FAISS)
+                # Create retriever (priority: LanceDB -> GeoAware -> FAISS)
                 if loader.lance_table is not None:
                     retriever = LanceDBRetrieval(loader.lance_table)
                     logger.info(
@@ -81,7 +71,6 @@ class MultiDatabaseManager:
                     )
                 elif loader.global_descriptors is not None:
                     if loader.spatial_index is not None and loader.spatial_index.is_available:
-                        # GeoAwareRetriever: геофільтрація через SpatialIndex
                         retriever = GeoAwareRetriever(
                             loader.global_descriptors,
                             spatial_index=loader.spatial_index,
@@ -121,14 +110,7 @@ class MultiDatabaseManager:
         self._check_interchangeability()
 
     def _check_interchangeability(self) -> None:
-        """Warn if loaded databases were built with incompatible schema settings.
-
-        Databases combined in one manager must be mutually queryable, which
-        requires an identical schema fingerprint (same models, dims, keypoint
-        budget, sampling scale, ...). A mismatch means a database was built with
-        different settings (e.g. a different local extractor on another machine)
-        and combined results would be silently wrong. Never raises.
-        """
+        """Warn if loaded databases were built with incompatible schema settings."""
         import json as _json
 
         fps: dict[str, str] = {}
@@ -147,9 +129,6 @@ class MultiDatabaseManager:
                 try:
                     comps[sid] = _json.loads(raw)
                 except Exception as e:
-                    # Симетрично до гілки «немає fingerprint» вище: перевірка
-                    # сумісності, що тихо перестала перевіряти, гірша за
-                    # відсутню — вона виглядає як пройдена.
                     logger.warning(
                         f"Source '{sid}': schema_components is not valid JSON ({e}) — "
                         f"per-field comparison unavailable, only the fingerprint is checked."
@@ -181,11 +160,7 @@ class MultiDatabaseManager:
                 )
 
     def unload_source(self, source_id: str) -> None:
-        """
-        Закриває та вивантажує джерело з пам'яті (без вимкнення).
-        ОБОВ'ЯЗКОВО викликати перед перегенерацією БД джерела, інакше
-        retriever триматиме stale handle на видалені файли vectors.lance.
-        """
+        """Unloads a source from memory."""
         if source_id in self._databases:
             try:
                 self._databases[source_id].close()
@@ -198,13 +173,7 @@ class MultiDatabaseManager:
         logger.info(f"Source '{source_id}' unloaded (e.g. pending rebuild)")
 
     def reload_source(self, src: ProjectVideoSource) -> bool:
-        """
-        Перезавантажує джерело після перегенерації БД: закриває старі handles
-        (HDF5 + LanceDB table) і створює новий loader та retriever.
-
-        Returns:
-            True якщо джерело успішно перезавантажено.
-        """
+        """Reloads source after database rebuild."""
         self.unload_source(src.source_id)
         self._load_sources([src])
         ok = src.source_id in self._databases
@@ -215,7 +184,7 @@ class MultiDatabaseManager:
         return ok
 
     def toggle_source(self, src: ProjectVideoSource) -> None:
-        """Вмикає або вимикає джерело. Завантажує або вивантажує БД з пам'яті."""
+        """Enables or disables a video source."""
         if src.enabled:
             if src.source_id not in self._databases:
                 self._load_sources([src])
@@ -241,13 +210,7 @@ class MultiDatabaseManager:
         global_desc: np.ndarray,
         top_k: int = 8,
     ) -> tuple[str | None, list[tuple[int, float]]]:
-        """
-        Виконує vectorний пошук у кожній активній базі.
-
-        Returns:
-            (source_id, candidates): source_id з найвищим top-1 score,
-            candidates — список (frame_id, score). None якщо нічого не знайдено.
-        """
+        """Performs vector search across active databases, returning best match."""
         if not self._active_source_ids:
             logger.warning("No active sources for retrieval")
             return None, []
@@ -256,7 +219,7 @@ class MultiDatabaseManager:
         best_candidates: list[tuple[int, float]] = []
         best_top_score: float = -1.0
 
-        # Сортуємо за priority (0 = найвищий) для детерміністичного tiebreak
+        # Sort by priority (0 = highest)
         sorted_ids = sorted(
             self._active_source_ids,
             key=lambda sid: self._sources[sid].priority,
@@ -272,7 +235,7 @@ class MultiDatabaseManager:
                 if not candidates:
                     continue
 
-                top_score = candidates[0][1]  # (frame_id, score)
+                top_score = candidates[0][1]
                 if top_score > best_top_score:
                     best_top_score = top_score
                     best_source_id = source_id
@@ -293,20 +256,20 @@ class MultiDatabaseManager:
 
         return best_source_id, best_candidates
 
-    # ── Доступ до об'єктів ───────────────────────────────────────────────────
+    # ── Object Access ────────────────────────────────────────────────────────
 
     def get_database(self, source_id: str) -> DatabaseLoader | None:
-        """Повертає DatabaseLoader для вказаного source_id."""
+        """Returns DatabaseLoader for given source_id."""
         return self._databases.get(source_id)
 
     def get_source_config(self, source_id: str) -> ProjectVideoSource | None:
-        """Повертає ProjectVideoSource для вказаного source_id."""
+        """Returns ProjectVideoSource for given source_id."""
         return self._sources.get(source_id)
 
-    # ── Просторова фільтрація ────────────────────────────────────────────────
+    # ── Spatial Filtering ────────────────────────────────────────────────────
 
     def set_active_area(self, area_id: str) -> None:
-        """Активує всі джерела вказаної зони."""
+        """Activates all sources in specified area."""
         new_active = {
             sid
             for sid, src in self._sources.items()
@@ -322,13 +285,7 @@ class MultiDatabaseManager:
         lon: float,
         radius_m: float = 2500.0,
     ) -> bool:
-        """
-        Активує джерела, geo_bounds яких містять точку (lat, lon).
-        Джерела без geo_bounds завжди залишаються активними.
-
-        Returns:
-            True якщо набір активних джерел змінився.
-        """
+        """Activates sources whose geo_bounds contain point (lat, lon)."""
         new_active: set[str] = set()
         for sid, src in self._sources.items():
             if sid not in self._databases:
@@ -347,17 +304,17 @@ class MultiDatabaseManager:
         return changed
 
     def update_retriever_positions(self, lat: float, lon: float) -> None:
-        """Оновлює позицію у всіх GeoAwareRetriever-ах для перебудови FAISS-підмножини."""
+        """Updates position in all GeoAwareRetrievers."""
         for sid in self._active_source_ids:
             retriever = self._retrievers.get(sid)
             if isinstance(retriever, GeoAwareRetriever) and retriever.is_geo_aware:
                 retriever.update_position(lat, lon)
 
     def set_all_active(self) -> None:
-        """Активує всі завантажені джерела."""
+        """Activates all loaded sources."""
         self._active_source_ids = set(self._databases.keys())
 
-    # ── Утиліти ──────────────────────────────────────────────────────────────
+    # ── Utilities ────────────────────────────────────────────────────────────
 
     @property
     def active_source_ids(self) -> set[str]:
@@ -372,7 +329,7 @@ class MultiDatabaseManager:
         return len(self._databases)
 
     def close_all(self) -> None:
-        """Закриває всі DatabaseLoader."""
+        """Closes all DatabaseLoader instances."""
         for sid, db in self._databases.items():
             try:
                 db.close()

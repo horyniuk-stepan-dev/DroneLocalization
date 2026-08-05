@@ -39,10 +39,10 @@ class ResultBuilder:
     ) -> float:
         """Confidence from DB QA (rmse/disagreement) + inliers + match ratio/RMSE.
 
-        ``spread`` (ADDENDUM 1.1) — просторовий розкид інлаєрів у кадрі,
-        ``src.geometry.point_spread.inlier_spread``. ``None`` = сигнал
-        недоступний → множник 1.0. Застосовується лише за прапорцем
-        ``localization.spread_confidence_enabled``.
+        ``spread`` (ADDENDUM 1.1) — spatial inlier spread in frame,
+        ``src.geometry.point_spread.inlier_spread``. ``None`` = signal
+        unavailable -> multiplier 1.0. Applied only when flag
+        ``localization.spread_confidence_enabled`` is active.
         """
         max_inliers = get_cfg(self.config, "localization.confidence.confidence_max_inliers", 80)
         rmse_norm = get_cfg(self.config, "localization.confidence.rmse_norm_m", 10.0)
@@ -70,9 +70,9 @@ class ResultBuilder:
 
         final_conf = stability_score * 0.3 + inlier_score * 0.4 + match_score * 0.3
 
-        # ADDENDUM 1.1: скупчені інлаєри → ill-conditioned H. Множник, а не
-        # відкидання: далі confidence керує R у Kalman (B2), тож слабкий фікс
-        # просто важить менше. На межі покриття скупчення легітимне.
+        # Clustered inliers → ill-conditioned H. Applied as a multiplier, not
+        # rejection: confidence drives R in Kalman (B2), so a weak fix simply
+        # weighs less. Clustering at coverage boundaries is legitimate.
         if get_cfg(self.config, "localization.spread_confidence_enabled", False):
             factor = spread_confidence_factor(
                 spread,
@@ -201,8 +201,8 @@ class ResultBuilder:
                     f"Center metric: ({mx:.1f}, {my:.1f}) | "
                     f"Filtered: ({filtered_pt[0]:.1f}, {filtered_pt[1]:.1f})"
                 )
-                # Все-або-нічого: частковий полігон (1-3 кути) гірший за
-                # відсутній — споживачі (GUI-мапа, експорт) чекають чотирикутник.
+                # All-or-nothing: a partial polygon (1-3 corners) is worse than
+                # none — consumers (GUI map, export) expect a quadrilateral.
                 try:
                     for cx, cy in metric_corners:
                         clat, clon = converter.metric_to_gps(float(cx + dx), float(cy + dy))

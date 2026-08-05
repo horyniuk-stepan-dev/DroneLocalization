@@ -131,7 +131,9 @@ def main() -> int:
         with open(args.csv, "w", encoding="utf-8") as f:
             f.write("slot,is_anchor,err_m,angle_err_deg,scale_err_pct\n")
             for i, e, a, s in zip(ids, err, d_ang, d_scale):
-                f.write(f"{i},{int(slots[int(i)].get('is_anchor', False))},{e:.3f},{a:.4f},{s:.4f}\n")
+                f.write(
+                    f"{i},{int(slots[int(i)].get('is_anchor', False))},{e:.3f},{a:.4f},{s:.4f}\n"
+                )
         print(f"\nper-slot CSV written: {args.csv}")
 
     return 0

@@ -183,12 +183,12 @@ class ControlPanel(QWidget):
         status_layout.addWidget(self.lbl_status)
         status_layout.addWidget(self.progress_bar)
 
-        # Video Sources group (мультиджерельна підтримка)
+        # Video Sources group (multi-source support)
         self.sources_group = QGroupBox("Відеоджерела")
         sources_layout = QVBoxLayout(self.sources_group)
         sources_layout.setSpacing(6)
 
-        # ── Активне джерело (бейдж, завжди видимий при відкритому проєкті) ──
+        # ── Active source badge (always visible when a project is open) ──
         self._active_badge = QFrame()
         self._active_badge.setFrameShape(QFrame.Shape.StyledPanel)
         self._active_badge.setStyleSheet(
@@ -225,7 +225,7 @@ class ControlPanel(QWidget):
         self._lbl_source_video.setWordWrap(True)
         sources_layout.addWidget(self._lbl_source_video)
 
-        # ── Таблиця (тільки для мульти-проєктів) ──
+        # ── Table (only for multi-source projects) ──
         self.sources_table = QTableWidget()
         self.sources_table.setColumnCount(3)
         self.sources_table.setHorizontalHeaderLabels(["Source ID", "Area", "Статус"])
@@ -363,9 +363,9 @@ class ControlPanel(QWidget):
         """
         propagated_source_ids = propagated_source_ids or set()
         is_multi = len(sources) > 1 or any(s.get("source_id") != "main" for s in sources)
-        # Група завжди видима при відкритому проєкті
+        # Group is always visible when a project is open
         self.sources_group.setVisible(True)
-        # Таблиця — тільки для multi-source проєктів
+        # Table is only shown for multi-source projects
         self.sources_table.setVisible(is_multi)
         self.btn_add_source.setVisible(True)
 
@@ -378,16 +378,16 @@ class ControlPanel(QWidget):
             area = src.get("area_id", "?")
             enabled = src.get("enabled", True)
 
-            # Визначаємо статус
+            # Determine status
             status = "⏳ Очікує"
             status_color = QColor("#888")
             if project_dir:
                 db_path = Path(project_dir) / src.get("database_file", "")
                 cal_path = Path(project_dir) / src.get("calibration_file", "")
                 db_exists = db_path.exists()
-                # Калібрування вважається виконаним якщо:
-                # • існує окремий calibration.json, АБО
-                # • пропагація вже збережена всередині HDF5 (sid in propagated_source_ids)
+                # Calibration is considered done if:
+                # • a separate calibration.json exists, OR
+                # • propagation is already stored inside HDF5 (sid in propagated_source_ids)
                 is_calibrated = cal_path.exists() or sid in propagated_source_ids
 
                 if db_exists and is_calibrated:
@@ -409,14 +409,14 @@ class ControlPanel(QWidget):
             item_status = QTableWidgetItem(status)
             item_status.setForeground(status_color)
 
-            # Зберігаємо source_id як data для context menu
+            # Store source_id as UserRole data for context menu
             item_sid.setData(Qt.ItemDataRole.UserRole, sid)
 
             self.sources_table.setItem(row, 0, item_sid)
             self.sources_table.setItem(row, 1, item_area)
             self.sources_table.setItem(row, 2, item_status)
 
-            # Підсвічуємо активний рядок
+            # Highlight active row
             is_active = sid == active_source_id
             bg = QColor("#e8f5e9") if is_active else QColor("transparent")
             for col in range(3):
@@ -439,7 +439,7 @@ class ControlPanel(QWidget):
         """
         self.sources_group.setVisible(True)
 
-        # Назва файлу
+        # Filename label
         if video_path:
             if source_type == "rtsp":
                 short = video_path
@@ -467,7 +467,7 @@ class ControlPanel(QWidget):
                           None/пусто — скинути стан трекінгу.
         """
         if not video_source:
-            # Скидаємо до стану проєкту (зелений без мітки REC)
+            # Reset to project state (green, no REC marker)
             self._lbl_source_dot.setStyleSheet("color: #4caf50; font-size: 13px;")
             self._active_badge.setStyleSheet(
                 "QFrame { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 5px; }"

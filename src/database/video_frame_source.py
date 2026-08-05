@@ -1,7 +1,7 @@
 """Video decoding for the database build (decord with cv2 fallback).
 
 Extracted verbatim from ``DatabaseBuilder.build_from_video`` (IMPROVEMENT_PLAN
-п.1.3, розбиття ``db_builder``). This module owns ONLY decoding and frame
+item 1.3, splitting ``db_builder``). This module owns ONLY decoding and frame
 prefetching: opening the video, reporting geometry/FPS, and feeding a bounded
 queue of ``(slot_index, (frame_bgr, frame_rgb))`` pairs from a daemon thread.
 
@@ -82,7 +82,7 @@ class VideoFrameSource:
                     f"Failed to open video: {video_path}. "
                     f"Check that the file exists and uses a supported codec (H.264/H.265 recommended)."
                 )
-                raise ValueError(f"Не вдалося відкрити відео: {video_path}")
+                raise ValueError(f"Failed to open video: {video_path}")
 
         if self.use_decord:
             self.total_frames = len(self._vr)
@@ -96,22 +96,18 @@ class VideoFrameSource:
             self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.original_fps = self._cap.get(cv2.CAP_PROP_FPS)
 
-        # Скільки кадрів РЕАЛЬНО буде оброблено
+        # Actual frame count to process
         self.num_frames = (self.total_frames + self.frame_step - 1) // self.frame_step
         self.effective_fps = self.original_fps / self.frame_step
 
         if self.num_frames <= 0:
-            # FIX: the original released ``cap`` unconditionally here, which
-            # raised AttributeError on the decord path (cap is None) and masked
-            # the intended ValueError.
             self.release()
             logger.error(
                 f"Invalid frame count ({self.num_frames}). "
                 f"Video might be corrupted or uses unsupported codec."
             )
             raise ValueError(
-                "OpenCV не зміг розпізнати відео. Файл пошкоджений або використовує непідтримуваний кодек. "
-                "Спробуйте переконвертувати відео у стандартний MP4 (H.264)."
+                f"Could not parse video '{video_path}'. File may be corrupt or use unsupported codec."
             )
 
         logger.info(

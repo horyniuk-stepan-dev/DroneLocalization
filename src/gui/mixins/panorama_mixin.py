@@ -136,24 +136,24 @@ class PanoramaMixin:
         x, y, w, h = cv2.boundingRect(coords)
         crop_size = min(_CROP_SIZE_MAX, min(w, h) // 2)
 
-        # Обчислюємо відстань від кожного пікселя до чорного фону
-        # Це допоможе нам вибрати центри, які знаходяться глибоко всередині зображення
+        # Compute distance from each pixel to the black background;
+        # used to select crop centres that lie deep inside the panorama.
         dist = cv2.distanceTransform(
             cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)[1], cv2.DIST_L2, 5
         )
 
-        # Визначаємо "безпечну зону", де можна брати центр кропу, щоб він (майже) не захоплював чорні краї
-        # Якщо панорама тонка, беремо хоча б 80% від її максимальної товщини
+        # Define a "safe zone" for crop centres that avoids black borders;
+        # if the panorama is thin, allow at least 80% of its max thickness.
         safe_dist = min(crop_size // 2, dist.max() * 0.8)
         safe_mask = dist >= safe_dist
 
         safe_y, safe_x = np.where(safe_mask > 0)
 
         if len(safe_x) == 0:
-            QMessageBox.warning(self, "Помилка", "Панорама занадто тонка для аналізу.")
+            QMessageBox.warning(self, "Error", "Panorama is too thin for analysis.")
             return None
 
-        # Цільові ідеальні 4 кути рамки
+        # Target ideal 4 corners of the bounding rect
         target_corners = [
             (x, y),  # Top-Left
             (x + w, y),  # Top-Right
@@ -161,7 +161,7 @@ class PanoramaMixin:
             (x + w, y + h),  # Bottom-Right
         ]
 
-        # Формуємо 4 центри, знаходячи найближчу "безпечну" точку до кожного ідеального кута
+        # Find the nearest safe point to each target corner
         centers = []
         for tx, ty in target_corners:
             dists_sq = (safe_x - tx) ** 2 + (safe_y - ty) ** 2
@@ -170,15 +170,15 @@ class PanoramaMixin:
 
         crops = []
         for cx, cy in centers:
-            # Зміщуємо так, щоб центр crop співпадав з cx, cy (або якомога ближче, враховуючи межі)
+            # Offset so crop centre aligns with (cx, cy), clamped to image bounds
             x1 = max(0, cx - crop_size // 2)
             y1 = max(0, cy - crop_size // 2)
 
-            # Коригуємо межі, щоб не вилізти за межі зображення
+            # Clamp to image bounds
             x1 = min(x1, W - crop_size)
             y1 = min(y1, H - crop_size)
 
-            # Якщо розмір менший за crop_size (наприклад зображення мале)
+            # Clamp in case the image is smaller than crop_size
             x1, y1 = max(0, x1), max(0, y1)
 
             crops.append((img[y1 : y1 + crop_size, x1 : x1 + crop_size], x1, y1))

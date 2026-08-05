@@ -17,11 +17,11 @@ logger = get_logger(__name__)
 class TrackingMixin:
     def _build_localizer(self) -> Localizer:
         """Shared factory — used by tracking and single-image localization."""
-        # ОНОВЛЕНО: Завантажуємо ALIKED та DINOv2
+        # Load ALIKED and DINOv2 models
         xf = self.model_manager.load_local_extractor()
         nv = self.model_manager.load_dinov2()
 
-        # Опціональне завантаження CESP для покращення DINOv2 global descriptors
+        # Optional: load CESP to enhance DINOv2 global descriptors
         cesp = None
         if get_cfg(self.config, "models.cesp.enabled", False):
             try:
@@ -33,13 +33,13 @@ class TrackingMixin:
             xf, nv, self.model_manager.device, config=self.config, cesp_module=cesp
         )
 
-        # ОНОВЛЕНО: Матчер сам вирішить (Numpy для XFeat або LightGlue для SuperPoint)
+        # Matcher selects backend automatically (Numpy for XFeat, LightGlue for SuperPoint)
         matcher = FeatureMatcher(model_manager=self.model_manager, config=self.config)
 
-        # Передаємо model_manager у конфіг для SuperPoint+LightGlue fallback
+        # Pass model_manager in config for SuperPoint+LightGlue fallback
         localizer_config = {**self.config, "_model_manager": self.model_manager}
 
-        # Мультиджерельна підтримка: передаємо менеджери якщо вони є
+        # Multi-source support: pass managers if available
         db_manager = getattr(self, "db_manager", None)
         calib_manager = getattr(self, "calib_manager", None)
 
@@ -80,8 +80,8 @@ class TrackingMixin:
         if not self.database:
             QMessageBox.warning(self, "Увага", "Завантажте базу даних HDF5!")
             return
-        # Взаємне виключення з пропагацією: вона перезаписує HDF5
-        # (close→write→reload), конкурентний трекінг читав би з перехідного хендла.
+        # Mutual exclusion with propagation: it closes→writes→reloads the HDF5;
+        # concurrent tracking would read from a transient file handle.
         pw = getattr(self, "propagation_worker", None)
         if pw is not None and pw.isRunning():
             QMessageBox.warning(
@@ -181,9 +181,9 @@ class TrackingMixin:
 
         self.control_panel.set_tracking_enabled(False)
 
-        # Оновлюємо індикатор активного відеоджерела (червона мітка REC + ім'я файлу)
+        # Update active source badge (red REC marker + filename)
         self.control_panel.mark_source_tracking(str(video_source))
-        # Тайтл-бар: додаємо ім'я відеофайлу
+        # Title bar: append video filename
         from pathlib import Path as _Path
 
         src_name = (
@@ -192,7 +192,7 @@ class TrackingMixin:
         project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
         self.setWindowTitle(f"Drone Topometric Localizer - {project_name}  🔴 {src_name}")
 
-        # Debug views: передаємо worker-у поточний стан видимості вікон
+        # Debug views: pass current window visibility state to worker
         if hasattr(self, "_active_debug_channels"):
             self.tracking_worker.set_debug_channels(self._active_debug_channels())
 
@@ -208,7 +208,7 @@ class TrackingMixin:
         ):
             self.control_panel.update_status("Зупинка...")
             self.tracking_worker.stop()
-            # НЕ чекаємо тут — finished сигнал прийде сам
+            # Do not block here — the finished signal will arrive on its own
 
     @pyqtSlot()
     def _on_tracking_finished(self):
@@ -219,9 +219,9 @@ class TrackingMixin:
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.coordinates_broker.set_tracking_active(False)
         self.control_panel.set_tracking_enabled(True)
-        # Скидаємо бейдж з REC → звичайний зелений стан
+        # Reset REC badge → normal idle state
         self.control_panel.mark_source_tracking("")
-        # Повертаємо звичайний заголовок вікна
+        # Restore normal window title
         project_name = self.project_manager.project_name if self.project_manager.is_loaded else ""
         self.setWindowTitle(
             f"Drone Topometric Localizer - {project_name}"
@@ -343,7 +343,7 @@ class TrackingMixin:
         self.map_widget.update_marker(lat, lon)
         self.map_widget.add_trajectory_point(lat, lon)
 
-        # Зберігаємо результат для експорту
+        # Store result for export
         if not hasattr(self, "_tracking_results"):
             self._tracking_results = []
         self._tracking_results.append(

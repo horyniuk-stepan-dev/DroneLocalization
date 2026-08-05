@@ -25,15 +25,15 @@ class VideoSourceConfig:
     source_type: VideoSourceType = VideoSourceType.FILE
     reconnect_attempts: int = 5
     reconnect_delay_sec: float = 2.0
-    buffer_size: int = 1  # Для live: буфер 1 кадр (мінімальна затримка)
+    buffer_size: int = 1  # For live sources: 1-frame buffer (minimum latency)
     read_timeout_sec: float = 10.0
-    # Для live: фоновий читач тримає лише останній кадр (drop-late).
-    # Без нього споживач, повільніший за потік, хронічно відстає від реального часу.
+    # For live: background reader keeps only the most recent frame (drop-late).
+    # Without it a consumer slower than the stream chronically lags behind real time.
     drop_late_frames: bool = True
 
 
 class VideoSource:
-    """Обгортка над cv2.VideoCapture з auto-reconnect та type detection."""
+    """Thin wrapper over cv2.VideoCapture with auto-reconnect and source-type detection."""
 
     def __init__(self, config: VideoSourceConfig):
         self.config = config
@@ -41,7 +41,7 @@ class VideoSource:
         self._fps = 30.0
         self._is_open = False
 
-        # Фоновий drop-late читач (тільки для live-джерел)
+        # Background drop-late reader (live sources only)
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
@@ -49,7 +49,7 @@ class VideoSource:
         self._latest_seq = 0
         self._consumed_seq = 0
 
-        # Визначаємо тип джерела, якщо він не вказаний явно
+        # Auto-detect source type if not specified explicitly
         if self.config.source_type == VideoSourceType.FILE:
             source_lower = str(self.config.source).lower()
             if source_lower.startswith("rtsp://"):
@@ -60,7 +60,7 @@ class VideoSource:
                 self.config.source_type = VideoSourceType.HTTP
             elif source_lower.startswith("usb:") or source_lower.isdigit():
                 self.config.source_type = VideoSourceType.USB
-                # Очищаємо префікс
+                # Strip the prefix
                 if source_lower.startswith("usb:"):
                     self.config.source = self.config.source[4:]
 
@@ -70,7 +70,7 @@ class VideoSource:
             self._start_reader()
 
     def _start_reader(self):
-        """Запускає фоновий потік, що постійно тягне кадри й лишає тільки останній."""
+        """Starts a background thread that continuously pulls frames and retains only the latest."""
         if self._reader_thread is not None:
             return
         self._stop_event.clear()
@@ -81,7 +81,7 @@ class VideoSource:
         logger.info("Drop-late reader thread started for live source.")
 
     def _reader_loop(self):
-        """Читає потік максимально швидко; зберігає лише найсвіжіший кадр."""
+        """Reads the stream as fast as possible; stores only the most recent frame."""
         failures = 0
         while not self._stop_event.is_set():
             cap = self._cap
@@ -100,8 +100,8 @@ class VideoSource:
             if self._stop_event.is_set():
                 break
 
-            # Лічильник рахує ПІДРЯД невдалі читання, а не невдалі open():
-            # RTSP-сервер може приймати зʼєднання й не віддавати кадрів.
+            # Counter tracks CONSECUTIVE failed reads, not failed open() calls:
+            # an RTSP server can accept connections without delivering frames.
             failures += 1
             if failures > self.config.reconnect_attempts:
                 logger.error("Failed to reconnect after multiple attempts.")
@@ -117,7 +117,7 @@ class VideoSource:
             self._connect()
 
     def _read_latest(self) -> tuple[bool, np.ndarray | None]:
-        """Віддає найсвіжіший кадр від фонового читача; чекає нового, не повторює старий."""
+        """Returns the most recent frame from the background reader; waits for a new one, never repeats the old one."""
         deadline = time.monotonic() + self.config.read_timeout_sec
         while True:
             with self._frame_lock:
@@ -137,7 +137,7 @@ class VideoSource:
             time.sleep(0.002)
 
     def _connect(self):
-        """Підключається до джерела. Якщо це live, налаштовує розмір буфера."""
+        """Connects to the source. Configures buffer size for live sources."""
         if self._cap is not None:
             self._cap.release()
 
@@ -160,22 +160,22 @@ class VideoSource:
 
         self._is_open = True
 
-        # Для live-потоків мінімізуємо буферизацію
+        # Minimise buffering for live streams
         if self.is_live:
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config.buffer_size)
 
-        # Зчитуємо FPS
+        # Read FPS
         fps = self._cap.get(cv2.CAP_PROP_FPS)
         if fps > 0 and fps < 120:
             self._fps = fps
         else:
-            self._fps = 30.0  # Фолбек
+            self._fps = 30.0  # Fallback
 
         logger.info(f"Successfully connected to video source. FPS: {self._fps:.2f}")
 
     @property
     def is_live(self) -> bool:
-        """True для RTSP/RTMP/USB/HTTP (немає кінця потоку, немає sync-sleep)."""
+        """True for RTSP/RTMP/USB/HTTP (no end-of-stream, no sync-sleep)."""
         return self.config.source_type in [
             VideoSourceType.RTSP,
             VideoSourceType.RTMP,
@@ -185,7 +185,7 @@ class VideoSource:
 
     @property
     def fps(self) -> float:
-        """FPS потоку (для live — з метаданих, для файлу — з заголовку)."""
+        """Stream FPS (from metadata for live sources, from header for files)."""
         return self._fps
 
     @property
@@ -194,20 +194,20 @@ class VideoSource:
 
     @property
     def pos_msec(self) -> float:
-        """Поточна позиція відео у мс (0.0 якщо кодек не повідомляє/закрито)."""
+        """Current video position in ms (0.0 if codec does not report / closed)."""
         if self._cap is None:
             return 0.0
         return float(self._cap.get(cv2.CAP_PROP_POS_MSEC))
 
     @property
     def pos_frames(self) -> float:
-        """Поточний номер кадру (0.0 якщо закрито)."""
+        """Current frame number (0.0 if closed)."""
         if self._cap is None:
             return 0.0
         return float(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
 
     def read(self) -> tuple[bool, np.ndarray | None]:
-        """Читає кадр з auto-reconnect при втраті з'єднання."""
+        """Reads a frame with auto-reconnect on connection loss."""
         if not self._is_open:
             return False, None
 
@@ -217,7 +217,7 @@ class VideoSource:
         ret, frame = self._cap.read()
 
         if not ret and self.is_live:
-            # Для live-потоків: пробуємо перепідключитися
+            # For live streams: try to reconnect
             logger.warning("Connection lost to live stream. Attempting to reconnect...")
             for attempt in range(self.config.reconnect_attempts):
                 time.sleep(self.config.reconnect_delay_sec)
@@ -236,7 +236,7 @@ class VideoSource:
         return ret, frame
 
     def release(self):
-        """Звільняє ресурси."""
+        """Release all resources."""
         self._stop_event.set()
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=2.0)

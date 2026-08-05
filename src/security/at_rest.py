@@ -1,18 +1,14 @@
-"""HARDENING P1-6: passphrase-derived encryption-at-rest for map artifacts.
+"""Module for project artifact and data encryption (Encryption-at-Rest).
 
-Threat: airframe capture — an adversary who recovers the payload must not read
-the mission's operational area or map. The key is *never* stored on the device;
-it is derived from an operator passphrase at load time (Scrypt), so a captured,
-powered-off payload yields only authenticated ciphertext.
+Protects disk data from unauthorized access in case of physical device loss.
+The encryption key is derived from the operator passphrase during loading (Scrypt),
+so a powered-off or captured device contains only authenticated AES-256-GCM ciphertext.
 
-Self-describing container (so a plaintext project stays byte-for-byte unchanged
-and encrypted artifacts are auto-detected on load):
+Encrypted container format:
 
     MAGIC(7) | version(1) | salt(16) | nonce(12) | AES-256-GCM(ciphertext‖tag)
 
-This module is the crypto foundation reused by every encryption-at-rest
-sub-project (geo-anchors, the h5 map, the lance index). It depends only on
-`cryptography` — no torch/Qt — so it is unit-testable in the pure-Python suite.
+Uses cryptographic primitives from `cryptography` without depending on PyTorch or Qt.
 """
 
 from __future__ import annotations

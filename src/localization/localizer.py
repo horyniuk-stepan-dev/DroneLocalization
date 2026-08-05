@@ -40,12 +40,12 @@ class Localizer:
         self.config = config or {}
         self._failure_logger = FailureLogger()
 
-        # Мультиджерельна підтримка (Phase 3 ТЗ)
+        # Multi-source database and calibration management
         self.db_manager = db_manager  # MultiDatabaseManager | None
         self.calib_manager = calib_manager  # MultiCalibrationManager | None
         self._active_source_id: str | None = None
 
-        # Дефолти синхронізовані з APP_CONFIG через get_cfg()
+        # Defaults synchronized with APP_CONFIG via get_cfg()
         self.min_matches = get_cfg(self.config, "localization.min_matches", 12)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
         self.enable_auto_rotation = get_cfg(self.config, "localization.auto_rotation", True)
@@ -71,9 +71,7 @@ class Localizer:
             self.config, "tracking.outlier_mahalanobis_enabled", False
         )
 
-        # RESEARCH 3.1: ковзний віконний back-end smoother (флаг, дефолт off).
-        # Синхронний 2D Huber-IRLS поверх keyframe-фіксів + OF-одометрії;
-        # корекція KF зсувом. Див. src/tracking/smoother.py.
+        # Sliding Window Smoother for trajectory optimization over keyframe fixes & optical flow.
         self._smoother = None
         if get_cfg(self.config, "tracking.smoother_enabled", False):
             from src.tracking.smoother import SlidingWindowSmoother
@@ -94,10 +92,9 @@ class Localizer:
                 max_step_m=get_cfg(self.config, "tracking.smoother_max_step_m", 3.0),
             )
 
-        # Retriever: при мульти-режимі він у db_manager, тут — для single-mode
+        # Retriever: single-database mode fallback
         self.retriever = None
         if self.db_manager is None:
-            # Single-database mode (зворотна сумісність)
             if hasattr(self.database, "lance_table") and self.database.lance_table is not None:
                 self.retriever = LanceDBRetrieval(self.database.lance_table)
             else:
@@ -107,18 +104,14 @@ class Localizer:
         self.fallback_enabled = get_cfg(self.config, "localization.enable_lightglue_fallback", True)
         self.min_inliers_for_accept = get_cfg(self.config, "localization.min_inliers_accept", 10)
         self.retrieval_top_k = get_cfg(self.config, "localization.retrieval_top_k", 8)
-        # RESEARCH 2.2: аварійний SIFT+LightGlue фолбек
+        # SIFT + LightGlue emergency fallback
         self._sift_fallback = get_cfg(self.config, "localization.sift_fallback", False)
         self._sift_fallback_max_cand = get_cfg(
             self.config, "localization.sift_fallback_max_candidates", 3
         )
         self.early_stop_inliers = get_cfg(self.config, "localization.early_stop_inliers", 30)
 
-        # ── PIPELINE_OPTIMIZATION_PLAN §A1: темпоральний prior кандидатів ───
-        # У steady state глобальний дескриптор коштує половину keyframe-а
-        # (470 мс із 945 на GTX 1650), хоча відповідь — номер кадру БД — уже
-        # відома з попереднього keyframe: дрон за секунду не телепортується.
-        # Прапорець дефолтом вимкнено: поведінка без нього побітово стара.
+        # Temporal candidate prior for steady flight mode
         self._temporal_prior = get_cfg(self.config, "localization.temporal_candidate_prior", False)
         self._tp_window = int(get_cfg(self.config, "localization.temporal_prior_window", 2))
         self._tp_keep = int(get_cfg(self.config, "localization.temporal_prior_keep", 1))
@@ -133,10 +126,7 @@ class Localizer:
         self._tp_tries = 0
         self._tp_hits = 0
 
-        # ADDENDUM 1.1: статистика розкиду інлаєрів. Без неї прогін не дає
-        # вердикту — критерій приймання сформульований саме як ЧАСТОТА
-        # спрацювання («< 1% keyframe-ів зі spread < 0.10 → пункт відкотити»).
-        # Лічильники живуть лише коли увімкнено spread_confidence_enabled.
+        # Monitoring of inlier spatial spread across frame
         self._spread_stats_enabled = get_cfg(
             self.config, "localization.spread_confidence_enabled", False
         )
@@ -146,22 +136,17 @@ class Localizer:
         self._spread_min = 1.0
         self._spread_sum = 0.0
 
-        # Аудит §1.2: гейт аутлаєрів на OF-шляху. Дефолт False — стара поведінка
-        # (OF взагалі не перевірявся). Вмикати разом із поверненням
-        # tracking.outlier_threshold_std / max_speed_mps до фізичних значень:
-        # при std=80 і 350 м/с гейт усе одно майже не спрацьовує.
+        # Filtering anomalous shifts along optical flow track
         self._of_outlier_gate = get_cfg(self.config, "tracking.of_outlier_gate", False)
-        # Етап 6: перевести відстані аутлаєр-гейта у справжні наземні метри.
+        # Distance correction considering real ground metric scale
         self._ground_scale_correction = get_cfg(
             self.config, "tracking.ground_scale_correction", False
         )
-        # Локальна (кадр-до-кадру) швидкість на OF-шляху замість накопиченої.
+        # Calculating local frame-to-frame velocity instead of accumulated
         self._of_local_speed = get_cfg(self.config, "tracking.of_local_speed", False)
         self._last_of_raw: np.ndarray | None = None
 
-        # Обхід кінематичного гейта за силою незалежних доказів (див.
-        # config/localization.py). Кінематика — це пріор про рух платформи;
-        # інлаєри та flow_quality — прямі свідчення про саме вимірювання.
+        # Accepting measurements when strong independent geometric evidence is present
         self._trust_strong = get_cfg(self.config, "tracking.outlier_trust_strong_evidence", False)
         self._trust_min_inliers = int(
             get_cfg(self.config, "tracking.outlier_trust_min_inliers", 100)
@@ -170,16 +155,16 @@ class Localizer:
             get_cfg(self.config, "tracking.outlier_trust_min_flow_quality", 0.5)
         )
 
-        # Fix #1: Захист від нескінченного циклу при виході за межі покриття
+        # Fix #1: Guard against infinite loop when outside coverage bounds
         self._consecutive_failures = 0
         self._max_failures = get_cfg(self.config, "localization.max_consecutive_failures", 10)
 
-        # Нормалізація роздільної здатності вхідного кадру до еталонної роздільної здатності БД
+        # Normalizing input frame resolution to DB reference resolution
         self.normalizer = ResolutionNormalizer(ref_frame_width, ref_frame_height)
         self._last_scale = 1.0
 
-        # A3: темпоральний prior на кут повороту — кут останньої успішної
-        # локалізації; повний скан 4 кутів лише при просіданні score або невдачі
+        # A3: temporal prior on rotation angle — angle of last successful
+        # localization; full 4-angle scan only on score dip or failure
         self._last_best_angle: int | None = None
 
         # ── ScaleManager: GSD-ratio estimation for altitude-invariant localization ─
@@ -192,16 +177,16 @@ class Localizer:
         self._depth_estimator = None
         self._depth_hint_counter = 0
 
-        # ── Debug views: незалежний depth-інференс для вікна (окрема каденція) ─
+        # ── Debug views: independent depth inference for window (separate cadence) ─
         self._debug_depth_every_n = get_cfg(self.config, "debug_views.depth_every_n_keyframes", 1)
         self._debug_depth_estimator = None
         self._debug_depth_counter = 0
 
-        # ── Patchify: мультипатч-retrieval ────────────────────────────────────
-        # ВАЖЛИВО: PatchifyRetrieval ініціалізується тільки ЯКЩО:
-        #   1. Увімкнено через конфіг
-        #   2. В базі є patch_descriptors (тобто БД будувалась з use_patchify=True)
-        # Якщо хоча б одна умова не виконана — patchify мовчки вимкнено (backward compat).
+        # ── Patchify: multi-patch retrieval ────────────────────────────────────
+        # IMPORTANT: PatchifyRetrieval is initialized ONLY IF:
+        #   1. Enabled via config
+        #   2. Database contains patch_descriptors (i.e. built with use_patchify=True)
+        # If either condition is not met — patchify is silently disabled (backward compat).
         self.patchify_retrieval = None
         use_patchify = get_cfg(self.config, "localization.use_patchify", False)
         if use_patchify:
@@ -277,19 +262,19 @@ class Localizer:
 
     @property
     def last_state(self) -> dict | None:
-        """Останній успішний стан локалізації (H, affine, кут, source_id) або None.
+        """Last successful localization state (H, affine, angle, source_id) or None.
 
-        Публічний доступ замість читання приватного _last_state ззовні.
+        Public access instead of reading private _last_state externally.
         """
         return getattr(self, "_last_state", None)
 
     def _sync_ground_scale(self, lat: float) -> None:
-        """Оновлює множник проєкція→наземні метри в аутлаєр-детекторі.
+        """Updates projection-to-ground metric multiplier in outlier detector.
 
-        Флаг-гейт: при вимкненому tracking.ground_scale_correction множник
-        лишається 1.0, тобто поведінка побітово стара. Широта береться зі
-        свіжого фікса; за місію cos(lat) міняється на ~1e-5, тож відставання
-        на один кадр не має значення.
+        Flag-gate: when tracking.ground_scale_correction is disabled multiplier
+        remains 1.0 (legacy behavior). Latitude is taken from
+        fresh fix; during mission cos(lat) changes by ~1e-5, so lag
+        of one frame does not matter.
         """
         if not self._ground_scale_correction:
             return
@@ -298,14 +283,14 @@ class Localizer:
             return
         try:
             self.outlier_detector.set_ground_scale(converter.ground_scale_factor(lat))
-        except Exception as e:  # noqa: BLE001 — корекція не має валити локалізацію
+        except Exception as e:  # noqa: BLE001 — correction must not crash localization
             logger.warning(f"Ground-scale sync failed ({type(e).__name__}: {e})")
 
     def reset_session(self) -> None:
-        """Скидає стан сесії трекінгу (фільтри, лічильники, кутовий prior).
+        """Resets tracking session state (filters, counters, angle prior).
 
-        Викликати при старті нового відстеження, щоб уникнути хибних
-        передбачень на основі попередньої сесії.
+        Call at start of new tracking to avoid false
+        predictions based on previous session.
         """
         self.trajectory_filter.reset()
         self.outlier_detector.reset()
@@ -340,7 +325,7 @@ class Localizer:
             logger.debug(f"Depth hint skipped: {e}")
 
     def _maybe_collect_depth(self, frame_rgb: np.ndarray, collector) -> None:
-        """Debug: незалежний depth-інференс для вікна (окрема каденція).
+        """Debug: independent depth inference for window (separate cadence).
 
         Не впливає на локалізацію — суто візуалізація «очима Depth Anything».
         Рахується лише коли вікно depth відкрите (collector.want_depth) і не
@@ -359,7 +344,7 @@ class Localizer:
                 self._debug_depth_estimator = DepthEstimator.build(device=device)
             depth = self._debug_depth_estimator.estimate(frame_rgb)
             collector.depth_map = depth
-            # відносний масштаб з центру (як get_relative_scale, без 2-го інференсу)
+            # relative scale from center (like get_relative_scale, without 2nd inference)
             h, w = depth.shape
             cd = depth[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
             vm = cd > 0
@@ -379,7 +364,7 @@ class Localizer:
         yaw_hint_deg: float | None = None,
         collector=None,
     ) -> dict:
-        # Fix #1: Якщо було занадто багато послідовних невдач — повертаємо out_of_coverage
+        # Fix #1: If too many consecutive failures occurred — return out_of_coverage
         if self._consecutive_failures >= self._max_failures:
             self._consecutive_failures = 0
             self._log_failure(
@@ -400,7 +385,7 @@ class Localizer:
 
         height, width = query_frame.shape[:2]
 
-        # Нормалізація до еталонної роздільної здатності БД
+        # Normalization to database reference resolution
         query_frame, self._last_scale = self.normalizer.normalize(query_frame)
         if static_mask is not None:
             static_mask = self.normalizer.normalize_mask(static_mask)
@@ -408,21 +393,21 @@ class Localizer:
 
         # Depth hint: soft reorder of the scale pyramid toward the DB GSD (every N keyframes).
         self._maybe_set_depth_hint(query_frame)
-        # Debug: depth-мапа для вікна (незалежно від успіху локалізації).
+        # Debug: depth map for window (independent of localization success).
         self._maybe_collect_depth(query_frame, collector)
 
         angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
 
         top_k = self.retrieval_top_k
 
-        # §A1: кеш (кут, масштаб) → (кадр, маска, crop, фічі) на ОДИН виклик.
-        # Якщо темпоральна гіпотеза провалилась, а повний шлях обрав ті самі
-        # кут і масштаб — ALIKED не рахується вдруге (217-339 мс на GTX 1650).
+        # §A1: cache (angle, scale) -> (frame, mask, crop, features) for ONE call.
+        # If temporal hypothesis failed, and full path chose the same
+        # angle and scale — ALIKED is not recomputed (217-339 ms on GTX 1650).
         _feat_cache: dict = {}
 
-        # ── §A1: спроба локалізуватись БЕЗ глобального дескриптора ──────────
-        # yaw_hint_deg вимикає цей шлях: зовнішній курс — це нова інформація
-        # про орієнтацію, її треба відпрацювати повним ротаційним трактом.
+        # ── §A1: attempt to localize WITHOUT global descriptor ──────────
+        # yaw_hint_deg disables this path: external heading is new information
+        # about orientation, it must be processed by full rotation path.
         _tp = None
         if self._temporal_prior and yaw_hint_deg is None:
             self._tp_counter += 1
@@ -450,10 +435,10 @@ class Localizer:
                 best_query_features,
                 best_global_candidates,
             ) = _tp
-            # Retrieval не виконувався — глобального score не існує. -1.0
-            # свідомо не проходить retrieval_only_min_score, тож фолбек
-            # «за схожістю» на цьому шляху не спрацює; кандидати й так
-            # відібрані за наявністю пропагованої калібрації.
+            # Retrieval was not executed — global score does not exist. -1.0
+            # deliberately fails retrieval_only_min_score, so fallback
+            # 'by similarity' on this path will not trigger; candidates are already
+            # selected by presence of propagated calibration.
             best_global_score = -1.0
             best_source_id_per_angle = self._active_source_id
             if collector is not None:
@@ -471,13 +456,13 @@ class Localizer:
                 f"(global descriptor skipped)"
             )
         else:
-            # ── RESEARCH 2.3: зовнішній yaw-hint (симулятор / телеметрія) ────────
-            # yaw_hint_deg — кут CW у градусах, на який слід повернути кадр, щоб
-            # він збігся з орієнтацією БД (north-up); конвертацію з курсу дрона
-            # робить викликач. Квантуємо до 90° — весь rotation-тракт працює з
-            # k·90. Хибний hint самовиліковується: якщо retrieval-score prior-кута
-            # нижчий за rotation_rescan_min_score, RotationSelector сам виконає
-            # повний батчований скан 4 кутів.
+            # ── RESEARCH 2.3: external yaw-hint (simulator / telemetry) ────────
+            # yaw_hint_deg — CW angle in degrees to rotate the frame to match
+            # DB orientation (north-up); conversion from drone heading
+            # is done by caller. Quantized to 90 degrees — full rotation path operates with
+            # k*90. False hint self-heals: if retrieval-score of prior-angle
+            # is lower than rotation_rescan_min_score, RotationSelector performs
+            # full batched 4-angle scan.
             prior_angle = self._last_best_angle
             use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
             if yaw_hint_deg is not None and self.enable_auto_rotation:
@@ -523,7 +508,7 @@ class Localizer:
                 f"with global score {best_global_score:.3f}"
             )
 
-            # ── Крок 1.5a: Перемикання database/calibration для мульти-режиму ───
+            # ── Step 1.5a: Switching database/calibration for multi-mode ───
             if self.db_manager is not None and best_source_id_per_angle is not None:
                 self._active_source_id = best_source_id_per_angle
                 self.database = self.db_manager.get_database(best_source_id_per_angle)
@@ -531,11 +516,11 @@ class Localizer:
                     self.calibration = self.calib_manager.get(best_source_id_per_angle)
                 logger.debug(f"Active source switched to '{best_source_id_per_angle}'")
 
-            # ── Кроки 1.5 + 1.5b + 2: поворот, GSD-нормалізація, ALIKED ─────────
-            # §A1: через _prepare_and_extract, щоб фічі, вже пораховані невдалою
-            # темпоральною гіпотезою на тих самих (кут, масштаб), не рахувались
-            # удруге. Крок 1.6 (patchify-expand) переїхав НИЖЧЕ екстракції — вони
-            # незалежні: expand читає лише кадр, а не фічі.
+            # ── Steps 1.5 + 1.5b + 2: rotation, GSD normalization, ALIKED ─────────
+            # §A1: via _prepare_and_extract, so features already computed by failed
+            # temporal hypothesis at the same (angle, scale) are not computed
+            # a second time. Step 1.6 (patchify-expand) moved BELOW extraction — they are
+            # independent: expand reads only the frame, not features.
             (
                 best_rotated_frame,
                 best_rotated_mask,
@@ -547,14 +532,14 @@ class Localizer:
                 best_global_angle,
                 best_scale,
                 _feat_cache,
-                # §2.2: селектор уже повернув і відмасштабував саме цей кадр
+                # §2.2: selector has already rotated and scaled this exact frame
                 prepared=(rot.frame, rot.crop_info),
             )
 
-            # ── Крок 1.6: Patchify-розширення кандидатів (тільки для найкращого ракурсу) ─
-            # Запускаємо ОДИН РАЗ після вибору кута — не в циклі.
-            # Пatchify додає кандидатів, яких міг пропустити CLS-token DINOv2
-            # (наприклад, при зміні висоти польоту).
+            # ── Step 1.6: Patchify candidate expansion (only for best angle) ─
+            # Run ONCE after angle selection — not in a loop.
+            # Patchify adds candidates that DINOv2 CLS-token might have missed
+            # (e.g., during altitude change).
             best_global_candidates = self._candidate_retriever.expand(
                 best_rotated_frame, best_global_candidates, top_k
             )
@@ -600,17 +585,17 @@ class Localizer:
             collector.mkpts_q_inliers = best_mkpts_q_inliers
             collector.mkpts_r_inliers = best_mkpts_r_inliers
 
-        # ADDENDUM 1.1: розкид інлаєрів — рахуємо ДО SIFT-фолбеку і
-        # перераховуємо після нього, бо він підміняє набір точок.
+        # ADDENDUM 1.1: inlier spread — computed BEFORE SIFT fallback and
+        # recomputed after it, because it replaces the point set.
         best_spread = self._inlier_spread(best_mkpts_q_inliers, best_query_features)
         if collector is not None:
             collector.spread = best_spread
 
-        # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ────────────────────
-        # ALIKED (як і SuperPoint) втрачає матчі при великому in-plane rotation
-        # та екстремальній похилості [ISPRS 2025; MDPI RS 17(22)]. Одноразовий
-        # перезапуск через ротаційно-інваріантний SIFT + LightGlue(sift) рятує
-        # кадр до того, як він піде у retrieval-only фолбек.
+        # ── RESEARCH 2.2: emergency SIFT+LightGlue fallback ────────────────────
+        # ALIKED (like SuperPoint) loses matches under large in-plane rotation
+        # and extreme tilt [ISPRS 2025; MDPI RS 17(22)]. Single
+        # re-run via rotation-invariant SIFT + LightGlue(sift) saves
+        # the frame before it goes into retrieval-only fallback.
         if (
             (best_inliers < self.min_matches or best_H_query_to_ref is None)
             and self._sift_fallback
@@ -629,7 +614,7 @@ class Localizer:
                     best_total_matches,
                     best_rmse,
                 ) = rescue
-                # Точки підмінені SIFT-ом — розкид більше не той, що вище.
+                # Points replaced by SIFT — spread is no longer what was above.
                 best_spread = self._inlier_spread(best_mkpts_q_inliers, best_query_features)
                 if collector is not None:
                     collector.spread = best_spread
@@ -664,7 +649,7 @@ class Localizer:
                 "error": f"Not enough valid inliers ({best_inliers} < {self.min_matches})",
             }
 
-        # ── Крок 4: Отримуємо аффінну матрицю кандидата ─────────────────────
+        # ── Step 4: Obtaining candidate affine matrix ─────────────────────
         affine_ref = self.database.get_frame_affine(best_candidate_id)
         if affine_ref is None:
             target_id = (
@@ -687,7 +672,7 @@ class Localizer:
                 ),
             }
 
-        # Розміри повернутого нормалізованого зображення
+        # Dimensions of rotated normalized image
         if best_global_angle in (90, 270):
             rot_height, rot_width = width, height
         else:
@@ -700,28 +685,28 @@ class Localizer:
             )
             return {"success": False, "error": "Failed to compute transform"}
 
-        # ── FOV-remap (IMPLEMENTATION_PLAN, Фаза 1.2) ────────────────────────────────────
-        # H знайдена в координатах GSD-нормалізованого кадру (crop/resize).
-        # Композиція з A (rotated→normalized) переводить H у координати
-        # повернутого кадру — далі центр (Крок 6), FOV (Крок 8), OF-стан
-        # (Крок 5) і scale-prior (update_from_homography) рахуються в одній
-        # системі координат. Без цього при r < 0.85 центр зміщений на
-        # ~(1−r)/2 кадру, полігон завищений у 1/r, а prior колапсує до 1.
+        # ── FOV-remap (IMPLEMENTATION_PLAN, Phase 1.2) ────────────────────────────────────
+        # H found in GSD-normalized frame coordinates (crop/resize).
+        # Composition with A (rotated->normalized) transforms H into coordinates
+        # of rotated frame — further center (Step 6), FOV (Step 8), OF-state
+        # (Step 5) and scale-prior (update_from_homography) are computed in single
+        # coordinate system. Without this, for r < 0.85 center is shifted by
+        # ~(1-r)/2 frame, polygon inflated by 1/r, and prior collapses to 1.
         if _crop_info is not None and _crop_info.resize_scale != 1.0:
             n_h, n_w = best_rotated_frame.shape[:2]
             _A_norm = crop_to_affine(_crop_info, n_w, n_h)
             M_query_to_ref = M_query_to_ref @ _A_norm
             if best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
-                # mkpts лишаються в нормалізованих координатах лише для
-                # collector (він малює по нормалізованому кадру); для
-                # build_fov (кламп до rot_width/rot_height) переводимо в
-                # координати повернутого кадру.
+                # mkpts remain in normalized coordinates only for
+                # collector (draws on normalized frame); for
+                # build_fov (clamped to rot_width/rot_height) converted to
+                # rotated frame coordinates.
                 _A_inv = crop_to_affine(_crop_info, n_w, n_h, inverse=True)
                 best_mkpts_q_inliers = GeometryTransforms.apply_homography(
                     np.asarray(best_mkpts_q_inliers, dtype=np.float64), _A_inv
                 )
 
-        # ── Крок 5: Стан для Optical Flow (коміт — ПІСЛЯ outlier-гейту) ─────
+        # ── Step 5: State for Optical Flow (commit — AFTER outlier gate) ─────
         pending_state = {
             "H": M_query_to_ref,
             "affine": affine_ref,
@@ -729,13 +714,13 @@ class Localizer:
             "inliers": best_inliers,
             "global_angle": best_global_angle,
             "source_id": self._active_source_id,
-            # Масштаб нормалізації САМЕ ЦЬОГО keyframe: OF має працювати в
-            # системі кадру, якому належить H (свіжий self._last_scale на
-            # наступних кадрах може вже відрізнятись).
+            # Normalization scale of THIS SPECIFIC keyframe: OF operates in
+            # frame system belonging to H (fresh self._last_scale on
+            # subsequent frames may already differ).
             "scale": self._last_scale,
         }
 
-        # ── Крок 6: Query center → Reference → Metric → GPS ─────────────────
+        # ── Step 6: Query center → Reference → Metric → GPS ─────────────────
         center_query = np.array([[rot_width / 2.0, rot_height / 2.0]], dtype=np.float64)
         pts_in_ref = GeometryTransforms.apply_homography(center_query, M_query_to_ref)
         if pts_in_ref is None or len(pts_in_ref) == 0:
@@ -760,22 +745,22 @@ class Localizer:
         my = float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        # ── Крок 7: Фільтрація аномалій ─────────────────────────────────────
-        # Сильна геометрія б'є кінематичний пріор: фікс, підтверджений сотнями
-        # інлаєрів RANSAC, не має відкидатись через припущення про швидкість
-        # платформи. Позицію все одно дописуємо в історію, щоб вікно детектора
-        # відповідало реальності, а не відфільтрованій її версії.
+        # ── Step 7: Outlier filtering ─────────────────────────────────────
+        # Strong geometry beats kinematic prior: fix supported by hundreds of
+        # RANSAC inliers should not be discarded due to platform speed assumptions.
+        # Position is still appended to history so detector window
+        # corresponded to reality, not to a filtered version of it.
         _strong = self._trust_strong and best_inliers >= self._trust_min_inliers
         if _strong:
             logger.debug(
                 f"Kinematic gate bypassed: {best_inliers} inliers "
                 f">= {self._trust_min_inliers} (geometry outranks motion prior)"
             )
-        # Mahalanobis-гейт (флаг): d² рахуємо ДО оновлення фільтра, чистою
-        # функцією. noise_scale=1.0 — базове R: confidence на цій точці коду ще
-        # не пораховано (воно нижче, у Кроці 8), а переставляти порядок заради
-        # гейта означало б міняти більше, ніж вимагає задача. Наслідок: для
-        # фіксів із низьким confidence гейт трохи суворіший за подальший update.
+        # Mahalanobis-gate (flag): d^2 computed BEFORE filter update, using pure
+        # function. noise_scale=1.0 — base R: confidence at this point in code is not
+        # yet computed (it is below in Step 8), and reordering for the sake of
+        # the gate would mean changing more than the task requires. Consequence: for
+        # fixes with low confidence gate is slightly stricter than subsequent update.
         _maha_d2 = (
             self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.0)
             if self._maha_gate_enabled
@@ -788,9 +773,9 @@ class Localizer:
                 f"Position jump was too large relative to recent trajectory."
             )
             self._log_failure(FAILURE_TYPES["Outlier detected"], inliers=best_inliers)
-            # RESEARCH 3.1: відхилений фікс усе одно входить у вікно
-            # smoother-а — Huber-вага арбітрує замість бінарного відкидання
-            # (страхує Z-score false positives на різких маневрах).
+            # RESEARCH 3.1: rejected fix still enters the window
+            # of the smoother — Huber weight arbitrates instead of binary rejection
+            # (insures Z-score false positives during sharp maneuvers).
             if self._smoother is not None:
                 conf_rej = self._compute_confidence(
                     best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
@@ -804,15 +789,15 @@ class Localizer:
                 )
             return {"success": False, "error": "Outlier detected — position jump filtered"}
 
-        # БАГФІКС (OF-шов): коміт стану лише ПІСЛЯ outlier-гейту. Раніше стан
-        # комітився на Кроці 5 — і для відхилених кадрів, і до
-        # homography-failure return — тож OF отримував H, неузгоджену з
-        # prev_pts воркера (він не ребейзить точки без success).
+        # BUGFIX (OF-seam): state commit ONLY AFTER outlier gate. Previously state
+        # was committed at Step 5 — both for rejected frames and prior to
+        # homography-failure return — so OF received H inconsistent with
+        # worker prev_pts (does not rebase points without success).
         self._last_state = pending_state
         self._consecutive_failures = 0
 
-        # Confidence рахуємо ДО фільтрації — B2: адаптивний шум вимірювання,
-        # слабка локалізація впливає на траєкторію менше, впевнена — більше
+        # Confidence computed BEFORE filtering — B2: adaptive measurement noise,
+        # weak localization affects trajectory less, confident — more
         confidence = self._compute_confidence(
             best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
         )
@@ -820,9 +805,9 @@ class Localizer:
         filtered_pt = self.trajectory_filter.update(
             metric_pt, dt=dt, noise_scale=1.0 / max(confidence, 0.25)
         )
-        # RESEARCH 3.1: back-end smoother — вікно фіксів + OF-одометрії;
-        # корекція KF зсувом ДО запису в історію детектора та GPS/FOV,
-        # щоб виправлення потрапило в ЦЕЙ же кадр.
+        # RESEARCH 3.1: back-end smoother — fix window + OF-odometry;
+        # KF correction by shift BEFORE writing to detector history and GPS/FOV,
+        # so correction lands in THIS frame.
         if self._smoother is not None:
             corr = self._smoother.add_fix(
                 metric_pt,
@@ -840,10 +825,10 @@ class Localizer:
                 )
                 logger.debug(f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m")
         self.outlier_detector.add_position(filtered_pt, dt=dt)
-        # Новий keyframe перезапускає LK, тож ланцюг локальних OF-порівнянь
-        # обривається: перший OF після keyframe має міряти зсув ВІД keyframe
-        # (ref=None -> база = щойно додана позиція у вікні), а не від OF-виміру
-        # попереднього циклу. Інакше знову розходяться бази зсуву і dt.
+        # New keyframe restarts LK, so chain of local OF comparisons
+        # breaks: first OF after keyframe should measure shift FROM keyframe
+        # (ref=None -> database = newly added position in window), not from OF-measurement
+        # of previous cycle. Otherwise database of shift and dt diverge again.
         self._last_of_raw = None
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
@@ -851,7 +836,7 @@ class Localizer:
         self._sync_ground_scale(lat)
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
-        # ── Крок 8: Розрахунок FOV ───────────────────────────────────────────
+        # -- Step 8: FOV calculation -------------------------------------------
         gps_corners = self._result_builder.build_fov(
             M_query_to_ref,
             affine_ref,
@@ -877,7 +862,7 @@ class Localizer:
             f"metric=({mx:.1f}, {my:.1f}) | inliers={best_inliers} | conf={confidence:.2f}"
         )
 
-        # A3: запам'ятовуємо кут для темпорального prior наступного keyframe
+        # A3: remember angle for temporal prior of next keyframe
         self._last_best_angle = best_global_angle
 
         # Scale prior: extract scale from H for the next keyframe
@@ -907,7 +892,7 @@ class Localizer:
         flow_affine: np.ndarray | None = None,
         flow_quality: float | None = None,
     ) -> dict:
-        """Локалізація на основі піксельного зсуву від Optical Flow.
+        """Localization based on pixel shift from Optical Flow.
 
         Параметри rot_width / rot_height — ОРИГІНАЛЬНІ розміри кадру (до нормалізації
         і повороту), так як передаються з TrackingWorker через frame.shape.
@@ -925,46 +910,46 @@ class Localizer:
         if state is None or state.get("H") is None or state.get("affine") is None:
             return {"success": False, "error": "No previous state to apply OF"}
 
-        # Відновлюємо database/calibration для збереженого source_id (мульти-режим)
+        # Restoring database/calibration for saved source_id (multi-mode)
         last_source_id = self._last_state.get("source_id")
         if last_source_id is not None and self.db_manager is not None:
             self.database = self.db_manager.get_database(last_source_id)
             if self.calib_manager is not None:
                 self.calibration = self.calib_manager.get(last_source_id)
 
-        # Масштаб зі збереженого стану keyframe-а (узгоджений з його H);
-        # фолбек на _last_scale для станів, записаних до цього поля.
+        # Scale from saved keyframe state (consistent with its H);
+        # fallback to _last_scale for states recorded prior to this field.
         scale = self._last_state.get("scale", self._last_scale)
         angle = self._last_state.get("global_angle", 0)
 
-        # ── 1. Вектор зсуву: оригінальний простір → нормалізований + повернутий ──
-        # Масштабуємо до нормалізованого простору
+        # -- 1. Shift vector: original space -> normalized + rotated --
+        # Scaling to normalized space
         sdx = dx_px * scale
         sdy = dy_px * scale
 
-        # Обертаємо вектор зсуву відповідно до повороту кадру.
-        # H побудована в просторі повернутого нормалізованого кадру, тому зсув
-        # теж має бути в тій самій системі координат.
+        # Rotating shift vector according to frame orientation.
+        # H constructed in rotated normalized frame space, so shift
+        # must also be in the same coordinate system.
         a, b, c, d = _ROTATION_VEC.get(angle, (1, 0, 0, 1))
         rot_sdx = a * sdx + b * sdy
         rot_sdy = c * sdx + d * sdy
 
-        # ── 2. Розміри кадру: оригінальні → нормалізовані + повернуті ────────
+        # -- 2. Frame dimensions: original -> normalized + rotated --------
         if angle in (90, 270):
-            # 90° / 270°: рядки і стовпці міняються місцями
+            # 90 deg / 270 deg: rows and columns swap
             norm_rot_w = rot_height * scale
             norm_rot_h = rot_width * scale
         else:
             norm_rot_w = rot_width * scale
             norm_rot_h = rot_height * scale
 
-        # ── 3. Центр поточного кадру в системі координат попереднього ────────
+        # -- 3. Current frame center in previous coordinate system --------
         center_query_shifted = None
 
         if flow_affine is not None:
-            # B4: повна симілярність S (original px, KF→current). Точка KF-кадру,
-            # що зараз опинилась у центрі: p0 = S⁻¹ @ center. Далі p0 переводимо
-            # normalized → rotated (та сама трансформація, що й для кадру).
+            # B4: full similarity S (original px, KF->current). Point in KF-frame,
+            # currently located at center: p0 = S^-1 @ center. Then p0 is mapped
+            # normalized -> rotated (same transform as for frame).
             try:
                 S3 = np.vstack([np.asarray(flow_affine, dtype=np.float64), [0.0, 0.0, 1.0]])
                 S_inv = np.linalg.inv(S3)
@@ -974,7 +959,7 @@ class Localizer:
                 # original → normalized
                 p0x *= scale
                 p0y *= scale
-                # normalized → rotated (мапінг точки np.rot90, верифікований)
+                # normalized -> rotated (point mapping via np.rot90, verified)
                 w_n, h_n = rot_width * scale, rot_height * scale
                 rx, ry = _rotate_point_np90(p0x, p0y, w_n, h_n, angle)
                 center_query_shifted = np.array([[rx, ry]], dtype=np.float64)
@@ -982,8 +967,8 @@ class Localizer:
                 center_query_shifted = None  # вироджена S → fallback на трансляцію
 
         if center_query_shifted is None:
-            # Fallback: чиста трансляція — якщо з моменту KF точки змістились на
-            # (dx, dy), центр відповідає точці (center − displacement) у КС KF.
+            # Fallback: pure translation — if since KF points shifted by
+            # (dx, dy), center corresponds to point (center - displacement) in KF frame.
             center_query_shifted = np.array(
                 [[norm_rot_w / 2.0 - rot_sdx, norm_rot_h / 2.0 - rot_sdy]],
                 dtype=np.float64,
@@ -1002,16 +987,16 @@ class Localizer:
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
-        # ── Гейт аутлаєрів на OF-шляху (аудит §1.2), flag-gated ──────────────
-        # Структурна прогалина: keyframe-шлях питає is_outlier (Крок 7), а OF —
-        # ні, він лише дописував позицію в історію. При keyframe_interval=30 це
-        # 29 із 30 позицій, що виходять назовні без жодної перевірки: зрив
-        # трекінгу LK на хмару чи водну поверхню потрапляв прямо в GPS.
-        # Дефолт False = стара поведінка побітово.
-        # Висока flow_quality — незалежне свідчення, що потік узгоджений: зсув
-        # реальний, а не зрив трекінгу. Заміряно на живому прогоні: справжні
-        # зриви LK давали 0.017–0.035, а помилково відкинуті швидкі рухи —
-        # 0.625–1.0. Кінематичний гейт їх не розрізняє, а цей поріг — так.
+        # -- Outlier gate on OF path (audit item 1.2), flag-gated ------------
+        # Structural gap: keyframe path checks is_outlier (Step 7), while OF —
+        # did not, it only appended position to history. At keyframe_interval=30 this is
+        # 29 out of 30 positions going outward without any check: loss
+        # tracking LK onto cloud or water surface went straight into GPS.
+        # Default False = legacy behavior bitwise.
+        # High flow_quality is independent evidence that flow is consistent: shift
+        # real, not tracking loss. Measured on live run: real
+        # LK slips gave 0.017-0.035, while falsely rejected fast motions —
+        # 0.625-1.0. Kinematic gate does not distinguish them, but this threshold does.
         _strong_flow = (
             self._trust_strong
             and flow_quality is not None
@@ -1022,12 +1007,12 @@ class Localizer:
                 f"OF kinematic gate bypassed: flow_quality={float(flow_quality):.3f} "
                 f">= {self._trust_min_flow_q} (flow is self-consistent)"
             )
-        # Опорна точка миттєвої швидкості: попередній СИРИЙ OF-вимір (навіть
-        # відкинутий). Без неї база — остання прийнята позиція, зазвичай
-        # keyframe, і швидкість накопичується разом зі зсувом LK.
+        # Instantaneous velocity reference point: previous RAW OF measurement (even
+        # if rejected). Without it reference is last accepted position, usually
+        # keyframe, and speed accumulates along with LK shift.
         _of_ref = self._last_of_raw if self._of_local_speed else None
-        # noise_scale=1.5 повторює базовий множник OF-гілки update() при
-        # of_conf=1.0 — OF-вимір апріорі шумніший за keyframe-фікс.
+        # noise_scale=1.5 matches base multiplier of OF-branch update() at
+        # of_conf=1.0 — OF measurement is inherently noisier than keyframe-fix.
         _maha_d2 = (
             self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.5)
             if self._maha_gate_enabled
@@ -1040,8 +1025,8 @@ class Localizer:
                 metric_pt, dt, ref_position=_of_ref, maha_d2=_maha_d2
             )
         )
-        # Оновлюємо ДО раннього return: наступний кадр має порівнюватись із цим
-        # виміром незалежно від того, прийняли ми його чи ні.
+        # Updating BEFORE early return: next frame must be compared with this one
+        # measurement regardless of whether we accepted it or not.
         self._last_of_raw = metric_pt.copy()
         if _is_out:
             logger.warning(
@@ -1050,20 +1035,20 @@ class Localizer:
                 f"Optical flow likely lost lock (clouds, water, motion blur)."
             )
             self._log_failure(FAILURE_TYPES["Outlier detected"])
-            # Відхилений OF усе одно йде у вікно smoother-а як одометрія:
-            # Huber-вага арбітрує краще за бінарне відкидання (та сама логіка,
-            # що для відхилених keyframe-ів).
+            # Rejected OF still goes into smoother window as odometry:
+            # Huber weight arbitrates better than binary rejection (same logic,
+            # as for rejected keyframes).
             if self._smoother is not None:
                 self._smoother.note_of(metric_pt, dt=dt, quality=flow_quality)
             return {"success": False, "error": "OF outlier — position jump filtered"}
 
-        # RESEARCH 3.1: сирий OF-фікс у вікно smoother-а — відносна одометрія,
-        # прив'язана до H останнього прийнятого keyframe.
+        # RESEARCH 3.1: raw OF fix into smoother window — relative odometry,
+        # tied to H of last accepted keyframe.
         if self._smoother is not None:
             self._smoother.note_of(metric_pt, dt=dt, quality=flow_quality)
 
-        # B2: чесний confidence OF (раніше хардкод 0.8) + більший шум вимірювання
-        # для Kalman (OF — відносне вимірювання, воно дрейфує від KF)
+        # B2: honest OF confidence (previously hardcoded 0.8) + higher measurement noise
+        # for Kalman (OF is relative measurement, drifts from KF)
         if flow_quality is not None:
             of_conf = 0.5 + 0.35 * float(np.clip(flow_quality, 0.0, 1.0))
         else:
@@ -1105,7 +1090,7 @@ class Localizer:
         cache: dict,
         prepared: tuple | None = None,
     ) -> tuple:
-        """Повернути кадр на ``angle``, нормалізувати до ``scale``, витягти ALIKED.
+        """Rotate frame by ``angle``, normalize to ``scale``, extract ALIKED.
 
         ``cache`` живе рівно один виклик ``localize_frame``: якщо темпоральна
         гіпотеза провалилась і повний шлях обрав ті самі (кут, масштаб),
@@ -1128,14 +1113,14 @@ class Localizer:
         needs_gsd = abs(float(scale) - 1.0) > 0.15
 
         if prepared is not None and prepared[0] is not None:
-            # Кадр уже підготовлений селектором під ці ж (кут, масштаб).
+            # Frame is already prepared by selector for these same (angle, scale).
             rotated, crop_info = prepared
             if needs_gsd and rot_mask is not None:
                 rot_mask, _ = self._scale_manager.normalize(rot_mask, float(scale))
         else:
             rotated = np.rot90(query_frame, k=k).copy()
             crop_info = None
-            # GSD-нормалізація: у сталому польоті scale ≈ 1.0 і це no-op.
+            # GSD-normalization: in steady flight scale ≈ 1.0 and this is a no-op.
             if needs_gsd:
                 rotated, crop_info = self._scale_manager.normalize(rotated, float(scale))
                 if rot_mask is not None:
@@ -1150,7 +1135,7 @@ class Localizer:
         return cache[key]
 
     def _tp_neighbour_ids(self) -> list[int]:
-        """Кандидати з околу останнього збігу — без жодного forward-пасу.
+        """Candidates from neighborhood of last match — without any forward-pass.
 
         Порядок: сам останній кадр, далі симетрично id±1, id±2 … Кадри без
         пропагованої калібрації відкидаються одразу: без ``frame_affine``
@@ -1180,7 +1165,7 @@ class Localizer:
     def _try_temporal_prior(
         self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
     ) -> tuple | None:
-        """§A1: локалізація без глобального дескриптора.
+        """Item A1: localization without global descriptor.
 
         Повертає кортеж для гілки в ``localize_frame`` або ``None`` — тоді
         викликач іде повним шляхом (фічі вже лежать у ``cache``, тож ALIKED
@@ -1246,7 +1231,7 @@ class Localizer:
         )
 
     def _record_spread(self, spread: float | None) -> None:
-        """Накопичує статистику розкиду і періодично друкує її в лог.
+        """Accumulates spread statistics and periodically logs them.
 
         LOW_SPREAD = 0.10 — поріг із критерію приймання (≈ третина рівномірного
         покриття 0.289), а НЕ поріг штрафу (той — ``spread_ref`` = 0.15).
@@ -1268,7 +1253,7 @@ class Localizer:
 
     @staticmethod
     def _inlier_spread(pts_q: np.ndarray | None, query_features: dict) -> float | None:
-        """ADDENDUM 1.1: розкид інлаєрів у системі координат query-кадру.
+        """ADDENDUM 1.1: inlier spread in query frame coordinate system.
 
         Розміри беремо з ``query_features["image_size"]`` (= [H, W] кадру, з
         якого екстрагувались фічі), а не з ``frame.shape``: keypoints живуть
@@ -1286,7 +1271,7 @@ class Localizer:
         rotated_mask: np.ndarray | None,
         candidates: list,
     ) -> tuple | None:
-        """RESEARCH 2.2: одноразовий SIFT+LightGlue перезапуск матчингу.
+        """RESEARCH 2.2: single-attempt SIFT+LightGlue matching rerun.
 
         Повертає (candidate_id, H, inliers, mkpts_q_in, mkpts_r_in,
         total_matches, rmse) або None. Координати SIFT-точок — у тій самій

@@ -9,18 +9,18 @@ logger = get_logger(__name__)
 
 
 def mercator_scale_factor(lat: float) -> float:
-    """Множник Web-Mercator-метри → справжні наземні метри (Етап 6): cos(lat).
+    """Multiplier for Web-Mercator-meters → real ground meters: cos(lat).
 
-    WebMercator (EPSG:3857) розтягує відстані у 1/cos(lat) (×~1.5 на 48°), тож
-    «метрові» цифри звітів/GSD на реальних даних систематично завищені. Множення
-    Mercator-відстані на cos(lat) дає справжні метри. Для UTM корекція = 1.0.
-    На сим-даних (усе в Mercator, порівняння відносне) не впливає на висновки.
+    WebMercator (EPSG:3857) stretches distances by 1/cos(lat) (~1.5x at 48°), so
+    metric figures in reports/GSD on real data are systematically overestimated.
+    Multiplying Mercator distance by cos(lat) yields real meters. For UTM, correction = 1.0.
+    On synthetic data (all in Mercator, relative comparison) does not affect conclusions.
     """
     return math.cos(math.radians(lat))
 
 
 class CoordinateConverter:
-    """Детермінована конвертація координат (WebMercator або UTM) на основі екземпляра."""
+    """Deterministic coordinate conversion (WebMercator or UTM) based on instance configuration."""
 
     def __init__(
         self, mode: str = "WEB_MERCATOR", reference_gps: tuple[float, float] | None = None
@@ -38,24 +38,24 @@ class CoordinateConverter:
 
     @property
     def is_initialized(self) -> bool:
-        """Повертає True, якщо проєкція успішно ініціалізована."""
+        """Returns True if the projection is successfully initialized."""
         return self._initialized
 
     @property
     def reference_gps(self) -> tuple[float, float] | None:
-        """Повертає опорні GPS-координати, використані для UTM проєкції."""
+        """Returns reference GPS coordinates used for UTM projection."""
         return self._reference_gps
 
     @property
     def mode(self) -> str:
-        """Режим проєкції: "UTM" або "WEB_MERCATOR" (публічний доступ замість _mode)."""
+        """Projection mode: 'UTM' or 'WEB_MERCATOR' (public access instead of _mode)."""
         return self._mode
 
     def ground_scale_factor(self, lat: float | None = None) -> float:
-        """Множник «проєкційні метри → справжні наземні» (Етап 6).
+        """Multiplier for 'projection meters -> real ground meters'.
 
-        UTM → 1.0 (уже справжні метри). WEB_MERCATOR → cos(lat): lat береться з
-        аргументу або з reference_gps. Якщо широта невідома — 1.0 (без корекції).
+        UTM -> 1.0 (already real meters). WEB_MERCATOR -> cos(lat): lat is taken from
+        argument or reference_gps. If latitude is unknown -> 1.0 (no correction).
         """
         if self._mode != "WEB_MERCATOR":
             return 1.0
@@ -124,12 +124,12 @@ class CoordinateConverter:
         return float(lat), float(lon)
 
     def export_metadata(self) -> dict[str, Any]:
-        """Експорт налаштувань для серіалізації."""
+        """Export settings for serialization."""
         return {"mode": self._mode, "reference_gps": self._reference_gps}
 
     @classmethod
     def from_metadata(cls, meta: dict[str, Any]) -> "CoordinateConverter":
-        """Створення конвертера з метаданих."""
+        """Create a converter from metadata."""
         if not meta:
             return cls("WEB_MERCATOR")
         mode = meta.get("mode", "WEB_MERCATOR")
@@ -138,10 +138,10 @@ class CoordinateConverter:
 
     @staticmethod
     def haversine_distance(coord1: tuple[float, float], coord2: tuple[float, float]) -> float:
-        """Розрахунок фізичної відстані між двома GPS точками в метрах."""
+        """Calculate physical distance between two GPS points in meters."""
         lat1, lon1 = coord1
         lat2, lon2 = coord2
-        R = 6371000  # Радіус Землі
+        R = 6371000  # Earth radius in meters
 
         phi1, phi2 = math.radians(lat1), math.radians(lat2)
         delta_phi = math.radians(lat2 - lat1)
@@ -154,5 +154,5 @@ class CoordinateConverter:
         return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# Глобальний екземпляр для зворотної сумісності (тимчасово)
+# Global instance for backward compatibility (temporary)
 DEFAULT_CONVERTER = CoordinateConverter("WEB_MERCATOR")

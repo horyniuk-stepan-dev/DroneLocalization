@@ -1,10 +1,10 @@
 """
-Атомарний запис файлів: tempfile у тій самій директорії + os.replace.
+Atomic file write: tempfile in the same directory + os.replace.
 
-Навіщо: прямий open(path, "w") при конкурентному записі або краші процесу
-залишає файл обрізаним/зіпсованим (реальний випадок: 470 хвостових null-байтів
-у config.py після конкурентного збереження). os.replace — атомарний на
-POSIX і Windows (NTFS), тому читач завжди бачить або стару, або нову версію.
+Rationale: a plain open(path, 'w') under concurrent writes or a process crash
+leaves the file truncated/corrupted (real case: 470 trailing null bytes in
+config.py after concurrent saves). os.replace is atomic on POSIX and Windows
+(NTFS), so the reader always sees either the old or the new version.
 """
 
 import os
@@ -12,7 +12,7 @@ import tempfile
 
 
 def atomic_write_bytes(path: str, data: bytes) -> None:
-    """Атомарно записує bytes у файл."""
+    """Atomically write bytes to a file."""
     directory = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".part")
     try:
@@ -30,5 +30,5 @@ def atomic_write_bytes(path: str, data: bytes) -> None:
 
 
 def atomic_write_text(path: str, text: str, encoding: str = "utf-8") -> None:
-    """Атомарно записує текст у файл."""
+    """Atomically write text to a file."""
     atomic_write_bytes(path, text.encode(encoding))

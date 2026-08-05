@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
 
 from config import APP_CONFIG, APP_SETTINGS
 
-# Відомі варіанти вибору (домени) для специфічних полів
+# Known options for specific config fields
 COMBO_OPTIONS = {
     "backend": {
         "global_descriptor": ["dinov3", "dinov2"],
@@ -27,21 +27,17 @@ COMBO_OPTIONS = {
         "lightglue": ["git", "torchscript", "tensorrt"],
         "lightglue_superpoint": ["git", "torchscript", "tensorrt"],
         "lightglue_rdd": ["git", "torchscript", "tensorrt"],
-        # Backend-и локальних екстракторів (раніше падали у free-text)
         "aliked": ["git", "torchscript", "tensorrt"],
         "xfeat": ["git", "torchscript", "tensorrt"],
         "rdd": ["git", "torchscript", "tensorrt"],
         "superpoint": ["git", "torchscript", "tensorrt"],
     },
-    # Пристрій інференсу: auto (CUDA→CPU фолбек) | cuda (форс) | cpu (форс)
     "device": ["auto", "cuda", "cpu"],
     "masking_strategy": ["yolo", "none"],
     "local_extractor": ["rdd", "aliked", "superpoint", "xfeat"],
     "fallback_extractor": ["aliked", "rdd", "superpoint", "xfeat"],
     "dtype": ["float16", "float32"],
-    # Повний набір рівнів loguru — щоб combo не «загубив» нестандартний рівень
     "log_level": ["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
-    # ВИПРАВЛЕНО: "WGS84" не є режимом конвертера (підтримуються UTM/WEB_MERCATOR)
     "default_mode": ["UTM", "WEB_MERCATOR"],
     "verify_display_mode": ["center", "center_corners", "full"],
     "verify_label_mode": ["number", "number_rmse", "full"],
@@ -50,7 +46,7 @@ COMBO_OPTIONS = {
 
 
 class ConfigDialog(QDialog):
-    """Інтерактивне діалогове вікно для редагування конфігурації (APP_SETTINGS)."""
+    """Interactive dialog for editing configuration settings (APP_SETTINGS)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,7 +62,7 @@ class ConfigDialog(QDialog):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
 
-        # Створюємо вкладки на основі APP_SETTINGS
+        # Create tabs based on APP_SETTINGS
         for group_name, group_model in APP_SETTINGS:
             if isinstance(group_model, BaseModel):
                 self._create_tab(group_name, group_model)
@@ -94,21 +90,20 @@ class ConfigDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def _create_tab(self, group_name: str, model: BaseModel):
-        """Створює форму для однієї групи налаштувань."""
+        """Creates a form tab for a single settings group."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
 
         container = QWidget()
         form_layout = QFormLayout(container)
 
-        # Перебір всіх полів у Pydantic моделі
-        # Support for Pydantic V2 model_fields or fallback to dict
+        # Iterate all fields in Pydantic model
         fields = getattr(model, "model_fields", model.__dict__)
 
         for field_name in fields:
             val = getattr(model, field_name)
 
-            # Рекурсивна підтримка вкладених моделей (наприклад models.yolo)
+            # Recursive support for nested models
             if isinstance(val, BaseModel):
                 form_layout.addRow(QLabel(f"<b>{field_name.upper()}</b>"))
                 sub_fields = getattr(val, "model_fields", val.__dict__)
@@ -128,15 +123,13 @@ class ConfigDialog(QDialog):
         self.tabs.addTab(scroll, group_name.replace("_", " ").title())
 
     def _create_widget(self, group_name: str, field_name: str, value):
-        """Створює відповідний віджет (QSpinBox, QComboBox і т.д.) на основі типу значення."""
-        # Перевірка на ComboBox (наперед задані варіанти)
+        """Creates appropriate widget (QSpinBox, QComboBox, etc.) based on value type."""
         combo_options = None
         base_field = field_name.split(".")[-1]
 
         if base_field in COMBO_OPTIONS:
             opts = COMBO_OPTIONS[base_field]
             if isinstance(opts, dict):
-                # Наприклад backend залежить від батьківської групи
                 parent_prefix = field_name.split(".")[0] if "." in field_name else group_name
                 if parent_prefix in opts:
                     combo_options = opts[parent_prefix]
@@ -146,15 +139,12 @@ class ConfigDialog(QDialog):
         if combo_options is not None:
             cb = QComboBox()
             cb.addItems(combo_options)
-            # Якщо поточне значення не входить у відомий набір — не «губимо» його
-            # (інакше на збереженні combo мовчки скинув би на перший пункт), а
-            # додаємо окремим пунктом і показуємо.
             if value is not None and str(value) not in combo_options:
                 cb.addItem(str(value))
             cb.setCurrentText(str(value))
             return cb
 
-        # Стандартні типи
+        # Standard types
         if isinstance(value, bool):
             chk = QCheckBox()
             chk.setChecked(value)
@@ -182,7 +172,7 @@ class ConfigDialog(QDialog):
             return le
 
     def _get_widget_value(self, widget, original_value):
-        """Зчитує значення з віджета та конвертує до оригінального типу."""
+        """Reads widget value and converts to original type."""
         if isinstance(widget, QComboBox):
             return widget.currentText()
         elif isinstance(widget, QCheckBox):
@@ -201,7 +191,6 @@ class ConfigDialog(QDialog):
                 try:
                     return json.loads(text)
                 except json.JSONDecodeError:
-                    # Якщо не валідний JSON, пробуємо просто розбити по комах
                     return [x.strip() for x in text.split(",")]
             if original_value is None and not text:
                 return None
@@ -209,12 +198,11 @@ class ConfigDialog(QDialog):
         return None
 
     def _load_defaults(self):
-        """Скидає всі поля до заводських налаштувань (визначених у коді)."""
+        """Resets all fields to code-default settings."""
         from config import AppConfig
 
         default_config = AppConfig()
 
-        # Оновлюємо значення в UI на основі дефолтних
         for group_name, group_model in default_config:
             if not isinstance(group_model, BaseModel):
                 continue
@@ -234,7 +222,7 @@ class ConfigDialog(QDialog):
                         self._set_widget_value(w, val)
 
     def _load_config(self):
-        """Оновлює віджети з поточного APP_SETTINGS."""
+        """Updates widgets from current APP_SETTINGS."""
         for group_name, group_model in APP_SETTINGS:
             if not isinstance(group_model, BaseModel):
                 continue
@@ -269,9 +257,8 @@ class ConfigDialog(QDialog):
                 widget.setText(str(value) if value is not None else "")
 
     def _save_config(self):
-        """Зберігає дані з форми назад у APP_SETTINGS та APP_CONFIG."""
+        """Saves form data back to APP_SETTINGS and APP_CONFIG."""
         try:
-            # Створюємо словник оновлень
             updates = {}
             for group_name, group_model in APP_SETTINGS:
                 if not isinstance(group_model, BaseModel):
@@ -293,15 +280,12 @@ class ConfigDialog(QDialog):
                         if w:
                             group_dict[field_name] = self._get_widget_value(w, val)
 
-                # Валідуємо і створюємо новий об'єкт групи з усіма вкладеними моделями
                 new_group_model = group_model.__class__.model_validate(group_dict)
                 setattr(APP_SETTINGS, group_name, new_group_model)
 
-            # Оновлюємо глобальний словник
             APP_CONFIG.clear()
             APP_CONFIG.update(APP_SETTINGS.model_dump())
 
-            # Зберігаємо на диск
             from config import save_user_config
 
             save_user_config(APP_SETTINGS)

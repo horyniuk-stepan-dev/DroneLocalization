@@ -111,8 +111,10 @@ def _run_supervised(args, logger) -> int:
 
     child_cmd = base_cmd + [
         "--headless",
-        "--project", args.project,
-        "--source", args.source,
+        "--project",
+        args.project,
+        "--source",
+        args.source,
     ]
     # Порти передаємо дитині ЛИШЕ якщо їх явно задали в CLI: інакше дитина має
     # взяти їх із user_config.json так само, як це зробив би одиночний запуск.
@@ -287,11 +289,15 @@ def main() -> None:
     # навіть коли прапорець не передавали — headless завжди слухав 8080, хоча
     # конфіг казав 8081.
     parser.add_argument(
-        "--ws-port", type=int, default=None,
+        "--ws-port",
+        type=int,
+        default=None,
         help="WebSocket port (default: network_api.ws_port from config)",
     )
     parser.add_argument(
-        "--rest-port", type=int, default=None,
+        "--rest-port",
+        type=int,
+        default=None,
         help="REST API port (default: network_api.rest_port from config)",
     )
     parser.add_argument(

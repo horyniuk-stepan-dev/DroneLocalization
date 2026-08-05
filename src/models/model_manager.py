@@ -34,8 +34,7 @@ class LightGlueExportWrapper(torch.nn.Module):
 
     def forward(self, data):
         res = self.model(data)
-        # Повертаємо matches0 та matches1 (тензори індексів)
-        # Це найбільш стабільний формат для експорту
+        # Returns matches0 and matches1 (index tensors) — the most stable format for export
         return res["matches0"], res["matches1"], res["matching_scores0"]
 
 
@@ -68,8 +67,8 @@ class ModelManager:
     def __init__(self, config=None, device="cuda"):
         self.config = config or {}
 
-        # Пристрій керується конфігом (models.device), не кодом.
-        # use_cuda:false — легасі-аліас на "cpu".
+        # Device is governed by config (models.device), not by code.
+        # use_cuda:false is a legacy alias for 'cpu'.
         mode = str(get_cfg(self.config, "models.device", "auto")).lower()
         if not get_cfg(self.config, "models.use_cuda", True):
             mode = "cpu"
@@ -89,20 +88,20 @@ class ModelManager:
         elif mode == "cpu":
             self.device = "cpu"
             logger.info("models.device='cpu' — running on CPU (localization only, slow)")
-        else:  # auto: стара поведінка (respects legacy use_cuda + requested device)
+        else:  # auto: legacy behaviour (respects use_cuda flag + requested device)
             self.device = "cuda" if (cuda_ok and device == "cuda") else "cpu"
         self.models = {}
 
-        # Fix #4: Захист від race condition при паралельному завантаженні моделей (prewarm + main thread)
+        # Guard against race condition on parallel model loading (prewarm + main thread)
         self._model_lock = threading.Lock()
 
-        # Конфігурація VRAM
+        # VRAM configuration
         self.max_vram_ratio = get_cfg(self.config, "models.vram_management.max_vram_ratio", 0.8)
         self.default_vram_required = get_cfg(
             self.config, "models.vram_management.default_required_mb", 2000.0
         )
-        # Політика виселення винесена у VramBudget (без torch, тестована).
-        # Лок лишається тут: _model_lock має охоплювати load+evict атомарно.
+        # Eviction policy is in VramBudget (torch-free, testable).
+        # The lock stays here: _model_lock must cover load+evict atomically.
         self._vram = VramBudget(
             free_vram_mb=self.get_available_vram_mb,
             unload=self._unload_model_unsafe,
@@ -157,21 +156,21 @@ class ModelManager:
 
     @property
     def model_usage(self) -> dict:
-        """LRU-мітки (сумісність: облік живе у VramBudget)."""
+        """LRU tags (compatibility: tracking lives in VramBudget)."""
         return self._vram.usage
 
     @property
     def _pinned_models(self) -> set[str]:
-        """Закріплені моделі (сумісність: множина живе у VramBudget)."""
+        """Pinned models (compatibility: set lives in VramBudget)."""
         return self._vram.pinned
 
     def pin(self, models: list[str]):
-        """Закріплює моделі в пам'яті (запобігає вивантаженню при нестачі VRAM)"""
+        """Pins models in memory (prevents eviction under VRAM pressure)"""
         with self._model_lock:
             self._vram.pin(models)
 
     def unpin_all(self):
-        """Знімає закріплення з усіх моделей"""
+        """Unpins all models"""
         with self._model_lock:
             self._vram.unpin_all()
 
@@ -203,14 +202,14 @@ class ModelManager:
         logger.success("Centralized model prewarm complete")
 
     def load_local_extractor(self):
-        """Завантажує поточний локальний екстрактор згідно конфігу (aliked | rdd | xfeat)."""
+        """Loads local feature extractor based on config (aliked | rdd | xfeat)."""
         local_extractor = get_cfg(self.config, "models.local_extractor", "aliked")
         if local_extractor == "rdd":
             return self.load_rdd()
         if local_extractor == "xfeat":
-            # XFeat-шлях (легший екстрактор + 64-dim → MNN замість LightGlue).
-            # DatabaseBuilder уже кликав load_xfeat() напряму; тепер онлайн-шлях
-            # локалізації теж отримує XFeat замість тихого фолбеку на ALIKED.
+            # XFeat-path (lighter extractor + 64-dim → MNN instead of LightGlue).
+            # DatabaseBuilder already calls load_xfeat() directly; now online path
+            # localization also gets XFeat instead of silent fallback to ALIKED.
             return self.load_xfeat()
         return self.load_aliked()
 
@@ -360,14 +359,14 @@ class ModelManager:
             return self.models[name]
 
     def load_lightglue(self, features: str = "superpoint"):
-        """
-        Уніфікований метод завантаження LightGlue з підтримкою різних бекендів.
-        features: "aliked", "superpoint" або "rdd"
+        """Unified LightGlue loading method supporting multiple backends.
+
+        features: "aliked", "superpoint", or "rdd"
         """
         name = f"lightglue_{features}"
         with self._model_lock:
             if name not in self.models:
-                # Визначаємо який конфіг використовувати
+                # Determine which config to use
                 config_key_map = {
                     "aliked": "models.lightglue",
                     "superpoint": "models.lightglue_superpoint",
@@ -387,7 +386,7 @@ class ModelManager:
 
                 model = None
 
-                # 1. Спроба завантажити як TensorRT або ONNX
+                # 1. Try TensorRT or ONNX
                 if backend == "tensorrt" and model_path and os.path.exists(model_path):
                     if not is_trt_available() and model_path.endswith(".engine"):
                         logger.warning(
@@ -397,8 +396,8 @@ class ModelManager:
                         try:
                             if model_path.endswith(".engine"):
                                 logger.info(f"Loading LightGlue TensorRT: {model_path}")
-                                # Для справжнього TRT engine потрібен wrapper.
-                                # Якщо він не передбачений, попереджаємо.
+                                # Requires specialized wrapper.
+                                # If not provided, warn.
                                 logger.warning(
                                     "TensorRT engine loading requires specialized wrapper. Falling back."
                                 )
@@ -412,7 +411,7 @@ class ModelManager:
                                         "CUDAExecutionProvider",
                                         "CPUExecutionProvider",
                                     ]
-                                    # Створюємо сесію
+                                    # Create session
                                     model = ort.InferenceSession(model_path, providers=providers)
                                     logger.success(
                                         f"LightGlue ONNX loaded with providers: {model.get_providers()}"
@@ -424,7 +423,7 @@ class ModelManager:
                                 f"Failed to load LightGlue TRT/ONNX: {e}. Falling back to TorchScript/Git."
                             )
 
-                # 2. Спроба завантажити як TorchScript
+                # 2. Try TorchScript
                 if model is None and (backend == "torchscript" or backend == "tensorrt"):
                     if model_path and os.path.exists(model_path) and model_path.endswith(".pth"):
                         try:
@@ -444,7 +443,7 @@ class ModelManager:
                             f"TorchScript model not found at {model_path} and auto_convert is disabled."
                         )
 
-                # 3. Fallback до Git (бібліотеки) або Auto-conversion
+                # 3. Fallback to Git library or Auto-conversion
                 if model is None:
                     try:
                         if LightGlue is None:
@@ -452,11 +451,11 @@ class ModelManager:
 
                         logger.info(f"Loading LightGlue ({features}) from library (Git backend)...")
 
-                        # Для RDD використовуємо архітектуру SuperPoint (256-dim), оскільки 'rdd' не є нативним для бібліотеки
+                        # For RDD, use SuperPoint architecture (256-dim), as 'rdd' is not native to the library
                         lg_feature_type = "superpoint" if features == "rdd" else features
                         model = LightGlue(features=lg_feature_type).eval().to(self.device)
 
-                        # Якщо вказано кастомні ваги (наприклад, для rdd), завантажуємо їх
+                        # If custom weights provided (e.g., for RDD), load them
                         if model_path and os.path.exists(model_path):
                             state_dict = torch.load(
                                 model_path, map_location=self.device, weights_only=True
@@ -478,7 +477,7 @@ class ModelManager:
             return self.models[name]
 
     def _auto_export_lightglue(self, model, features, model_path, target_backend):
-        """Автоматичний експорт моделі у TorchScript."""
+        """Export model to TorchScript automatically."""
         try:
             path = Path(model_path)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -501,10 +500,10 @@ class ModelManager:
                 }
 
                 try:
-                    # Використовуємо обгортку для стабільного трасування
+                    # Use wrapper for stable tracing
                     wrapper = LightGlueExportWrapper(model)
 
-                    # strict=False для підтримки динамічних форм у LightGlue
+                    # strict=False for dynamic shape support in LightGlue
                     traced_model = torch.jit.trace(wrapper, (dummy_data,), strict=False)
                     traced_model.save(str(path))
                     logger.success(
@@ -518,7 +517,7 @@ class ModelManager:
             logger.warning(f"Auto-exporting LightGlue failed: {e}")
 
     def validate_lightglue(self, features: str = "aliked") -> bool:
-        """Перевірка сумісності та наявності VRAM для LightGlue."""
+        """Validates VRAM availability for LightGlue."""
         config_key = "models.lightglue" if features == "aliked" else "models.lightglue_superpoint"
         config = get_cfg(self.config, config_key)
         vram_req = get_cfg(config, "vram_required_mb", 800.0)
@@ -533,12 +532,7 @@ class ModelManager:
         return True
 
     def load_dinov2(self):
-        """
-        Завантажує глобальний дескриптор (DINOv2 або DINOv3).
-        Вибір здійснюється через AppConfig.global_descriptor.backend:
-          'dinov2' — torch.hub (ImageNet pretrained)
-          'dinov3' — HuggingFace (493M satellite pretrained)
-        """
+        """Loads global descriptor (DINOv2 or DINOv3)."""
         name = "dinov2"
         with self._model_lock:
             if name not in self.models:
@@ -589,7 +583,7 @@ class ModelManager:
                 logger.info(f"Loading DINOv2 ({model_name}) model...")
                 self._ensure_vram_available(vram_req)
 
-                # Спроба завантажити TensorRT engine (якщо скомпільований)
+                # Attempt to load TensorRT engine (if compiled)
                 trt_loaded = False
                 engine_dir = get_cfg(
                     self.config, "models.engines_cache.engine_cache_dir", "models/engines/"
@@ -605,7 +599,7 @@ class ModelManager:
                 except Exception as e:
                     logger.debug(f"TensorRT DINOv2 not available, using PyTorch: {e}")
 
-                # Fallback: стандартний PyTorch hub
+                # Fallback: standard PyTorch hub
                 if not trt_loaded:
                     try:
                         model = torch.hub.load(repo, model_name, verbose=False).to(self.device)
@@ -629,7 +623,7 @@ class ModelManager:
             return self.models[name]
 
     def load_aliked(self):
-        """Завантажує ALIKED extractor (128-dim, lightglue-compatible)"""
+        """Loads ALIKED extractor (128-dim, lightglue-compatible)."""
         name = "aliked"
         with self._model_lock:
             if name not in self.models:
@@ -668,11 +662,11 @@ class ModelManager:
             return self.models[name]
 
     def load_lightglue_aliked(self):
-        """Завантажує LightGlue з вагами для ALIKED (128-dim)"""
+        """Loads LightGlue with ALIKED weights (128-dim)."""
         return self.load_lightglue(features="aliked")
 
     def load_rdd(self):
-        """Завантажує RDD extractor (deformable transformer, scale-invariant)"""
+        """Loads RDD extractor (deformable transformer, scale-invariant)."""
         name = "rdd"
         with self._model_lock:
             if name not in self.models:
@@ -705,11 +699,11 @@ class ModelManager:
             return self.models[name]
 
     def load_lightglue_rdd(self):
-        """Завантажує LightGlue з вагами для RDD"""
+        """Loads LightGlue with RDD weights."""
         return self.load_lightglue(features="rdd")
 
     def load_cesp(self):
-        """Завантажує CESP модуль для покращення DINOv2 global descriptors"""
+        """Loads CESP module to enhance DINOv2 global descriptors."""
         name = "cesp"
         with self._model_lock:
             if name not in self.models:
@@ -721,7 +715,7 @@ class ModelManager:
                     scales = get_cfg(self.config, "models.cesp.scales", [1, 2, 4])
                     cesp = CESP(dim=1024, scales=tuple(scales))
 
-                    # Завантаження pretrained ваг (якщо є)
+                    # Load pretrained weights (if any)
                     weights_path = get_cfg(self.config, "models.cesp.weights_path", None)
                     if weights_path:
                         cesp.load_state_dict(

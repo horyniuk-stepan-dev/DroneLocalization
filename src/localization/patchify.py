@@ -7,11 +7,11 @@ logger = get_logger(__name__)
 
 
 class PatchifyRetrieval:
-    """Мультимасштабний retrieval через патч-дескриптори DINOv2/DINOv3.
+    """Multi-scale retrieval via DINOv2/DINOv3 patch descriptors.
 
-    Розбиває зображення на патчі за сітками (1×1, 2×2, 3×3) = 14 патчів,
-    для кожного витягує CLS-token, і шукає найбільш схожі кадри
-    за агрегованими патч-скорами.
+    Splits the image into grid patches (1x1, 2x2, 3x3) = 14 patches total,
+    extracts the CLS-token for each patch, and retrieves the most similar frames
+    via aggregated patch scores.
     """
 
     DEFAULT_GRIDS = [(1, 1), (2, 2), (3, 3)]  # 1 + 4 + 9 = 14 патчів
@@ -29,9 +29,9 @@ class PatchifyRetrieval:
         self.grids = [tuple(g) for g in grids] if grids else self.DEFAULT_GRIDS
         self.num_patches = sum(r * c for r, c in self.grids)
 
-        # FAISS index (заповнюється через build_index)
+        # FAISS index (populated via build_index)
         self.patch_index = None
-        # Маппінг: linear_patch_idx → frame_id
+        # Mapping: linear_patch_idx → frame_id
         self.patch_frame_ids: np.ndarray | None = None
 
         logger.info(
@@ -43,7 +43,7 @@ class PatchifyRetrieval:
 
     @staticmethod
     def extract_patches(image: np.ndarray, grids: list[tuple[int, int]]) -> list[np.ndarray]:
-        """Розрізає зображення на патчі за сітками.
+        """Crops image into grid patches.
 
         Args:
             image: (H, W, 3) RGB зображення
@@ -70,7 +70,7 @@ class PatchifyRetrieval:
                 for c in range(cols):
                     y1 = r * ph
                     x1 = c * pw
-                    # Останній патч забирає залишок (щоб не втрачати пікселі)
+                    # Last patch takes the remainder (to avoid losing pixels)
                     y2 = h if r == rows - 1 else (r + 1) * ph
                     x2 = w if c == cols - 1 else (c + 1) * pw
                     patches.append(image[y1:y2, x1:x2].copy())
@@ -81,7 +81,7 @@ class PatchifyRetrieval:
 
     @torch.no_grad()
     def compute_patch_descriptors(self, image: np.ndarray) -> np.ndarray:
-        """Витягує DINOv2 дескриптор для кожного патча зображення.
+        """Extracts DINOv2 descriptor for each image patch.
 
         Args:
             image: (H, W, 3) RGB зображення
@@ -93,11 +93,11 @@ class PatchifyRetrieval:
         descriptors = np.empty((len(patches), self.descriptor_dim), dtype=np.float32)
 
         if self.batch_size <= 1:
-            # Послідовний інференс — мінімальне споживання VRAM
+            # Sequential inference — minimal VRAM consumption
             for i, patch in enumerate(patches):
                 descriptors[i] = self.feature_extractor.extract_global_descriptor(patch)
         else:
-            # Батчований інференс — швидше, але більше VRAM
+            # Batched inference — faster but uses more VRAM
             for start in range(0, len(patches), self.batch_size):
                 batch = patches[start : start + self.batch_size]
                 batch_descs = self._extract_batch_descriptors(batch)
@@ -107,7 +107,7 @@ class PatchifyRetrieval:
 
     @torch.no_grad()
     def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
-        """Батчований інференс для групи патчів.
+        """Batched inference for patch group.
 
         Використовує fe.dinov2_transform — нормалізація та розмір вже налаштовані
         відповідно до активного backend (DINOv2 або DINOv3).
@@ -121,13 +121,13 @@ class PatchifyRetrieval:
             tensors.append(t)
 
         batch_tensor = torch.stack(tensors).to(device, non_blocking=True)
-        # Використовуємо готовий transform з FeatureExtractor (правильні mean/std для активного backend)
+        # Use the pre-built transform from FeatureExtractor (correct mean/std for the active backend)
         batch_input = fe.dinov2_transform(batch_tensor)
 
         amp_dtype = fe.amp_dtype
         use_half = fe.use_half
 
-        # Визначаємо тип пристрою динамічно для коректного autocast (Fix Bug 2)
+        # Determine device type dynamically for correct autocast dtype
         device_type = "cuda" if "cuda" in str(device) else "cpu"
         enabled = use_half and device_type == "cuda"
 
@@ -139,7 +139,7 @@ class PatchifyRetrieval:
     # ── Index management ─────────────────────────────────────────────────
 
     def build_index(self, patch_descriptors_all: np.ndarray, frame_ids: list[int]):
-        """Будує FAISS індекс з усіх патч-дескрипторів.
+        """Builds FAISS index from all patch descriptors.
 
         Args:
             patch_descriptors_all: (N_frames, num_patches, D) — всі патч-дескриптори
@@ -152,14 +152,14 @@ class PatchifyRetrieval:
             f"Expected {self.num_patches} patches per frame, got {n_patches}"
         )
 
-        # Розгортаємо (N_frames × num_patches, D)
+        # Flatten to (N_frames × num_patches, D)
         flat = patch_descriptors_all.reshape(-1, dim).astype(np.float32)
 
-        # Нормалізація для cosine similarity
+        # L2-normalise for cosine similarity
         norms = np.linalg.norm(flat, axis=1, keepdims=True)
         flat = flat / (norms + 1e-8)
 
-        # Маппінг: кожен рядок flat → frame_id
+        # Mapping: each flat row → frame_id
         self.patch_frame_ids = np.repeat(np.array(frame_ids, dtype=np.int32), n_patches)
 
         # FAISS Inner Product index
@@ -173,7 +173,7 @@ class PatchifyRetrieval:
         )
 
     def search(self, query_descriptors: np.ndarray, top_k: int = 10) -> list[tuple[int, float]]:
-        """Пошук top-K кадрів за агрегованими патч-скорами.
+        """Searches top-K frames by aggregated patch scores.
 
         Args:
             query_descriptors: (num_patches, D) — патч-дескриптори query
@@ -186,15 +186,15 @@ class PatchifyRetrieval:
             logger.warning("Patchify index not built, returning empty results")
             return []
 
-        # Нормалізація query
+        # Normalise query descriptors
         q = query_descriptors.astype(np.float32)
         norms = np.linalg.norm(q, axis=1, keepdims=True)
         q = q / (norms + 1e-8)
 
-        # Для кожного з num_patches query-патчів знаходимо top-K ref-патчів
+        # For each of the num_patches query patches, find top-K ref patches
         search_k = top_k * 3  # шукаємо більше для кращої агрегації
 
-        # Захист: search_k не може бути більше за розмір індексу (Fix Bug 4)
+        # Guard: search_k cannot exceed the index size
         max_k = self.patch_index.ntotal
         if search_k > max_k:
             logger.debug(f"search_k={search_k} > index size={max_k}, clamping")
@@ -202,7 +202,7 @@ class PatchifyRetrieval:
 
         scores, indices = self.patch_index.search(q, search_k)
 
-        # Агрегація: сумуємо cosine-скори та рахуємо хіти для кожного frame_id (Fix Bug 1)
+        # Aggregate: sum cosine scores and count hits per frame_id
         frame_scores: dict[int, float] = {}
         frame_hits: dict[int, int] = {}
 
@@ -217,7 +217,7 @@ class PatchifyRetrieval:
                 frame_scores[fid] = frame_scores.get(fid, 0.0) + score
                 frame_hits[fid] = frame_hits.get(fid, 0) + 1
 
-        # Розрахунок підсумкового скору: coverage * avg_score
+        # Compute final score: coverage * avg_score
         num_patches = len(q)
         final_scores: dict[int, float] = {}
         for fid in frame_scores:
@@ -226,6 +226,6 @@ class PatchifyRetrieval:
             coverage = hits / num_patches  # частка патчів що знайшли
             final_scores[fid] = coverage * avg_score
 
-        # Сортуємо та повертаємо top-K
+        # Sort and return top-K
         sorted_frames = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_frames[:top_k]

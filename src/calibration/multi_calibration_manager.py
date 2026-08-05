@@ -1,8 +1,6 @@
-"""
-multi_calibration_manager.py — Менеджер множинних калібрацій.
+"""Multi-calibration manager.
 
-Зберігає dict[source_id → MultiAnchorCalibration].
-Логіка самої калібрації не змінюється — лише оркестрація.
+Stores dict[source_id -> MultiAnchorCalibration] for multi-source projects.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ logger = get_logger(__name__)
 
 
 class MultiCalibrationManager:
-    """Менеджер множинних калібрацій: dict[source_id → MultiAnchorCalibration]."""
+    """Manages multiple calibration instances: dict[source_id -> MultiAnchorCalibration]."""
 
     def __init__(self) -> None:
         self._calibrations: dict[str, MultiAnchorCalibration] = {}
@@ -28,7 +26,7 @@ class MultiCalibrationManager:
     # ── Public API ───────────────────────────────────────────────────────────
 
     def get(self, source_id: str) -> MultiAnchorCalibration:
-        """Повертає калібрацію для source_id. Створює порожню якщо не існує."""
+        """Returns calibration for source_id, creating an empty one if missing."""
         if source_id not in self._calibrations:
             self._calibrations[source_id] = MultiAnchorCalibration()
             logger.debug(f"Created empty calibration for source '{source_id}'")
@@ -39,7 +37,7 @@ class MultiCalibrationManager:
         sources: list[ProjectVideoSource],
         project_dir: Path,
     ) -> None:
-        """Завантажує калібрації для всіх enabled джерел."""
+        """Loads calibration for all enabled sources."""
         self._calibrations.clear()
         for src in sources:
             if not src.enabled:
@@ -67,17 +65,13 @@ class MultiCalibrationManager:
         sources: list[ProjectVideoSource],
         project_dir: Path,
     ) -> None:
-        """Зберігає всі модифіковані калібрації. Створює підпапки якщо потрібно."""
+        """Saves all modified calibrations, creating subdirectories if needed."""
         for src in sources:
             if src.source_id not in self._calibrations:
                 continue
             cal = self._calibrations[src.source_id]
             calib_path = project_dir / src.calibration_file
             if not cal.is_calibrated and not calib_path.exists():
-                # Порожня калібрація і файлу нема — писати нічого. Але якщо файл
-                # Є, його треба перезаписати порожнім списком: інакше видалення
-                # всіх якорів лишало осиротілий calibration.json, який наступний
-                # load_all підхоплював як актуальний.
                 continue
             calib_path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -85,19 +79,20 @@ class MultiCalibrationManager:
             except Exception as e:
                 logger.error(f"Failed to save calibration for '{src.source_id}': {e}")
 
-    # ── Властивості ──────────────────────────────────────────────────────────
+    # ── Properties ───────────────────────────────────────────────────────────
 
     @property
     def is_any_calibrated(self) -> bool:
-        """True якщо хоча б одне джерело має повну калібрацію."""
+        """Returns True if at least one source is fully calibrated."""
         return any(cal.is_calibrated for cal in self._calibrations.values())
 
     @property
     def source_ids(self) -> list[str]:
-        """Список source_id з завантаженими калібраціями."""
+        """List of loaded calibration source_ids."""
         return list(self._calibrations.keys())
 
     def __contains__(self, source_id: str) -> bool:
+        return source_id in self._calibrations
         return source_id in self._calibrations
 
     def __len__(self) -> int:

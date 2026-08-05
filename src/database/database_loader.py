@@ -26,14 +26,7 @@ logger = get_logger(__name__)
 
 
 def open_maybe_encrypted_h5(path: str) -> tuple[h5py.File, io.BytesIO | None]:
-    """Open an HDF5 database, transparently decrypting an at-rest-encrypted map.
-
-    HARDENING P1-6 SP2: h5py needs a seekable source for the whole session. A
-    plaintext DB is opened straight from the path (h5py reads lazily — no full
-    load, zero overhead). An encrypted DB (`MAGIC` header) is decrypted whole into
-    RAM and served from a ``BytesIO`` (67 MB fits comfortably); the buffer is
-    returned so the caller can keep it alive for the file handle's lifetime.
-    """
+    """Opens HDF5 database, auto-decrypting into a BytesIO buffer if encrypted."""
     with open(path, "rb") as f:
         head = f.read(len(MAGIC))
     if head != MAGIC:
@@ -52,11 +45,7 @@ def _owner_file(tmpdir: str) -> Path:
 
 
 def _pid_is_running(pid: int) -> bool | None:
-    """True/False if the PID's liveness can be determined, None if it cannot.
-
-    ``os.kill(pid, 0)`` is not usable here: on Windows it maps to TerminateProcess
-    and would kill the very process we are probing. Without psutil we return None
-    and the caller keeps the directory — never delete on a guess."""
+    """True/False if the PID's liveness can be determined, None if it cannot."""
     try:
         import psutil
     except ImportError:
@@ -68,27 +57,18 @@ def _pid_is_running(pid: int) -> bool | None:
 
 
 def sweep_stale_lance_tempdirs() -> int:
-    """Wipe decrypted-index temp directories abandoned by crashed runs.
-
-    ``DatabaseLoader.close`` wipes its own directory, but a hard kill or power
-    loss skips it and leaves plaintext global descriptors on the temp disk. Called
-    once at startup. Returns the number of directories wiped.
-
-    Conservative by construction: a directory is removed only when its owner PID
-    is known to be gone. An unreadable stamp, a live PID, or no way to check
-    (psutil missing) all mean "leave it alone" — deleting a directory a
-    concurrently running instance is reading from would break that instance."""
+    """Wipe decrypted-index temp directories abandoned by crashed runs."""
     wiped = 0
     for path in Path(tempfile.gettempdir()).glob(_LANCE_TEMP_PREFIX + "*"):
         if not path.is_dir():
-            continue  # the .owner stamps themselves
+            continue
         owner = _owner_file(str(path))
         try:
             pid = int(owner.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
-            continue  # no readable stamp: not ours to judge
+            continue
         if _pid_is_running(pid) is not False:
-            continue  # alive, or undeterminable
+            continue
         wipe_tree(str(path))
         wiped += 1
     if wiped:
@@ -100,17 +80,7 @@ def sweep_stale_lance_tempdirs() -> int:
 
 
 def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None]:
-    """Return a path LanceDB can open, decrypting an at-rest-encrypted index first.
-
-    HARDENING P1-6 SP3: LanceDB opens a *filesystem directory* and manages its own
-    file handles, so there is no in-RAM route like the h5 one. A plaintext index is
-    opened in place (unchanged path, zero overhead). An encrypted index is
-    materialised into a temp directory, preserving the dataset layout.
-
-    Returns ``(path_to_open, temp_dir_or_None)``; the caller must wipe the temp
-    directory when closing. Fails closed: a failed decryption leaves no partial
-    plaintext behind.
-    """
+    """Returns path to LanceDB index, decrypting encrypted directories into a temp location."""
     files = sorted(p for p in lance_path.rglob("*") if p.is_file())
     if not files:
         return str(lance_path), None
@@ -120,9 +90,6 @@ def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None
     passphrase = get_passphrase()
     tmpdir = tempfile.mkdtemp(prefix=_LANCE_TEMP_PREFIX)
     try:
-        # Owner stamp, kept as a SIBLING file so LanceDB never sees a stray entry
-        # in its dataset root. Lets a later run tell an abandoned directory (crash)
-        # from one a concurrently running instance is still using.
         _owner_file(tmpdir).write_text(str(os.getpid()), encoding="utf-8")
         for src in files:
             target = Path(tmpdir) / src.relative_to(lance_path)
@@ -137,9 +104,7 @@ def materialize_maybe_encrypted_lance(lance_path: Path) -> tuple[str, str | None
 
 
 def wipe_tree(dir_path: str) -> None:
-    """Best-effort secure delete of a decrypted temp directory (see ``wipe_file``
-    for the SSD/CoW caveat) — overwrite every file, then drop the tree and its
-    owner stamp."""
+    """Best-effort secure delete of a decrypted temp directory."""
     root = Path(dir_path)
     if root.exists():
         for path in root.rglob("*"):
@@ -150,7 +115,7 @@ def wipe_tree(dir_path: str) -> None:
 
 
 def _synchronized(method):
-    """Декоратор: виконує метод під self._lock (RLock — реентерабельний)."""
+    """Decorator executing method under self._lock."""
     import functools
 
     @functools.wraps(method)
@@ -167,11 +132,7 @@ class DatabaseLoader:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.db_file: h5py.File | None = None
-        # HARDENING P1-6 SP2: holds the decrypted-map RAM buffer (encrypted DBs
-        # only), kept alive for the h5py handle's lifetime; None when plaintext.
         self._decrypted_buf: io.BytesIO | None = None
-        # HARDENING P1-6 SP3: temp directory holding the decrypted LanceDB index
-        # (encrypted projects only); wiped on close. None when plaintext.
         self._lance_tempdir: str | None = None
         self.global_descriptors: np.ndarray | None = None
         self.lance_table = None
@@ -179,30 +140,25 @@ class DatabaseLoader:
         self.metadata: dict[str, Any] = {}
         self.converter: CoordinateConverter | None = None
 
-        # Дані пропагації калібрування (заповнюються після калібрування)
+        # Calibration propagation arrays
         self.frame_affine: np.ndarray | None = None  # (N, 2, 3) — Metric Affine Matrices
-        self.frame_valid: np.ndarray | None = None  # (N,)      — True якщо кадр має GPS
-        self.frame_rmse: np.ndarray | None = None  # (N,)      — RMSE кожного кадру
-        self.frame_disagreement: np.ndarray | None = None  # (N,)   — Розбіжність між гілками
-        self.frame_matches: np.ndarray | None = None  # (N,)      — Кількість точок (inliers)
+        self.frame_valid: np.ndarray | None = None  # (N,)      — True if frame is anchored
+        self.frame_rmse: np.ndarray | None = None  # (N,)      — RMSE per frame
+        self.frame_disagreement: np.ndarray | None = None  # (N,)   — Disagreement between branches
+        self.frame_matches: np.ndarray | None = None  # (N,)      — Keypoint count (inliers)
         self.depth_scales: np.ndarray | None = None  # (N,) — 1/median_depth per frame (GSD hint)
 
-        # GPS-координати кадрів та просторовий індекс (мультиджерельна геолокалізація)
+        # GPS coordinates per frame and spatial index
         self.frame_gps: np.ndarray | None = None  # (N, 2) — [lat, lon] per frame
         self.spatial_index = None  # SpatialIndex | None
 
-        # Потокобезпека: h5py-хендл і кеші читаються з GUI-потоку та воркерів
-        # одночасно (h5py не потокобезпечний, OrderedDict-кеш мутується).
-        # RLock — бо публічні методи викликають один одного.
-        # ЗОВНІШНІЙ код (напр. пропагація при перезаписі HDF5) може взяти
-        # self.lock на весь цикл close → write → reload.
+        # Thread safety for concurrent access from GUI & worker threads
         self._lock = threading.RLock()
 
-        # Каш для методів (заміна lru_cache для уникнення B019)
         self._size_cache: dict[int, tuple[int, int]] = {}
         self._feature_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
 
-        # Patchify: мультимасштабні дескриптори (None якщо БД не має їх)
+        # Patchify descriptors (None if database doesn't include them)
         self.patch_descriptors: np.ndarray | None = None
 
         logger.info(f"Initializing DatabaseLoader | path={db_path}")
@@ -210,7 +166,7 @@ class DatabaseLoader:
 
     @property
     def lock(self) -> threading.RLock:
-        """Публічний лок для зовнішніх критичних секцій (напр. перезапис HDF5)."""
+        """Public lock for external critical sections (e.g. HDF5 rewrite)."""
         return self._lock
 
     @_synchronized
@@ -273,7 +229,7 @@ class DatabaseLoader:
                 self.frame_index_map = np.arange(total_len)
                 logger.debug("No frame_index_map found — using sequential indices")
 
-            # Завантажуємо патч-дескриптори якщо є (Patchify)
+            # Load patch descriptors if present (Patchify)
             if "patch_descriptors" in self.db_file:
                 self.patch_descriptors = self.db_file["patch_descriptors"]["descriptors"][:]
                 logger.info(f"Loaded patch descriptors: shape={self.patch_descriptors.shape}")
@@ -286,10 +242,10 @@ class DatabaseLoader:
             else:
                 self.depth_scales = None
 
-            # Завантажуємо frame_gps якщо є (мультиджерельна геолокалізація)
+            # Load frame_gps if present (multi-source geo-localisation)
             if "frame_gps" in self.db_file:
                 self.frame_gps = self.db_file["frame_gps"][:]
-                # Перевіряємо чи є non-NaN значення
+                # Check whether any non-NaN values exist
                 valid_count = int(np.sum(~np.isnan(self.frame_gps[:, 0])))
                 if valid_count > 0:
                     from src.database.spatial_index import SpatialIndex
@@ -305,7 +261,7 @@ class DatabaseLoader:
             else:
                 self.frame_gps = None
 
-            # Завантажуємо дані пропагації якщо є
+            # Load propagation data if present
             self._load_propagation_data()
 
             logger.success(f"Hot data loaded successfully | {len(self.frame_poses)} frames")
@@ -337,7 +293,7 @@ class DatabaseLoader:
         try:
             grp = self.db_file["calibration"]
 
-            # 1. Відновлення проєкції (пріоритет)
+            # 1. Restore projection (priority)
             if "projection_json" in grp.attrs:
                 try:
                     meta = json.loads(grp.attrs["projection_json"])
@@ -350,7 +306,7 @@ class DatabaseLoader:
                         f"Falling back to default projection."
                     )
             elif "reference_gps" in grp.attrs:
-                # Fallback для v2.0 (UTM)
+                # Fallback for v2.0 (UTM)
                 try:
                     ref_gps = json.loads(grp.attrs["reference_gps"])
                     self.converter = CoordinateConverter("UTM", tuple(ref_gps))
@@ -362,16 +318,16 @@ class DatabaseLoader:
                         f"Defaulting to WEB_MERCATOR."
                     )
             else:
-                # Fallback для v1.0 (WebMercator)
+                # Fallback for v1.0 (WebMercator)
                 logger.info("No projection metadata found. Defaulting to WEB_MERCATOR fallback.")
                 self.converter = CoordinateConverter("WEB_MERCATOR")
 
-            # 2. Завантаження датасетів
+            # 2. Load datasets
             if "frame_affine" in grp:
                 self.frame_affine = grp["frame_affine"][:]
                 self.frame_valid = grp["frame_valid"][:].astype(bool)
 
-                # Метрики якості (QA)
+                # Quality metrics (QA)
                 self.frame_rmse = grp["frame_rmse"][:] if "frame_rmse" in grp else None
                 self.frame_disagreement = (
                     grp["frame_disagreement"][:] if "frame_disagreement" in grp else None
@@ -407,7 +363,7 @@ class DatabaseLoader:
 
     @_synchronized
     def get_frame_affine(self, frame_id: int) -> np.ndarray | None:
-        """Повертає афінну матрицю для конкретного кадру"""
+        """Returns affine matrix for a specific frame"""
         if not self.is_propagated or self.frame_affine is None or self.frame_valid is None:
             return None
         if frame_id < 0 or frame_id >= len(self.frame_valid):
@@ -418,14 +374,14 @@ class DatabaseLoader:
 
     @_synchronized
     def get_frame_size(self, frame_id: int) -> tuple[int, int]:
-        """Повертає (height, width) для вказаного кадру"""
+        """Returns (height, width) for specified frame"""
         if frame_id in self._size_cache:
             return self._size_cache[frame_id]
 
         if self.db_file is None:
             return 1080, 1920
 
-        # Нова схема v2: розміри збережені один раз в local_features.attrs
+        # Schema v2: frame dimensions stored once in local_features.attrs
         schema = self.metadata.get("hdf5_schema", "v1")
         if schema == "v2" and "local_features" in self.db_file:
             lf_attrs = self.db_file["local_features"].attrs
@@ -434,7 +390,7 @@ class DatabaseLoader:
             self._size_cache[frame_id] = (h, w)
             return h, w
 
-        # Стара схема v1: fallback — читаємо з групи кадру (зворотня сумісність)
+        # Schema v1: fallback — read from the per-frame group (backward compatibility)
         group_name = f"local_features/frame_{frame_id}"
         if group_name in self.db_file:
             g = self.db_file[group_name]
@@ -454,7 +410,7 @@ class DatabaseLoader:
 
     @_synchronized
     def get_local_features(self, frame_id: int) -> dict[str, np.ndarray]:
-        """Повертає локальні ознаки для вказаного кадру (сумісно з v1 і v2)"""
+        """Returns local features for specified frame (compatible with v1 and v2)"""
         if frame_id in self._feature_cache:
             self._feature_cache.move_to_end(frame_id)
             return self._feature_cache[frame_id]
@@ -467,17 +423,17 @@ class DatabaseLoader:
             lf = self.db_file["local_features"]
             n = int(lf["kp_counts"][frame_id])
             if n == 0:
-                raise ValueError(f"Кадр {frame_id} не має keypoints (kp_count=0).")
+                raise ValueError(f"Frame {frame_id} has no keypoints (kp_count=0).")
             res = {
                 "keypoints": lf["keypoints"][frame_id, :n],
                 "descriptors": lf["descriptors"][frame_id, :n].astype("float32"),  # float16→32
                 "coords_2d": lf["coords_2d"][frame_id, :n],
             }
         else:
-            # Стара схема v1 — зворотня сумісність
+            # Schema v1 — backward compatibility
             group_name = f"local_features/frame_{frame_id}"
             if group_name not in self.db_file:
-                raise ValueError(f"Кадр {frame_id} не знайдено у базі даних.")
+                raise ValueError(f"Frame {frame_id} not found in database.")
             g = self.db_file[group_name]
             res = {
                 "keypoints": g["keypoints"][:],
@@ -485,11 +441,11 @@ class DatabaseLoader:
                 "coords_2d": g["coords_2d"][:],
             }
 
-        # Додаємо image_size для коректної нормалізації у LightGlue
+        # Append image_size for correct normalisation in LightGlue
         h, w = self.get_frame_size(frame_id)
         res["image_size"] = np.array([h, w], dtype=np.int32)
 
-        # LRU-витіснення
+        # LRU eviction
         if len(self._feature_cache) >= 200:
             self._feature_cache.popitem(last=False)
 
@@ -498,7 +454,7 @@ class DatabaseLoader:
 
     @property
     def has_sift_features(self) -> bool:
-        """RESEARCH 2.2: чи містить БД SIFT-ознаки для аварійного фолбека."""
+        """RESEARCH 2.2: whether DB contains SIFT features for emergency fallback."""
         try:
             return self.db_file is not None and "sift_features" in self.db_file
         except Exception:
@@ -506,21 +462,20 @@ class DatabaseLoader:
 
     @_synchronized
     def get_sift_features(self, frame_id: int) -> dict[str, np.ndarray]:
-        """RESEARCH 2.2: SIFT-ознаки кадру (rootSIFT, сумісні з LightGlue-sift).
-
-        Без LRU-кешу: фолбек викликається рідко (лише при провалі ALIKED),
-        кешування лише витісняло б гарячі ALIKED-ознаки з пам'яті.
+        """RESEARCH 2.2: SIFT features of frame (rootSIFT, compatible with LightGlue-sift).
+        No LRU cache: fallback is called rarely (only on ALIKED failure),
+        caching would only evict hot ALIKED features from memory.
         """
         if self.db_file is None:
             raise RuntimeError("Database not opened")
         if "sift_features" not in self.db_file:
             raise ValueError(
-                "База не містить SIFT-ознак — перебудуйте з database.store_sift_features=True"
+                "Database contains no SIFT features — rebuild with database.store_sift_features=True"
             )
         sf = self.db_file["sift_features"]
         n = int(sf["kp_counts"][frame_id])
         if n == 0:
-            raise ValueError(f"Кадр {frame_id} не має SIFT keypoints (kp_count=0)")
+            raise ValueError(f"Frame {frame_id} has no SIFT keypoints (kp_count=0)")
         res = {
             "keypoints": sf["keypoints"][frame_id, :n],
             "descriptors": sf["descriptors"][frame_id, :n].astype("float32"),
@@ -529,7 +484,7 @@ class DatabaseLoader:
         return res
 
     def get_num_frames(self) -> int:
-        """Повертає кількість кадрів у БД (pre-allocated slots для v2)."""
+        """Returns total frame count in DB (pre-allocated slots for v2)."""
         return int(self.metadata.get("num_frames", 0))
 
     @_synchronized
@@ -547,6 +502,6 @@ class DatabaseLoader:
             logger.info("Decrypted LanceDB temp directory wiped")
             self._lance_tempdir = None
 
-        # Очищення кешу при закритті БД
+        # Clear caches on database close
         self._size_cache.clear()
         self._feature_cache.clear()

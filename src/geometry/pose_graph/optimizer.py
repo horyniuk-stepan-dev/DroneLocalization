@@ -26,12 +26,12 @@ logger = get_logger(__name__)
 
 
 class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
-    """5-DoF Pose Graph Optimizer з Levenberg-Marquardt."""
+    """5-DoF Pose Graph Optimizer with Levenberg-Marquardt."""
 
     def __init__(
         self, frame_w: int = 1920, frame_h: int = 1080, isotropy_weight: float = 200.0
     ) -> None:
-        # frame_id → [center_x_metric, center_y_metric, log_sx, log_sy, θ]
+        # frame_id -> [center_x_metric, center_y_metric, log_sx, log_sy, theta]
         self._free_nodes: dict[int, np.ndarray] = {}
         self._fixed_nodes: dict[int, np.ndarray] = {}
         self._edges: list[GraphEdge] = []
@@ -43,18 +43,16 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         self.cx = frame_w / 2.0
         self.cy = frame_h / 2.0
 
-        # Вага регуляризатора ізотропії: r = isotropy_weight·cx·(log_sx − log_sy).
-        # Історично захардкоджена 200.0; винесена в конфіг без зміни дефолту.
+        # Isotropy regularizer weight: r = isotropy_weight * cx * (log_sx - log_sy)
         self.isotropy_weight = float(isotropy_weight)
 
-        # Кеш пер-ребрових резидуалів (діагностика, Етап 1). None = ще не рахували.
+        # Per-edge residual cache
         self._last_edge_residuals: np.ndarray | None = None
 
-        # Ребра, викинуті two-stage prune (Етап 3). Порожньо = prune не спрацював.
+        # Edges pruned during optimization
         self._pruned_edges: list[GraphEdge] = []
 
-        # М'які якорі (Етап 1.1): frame_id → (state_anchor 5-вектор, w_a). Порожньо
-        # = поведінка як раніше (жорсткі fix_node). Заповнюється add_anchor().
+        # Soft anchor priors: frame_id -> (state_anchor 5-vector, w_a)
         self._anchor_priors: dict[int, tuple[np.ndarray, float]] = {}
 
     @property
@@ -104,17 +102,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         base_w: float = 200.0,
         sigma_floor: float = 0.05,
     ) -> None:
-        """М'який якір як унарний фактор (Етап 1.1) — альтернатива fix_node.
-
-        Вузол ЛИШАЄТЬСЯ ВІЛЬНИМ, але отримує пріор w_a·(state − state_anchor),
-        де w_a = base_w / max(sigma_m, sigma_floor). σ→floor (GT-якорі симулятора,
-        rmse≈0) → величезна вага → практично жорсткий (сим-бенчмарк не змінюється).
-        Реальний якір (RMSE 5–10 м) стає м'яким: узгоджений ланцюг ребер може його
-        «переголосувати», тоді як хибний ручний якір більше не гне граф.
-
-        Вузол ініціалізується станом якоря (лишається стартом BFS), знак det
-        встановлюється як у fix_node.
-        """
+        """Adds a soft anchor prior (unary factor) for the given frame_id."""
         affine_2x3 = np.asarray(affine_2x3, dtype=np.float64)
         det = affine_2x3[0, 0] * affine_2x3[1, 1] - affine_2x3[0, 1] * affine_2x3[1, 0]
         if det < 0:
@@ -131,12 +119,11 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
 
     @property
     def sign(self) -> float:
-        """Знак det (−1 = дзеркальні калібрувальні матриці). Для vo_guards."""
+        """Determinant sign (-1.0 for mirrored calibration matrices)."""
         return self._sign
 
     def anchor_states(self) -> dict[int, np.ndarray]:
-        """Стани всіх якорів (жорстких fix_node і м'яких add_anchor) —
-        опора для check_anchor_gaps (vo_guards, сесія 2026-07-12)."""
+        """Returns states of all fixed and soft anchors."""
         states: dict[int, np.ndarray] = dict(self._fixed_nodes)
         for fid, (st, _w) in self._anchor_priors.items():
             states.setdefault(fid, st)
@@ -152,8 +139,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         inliers: int,
         rmse: float,
     ) -> GraphEdge:
-        """Будує GraphEdge із відносної афінної (спільне для add_edge та
-        odometry-consistency 2.3, який рахує ефемерні ребра без додавання в граф)."""
+        """Constructs a GraphEdge from a relative 2x3 affine matrix."""
         M = relative_affine_2x3
         tx, ty, sx, sy, angle = decompose_affine_5dof(M)
 
@@ -226,12 +212,11 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         return count
 
     def warm_start_from_affines(self, affines: dict[int, np.ndarray]) -> int:
-        """Тепла ініціалізація станів із попереднього розв'язку (Етап 4.2).
-
-        Замість BFS з нуля: коли користувач додав/посунув один якір, x0 =
-        попередній розв'язок (frame_affine з HDF5 → стани). Та сама модель,
-        швидша ітерація користувача. Фіксовані вузли (якорі) не чіпаємо; BFS
-        лишається для першого запуску та як fallback для вузлів без стану.
+        """Warm initialization of states from previous solution.
+        Instead of BFS from scratch: when user added/moved one anchor, x0 =
+        previous solution (frame_affine from HDF5 -> states). Same model,
+        faster user iteration. Fixed nodes (anchors) untouched; BFS
+        remains for first run and as fallback for nodes without state.
         """
         count = 0
         for fid, affine in affines.items():
@@ -245,11 +230,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         return count
 
     def preliminary_states(self, seed_affines: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
-        """Прикидка ПОВНИХ станів вузлів BFS-ланцюгом ЛИШЕ по temporal-ребрах від
-        заданих якірних матриць (Етапи 2.2/2.3 — ДО матчингу/оптимізації).
-
-        Відстані/пози інваріантні до Local Origin, тож беремо абсолютні матриці
-        якорів. Не мутує стан оптимізатора. Повертає {fid → state[5]}.
+        """Estimate FULL node states by BFS chain ONLY along temporal edges from
+        specified anchor matrices (BEFORE matching/optimization).
+        Distances/poses invariant to Local Origin, so take absolute matrices
+        of anchors. Does not mutate optimizer state. Returns {fid -> state[5]}.
         """
         seeds = {}
         for fid, aff in seed_affines.items():
@@ -282,8 +266,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         return states
 
     def preliminary_centers(self, seed_affines: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
-        """Прикидка метричних центрів (Етап 2.2, дистанційний префільтр) —
-        тонка обгортка над preliminary_states."""
+        """Estimate metric centers — thin wrapper over preliminary_states."""
         return {fid: st[:2].copy() for fid, st in self.preliminary_states(seed_affines).items()}
 
     def odometry_consistency_factors(
@@ -296,23 +279,20 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         drift_frac: float = 0.25,
         factor: float = 0.3,
     ) -> list:
-        """Odometry-consistency (PCM-lite, Етап 2.3): вага ×factor для spatial-ребер,
-        несумісних із temporal-ланцюгом.
-
-        Для кожного кандидата (i, j, similarity): передбачити центр j із вузла i
-        ЧЕРЕЗ РЕБРО (predict_forward на прикидці стану i) і порівняти з тим, куди
-        j ставить temporal-ланцюг (prelim center). Допуск росте з довжиною ланцюга
-        |i−j| (компенсація дрейфу). Несумісне ребро (аліас паралельних рядів посівів,
-        що узгоджені МІЖ СОБОЮ й проходять cluster-гейт) → вага ×factor. НЕ викидання.
-
-        specs — список dict із ключами 'i','j','similarity'. Повертає list факторів.
+        """Odometry-consistency (PCM-lite): xfactor weight for spatial edges
+        inconsistent with temporal chain.
+        For each candidate (i, j, similarity): predict center j from node i
+        VIA EDGE (predict_forward on preliminary state i) and compare to where
+        j is placed by temporal chain (prelim center). Tolerance grows with chain length
+        |i-j| (drift compensation). Inconsistent edge -> weight xfactor. NO pruning.
+        specs — list of dicts with keys 'i','j','similarity'. Returns list of factors.
         """
         n = len(specs)
         factors = [1.0] * n
         if not prelim_states or n == 0:
             return factors
 
-        # Медіанний метричний рух за слот (для компенсації дрейфу довгих ланцюгів).
+        # Median metric displacement per slot (to compensate for drift in long chains).
         ids = sorted(prelim_states)
         consec = [
             float(np.linalg.norm(prelim_states[b][:2] - prelim_states[a][:2])) / max(b - a, 1)
@@ -327,7 +307,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             si = prelim_states.get(i)
             sj = prelim_states.get(j)
             if si is None or sj is None:
-                continue  # без прикидки судити не можемо — лишаємо повну вагу
+                continue  # cannot judge without estimate — keep full weight
             edge = self._build_graph_edge(i, j, spec["similarity"], 1.0, "spatial", 0, 0.0)
             pred = _predict_forward(si, edge, self._sign)
             inconsistency = float(np.linalg.norm(pred[:2] - sj[:2]))
@@ -341,14 +321,13 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
     def estimate_min_loop_gap(
         self, frame_w: int, frame_h: int, k_overlap: float = 1.0
     ) -> int | None:
-        """Авто min_frame_gap для loop closure з геометрії руху (Етап 2.1).
-
-        Медіанний рух центру за слот у px беремо з temporal-ребер (dtx, dty
-        нормовані на span ребра). Мінімальний геп БЕЗ фізичного перекриття:
-        gap_min = ceil(k_overlap · frame_diag_px / median_disp_px). Нижче цього
-        гепа два кадри ще перекриваються в часі (не loop closure); вище —
-        збіг фіч означає справжній повторний прохід. None, якщо temporal-ребер
-        нема або рух вироджений (виклик тоді лишає явну константу).
+        """Auto min_frame_gap for loop closure from motion geometry.
+        Median frame center motion per slot in px taken from temporal edges (dtx, dty
+        normalized to edge span). Minimum gap WITHOUT physical overlap:
+        gap_min = ceil(k_overlap * frame_diag_px / median_disp_px). Below this
+        gap two frames still overlap in time (not a loop closure); above —
+        feature match means a real loop closure. None if no temporal edges
+        or motion is degenerate (call then leaves explicit constant).
         """
         disps = [
             np.hypot(e.dtx, e.dty) / max(abs(e.to_id - e.from_id), 1)
@@ -409,8 +388,8 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
 
         n_edges = len(valid_edges)
 
-        # М'які якорі (Етап 1.1): унарні пріори тільки для вільних анкер-вузлів.
-        # Порожньо (soft_anchors off) → n_anch=0 → усі гілки нижче — no-op.
+        # Soft anchors: unary priors only for free anchor nodes.
+        # Empty (soft_anchors off) → n_anch=0 → all branches below are no-ops.
         anchor_var_idx: list[int] = []
         anchor_states_list: list[np.ndarray] = []
         anchor_w_list: list[float] = []
@@ -421,9 +400,9 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 anchor_w_list.append(a_w)
         n_anch = len(anchor_var_idx)
 
-        # ── Кінематичний prior (Етап 7.1): фактори другої різниці центрів ──
-        # w=0 (дефолт) → n_kin=0 → блок повністю відсутній, структура резидуалів
-        # незмінна (контракт 5·E+N+5·A зберігається байт-у-байт).
+        # Kinematic prior: second-difference factors on frame centres.
+        # w=0 (default) → n_kin=0 → block is completely absent, residual
+        # structure is unchanged (contract 5·E+N+5·A preserved byte-for-byte).
         kin_ids, kin_alpha_l, kin_w_l = self._build_kinematic_triples(
             id_to_var, kinematic_prior_weight
         )
@@ -467,7 +446,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         free_indices_in_full = [node_id_to_idx[fid] for fid in free_ids]
         edges_from = np.array([node_id_to_idx[e.from_id] for e in valid_edges], dtype=np.int32)
         edges_to = np.array([node_id_to_idx[e.to_id] for e in valid_edges], dtype=np.int32)
-        # Індекс вільної змінної (−1 = фіксований вузол) — для аналітичного якобіана
+        # Free-variable index (−1 = fixed node) — used in the analytic Jacobian
         edge_from_free = np.array(
             [id_to_var.get(e.from_id, -1) for e in valid_edges], dtype=np.int64
         )
@@ -521,19 +500,19 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 remaining = max_evals - self._nfev
 
                 if remaining < 0:
-                    msg = f"Глобальна оптимізація: фіналізація... (обчислень: {self._nfev}), швидкість {rate:.0f} it/s"
+                    msg = f"Global optimization: finalizing... (evals: {self._nfev}), speed {rate:.0f} it/s"
                 else:
                     eta = remaining / rate if rate > 0 else 0
                     m, s = divmod(int(eta), 60)
-                    eta_str = f"{m}хв {s:02d}с" if m > 0 else f"{s}с"
-                    msg = f"Глобальна оптимізація: обчислення {self._nfev}/{max_evals}, швидкість {rate:.0f} it/s, ETA: {eta_str}"
+                    eta_str = f"{m}m {s:02d}s" if m > 0 else f"{s}s"
+                    msg = f"Global optimization: evaluating {self._nfev}/{max_evals}, speed {rate:.0f} it/s, ETA: {eta_str}"
 
                 d_dict["callback"](msg)
                 self._last_cb_time = now
             return self._residuals_vec(x, d_dict)
 
         if use_analytic_jac:
-            # Аналітичний якобіан (Етап 4.1): точніші градієнти, 3-10× швидше.
+            # Analytic Jacobian: more accurate gradients, 3-10× faster.
             jac_kwargs = {"jac": self._jacobian_vec}
         else:
             jac_kwargs = {"jac": "2-point", "jac_sparsity": jac_sp}
@@ -557,8 +536,8 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         for fid, idx in id_to_var.items():
             self._free_nodes[fid] = result.x[5 * idx : 5 * idx + 5].copy()
 
-        # ── Етап 3 (GNC): плавна еволюція prune. За прапорцем, дефолт off. ──
-        # Взаємно виключно з two_stage_prune; на чистій сцені — no-op (без деградації).
+        # GNC: gradual prune schedule. Flag-gated, default off.
+        # Mutually exclusive with two_stage_prune; on a clean scene it is a no-op.
         if gnc_spatial:
             return self._run_gnc_spatial(
                 gnc_rounds,
@@ -570,16 +549,16 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 kinematic_prior_weight=kinematic_prior_weight,
             )
 
-        # ── Етап 3: two-stage L2 → prune → L2 (за прапорцем, дефолт off) ──
-        # Поріг рахується ВІДНОСНО інших spatial-резидуалів (та сама природа),
-        # а не абсолютною константою — валідні loop closures лишаються з
-        # повною L2-вагою. Warm start із розв'язку кроку 1 (self._free_nodes).
+        # Two-stage L2 → prune → L2. Flag-gated, default off.
+        # Threshold is computed RELATIVE to other spatial residuals (same nature),
+        # not as an absolute constant — valid loop closures keep full L2 weight.
+        # Warm-started from step-1 solution (self._free_nodes).
         if two_stage_prune:
             pruned = self._prune_bad_spatial_edges(prune_mad_k, prune_max_spatial_frac)
             if pruned:
                 logger.info(
-                    f"Two-stage prune: викинуто {len(pruned)} spatial-ребер "
-                    f"(поза median+{prune_mad_k}·MAD), повторна L2 (warm start)"
+                    f"Two-stage prune: discarded {len(pruned)} spatial edges "
+                    f"(outside median+{prune_mad_k}*MAD), re-running L2 (warm start)"
                 )
                 return self.optimize(
                     max_iterations=max_iterations,
@@ -595,13 +574,12 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
     def _build_kinematic_triples(
         self, id_to_var: dict[int, int], weight: float
     ) -> tuple[list[tuple[int, int, int]], list[float], list[float]]:
-        """Трійки (a, b, c) сусідніх вузлів для кінематичного prior (Етап 7.1).
-
-        Нееквідистантні слоти (гепи keyframe selection, мости): центр b
-        порівнюється з α·a + (1−α)·c, α = h2/(h1+h2), h1 = b−a, h2 = c−b;
-        вага масштабується 2/(h1+h2) — при кроці 1 це рівно ``weight`` і
-        відповідає (a − 2b + c)/2, далі prior слабшає пропорційно гепу.
-        Трійки з усіма трьома фіксованими вузлами пропускаються (константа).
+        """Triplets (a, b, c) of adjacent nodes for kinematic prior.
+        Non-equidistant slots (keyframe selection gaps, bridges): center b
+        is compared against alpha*a + (1-alpha)*c, alpha = h2/(h1+h2), h1 = b-a, h2 = c-b;
+        weight scales as 2/(h1+h2) — at step 1 this equals ``weight`` and
+        corresponds to (a - 2b + c)/2, further prior weakens proportionally to gap.
+        Triplets with all three fixed nodes are skipped (constant).
         """
         if weight <= 0.0:
             return [], [], []
@@ -648,7 +626,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         parts = [res_edges.flatten(), res_reg]
 
         if d.get("n_anch", 0) > 0:
-            # Унарний пріор якоря: w_a·(state − state_anchor), кут SO(2)-safe.
+            # Unary anchor prior: w_a·(state − state_anchor), angle is SO(2)-safe.
             ap = x_reshaped[d["anchor_var_idx"]]  # (n_anch, 5)
             diff = ap - d["anchor_states"]
             ang = np.arctan2(np.sin(diff[:, 4]), np.cos(diff[:, 4]))
@@ -660,7 +638,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             )
 
         if d.get("n_kin", 0) > 0:
-            # Кінематичний prior (Етап 7.1): r = w·(α·a + (1−α)·c − b), центри.
+            # Kinematic prior: r = w·(α·a + (1−α)·c − b), centres only.
             ca = X_full[d["kin_ia"]][:, :2]
             cb = X_full[d["kin_ib"]][:, :2]
             cc = X_full[d["kin_ic"]][:, :2]
@@ -671,11 +649,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         return np.concatenate(parts)
 
     def _jacobian_vec(self, x: np.ndarray, d: dict):
-        """Аналітичний якобіан _residuals_vec (Етап 4.1).
-
-        Похідні виписані руками для 5-DoF анізотропної моделі. Та сама модель,
-        що й FD-варіант — лише точніші градієнти та 3-10× швидша оптимізація.
-        Верифікується проти 2-point FD (див. tests/test_pose_graph_jacobian.py).
+        """Analytical Jacobian of _residuals_vec.
+        Hand-derived partial derivatives for 5-DoF anisotropic model. Same model
+        as FD variant — just exact gradients and 3-10x faster optimization.
+        Verified against 2-point FD (see tests/test_pose_graph_jacobian.py).
         """
         X_full = d["X_full"]
         X_full[d["free_indices"]] = x.reshape(-1, 5)
@@ -705,7 +682,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         res0 = (w * inv_sxi) * (txj - pred_tx)
         res1 = (w * inv_syi) * (tyj - pred_ty)
 
-        # ── похідні по вузлу i (from) ──
+        # ── Derivatives w.r.t. node i (from) ──
         j0_txi = -w * inv_sxi
         j0_lxi = -w * ci * dtx - res0
         j0_lyi = w * sign * s_i * dty * syx
@@ -714,9 +691,9 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         j1_lxi = -w * s_i * dtx * sxy
         j1_lyi = -w * sign * ci * dty - res1
         j1_thi = -w * ci * dtx * sxy + w * sign * s_i * dty
-        jcx = w * cx  # ваги масштабу/кута (−для i, +для j)
+        jcx = w * cx  # scale/angle weights (- for i, + for j)
 
-        # ── похідні по вузлу j (to) ──
+        # ── Derivatives w.r.t. node j (to) ──
         j0_txj = w * inv_sxi
         j1_tyj = w * inv_syi
 
@@ -762,7 +739,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             add(br + 3, bj + 3, jcx[mt])
             add(br + 4, bj + 4, jcx[mt])
 
-        # регуляризатор ізотропії вузла: reg_p = 200*cx*(log_sx_p - log_sy_p)
+        # Isotropy regulariser for node: reg_p = 200*cx*(log_sx_p - log_sy_p)
         if n_free > 0:
             p_idx = np.arange(n_free)
             reg_row = 5 * n_edges + p_idx
@@ -770,8 +747,8 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             add(reg_row, 5 * p_idx + 2, np.full(n_free, w_reg))
             add(reg_row, 5 * p_idx + 3, np.full(n_free, -w_reg))
 
-        # М'які якорі (Етап 1.1): d(w_a·Δstate)/d(state) = w_a·I по 5 компонентах
-        # (похідна atan2(sin dθ, cos dθ) по θ = 1). Блок діагональний.
+        # Soft anchors: d(w_a·Δstate)/d(state) = w_a·I for all 5 components
+        # (derivative of atan2(sin dθ, cos dθ) w.r.t. θ = 1). Block is diagonal.
         if n_anch > 0:
             av = d["anchor_var_idx"]
             aw = d["anchor_w"]
@@ -780,8 +757,8 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             for comp in range(5):
                 add(a_rows + comp, 5 * av + comp, aw)
 
-        # Кінематичний prior (Етап 7.1): r = w·(α·a + (1−α)·c − b), лише центри —
-        # лінійний по станах, тож входи якобіана константні.
+        # Kinematic prior: r = w·(α·a + (1−α)·c − b), centres only —
+        # linear in states, so Jacobian entries are constant.
         if n_kin > 0:
             fa = d["kin_fa"]
             fb = d["kin_fb"]
@@ -815,8 +792,8 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         anchor_var_idx=None,
         kin_free=None,
     ):
-        # COO-конструктор (rows/cols списками) швидший за поелементний lil на
-        # великих графах. Патерн розрідженості ІДЕНТИЧНИЙ попередньому.
+        # COO constructor (list-based rows/cols) is faster than element-wise lil
+        # on large graphs. Sparsity pattern is IDENTICAL to the previous version.
         rows: list[int] = []
         cols: list[int] = []
         for k, edge in enumerate(valid_edges):
@@ -846,14 +823,14 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             rows += [row, row]
             cols += [bi + 2, bi + 3]
 
-        # М'які якорі (Етап 1.1): 5 діагональних входів на анкер-вузол.
+        # Soft anchors: 5 diagonal entries per anchor node.
         for a, v in enumerate(anchor_var_idx or []):
             base = n_edges * 5 + n_free + 5 * a
             for comp in range(5):
                 rows.append(base + comp)
                 cols.append(5 * v + comp)
 
-        # Кінематичний prior (Етап 7.1): 2 рядки/трійку, входи tx/ty вільних вузлів.
+        # Kinematic prior: 2 rows per triple, tx/ty entries of free nodes.
         base_k = n_edges * 5 + n_free + 5 * len(anchor_var_idx or [])
         for t, (fa, fb, fc) in enumerate(kin_free or []):
             for f_idx in (fa, fb, fc):
@@ -888,7 +865,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
 
 
 def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarray | None:
-    """Проєктує гомографію на афінну модель через 5 опорних точок навколо центру."""
+    """Projects homography onto 2x3 affine model via 5 control points around frame center."""
     cx, cy = frame_w / 2.0, frame_h / 2.0
     d = min(frame_w, frame_h) * 0.25
     pts = np.array(
@@ -905,11 +882,10 @@ def homography_to_affine(H: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
 
 
 def affine_fit_residual(H: np.ndarray, frame_w: int, frame_h: int) -> float | None:
-    """RMS-залишок афінного наближення гомографії H на 5 точках (Етап 6.2).
-
-    homography_to_affine відкидає цей залишок. Він великий, коли H неафінна
-    (нахил камери / рельєф) — такі temporal-кадри заслуговують меншої довіри.
-    Повертає залишок у пікселях або None. ~0 для чисто афінної H.
+    """RMS residual of affine approximation of homography H on 5 control points.
+    homography_to_affine discards this residual. It is large when H is non-affine
+    (camera tilt / terrain relief) — such temporal frames deserve lower trust.
+    Returns residual in pixels or None. ~0 for pure affine H.
     """
     cx, cy = frame_w / 2.0, frame_h / 2.0
     d = min(frame_w, frame_h) * 0.25
@@ -928,5 +904,5 @@ def affine_fit_residual(H: np.ndarray, frame_w: int, frame_h: int) -> float | No
     return float(np.sqrt(np.mean(np.sum((proj - transformed) ** 2, axis=1))))
 
 
-# Аліас для сумісності з worker-ом (використовує назву homography_to_similarity)
+# Alias for backward compatibility (worker uses the name homography_to_similarity)
 homography_to_similarity = homography_to_affine

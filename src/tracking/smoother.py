@@ -146,19 +146,19 @@ class SlidingWindowSmoother:
         max_step_m: float = 3.0,
     ) -> None:
         self.window = max(int(window), 2)
-        # Санітизація користувацьких параметрів (живий інцидент 2026-07-18:
-        # huber_k=-0.8 в user_config робив ваги ВСІХ фіксів від'ємними —
-        # система переставала бути SPD, розв'язок і серво-кроки — сміття).
+        # Sanitise user-supplied parameters (live incident 2026-07-18:
+        # huber_k=-0.8 in user_config made weights for ALL fixes negative —
+        # the system ceased to be SPD, solution and servo steps became garbage).
         self.huber_k = self._sane("huber_k", huber_k, 0.1)
         self.fix_sigma_base_m = self._sane("fix_sigma_base_m", fix_sigma_base_m, 0.1)
         self.odom_sigma_base_m = self._sane("odom_sigma_base_m", odom_sigma_base_m, 0.1)
         self.max_correction_m = self._sane("max_correction_m", max_correction_m, 0.1)
         self.entry_prior_sigma_m = self._sane("entry_prior_sigma_m", entry_prior_sigma_m, 0.1)
         self.irls_iterations = max(int(irls_iterations), 1)
-        # Fixed-lag servo (v2, після живого прогону 2026-07-18): корекція
-        # рахується на вузлі з лагом — голова вікна ще не уточнена майбутніми
-        # свідченнями (smoothed[head] ≈ сирий фікс, і корекція по ній
-        # РОЗФІЛЬТРОВУВАЛА Калмана — траєкторія сіпалась до фіксів).
+        # Fixed-lag servo (v2): correction is computed on the node at lag depth —
+        # the window head is not yet refined by future evidence
+        # (smoothed[head] ≈ raw fix, and correcting on it un-filtered the Kalman
+        # — the trajectory was jerking towards raw fixes).
         self.correction_lag = max(int(correction_lag), 1)
         self.deadband_m = self._sane("deadband_m", deadband_m, 0.0)
         self.gain = min(self._sane("gain", gain, 0.01), 1.0)
@@ -185,10 +185,10 @@ class SlidingWindowSmoother:
 
     @staticmethod
     def _sane(name: str, value, floor: float) -> float:
-        """Кламп користувацького параметра знизу з голосним warning."""
+        """Clamps a user config parameter from below with an explicit warning."""
         v = float(value)
         if not np.isfinite(v) or v < floor:
-            logger.warning(f"Smoother config: {name}={value!r} невалідне — клампимо до {floor}")
+            logger.warning(f"Smoother config: {name}={value!r} invalid — clamping to {floor}")
             return float(floor)
         return v
 
@@ -292,23 +292,22 @@ class SlidingWindowSmoother:
 
         step = self._servo_step(solution)
         if step is not None:
-            # Контракт: повернений крок ВЖЕ вважається застосованим викликачем
-            # (localizer робить trajectory_filter.shift безумовно). Ребейз
-            # збережених kf_xy у зсунуту систему — інакше лагова різниця
-            # рахувала б той самий офсет ще lag разів і серво перелітало б.
+            # Contract: the returned step is considered ALREADY applied by the
+            # caller (localizer unconditionally shifts trajectory_filter). Rebase
+            # the stored kf_xy values into the shifted frame — otherwise the lag
+            # difference would count the same offset lag more times and servo would overshoot.
             for nd in self._nodes:
                 if nd.kf_xy is not None:
                     nd.kf_xy = nd.kf_xy + step
         return step
 
     def _servo_step(self, solution: np.ndarray) -> np.ndarray | None:
-        """Крок корекції fixed-lag servo або None.
-
-        Різниця smoothed - KF береться на вузлі з глибиною >= correction_lag
-        (там обидві оцінки вже устоялись — різниця вимірює систематичний
-        дрейф, а не пер-фіксовий шум). Далі deadband (не смикати KF у
-        номінальному польоті), гейн і обмеження кроку (плавна збіжність
-        замість телепорту; збіжність геометрична завдяки ребейзу kf_xy).
+        """Fixed-lag servo correction step or None.
+        Difference smoothed - KF is taken at a node with depth >= correction_lag
+        (where both estimates have settled — difference measures systematic
+        drift, not per-fix noise). Then deadband (do not twitch KF in
+        nominal flight), gain, and step limit (smooth convergence
+        instead of teleportation; convergence is geometric thanks to kf_xy rebase).
         """
         lag = self.correction_lag
         if len(self._nodes) <= lag:
@@ -318,7 +317,7 @@ class SlidingWindowSmoother:
             if ref.kf_xy is not None:
                 break
         else:
-            return None  # у лаговій зоні нема жодного прийнятого вузла
+            return None  # no accepted node in the lag zone
 
         corr = solution[idx] - ref.kf_xy
         norm = float(np.linalg.norm(corr))

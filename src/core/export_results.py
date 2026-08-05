@@ -11,23 +11,15 @@ logger = get_logger(__name__)
 
 
 class ResultExporter:
-    """Експорт результатів локалізації у різні формати."""
+    """Exports localization results to various formats (CSV, GeoJSON, KML)."""
 
     @staticmethod
     def export_csv(results: list[dict[str, Any]], output_path: str) -> None:
-        """
-        Експорт у CSV файл.
-
-        Args:
-            results: список словників з ключами:
-                frame_id, lat, lon, confidence, timestamp, matched_frame, inliers
-            output_path: шлях до вихідного файлу
-        """
+        """Exports localization results to a CSV file."""
         if not results:
             logger.warning("No results to export")
             return
-        # HARDENING P1-6: the track IS the mission — never write it in plaintext
-        # into an encrypted deployment copy.
+        # Protection against writing results into an encrypted project.
         assert_project_writable(output_path)
 
         fieldnames = [
@@ -50,7 +42,7 @@ class ResultExporter:
 
     @staticmethod
     def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
-        """Експорт у GeoJSON (для GIS-систем). Додає точки та полігони FOV."""
+        """Exports localization results to GeoJSON format including FOV polygons."""
         assert_project_writable(output_path)
         features = []
         for r in results:
@@ -70,7 +62,7 @@ class ResultExporter:
             )
             features.append(point)
 
-            # 2. Polygon feature (FOV) - якщо є дані
+            # 2. Polygon feature (FOV) - if available
             fov = r.get("fov_polygon")
             if fov and len(fov) >= 3:
                 # GeoJSON Polygon coordinates must be a list of rings,
@@ -103,7 +95,7 @@ class ResultExporter:
     def export_kml(
         results: list[dict[str, Any]], output_path: str, name: str = "Drone Track"
     ) -> None:
-        """Експорт у KML (для Google Earth)."""
+        """Exports localization trajectory and points to KML (Google Earth)."""
         assert_project_writable(output_path)
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
@@ -113,7 +105,7 @@ class ResultExporter:
             f"  <description>Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}</description>",
         ]
 
-        # Стиль маркера
+        # Marker style
         lines.extend(
             [
                 '  <Style id="dronePoint">',
@@ -125,7 +117,7 @@ class ResultExporter:
             ]
         )
 
-        # Точки
+        # Points
         for r in results:
             if "lat" not in r or "lon" not in r:
                 continue
@@ -144,7 +136,7 @@ class ResultExporter:
                 ]
             )
 
-        # Трек (лінія)
+        # Track line
         coords_str = " ".join(
             f"{r['lon']},{r['lat']},0" for r in results if "lat" in r and "lon" in r
         )
@@ -171,7 +163,7 @@ class ResultExporter:
 
     @staticmethod
     def export_objects_csv(results: list[dict[str, Any]], output_path: str) -> None:
-        """Експорт об'єктів у CSV файл."""
+        """Exports tracked objects to a CSV file."""
         if not results:
             return
         assert_project_writable(output_path)
@@ -185,7 +177,7 @@ class ResultExporter:
 
     @staticmethod
     def export_objects_geojson(results: list[dict[str, Any]], output_path: str) -> None:
-        """Експорт об'єктів у GeoJSON."""
+        """Exports tracked objects to GeoJSON format."""
         if not results:
             return
         assert_project_writable(output_path)

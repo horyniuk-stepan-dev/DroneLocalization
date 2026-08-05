@@ -11,9 +11,9 @@ logger = get_logger(__name__)
 
 
 class VideoDecodeWorker(QThread):
-    """
-    Фоновий потік для декодування відео та читання кадрів.
-    Запобігає блокуванню головного GUI потоку під час I/O операцій.
+    """Background thread for video decoding and frame reading.
+
+    Prevents main GUI thread blocking during video I/O operations.
     """
 
     frame_ready = pyqtSignal(int, np.ndarray)  # (frame_id, frame_bgr)
@@ -35,9 +35,9 @@ class VideoDecodeWorker(QThread):
         while self._is_running:
             cmd_from_queue = False
             try:
-                # Читаємо команди блокуючи чергу (з таймаутом для плейбеку)
+                # Read commands blocking the queue (with playback timeout)
                 if is_playing:
-                    # Розрахунок часу до наступного кадру
+                    # Calculate time to next frame
                     elapsed = time.perf_counter() - last_play_time
                     delay = max(0.001, (1.0 / play_fps) - elapsed)
 
@@ -45,7 +45,7 @@ class VideoDecodeWorker(QThread):
                         cmd, arg = self.cmd_queue.get(timeout=delay)
                         cmd_from_queue = True
                     except queue.Empty:
-                        # Час грати наступний кадр
+                        # Time to play next frame
                         cmd, arg = "next_frame", None
                 else:
                     cmd, arg = self.cmd_queue.get(timeout=0.5)
@@ -53,7 +53,7 @@ class VideoDecodeWorker(QThread):
             except queue.Empty:
                 continue
 
-            # Обробка команди
+            # Command handling
             try:
                 if cmd == "load":
                     self._internal_load(arg)
@@ -104,7 +104,7 @@ class VideoDecodeWorker(QThread):
         if not cap.isOpened():
             if cap:
                 cap.release()
-            self.error.emit(f"Не вдалося відкрити: {path}")
+            self.error.emit(f"Failed to open video: {path}")
             return
 
         self.cap = cap
@@ -124,7 +124,7 @@ class VideoDecodeWorker(QThread):
         ret, frame = self.cap.read()
 
         if not ret:
-            # Fallback для деяких кодеків (шукати через час)
+            # Codec fallback (time-based seek)
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             if fps > 0:
                 self.cap.set(cv2.CAP_PROP_POS_MSEC, (frame_id / fps) * 1000.0)
@@ -139,8 +139,7 @@ class VideoDecodeWorker(QThread):
         self.cmd_queue.put(("load", path))
 
     def seek(self, frame_id: int):
-        # Відкидаємо попередні seek-команди, якщо їх накопичилось багато
-        # Це запобігає затримкам, якщо користувач швидко тягнув повзунок
+        # Clear previous pending seek commands to avoid lag during fast slider scrubbing
         self._clear_queue_of("seek")
         self.cmd_queue.put(("seek", frame_id))
 
@@ -154,7 +153,7 @@ class VideoDecodeWorker(QThread):
         self.cmd_queue.put(("stop", None))
 
     def _clear_queue_of(self, cmd_to_remove: str):
-        """Видаляє застарілі команди з черги (корисно для debounce)."""
+        """Removes stale commands from queue (useful for debouncing)."""
         temp_list = []
         try:
             while True:

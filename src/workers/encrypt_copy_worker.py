@@ -1,8 +1,6 @@
-"""HARDENING P1-6: background worker for building an encrypted project copy.
+"""Background worker for creating an encrypted project copy (EncryptCopyWorker).
 
-Encrypting the map database and the lance index runs to tens of seconds (Scrypt
-plus whole-file AES-GCM over hundreds of MB), so it must not run on the GUI
-thread. The plaintext master is never modified — see ``build_encrypted_copy``.
+Performs encryption of HDF5 databases and LanceDB indices in a background QThread.
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ logger = get_logger(__name__)
 
 
 class EncryptCopyWorker(QThread):
-    """Фоновий потік для створення зашифрованої копії проєкту."""
+    """Background thread for creating an encrypted project copy."""
 
     progress = pyqtSignal(str)
     completed = pyqtSignal(dict)
@@ -34,7 +32,7 @@ class EncryptCopyWorker(QThread):
 
     def run(self):
         try:
-            self.progress.emit("Шифрування проєкту...")
+            self.progress.emit("Encrypting project...")
             # scripts/ is not a package; add the repo root so the CLI builder is
             # importable from the GUI without duplicating its logic.
             repo_root = str(Path(__file__).resolve().parents[2])

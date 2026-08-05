@@ -1,16 +1,7 @@
-"""HARDENING P1-6: detect encrypted projects on disk and keep them immutable.
+"""Module for scanning and detecting encrypted project artifacts on disk.
 
-Kept free of Qt so it is unit-testable in the pure-Python suite; the GUI
-passphrase dialog is the only consumer that needs a widget toolkit.
-
-An encrypted deployment copy has EVERY file encrypted, ``project.json``
-included, so the manifest header is the marker: one 7-byte read tells you
-whether a directory is an encrypted copy, before anything is loaded.
-
-Copies built before that (plaintext manifest, encrypted artifacts) still open —
-the artifact scan below is kept as a fallback. Artifacts live per source
-(``sources/main/database.h5``, see ProjectSettings), so their paths are resolved
-through the project's own source configuration rather than guessed.
+Provides automatic detection of encrypted files via 7-byte container headers
+without reading large database files in full.
 """
 
 from __future__ import annotations

@@ -25,9 +25,9 @@ logger = get_logger(__name__)
 
 
 class OpenProjectDialog(QDialog):
-    """
-    Діалог вибору проєкту зі списку нещодавніх.
-    Замінює голий QFileDialog.getExistingDirectory.
+    """Dialog for selecting a project from the list of recent projects.
+
+    Replaces bare QFileDialog.getExistingDirectory.
     """
 
     def __init__(self, registry: ProjectRegistry, parent=None):
@@ -46,7 +46,7 @@ class OpenProjectDialog(QDialog):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # Пошук
+        # Search
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔍 Пошук за назвою проєкту...")
@@ -54,7 +54,7 @@ class OpenProjectDialog(QDialog):
         search_row.addWidget(self.search_input)
         layout.addLayout(search_row)
 
-        # Список проєктів
+        # Project list
         self.project_list = QListWidget()
         self.project_list.setAlternatingRowColors(True)
         self.project_list.setStyleSheet(
@@ -66,7 +66,7 @@ class OpenProjectDialog(QDialog):
         self.project_list.currentItemChanged.connect(self._on_selection_changed)
         layout.addWidget(self.project_list, stretch=1)
 
-        # Preview панель
+        # Preview panel
         self.preview_group = QGroupBox("Деталі проєкту")
         preview_layout = QVBoxLayout(self.preview_group)
         self.lbl_preview = QLabel("Виберіть проєкт зі списку")
@@ -75,7 +75,7 @@ class OpenProjectDialog(QDialog):
         preview_layout.addWidget(self.lbl_preview)
         layout.addWidget(self.preview_group)
 
-        # Кнопки
+        # Buttons
         buttons_row = QHBoxLayout()
 
         self.btn_browse = QPushButton("📂 Інша папка...")
@@ -118,7 +118,7 @@ class OpenProjectDialog(QDialog):
         return self._encrypted_cache[path]
 
     def _populate_list(self, filter_text: str = ""):
-        """Заповнити список проєктів."""
+        """Populates the list of projects."""
         self.project_list.clear()
         projects = self.registry.get_recent(limit=50)
 
@@ -127,7 +127,7 @@ class OpenProjectDialog(QDialog):
             if filter_text and filter_text.lower() not in name.lower():
                 continue
 
-            # Статус-іконки
+            # Status indicators
             has_db = proj.get("has_database", False)
             has_cal = proj.get("has_calibration", False)
             status = ""
@@ -138,7 +138,7 @@ class OpenProjectDialog(QDialog):
             else:
                 status = "❌ без бази"
 
-            # Формат дати
+            # Date format
             last = proj.get("last_opened", "")
             try:
                 dt = datetime.fromisoformat(last)
@@ -153,7 +153,7 @@ class OpenProjectDialog(QDialog):
             if lock:
                 item.setToolTip("🔒 Зашифрований проєкт — при відкритті запитає пароль карти")
 
-            # Позначаємо недоступні проєкти
+            # Flag unavailable projects
             if not Path(proj["path"]).is_dir():
                 item.setForeground(QColor("#aaa"))
                 item.setToolTip("⚠ Папка проєкту не знайдена")

@@ -1,12 +1,7 @@
-"""HARDENING P1-8 (safe slice): per-frame latency observability.
+"""Frame processing latency monitoring module.
 
-A navigation payload is judged by worst-case latency, not average FPS. The
-existing pipeline emits an averaged FPS but never surfaces the tail (p95/p99/
-max) where missed deadlines hide. ``LatencyTracker`` records per-frame
-durations the worker already computes and periodically logs percentiles.
-
-Measurement only — it does not alter timing, drop frames, or enforce a
-deadline (the deadline + drop policy is deferred pending a consumer SLA).
+Computes frame processing duration statistics (p50, p95, max) to detect
+performance dips and estimate the pipeline's computational latency.
 """
 
 import math

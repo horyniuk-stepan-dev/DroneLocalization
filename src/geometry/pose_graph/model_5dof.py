@@ -14,7 +14,7 @@ from src.geometry.affine_utils import decompose_affine_5dof
 
 @dataclass
 class GraphEdge:
-    """Ребро графу між кадрами з відносним перетворенням."""
+    """Graph edge between frames with relative transformation."""
 
     from_id: int
     to_id: int

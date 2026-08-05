@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 
 
 class HeadlessRunner:
-    """Керує запуском системи без GUI (консольний режим)."""
+    """Manages system execution without a GUI (headless console mode)."""
 
     def __init__(self, project_dir: str, video_source: str):
         self.project_dir = Path(project_dir)
@@ -46,22 +46,19 @@ class HeadlessRunner:
         self.database = None
         self.tracking_worker = None
 
-        # Мультиджерельна підтримка
+        # Multi-source support
         self.db_manager = None
         self.calib_manager = None
 
-        # Вмикаємо network api примусово для headless
+        # Force enable network API for headless execution
         APP_SETTINGS.network_api.enabled = True
         self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
 
     def _setup_project(self):
-        """Завантажує БД та калібрування з проекту."""
+        """Loads database and calibration files from project directory."""
         logger.info(f"Loading project from {self.project_dir}")
 
-        # HARDENING P1-6: resolve the passphrase BEFORE loading — an encrypted copy
-        # encrypts project.json itself, so the manifest is unparseable without it.
-        # Verified up front and retried, so a typo does not abort the run and never
-        # poisons the cache. Mirrors the GUI dialog.
+        # Verify passphrase before loading an encrypted project in headless mode.
         encrypted = encrypted_artifacts_at(self.project_dir)
         if encrypted and not prompt_and_verify_passphrase(str(encrypted[0])):
             raise EncryptionError(
@@ -69,14 +66,14 @@ class HeadlessRunner:
                 f"was given — cannot load the project."
             )
 
-        # Завантажуємо проект через ProjectManager для підтримки multi-source
+        # Load project via ProjectManager for multi-source support
         pm = ProjectManager()
         if pm.load_project(str(self.project_dir)):
             sources = pm.settings.get_enabled_sources()
             is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
 
             if is_multi and len(sources) > 0:
-                # Мультиджерельний режим
+                # Multi-source mode
                 self.db_manager = MultiDatabaseManager(sources, self.project_dir, config=APP_CONFIG)
                 self.calib_manager = MultiCalibrationManager()
                 self.calib_manager.load_all(sources, self.project_dir)
@@ -119,7 +116,7 @@ class HeadlessRunner:
                 if calib_path.exists():
                     self.calibration.load(str(calib_path))
         else:
-            # Fallback: прямий шлях (legacy)
+            # Fallback: direct legacy path
             db_path = self.project_dir / "database.h5"
             calib_path = self.project_dir / "calibration.json"
 
@@ -171,7 +168,7 @@ class HeadlessRunner:
         )
 
     def run(self):
-        """Головний цикл Headless-режиму."""
+        """Main execution loop for Headless mode."""
         logger.info("Starting Headless Localization System")
         try:
             self._setup_project()
@@ -188,7 +185,7 @@ class HeadlessRunner:
             config=APP_CONFIG,
         )
 
-        # Підключаємо брокер координат
+        # Connect coordinates broker
         self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
         self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
         self.tracking_worker.objects_gps_updated.connect(
@@ -217,6 +214,6 @@ class HeadlessRunner:
         logger.info("System is running. Press Ctrl+C to stop.")
         self.app.exec()
 
-        # Очищення
+        # Cleanup
         self.coordinates_broker.stop()
         logger.info("Headless runner exited gracefully.")

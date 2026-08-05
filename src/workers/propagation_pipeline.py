@@ -1,13 +1,12 @@
-"""
-Графова пропагація калібрування координат.
+"""Pose-graph coordinate calibration propagation pipeline.
 
-Замість лінійного ланцюжка гомографій, будується граф кадрів із:
-  - Часовими ребрами (sequential: frame i ↔ frame i+1)
-  - Просторовими ребрами (loop closure: DINOv2 retrieval → LightGlue matching)
-  - GPS-якорями як жорсткими вузлами
+Builds a frame graph containing:
+  - Temporal edges (sequential: frame i <-> frame i+1)
+  - Spatial edges (loop closure: DINOv2 retrieval -> LightGlue matching)
+  - GPS anchors as fixed/soft nodes
 
-Оптимізація: Levenberg-Marquardt через scipy.optimize.least_squares
-з SO(2)-safe кутовими residuals (arctan2(sin, cos)).
+Optimization: Levenberg-Marquardt via scipy.optimize.least_squares
+with SO(2)-safe angular residuals (arctan2(sin, cos)).
 """
 
 import json
@@ -45,15 +44,14 @@ logger = get_logger(__name__)
 
 
 class PropagationPipeline:
-    """
-    Графова пропагація з глобальною оптимізацією.
+    """Graph propagation with global optimization.
 
-    Фази:
-      1. Prefetch фіч → побудова часових ребер (sequential matching)
-      2. Loop closure detection (FAISS DINOv2 retrieval → LightGlue matching)
-      3. Фіксація GPS-якорів + BFS ініціалізація початкового наближення
-      4. Глобальна оптимізація (Levenberg-Marquardt)
-      5. Збереження результатів у HDF5
+    Phases:
+      1. Prefetch features -> build temporal edges (sequential matching)
+      2. Loop closure detection (FAISS DINOv2 retrieval -> LightGlue matching)
+      3. Fix GPS anchors + BFS initial state estimation
+      4. Global optimization (Levenberg-Marquardt)
+      5. Save results to HDF5
     """
 
     def __init__(
@@ -66,9 +64,9 @@ class PropagationPipeline:
         error_callback=None,
         completed_callback=None,
     ):
-        # Qt-free ядро графової пропагації. progress/error/completed
-        # виходять через колбеки (CalibrationPropagationWorker під'єднує
-        # їх до однойменних Qt-сигналів).
+        # Qt-free core of graph-based propagation. progress/error/completed
+        # events are delivered via callbacks (CalibrationPropagationWorker
+        # connects them to Qt signals of the same name).
         self._progress_cb = progress_callback
         self._error_cb = error_callback
         self._completed_cb = completed_callback
@@ -87,7 +85,7 @@ class PropagationPipeline:
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
 
-        # Параметри графової оптимізації
+        # Pose-graph optimization parameters
         self.lc_top_k = get_cfg(self.config, "graph_optimization.loop_closure_top_k", 5)
         self.lc_min_sim = get_cfg(
             self.config, "graph_optimization.loop_closure_min_similarity", 0.75
@@ -134,7 +132,7 @@ class PropagationPipeline:
         self.use_bfs = get_cfg(self.config, "graph_optimization.use_bfs_initialization", True)
         self.export_geojson = get_cfg(self.config, "graph_optimization.export_geojson", True)
 
-        # Скільки кадрів можна "перестрибнути" при побудові temporal ребер
+        # Maximum number of slots to skip when building temporal edges
         self.max_skip_frames = get_cfg(self.config, "propagation.max_skip_frames", 3)
         self.rotation_retry = get_cfg(self.config, "propagation.rotation_retry", False)
         self.temporal_weight_use_fit = get_cfg(
@@ -144,7 +142,7 @@ class PropagationPipeline:
             self.config, "graph_optimization.temporal_fit_quality_k", 0.05
         )
 
-        # ── Нові опції (Етапи 2/3/4). Дефолти off = поточна поведінка. ──
+        # New options (stages 2/3/4). Defaults off = current behaviour.
         go = "graph_optimization."
         self.use_analytic_jac = get_cfg(self.config, go + "use_analytic_jacobian", False)
         self.warm_start = get_cfg(self.config, go + "warm_start", False)
@@ -169,19 +167,19 @@ class PropagationPipeline:
             self.config, go + "spatial_weight_use_similarity", False
         )
 
-        # ── ADDENDUM 1.1: просторовий розкид інлаєрів ребра. Дефолти off. ──
+        # Spatial spread of edge inliers. Defaults off.
         self.edge_spread_weight = get_cfg(self.config, go + "edge_spread_weight", False)
         self.edge_spread_ref = get_cfg(self.config, go + "edge_spread_ref", 0.15)
         self.edge_spread_k = get_cfg(self.config, go + "edge_spread_k", 10.0)
         self.edge_gate_min_spread = get_cfg(self.config, go + "edge_gate_min_spread", 0.0)
 
-        # М'які якорі (Етап 1.1). off = fix_node (жорсткий, поточна поведінка).
+        # Soft anchors. off = fix_node (hard anchor, current behaviour).
         self.soft_anchors = get_cfg(self.config, go + "soft_anchors", False)
         self.anchor_base_w = get_cfg(self.config, go + "anchor_base_w", 200.0)
         self.anchor_sigma_floor_m = get_cfg(self.config, go + "anchor_sigma_floor_m", 0.05)
         self.anchor_loo_threshold_m = get_cfg(self.config, go + "anchor_loo_threshold_m", 5.0)
 
-        # ── Етап 8 (сесія 2026-07-12): запобіжники temporal-VO. Дефолти off. ──
+        # Temporal VO guards. Defaults off.
         self.temporal_edge_gate = get_cfg(self.config, go + "temporal_edge_gate", False)
         self.temporal_gate_max_rot = get_cfg(
             self.config, go + "temporal_gate_max_rotation_deg", 30.0
@@ -196,7 +194,7 @@ class PropagationPipeline:
         self.anchor_gap_max_dev_m = get_cfg(self.config, go + "anchor_gap_max_dev_m", 150.0)
         self.anchor_gap_downweight = get_cfg(self.config, go + "anchor_gap_downweight", 0.05)
 
-        # ── Аудит 2026-08-01. Дефолти = ПОТОЧНА поведінка. ──
+        # Outlier rejection and pose-graph optimization settings
         self.true_disagreement = get_cfg(self.config, go + "true_disagreement", False)
         self.ground_scale_thresholds = get_cfg(self.config, go + "ground_scale_thresholds", False)
         self.isotropy_weight = get_cfg(self.config, go + "isotropy_weight", 200.0)
@@ -220,27 +218,26 @@ class PropagationPipeline:
         if self._completed_cb is not None:
             self._completed_cb()
 
-    # ─── Головний метод ──────────────────────────────────────────────────────
+    # ─── Main method ─────────────────────────────────────────────────────────
 
     def _propagate(self):
         num_frames = self.database.get_num_frames()
         all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
         anchors = [a for a in all_anchors if a.frame_id < num_frames]
 
-        # ВИПРАВЛЕНО: раніше якорі поза межами БД викидалися МОВЧКИ (тільки лог),
-        # і користувач не знав, що половина його якорів не використовується.
+        # Validate that all anchors refer to slots within the database.
         dropped = [a.frame_id for a in all_anchors if a.frame_id >= num_frames]
         if dropped:
             self._report_error(
-                f"Якорі для кадрів {dropped} виходять за межі бази даних "
-                f"({num_frames} слотів). Ймовірно, вони були створені за номерами "
-                f"кадрів оригінального відео, а не слотів БД (кадр_відео // frame_step). "
-                f"Видаліть ці якорі та додайте заново через діалог калібрування."
+                f"Anchors for frames {dropped} are outside the database bounds "
+                f"({num_frames} slots). They were likely created using original video "
+                f"frame numbers rather than DB slot indices (video_frame // frame_step). "
+                f"Delete these anchors and re-add them via the calibration dialog."
             )
             return
 
         if not anchors:
-            self._report_error("Немає якорів калібрування")
+            self._report_error("No calibration anchors")
             return
 
         logger.info(
@@ -250,19 +247,19 @@ class PropagationPipeline:
         )
 
         # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
-        self._report_progress(0, "Передзавантаження фіч у RAM...")
+        self._report_progress(0, "Prefetching features into RAM...")
         all_features = self._prefetch_features(num_frames)
         if not all_features:
-            # Два випадки: (а) битий/нечитабельний файл — _prefetch_features уже
-            # викликав _report_error із деталями; (б) у базі просто немає жодного
-            # кадру з фічами — тоді рапортуємо тут. Далі йти немає сенсу:
-            # порожній граф однаково не дасть калібрації, а Phase 3 упав би на
-            # тій самій умові, спаливши до того матчинг і loop closure.
-            logger.error("Prefetch не повернув жодного кадру з фічами — пропагацію зупинено")
+            # Two cases: (a) corrupted/unreadable file — _prefetch_features already
+            # called _report_error with details; (b) no keyframe slots have features
+            # at all — report here. No reason to continue:
+            # an empty graph cannot produce calibration, and Phase 3 would fail on
+            # the same condition after wasting time on matching and loop closure.
+            logger.error("Prefetch returned no frames with features — propagation aborted")
             if not self._prefetch_reported_error:
                 self._report_error(
-                    "У базі даних немає жодного кадру з локальними фічами. "
-                    "Найімовірніше базу побудовано не до кінця — перебудуйте її."
+                    "The database has no frames with local features. "
+                    "The database is most likely built incompletely — rebuild it."
                 )
             return
 
@@ -273,23 +270,23 @@ class PropagationPipeline:
             if i in all_features:
                 optimizer.add_node(i)
 
-        self._report_progress(10, "Побудова часових ребер (sequential matching)...")
+        self._report_progress(10, "Building temporal edges (sequential matching)...")
         temporal_count = self._build_temporal_edges(optimizer, all_features, num_frames)
         logger.info(f"Phase 1 complete: {temporal_count} temporal edges")
 
-        # Авто min_frame_gap (Етап 2.1): з медіанного руху за слот. Замінює ручну
-        # константу; працює в парі з odometry-consistency (2.3), що ловить
-        # аліасні same-leg замикання в зоні поза фізичним перекриттям.
+        # Auto min_frame_gap: derived from median per-slot motion.
+        # Works in concert with odometry-consistency to reject alias same-leg
+        # closures outside the physically overlapping region.
         if self.lc_auto_min_gap:
             auto_gap = optimizer.estimate_min_loop_gap(
                 self.frame_w, self.frame_h, self.lc_overlap_factor
             )
             if auto_gap is not None:
-                logger.info(f"Auto min_frame_gap: {auto_gap} слотів (було {self.lc_min_gap})")
+                logger.info(f"Auto min_frame_gap: {auto_gap} slots (was {self.lc_min_gap})")
                 self.lc_min_gap = auto_gap
 
-        # Дистанційний префільтр (Етап 2.2): прикидка центрів BFS-ланцюгом temporal
-        # від якорів → поріг margin×діагональ_кадру у метрах. Далекі пари не матчаться.
+        # Distance pre-filter: approximate frame centers via BFS along temporal
+        # chain from anchors; reject pairs farther than margin × frame_diagonal.
         self._prelim_states = {}
         self._prelim_centers = {}
         self._prelim_dist_threshold = 0.0
@@ -308,12 +305,12 @@ class PropagationPipeline:
                 frame_diag_px = float(np.hypot(self.frame_w, self.frame_h))
                 self._prelim_dist_threshold = self.lc_dist_margin * frame_diag_px * scale_m_per_px
                 logger.info(
-                    f"Dist prefilter: поріг {self._prelim_dist_threshold:.1f} м, "
-                    f"{len(self._prelim_centers)} прикидок центрів"
+                    f"Dist prefilter: threshold {self._prelim_dist_threshold:.1f} m, "
+                    f"{len(self._prelim_centers)} preliminary centers"
                 )
 
         # ── Phase 2: Loop closure detection ──────────────────────────────────
-        self._report_progress(30, "Пошук просторових замикань (loop closure)...")
+        self._report_progress(30, "Searching spatial loop closures...")
         spatial_count = self._detect_loop_closures(optimizer, all_features, num_frames)
         logger.info(f"Phase 2 complete: {spatial_count} spatial edges (loop closures)")
         logger.info(
@@ -322,16 +319,12 @@ class PropagationPipeline:
         )
 
         # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
-        self._report_progress(60, "Фіксація GPS-якорів (Local Origin)...")
+        self._report_progress(60, "Fixing GPS anchors (Local Origin)...")
 
-        # ВИПРАВЛЕНО: якір міг потрапити на порожній слот (keyframe selection
-        # пропустила кадр) — тоді fix_node створював ізольований вузол без ребер,
-        # і якір мовчки ігнорувався оптимізацією. Снапимо до найближчого кадру
-        # з фічами: рух між сусідніми слотами в такому гепі нижчий за пороги
-        # keyframe selection, тому похибка снапу мізерна.
+        # Snap anchors to the nearest keyframe slot (one that has features).
         feature_ids = np.array(sorted(all_features.keys()), dtype=np.int64)
         if len(feature_ids) == 0:
-            self._report_error("У базі даних немає жодного кадру з фічами")
+            self._report_error("The database has no frames with features")
             return
 
         anchor_nodes: dict[int, object] = {}
@@ -345,20 +338,20 @@ class PropagationPipeline:
                 )
                 fid = nearest
             if fid in anchor_nodes:
-                # Раніше — лише warning, і другий якір мовчки зникав. Це той самий
-                # клас мовчазної втрати, що й якорі поза межами БД вище, тому й
-                # реакція та сама: зупинити і сказати користувачу.
+                # Previously only a warning was issued and the duplicate anchor was
+                # silently discarded. Same class of silent loss as anchors outside
+                # DB bounds above — halt and inform the user.
                 self._report_error(
-                    f"Якорі кадрів #{anchor_nodes[fid].frame_id} і #{anchor.frame_id} "
-                    f"після снапу до найближчого keyframe потрапили в один слот БД "
-                    f"(#{fid}) — один із них був би мовчки відкинутий. Видаліть "
-                    f"зайвий якір або перенесіть його на кадр, у якому є keyframe."
+                    f"Anchors of frames #{anchor_nodes[fid].frame_id} and #{anchor.frame_id} "
+                    f"snapped to the same DB keyframe slot "
+                    f"(#{fid}) — one would be silently discarded. Remove "
+                    f"the duplicate anchor or move it to a frame that has a keyframe."
                 )
                 return
             anchor_nodes[fid] = anchor
 
-        # Визначаємо локальну опорну точку для математичної стабільності (Local Center)
-        # Використовуємо метричну трансляцію першого якоря
+        # Establish local reference point for numerical stability (Local Center).
+        # Use the metric translation of the first anchor as origin.
         ref_anchor = anchors[0]
         origin_tx = float(ref_anchor.affine_matrix[0, 2])
         origin_ty = float(ref_anchor.affine_matrix[1, 2])
@@ -366,12 +359,12 @@ class PropagationPipeline:
         self._origin_xy = (origin_tx, origin_ty)
 
         for fid, anchor in anchor_nodes.items():
-            # Створюємо копію матриці з відносною трансляцією
+            # Build a copy of the affine with relative translation
             local_affine = anchor.affine_matrix.copy().astype(np.float64)
             local_affine[0, 2] -= origin_tx
             local_affine[1, 2] -= origin_ty
             if self.soft_anchors:
-                # σ = rmse_m якоря: GT (≈0)→floor→жорсткий; реальний (5–10 м)→м'який
+                # σ = rmse_m of anchor: GT (≈0) → floor → hard; real (5–10 m) → soft
                 optimizer.add_anchor(
                     fid,
                     local_affine,
@@ -382,13 +375,12 @@ class PropagationPipeline:
             else:
                 optimizer.fix_node(fid, local_affine)
 
-        # ── Пороги в наземних метрах (аудит 2026-08-01) ──────────────────────
-        # WEB_MERCATOR роздуває виміряні відстані в 1/cos(lat), тож метрові
-        # КОНСТАНТИ порогів означають проєкційні, а не наземні метри. Ділимо
-        # поріг на cos(lat): саме порівняння лишається в проєкційних одиницях,
-        # а константа починає читатись як наземні метри. Самоузгоджені перевірки
-        # (odometry, dist-prefilter, auto min_gap) не чіпаємо — там обидві
-        # сторони в одних одиницях. UTM / невідома широта → no-op.
+        # Ground-metric thresholds: WEB_MERCATOR stretches distances by 1/cos(lat),
+        # so constant thresholds in metres mean projected, not ground, metres.
+        # Divide by cos(lat) so comparisons stay in projected units while the
+        # constant reads as a ground metre. Self-consistent checks (odometry,
+        # dist-prefilter, auto min_gap) are left unchanged — both sides share
+        # the same units. UTM / unknown latitude → no-op.
         gap_max_dev = float(self.anchor_gap_max_dev_m)
         loo_threshold = float(self.anchor_loo_threshold_m)
         if self.ground_scale_thresholds:
@@ -397,14 +389,14 @@ class PropagationPipeline:
                 gap_max_dev /= k_ground
                 loo_threshold /= k_ground
                 logger.info(
-                    f"Наземний масштаб cos(lat)={k_ground:.4f}: пороги в проєкційних "
-                    f"метрах — проміжок {gap_max_dev:.0f}, LOO {loo_threshold:.2f}"
+                    f"Ground scale cos(lat)={k_ground:.4f}: thresholds in projected "
+                    f"metres — gap {gap_max_dev:.0f}, LOO {loo_threshold:.2f}"
                 )
 
-        # ── Етап 8.2: звірка проміжків між якорями ДО оптимізації ────────────
-        # Консистентний аліасинг (усі ребра проміжку брешуть однаково) невидимий
-        # для резидуалів; неузгоджені проміжки глушаться, їх кадри після
-        # оптимізації перезаповнюються інтерполяцією по якорях.
+        # Anchor-gap pre-check before optimization.
+        # Consistent aliasing (all edges in a gap lie uniformly) is invisible to
+        # residuals; inconsistent gaps are downweighted and their frames are
+        # replaced by anchor interpolation after optimization.
         flagged_gaps: list[tuple[int, int]] = []
         gap_report: dict = {}
         if self.anchor_gap_check:
@@ -417,14 +409,10 @@ class PropagationPipeline:
             flagged_gaps = [k for k, v in gap_report.items() if v["status"] != "ok"]
             for a, b in flagged_gaps:
                 v = gap_report[(a, b)]
-                dev = (
-                    f"розбіжність {v['dev_m']:.0f} м"
-                    if v["dev_m"] is not None
-                    else "ланцюг розірваний"
-                )
+                dev = f"deviation {v['dev_m']:.0f} m" if v["dev_m"] is not None else "chain broken"
                 logger.warning(
-                    f"Проміжок якорів #{a}→#{b} не узгоджений із VO-ланцюгом ({dev}) — "
-                    f"кадри проміжку підуть на інтерполяцію по якорях"
+                    f"Anchor gap #{a}\u2192#{b} is inconsistent with VO chain ({dev}) — "
+                    f"frames in this gap will be anchor-interpolated"
                 )
             n_dw = downweight_gap_edges(
                 optimizer.edges,
@@ -433,12 +421,11 @@ class PropagationPipeline:
             )
             if n_dw:
                 logger.info(
-                    f"Етап 8.2: приглушено {n_dw} temporal-ребер (вага ×{self.anchor_gap_downweight})"
+                    f"Stage 8.2: muted {n_dw} temporal edges (weight x{self.anchor_gap_downweight})"
                 )
 
-        # Warm start (Етап 4.2): x0 з попереднього розв'язку замість BFS з нуля.
-        # BFS нижче лишається для першого запуску та як fallback (заповнює лише
-        # вузли БЕЗ стану).
+        # Warm start: initialize from previous solution instead of BFS from scratch.
+        # BFS below remains as the fallback for first run and for uninitialised nodes.
         if self.warm_start:
             prev = self._load_previous_affines()
             if prev:
@@ -457,7 +444,7 @@ class PropagationPipeline:
             logger.info("Phase 3 complete: BFS initialization skipped (disabled)")
 
         # ── Phase 4: Optimize ────────────────────────────────────────────────
-        self._report_progress(70, "Глобальна оптимізація графу (Levenberg-Marquardt)...")
+        self._report_progress(70, "Global graph optimisation (Levenberg-Marquardt)...")
         results = optimizer.optimize(
             max_iterations=self.max_iters,
             tolerance=self.tolerance,
@@ -473,16 +460,17 @@ class PropagationPipeline:
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
 
-        # Звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших, anchor stress
+        # Propagation diagnostics: edge classes, residuals, worst frames, anchor stress
         try:
             logger.info(
-                "Звіт пропагації:\n" + optimizer.format_diagnostics(loo_threshold_m=loo_threshold)
+                "Propagation report:\n"
+                + optimizer.format_diagnostics(loo_threshold_m=loo_threshold)
             )
         except Exception as diag_err:
             logger.warning(f"Diagnostics report failed: {diag_err}")
 
-        # ── Етап 8.2: кадри неузгоджених проміжків → на інтерполяцію по якорях.
-        # Рахуємо в ЛОКАЛЬНИХ координатах (до відновлення origin).
+        # Frames from inconsistent gaps → anchor interpolation.
+        # Computed in LOCAL coordinates (before origin is restored).
         force_invalid: set[int] = set()
         if self.anchor_gap_check and flagged_gaps:
             cxp, cyp = self.frame_w / 2.0, self.frame_h / 2.0
@@ -498,21 +486,21 @@ class PropagationPipeline:
             )
             if force_invalid:
                 logger.info(
-                    f"Етап 8.2: {len(force_invalid)} кадрів перезаповнюються інтерполяцією "
-                    f"(відхилення від лінії якорів > {gap_max_dev:.0f} м): "
+                    f"Stage 8.2: {len(force_invalid)} frames replaced by anchor interpolation "
+                    f"(deviation from anchor line > {gap_max_dev:.0f} m): "
                     f"{sorted(force_invalid)}"
                 )
 
-        # Відновлюємо абсолютні координати (додаємо Local Origin назад)
+        # Restore absolute coordinates (add Local Origin back)
         for fid in results:
             results[fid][0, 2] += origin_tx
             results[fid][1, 2] += origin_ty
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
-        self._report_progress(85, "Збереження результатів у HDF5...")
+        self._report_progress(85, "Saving results to HDF5...")
         valid_count = self._save_to_hdf5(results, anchors, optimizer, force_invalid=force_invalid)
 
-        # Експорт GeoJSON для візуалізації
+        # Export GeoJSON for visualisation
         if self.export_geojson and self.calibration.converter:
             try:
                 geojson = optimizer.export_graph_geojson(
@@ -531,35 +519,31 @@ class PropagationPipeline:
 
         self._report_progress(
             100,
-            f"Готово! {valid_count}/{num_frames} кадрів отримали координати "
-            f"({temporal_count} часових + {spatial_count} просторових ребер).",
+            f"Done! {valid_count}/{num_frames} frames received coordinates "
+            f"({temporal_count} temporal + {spatial_count} spatial edges).",
         )
         self._report_completed()
 
     # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
 
-    # Частка НЕОЧІКУВАНИХ помилок читання, вище якої база вважається битою.
-    # Порожні слоти (ValueError) сюди не входять — це нормальний стан.
+    # Fraction of UNEXPECTED read errors above which the database is considered corrupt.
+    # Empty slots (ValueError) are excluded — that is normal for keyframe-selective DBs.
     _PREFETCH_MAX_ERROR_FRAC = 0.01
-    # Чи вже відрапортував _prefetch_features помилку користувачу (щоб
-    # викликач не дублював повідомлення). Клас-рівневий дефолт — страховка
-    # на випадок читання до першого виклику.
+    # Whether _prefetch_features has already reported an error to the user,
+    # to avoid duplicate messages from the caller.
     _prefetch_reported_error = False
 
     def _prefetch_features(self, num_frames: int) -> dict:
-        """Завантажує всі фічі в RAM.
+        """Load all features into RAM.
 
-        Раніше тут стояв голий ``except Exception: pass`` без логування: биту
-        HDF5, брак прав і «у цьому слоті немає keyframe» було не відрізнити,
-        пропагація мовчки будувала граф на менший набір вузлів і рапортувала
-        успіх. Тепер два класи розділені:
+        Two error classes are distinguished:
 
-        * ``ValueError`` / ``KeyError`` — слот порожній або відсутній. Штатно
-          для keyframe-селекції, рахуємо й не шумимо.
-        * будь-що інше (OSError на битому файлі, MemoryError…) — реальна
-          проблема: логуємо з деталями і, якщо таких понад
-          ``_PREFETCH_MAX_ERROR_FRAC``, зупиняємо пропагацію замість тихої
-          видачі неправильної калібрації.
+        * ``ValueError`` / ``KeyError`` — empty or missing slot. Expected for
+          keyframe-selective databases; counted silently.
+        * Any other exception (OSError on a corrupt file, MemoryError, …) —
+          a real problem: logged with details, and if such errors exceed
+          ``_PREFETCH_MAX_ERROR_FRAC`` the propagation is aborted rather than
+          silently producing a wrong calibration.
         """
         features: dict = {}
         n_empty = 0
@@ -573,12 +557,12 @@ class PropagationPipeline:
             try:
                 features[i] = self.database.get_local_features(i)
             except (ValueError, KeyError):
-                # Порожній/відсутній слот — очікувано.
+                # Empty/missing slot — expected.
                 n_empty += 1
-            except Exception as e:  # noqa: BLE001 — класифікуємо і рапортуємо нижче
+            except Exception as e:  # noqa: BLE001 — classify and report below
                 n_error += 1
                 if len(first_errors) < 5:
-                    first_errors.append(f"кадр {i}: {type(e).__name__}: {e}")
+                    first_errors.append(f"frame {i}: {type(e).__name__}: {e}")
             if i % 500 == 0:
                 self._report_progress(
                     int(i / num_frames * 8),
@@ -587,11 +571,11 @@ class PropagationPipeline:
 
         logger.info(
             f"Prefetched features for {len(features)}/{num_frames} frames "
-            f"(порожніх слотів: {n_empty}, помилок читання: {n_error})"
+            f"(empty slots: {n_empty}, read errors: {n_error})"
         )
         if first_errors:
             logger.error(
-                "Помилки читання фіч із бази (перші %d):\n  %s",
+                "Feature read errors from database (first %d):\n  %s",
                 len(first_errors),
                 "\n  ".join(first_errors),
             )
@@ -600,11 +584,11 @@ class PropagationPipeline:
         if n_error > max_errors:
             self._prefetch_reported_error = True
             self._report_error(
-                f"Не вдалося прочитати фічі для {n_error} із {num_frames} кадрів "
-                f"(поріг {max_errors}). Найімовірніше база пошкоджена або "
-                f"недоступна для читання. Пропагацію зупинено, щоб не видати "
-                f"неправильну калібрацію.\nПерша помилка: "
-                f"{first_errors[0] if first_errors else 'н/д'}"
+                f"Failed to read features for {n_error} of {num_frames} frames "
+                f"(threshold {max_errors}). The database is most likely corrupted or "
+                f"unreadable. Propagation stopped to avoid producing "
+                f"an incorrect calibration.\nFirst error: "
+                f"{first_errors[0] if first_errors else 'n/a'}"
             )
             return {}
 
@@ -616,18 +600,14 @@ class PropagationPipeline:
         features: dict,
         num_frames: int,
     ) -> int:
-        """Побудова часових ребер між послідовними кадрами."""
+        """Build sequential temporal edges between adjacent keyframe slots."""
         count = 0
         self._n_rotation_retry = 0
         n_gated = 0
         n_bridged = 0
         n_spread_down = 0
-        # ВИПРАВЛЕНО (раніше): ребро будується до попереднього кадру-З-ФІЧАМИ,
-        # незалежно від гепа keyframe selection. Етап 8 (2026-07-12): опційно
-        # (а) санітарний гейт трансформації ребра, (б) мости через розриви —
-        # якщо матч із найближчим сусідом упав/відсіяний, пробуємо глибших
-        # (до max_skip_frames), щоб ланцюг не розпадався на «острови» та
-        # «апендикси» без другого якоря (кадри 1–21 lasttest → відліт на км).
+        # Build temporal edges between consecutive frames with features.
+        # Geometric consistency gates and skip-bridge fallbacks are applied.
         recent: list[tuple[int, dict]] = []
 
         for i in range(num_frames):
@@ -663,16 +643,16 @@ class PropagationPipeline:
                         )
                         if not ok:
                             n_gated += 1
-                            logger.debug(f"Temporal gate відсіяв {last_id}→{i}: {reason}")
+                            logger.debug(f"Temporal gate rejected {last_id}\u2192{i}: {reason}")
                             continue
                     weight = self._compute_weight(inliers, rmse_val, self.temporal_base_w)
-                    # 6.2: менша довіра кадрам із нахилом/рельєфом (великий залишок
-                    # афінного фіту H). Лише первинний матч (result), не rotation-retry.
+                    # Reduced trust for frames with tilt/relief (large affine fit residual H).
+                    # Applies only to the primary match (result), not rotation-retry.
                     if self.temporal_weight_use_fit and result is not None:
                         fit_res = affine_fit_residual(result[0], self.frame_w, self.frame_h)
                         if fit_res is not None:
                             weight *= 1.0 / (1.0 + self.temporal_fit_k * fit_res)
-                    # ADDENDUM 1.1: скупчені інлаєри → ill-conditioned H → менша довіра.
+                    # Clustered inliers → ill-conditioned H → reduced weight.
                     if self.edge_spread_weight:
                         sf = spread_weight_factor(spread, self.edge_spread_ref, self.edge_spread_k)
                         if sf < 1.0:
@@ -700,26 +680,25 @@ class PropagationPipeline:
             if i % 200 == 0:
                 self._report_progress(
                     10 + int(i / num_frames * 18),
-                    f"Часові ребра: {count} (кадр {i}/{num_frames})",
+                    f"Temporal edges: {count} (frame {i}/{num_frames})",
                 )
 
         if self.rotation_retry and self._n_rotation_retry:
-            logger.info(f"Rotation-retry врятував {self._n_rotation_retry} temporal-ребер")
+            logger.info(f"Rotation-retry saved {self._n_rotation_retry} temporal edges")
         if n_gated:
-            logger.info(f"Temporal gate відсіяв {n_gated} ребер (дегенеративні трансформації)")
+            logger.info(f"Temporal gate rejected {n_gated} edges (degenerate transforms)")
         if n_bridged:
-            logger.info(f"Skip-мости з'єднали {n_bridged} розривів temporal-ланцюга")
+            logger.info(f"Skip-bridges connected {n_bridged} temporal-chain breaks")
         if n_spread_down:
             logger.info(
-                f"Spatial collapse: {n_spread_down}/{count} temporal-ребер отримали "
-                f"знижену вагу (інлаєри скупчені, ref={self.edge_spread_ref})"
+                f"Spatial collapse: {n_spread_down}/{count} temporal edges received "
+                f"reduced weight (inliers clustered, ref={self.edge_spread_ref})"
             )
         return count
 
     def _try_temporal_pair(self, feat_i, last_feat, last_id, i):
-        """Одна спроба temporal-матчу пари (last_id → i): основний матч +
-        (за прапорцем) rotation-retry (Етап 5). Повертає
-        (similarity | None, inliers, rmse, result_or_None)."""
+        """One temporal-match attempt for pair (last_id → i): primary match plus
+        optional rotation-retry. Returns (similarity | None, inliers, rmse, result_or_None)."""
         similarity = None
         inliers = 0
         rmse_val = 0.0
@@ -730,8 +709,7 @@ class PropagationPipeline:
             H, inliers, rmse_val, _n_matches, spread = result
             similarity = homography_to_similarity(H, self.frame_w, self.frame_h)
 
-        # Ротаційна робастність (Етап 5): матч упав → пробуємо з поворотом
-        # query на кут ланцюга frame_poses, далі перебір k·90°.
+        # Rotation robustness: match failed → retry with query rotated by chain angle
         if similarity is None and self.rotation_retry:
             retry = self._temporal_rotation_retry(feat_i, last_feat, last_id, i)
             if retry is not None:
@@ -741,14 +719,16 @@ class PropagationPipeline:
         return similarity, inliers, rmse_val, result, spread
 
     def _temporal_rotation_retry(self, feat_i, last_feat, from_id, to_id):
-        """Повторний temporal-матч із поворотом query (Етап 5). Повертає
-        (similarity, inliers, rmse, spread) або None. Кут — із ланцюга
-        frame_poses БД (одометричний пріор), fallback — перебір k·90°. Отриману
-        H_r (rotated_query→ref) компонуємо назад: H_true = H_r · R(θ).
+        """Re-attempt temporal match with a rotated query frame.
 
-        ``spread`` рахується по ПОВЕРНУТИХ точках, тобто в тому ж кадрі, що й
-        матч — розкид інваріантний до повороту навколо центру, тож значення
-        порівнянне зі значеннями звичайних ребер."""
+        Returns (similarity, inliers, rmse, spread) or None.
+        Angle is derived from the frame_poses chain in the DB (odometric prior),
+        with fallback to k×90° search.
+        The recovered H_r (rotated_query→ref) is composed back: H_true = H_r · R(θ).
+
+        ``spread`` is computed on the rotated keypoints (same frame as the match),
+        so the value is rotation-invariant and comparable to ordinary edges.
+        """
         from src.localization.rotation_geometry import (
             chain_relative_angle_deg,
             rotate_keypoints,
@@ -760,7 +740,7 @@ class PropagationPipeline:
         chain_angle = None
         fp = getattr(self.database, "frame_poses", None)
         if fp is not None and 0 <= to_id < len(fp) and 0 <= from_id < len(fp):
-            # to→from: кут, яким повертаємо query(to), щоб вирівняти з ref(from)
+            # to→from: the angle by which we rotate query(to) to align with ref(from)
             chain_angle = chain_relative_angle_deg(fp[to_id], fp[from_id])
 
         for ang_deg in temporal_retry_angles(chain_angle, use_chain=chain_angle is not None):
@@ -788,14 +768,14 @@ class PropagationPipeline:
         features: dict,
         num_frames: int,
     ) -> int:
-        """Знаходить просторові замикання через DINOv2 (LanceDB/FAISS) + LightGlue matching."""
+        """Detect spatial loop closures via DINOv2 (LanceDB/FAISS) + feature matching."""
 
         has_lancedb = (
             hasattr(self.database, "lance_table") and self.database.lance_table is not None
         )
         lance_table = self.database.lance_table if has_lancedb else None
 
-        # Завантажуємо вектори для швидкого пошуку
+        # Load global descriptor vectors for retrieval
         global_desc_dict = {}
 
         if has_lancedb:
@@ -818,13 +798,13 @@ class PropagationPipeline:
             logger.warning("No global descriptors available — skipping loop closure detection")
             return 0
 
-        # Нормалізація векторів
+        # Normalise vectors
         normed_dict = {}
         for fid, vec in global_desc_dict.items():
             norm = np.linalg.norm(vec)
             normed_dict[fid] = vec / (norm + 1e-8) if norm > 0 else vec
 
-        # Побудова FAISS індексу якщо немає LanceDB
+        # Build FAISS index if no LanceDB
         faiss_index = None
         faiss_id_map = []
         if not has_lancedb:
@@ -837,7 +817,7 @@ class PropagationPipeline:
             faiss_index.add(np.array(mat, dtype=np.float32))
             logger.info(f"FAISS index built: {faiss_index.ntotal} vectors, dim={dim}")
 
-        # ── Pass 1: retrieval top-k для всіх кадрів (для взаємної перевірки 2.2) ──
+        # Pass 1: retrieve top-k candidates for all frames (for mutual-check gate)
         retrieval: dict[int, list[tuple[int, float]]] = {}
         for i in range(num_frames):
             if not self._is_running:
@@ -850,7 +830,7 @@ class PropagationPipeline:
             )
         topk_sets = {fid: {int(j) for j, _ in cands} for fid, cands in retrieval.items()}
 
-        # ── Pass 2: збір spatial-кандидатів + гейти (Етап 2) ──
+        # Pass 2: collect spatial candidates + gates
         already_matched: set[tuple[int, int]] = set()
         specs: list[dict] = []
         n_gated_phys = 0
@@ -878,13 +858,13 @@ class PropagationPipeline:
                     continue
                 already_matched.add(edge_key)
 
-                # 2.2 взаємність retrieval: j теж має бачити i у своєму top-k
+                # Mutual retrieval check: j must also see i in its top-k
                 if self.edge_gate_enabled and self.edge_gate_mutual:
                     if i not in topk_sets.get(j, ()):
                         n_gated_mutual += 1
                         continue
 
-                # 2.2 дистанційний префільтр: якщо прикидки центрів далеко — не матчимо
+                # Distance pre-filter: skip if estimated centers are too far apart
                 if self.lc_dist_prefilter and self._prelim_dist_threshold > 0:
                     ci = self._prelim_centers.get(i)
                     cj = self._prelim_centers.get(j)
@@ -916,7 +896,7 @@ class PropagationPipeline:
                 if similarity is None:
                     continue
 
-                # 2.1 фізичні межі відносної трансформації
+                # Physical bounds gate on relative transformation
                 if self.edge_gate_enabled and not self._passes_physical_gate(
                     similarity, inliers, n_matches, spread
                 ):
@@ -938,16 +918,16 @@ class PropagationPipeline:
             if i % 200 == 0:
                 self._report_progress(
                     30 + int(i / num_frames * 28),
-                    f"Loop closure: {len(specs)} кандидатів (кадр {i}/{num_frames})",
+                    f"Loop closure: {len(specs)} candidates (frame {i}/{num_frames})",
                 )
 
-        # ── Pass 3: кластерна узгодженість (2.3) + фінальні ваги + додавання ──
+        # Pass 3: cluster consistency + final weights + edge insertion
         cluster_factor = (
             self._cluster_consistency_factors(specs)
             if (self.edge_gate_enabled and self.edge_gate_cluster)
             else None
         )
-        # 2.3 odometry-consistency: несумісні з temporal-ланцюгом spatial-ребра → ×factor
+        # Odometry-consistency: spatial edges inconsistent with temporal chain → ×factor
         odometry_factor = (
             optimizer.odometry_consistency_factors(
                 specs,
@@ -966,11 +946,11 @@ class PropagationPipeline:
             weight = self._compute_weight(spec["inliers"], spec["rmse"], self.spatial_base_w)
             if self.spatial_weight_use_sim:  # 4.3: w *= 0.5 + 0.5·sim
                 weight *= 0.5 + 0.5 * max(0.0, min(1.0, spec["sim"]))
-            if cluster_factor is not None:  # 2.3 (cluster): самотнє ребро → ×0.5
+            if cluster_factor is not None:  # 2.3 (cluster): isolated edge → x0.5
                 weight *= cluster_factor[idx]
-            if odometry_factor is not None:  # 2.3 (odometry): несумісне ребро → ×factor
+            if odometry_factor is not None:  # 2.3 (odometry): inconsistent edge → xfactor
                 weight *= odometry_factor[idx]
-            if self.edge_spread_weight:  # ADDENDUM 1.1: скупчені інлаєри → ×factor
+            if self.edge_spread_weight:  # 1.1: clustered inliers → xfactor
                 weight *= spread_weight_factor(
                     spec.get("spread"), self.edge_spread_ref, self.edge_spread_k
                 )
@@ -986,19 +966,19 @@ class PropagationPipeline:
 
         if self.edge_gate_enabled or self.lc_dist_prefilter or self.lc_odometry_check:
             logger.info(
-                f"Edge gating: {n_gated_phys} відсіяно фізично, "
-                f"{n_gated_mutual} за взаємністю retrieval, "
-                f"{n_gated_dist} дистанційним префільтром; "
-                f"{n_odo_down} ребер ×odometry-factor (несумісні з ланцюгом)"
+                f"Edge gating: {n_gated_phys} rejected by physics, "
+                f"{n_gated_mutual} by mutual retrieval, "
+                f"{n_gated_dist} by distance prefilter; "
+                f"{n_odo_down} edges xodometry-factor (inconsistent with chain)"
             )
         return len(specs)
 
-    # ─── Гейти ребер (Етап 2) ────────────────────────────────────────────────
+    # ─── Edge gates ───────────────────────────────────────────────────────────
 
     def _retrieve_candidates(
         self, q, has_lancedb, lance_table, faiss_index, faiss_id_map
     ) -> list[tuple[int, float]]:
-        """top-k схожих кадрів (id, similarity). Логіка ідентична попередній."""
+        """Return top-k similar frames as (id, similarity) pairs."""
         candidates: list[tuple[int, float]] = []
         if has_lancedb:
             try:
@@ -1012,8 +992,8 @@ class PropagationPipeline:
                 for r in res:
                     candidates.append((int(r["frame_id"]), max(0.0, 1.0 - r["_distance"])))
             except Exception as e:
-                # Мовчазний pass тут означав: loop closures просто не знаходяться,
-                # карта деградує, у логах — жодного сліду.
+                # Previously a silent pass here meant loop closures were simply
+                # not found; the map degraded with no trace in the logs.
                 logger.warning(
                     f"LanceDB retrieval failed — loop-closure candidates lost "
                     f"for this frame ({type(e).__name__}: {e})"
@@ -1029,12 +1009,12 @@ class PropagationPipeline:
     def _passes_physical_gate(
         self, similarity, inliers: int, n_matches: int, spread: float | None = None
     ) -> bool:
-        """Фізичні межі відносної трансформації хибного loop closure (2.1).
+        """Check physical bounds of the relative transformation for a potential loop closure.
 
-        ``spread`` (ADDENDUM 1.1) — жорсткий відсів лише на екстремумі
-        (``edge_gate_min_spread``, дефолт 0.0 = вимкнено): всі інлаєри в
-        крихітній зоні кадру = вироджена оцінка, а не слабке ребро.
-        Помірне скупчення обробляється вагою (``edge_spread_weight``), не тут.
+        ``spread`` — hard rejection only at the extreme (``edge_gate_min_spread``,
+        default 0.0 = disabled): all inliers concentrated in a tiny image region
+        indicates a degenerate estimate, not a merely weak edge.
+        Moderate clustering is handled by edge weight (``edge_spread_weight``), not here.
         """
         _, _, sx, sy, angle = decompose_affine_5dof(similarity)
         if abs(np.degrees(angle)) > self.edge_gate_max_rot:
@@ -1053,7 +1033,7 @@ class PropagationPipeline:
         return True
 
     def _cluster_consistency_factors(self, specs: list[dict], window: int = 3) -> list[float]:
-        """Самотнє loop closure без сусіда з близькими кінцями → вага ×0.5 (2.3)."""
+        """Reduce the weight of a loop closure that has no nearby supporting closure (×0.5)."""
         factors = [1.0] * len(specs)
         for a in range(len(specs)):
             ia, ja = specs[a]["i"], specs[a]["j"]
@@ -1080,9 +1060,9 @@ class PropagationPipeline:
         optimizer: PoseGraphOptimizer,
         force_invalid: set[int] | None = None,
     ) -> int:
-        """Зберігає оптимізовані афінні матриці у HDF5.
+        """Save optimised affine matrices to HDF5.
 
-        Формат 100% сумісний з існуючим DatabaseLoader.
+        Format is 100% compatible with the existing DatabaseLoader.
         """
         num_frames = self.database.get_num_frames()
         frame_affine = np.zeros((num_frames, 2, 3), dtype=np.float64)
@@ -1091,11 +1071,9 @@ class PropagationPipeline:
         frame_disagreement = np.zeros(num_frames, dtype=np.float64)
         frame_matches = np.zeros(num_frames, dtype=np.int32)
 
-        # Записуємо результати оптимізації
-        # Оскільки optimizer повертає ТІЛЬКИ досяжні вузли,
-        # незв'язані кадри залишаться з frame_valid = False
-        # Етап 8.2: кадри неузгоджених проміжків пропускаємо — їх заповнить
-        # штатна інтерполяція (pchip/лінійна) по якорях і валідних сусідах.
+        # Write optimisation results.
+        # optimizer only returns reachable nodes; unreachable frames stay frame_valid=False.
+        # Frames from inconsistent gaps are skipped and filled by standard interpolation.
         skip = force_invalid or set()
         for frame_id, affine in results.items():
             if 0 <= frame_id < num_frames and frame_id not in skip:
@@ -1106,7 +1084,7 @@ class PropagationPipeline:
         if filled_count > 0:
             logger.info(f"Interpolated coordinates for {filled_count} missing frames")
 
-        # Обчислюємо QA метрики з ребер графу
+        # Compute QA metrics from graph edges
         edge_stats: dict[int, list[tuple[int, float]]] = {}
         for edge in optimizer.edges:
             for fid in (edge.from_id, edge.to_id):
@@ -1114,29 +1092,29 @@ class PropagationPipeline:
                     edge_stats.setdefault(fid, []).append((edge.inliers, edge.rmse))
 
         for fid, stats in edge_stats.items():
-            # РОБИМО РОЗРАХУНОК ТІЛЬКИ ДЛЯ ВАЛІДНИХ КАДРІВ
+            # Only compute for valid frames
             if fid < num_frames and frame_valid[fid]:
                 inliers_list = [s[0] for s in stats]
                 rmse_list = [s[1] for s in stats if s[1] > 0]
                 frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
                 frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
 
-        # ── Disagreement ────────────────────────────────────────────────────
-        # Читається у ResultBuilder.compute_confidence (stability_score, далі R
-        # у Калмані), тож форма метрики має значення для ЖИВОЇ локалізації.
+        # Disagreement metric: read by ResultBuilder.compute_confidence (stability_score,
+        # then R in Kalman), so the metric shape matters for live localisation.
         #
-        # Історична форма (дефолт, true_disagreement=False): std від tx сусідніх
-        # кадрів. tx = M[0,2] — метрична позиція пікселя (0,0), а не центру, тож
-        # величина змішує рух і ПОВОРОТ сусіда і сягає десятків метрів. Проти
-        # confidence.disagreement_norm_m = 5.0 вона насичується для кожного
-        # кадру з ≥2 ребрами, а кадр з одним ребром отримує рівно 0 — гірше
-        # зв'язаний кадр виглядає стабільнішим за краще зв'язаний.
+        # Legacy form (default, true_disagreement=False): std of tx of neighbouring
+        # frames. tx=M[0,2] is the metric position of pixel (0,0), not the frame
+        # centre, so the value mixes motion and rotation of the neighbour and can
+        # reach tens of metres. Against confidence.disagreement_norm_m=5.0 it
+        # saturates for every frame with ≥2 edges, while a frame with one edge
+        # gets exactly 0 — a less-connected frame looks more stable than a
+        # better-connected one.
         #
-        # Нова форма (true_disagreement=True): наскільки самі ребра розходяться
-        # в тому, ДЕ цей кадр — середній розкид передбачень його центру кожним
-        # інцидентним ребром. Стани оптимізатора локальні (Local Origin ще не
-        # повернуто в них), але розкид інваріантний до трансляції, тож змішування
-        # систем координат тут неможливе.
+        # New form (true_disagreement=True): how much the edges themselves disagree
+        # about where this frame is — average spread of centre predictions from
+        # each incident edge. Optimiser states are local (Local Origin not yet
+        # restored), but the spread is translation-invariant, so coordinate mixing
+        # is impossible.
         adj = defaultdict(list)
         for e in optimizer.edges:
             adj[e.from_id].append(e)
@@ -1149,7 +1127,7 @@ class PropagationPipeline:
                 if not frame_valid[fid] or fid not in results:
                     continue
                 preds = []
-                for e in adj[fid][:5]:  # Обмежуємо для швидкодії
+                for e in adj[fid][:5]:  # Limit for performance
                     other_id = e.from_id if e.to_id == fid else e.to_id
                     st = states.get(other_id)
                     if st is None:
@@ -1172,24 +1150,23 @@ class PropagationPipeline:
                 edges_to_fid = adj[fid]
                 if len(edges_to_fid) >= 2:
                     predictions_tx = []
-                    for e in edges_to_fid[:5]:  # Обмежуємо для швидкодії
+                    for e in edges_to_fid[:5]:  # Limit for performance
                         other_id = e.from_id if e.to_id == fid else e.to_id
                         other_affine = results.get(other_id)
 
-                        # Перевіряємо, чи сусідній кадр також валідний
+                        # Check that the neighbouring frame is also valid
                         if other_affine is not None:
                             comp = decompose_affine(other_affine)
                             predictions_tx.append(comp[0])  # tx
                     if len(predictions_tx) >= 2:
                         frame_disagreement[fid] = float(np.std(predictions_tx))
 
-        # --- Збереження в HDF5 ---
-        # Тримаємо лок БД на весь цикл close → write → reload: інакше
-        # конкурентний get_local_features із GUI/трекінгу впаде на закритому
-        # h5py-хендлі (RuntimeError у кращому разі, сегфолт у гіршому).
+        # Save to HDF5.
+        # The DB lock is held for the entire close → write → reload cycle to
+        # prevent concurrent get_local_features from the GUI/tracking thread
+        # from crashing on a closed h5py handle.
         db_path = self.database.db_path
-        # HARDENING P1-6: refuse before touching the handle — a rewrite here would
-        # replace an encrypted map with plaintext inside a deployment copy.
+        # Guard against writing to encrypted deployment containers.
         assert_project_writable(db_path)
         self.database.lock.acquire()
         self.database.close()
@@ -1199,7 +1176,7 @@ class PropagationPipeline:
                     del f["calibration"]
                 grp = f.create_group("calibration")
 
-                grp.attrs["version"] = "3.0"  # Нова версія: графова оптимізація
+                grp.attrs["version"] = "3.0"  # New version: graph optimisation
                 grp.attrs["num_anchors"] = len(anchors)
                 grp.attrs["anchors_json"] = json.dumps(
                     [a.to_dict() for a in anchors], ensure_ascii=False
@@ -1225,8 +1202,7 @@ class PropagationPipeline:
                 )
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
-                # Обчислюємо та зберігаємо frame_gps (lat/lon для кожного кадру)
-                # Для мультиджерельної геолокалізації — дозволяє SpatialIndex
+                # Compute and save frame_gps (lat/lon per frame) for SpatialIndex
                 if self.calibration.converter and self.calibration.converter.is_initialized:
                     frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
                     gps_count = 0
@@ -1236,7 +1212,7 @@ class PropagationPipeline:
                         if not frame_valid[fid]:
                             continue
                         affine = frame_affine[fid]
-                        # Центр кадру в пікселях → metric через affine
+                        # Frame centre in pixels → metric via affine
                         center_px = np.array(
                             [[self.frame_w / 2.0, self.frame_h / 2.0]], dtype=np.float64
                         )
@@ -1250,16 +1226,15 @@ class PropagationPipeline:
                                 frame_gps[fid] = [lat, lon]
                                 gps_count += 1
                             except Exception as e:
-                                # Раніше збій ковтався мовчки: при систематичній
-                                # помилці конвертера (побита метадата проєкції)
-                                # у HDF5 лягав майже порожній frame_gps без
-                                # жодного сліду в лозі. Лічильник + перша
-                                # причина повідомляються після циклу.
+                                # Previously failures were swallowed silently; with a
+                                # systematic converter error the HDF5 frame_gps was
+                                # nearly empty with no log entry. Counter + first
+                                # cause are now reported after the loop.
                                 gps_failed += 1
                                 if gps_first_error is None:
                                     gps_first_error = repr(e)
 
-                    # Видаляємо старий датасет якщо є
+                    # Remove old dataset if present
                     if "frame_gps" in f:
                         del f["frame_gps"]
                     f.create_dataset("frame_gps", data=frame_gps, compression="gzip")
@@ -1286,14 +1261,14 @@ class PropagationPipeline:
 
         return int(np.sum(frame_valid))
 
-    # ─── Допоміжні методи ────────────────────────────────────────────────────
+    # ─── Helper methods ───────────────────────────────────────────────────────
 
     def _ground_scale_factor(self, anchors) -> float:
-        """cos(lat) для переведення наземних метрів у проєкційні (WEB_MERCATOR).
+        """Return cos(lat) to convert ground metres to projected metres (WEB_MERCATOR).
 
-        Широта береться з GPS-точок першого якоря, який їх має, далі —
-        з reference_gps конвертера. UTM, невідома широта або будь-яка
-        помилка → 1.0 (порогів не чіпаємо).
+        Latitude is taken from GPS points of the first anchor that has them,
+        then from the converter's reference_gps. UTM, unknown latitude, or any
+        error → 1.0 (thresholds unchanged).
         """
         converter = getattr(self.calibration, "converter", None)
         if converter is None:
@@ -1306,12 +1281,12 @@ class PropagationPipeline:
                 break
         try:
             return float(converter.ground_scale_factor(lat))
-        except Exception as e:  # noqa: BLE001 — поріг важливіший за причину
+        except Exception as e:  # noqa: BLE001 — threshold matters more than reason
             logger.warning(f"Ground scale factor unavailable ({e}) — using 1.0")
             return 1.0
 
     def _load_previous_affines(self) -> dict[int, np.ndarray]:
-        """Завантажує frame_affine попереднього калібрування з HDF5 (warm start)."""
+        """Load frame_affine from the previous HDF5 calibration for warm start."""
         try:
             with h5py.File(self.database.db_path, "r") as f:
                 if "calibration" not in f or "frame_affine" not in f["calibration"]:
@@ -1320,20 +1295,20 @@ class PropagationPipeline:
                 fv = f["calibration"]["frame_valid"][:].astype(bool)
             return {i: fa[i] for i in range(len(fa)) if fv[i]}
         except Exception as e:
-            logger.warning(f"Warm start: не вдалось прочитати попередній розв'язок: {e}")
+            logger.warning(f"Warm start: failed to read previous solution: {e}")
             return {}
 
     def _match_and_build_edge(
         self, features_a: dict, features_b: dict
     ) -> tuple[np.ndarray, int, float, int, float | None] | None:
-        """Матчить дві фічі та повертає (H, inliers, rmse, n_matches, spread) або None.
+        """Match two feature sets and return (H, inliers, rmse, n_matches, spread) or None.
 
         H maps features_a (src) → features_b (dst).
 
-        ``spread`` (ADDENDUM 1.1) — просторовий розкид інлаєрів у кадрі src;
-        ``None``, якщо порахувати неможливо. Раніше точки інлаєрів тут
-        обчислювались і викидались — лишався тільки їхній лічильник, а він
-        скупчення всіх точок в одному кутку кадру не бачить.
+        ``spread`` — spatial spread of inliers in the src frame;
+        ``None`` if it cannot be computed. Previously inlier points were computed
+        here and discarded — only the count remained, which cannot detect all
+        points clustered in one image corner.
         """
         try:
             mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
@@ -1342,8 +1317,8 @@ class PropagationPipeline:
                 and self.mnn_fallback
                 and hasattr(self.matcher, "match_mnn")
             ):
-                # Етап 8: LightGlue «сліпне» на повторюваній ріллі (12–28 матчів
-                # там, де MNN по тих самих дескрипторах бачить 100–800 пар).
+                # MNN fallback: LightGlue is blind on repetitive farmland
+                # (12–28 matches vs. MNN's 100–800 on the same descriptors).
                 mkpts_a, mkpts_b = self.matcher.match_mnn(features_a, features_b)
             if len(mkpts_a) < self.min_matches:
                 return None
@@ -1378,14 +1353,16 @@ class PropagationPipeline:
 
     @staticmethod
     def _compute_weight(inliers: int, rmse: float, base_weight: float) -> float:
-        """Обчислює вагу ребра: w = base * √inliers / (1 + RMSE)."""
+        """Compute edge weight: w = base * √inliers / (1 + RMSE)."""
         return base_weight * np.sqrt(max(inliers, 1)) / (1.0 + rmse)
 
     def _fill_gaps_pchip(self, frame_affine, frame_valid, valid_ids):
-        """PCHIP-заповнення (Етап 4): центр-базова shape-preserving 5-DoF інтерполяція
-        над УСІМА валідними кадрами (спільний білдер із MultiAnchorCalibration).
-        Кадри поза діапазоном валідних — clamp до крайнього (як лінійна екстраполяція).
-        None → білдер не зібрав інтерполятор → fallback на лінійну."""
+        """PCHIP gap fill over all valid frames.
+
+        Shape-preserving 5-DoF interpolation (shared builder with MultiAnchorCalibration).
+        Frames outside the valid range are clamped to the boundary (constant extrapolation).
+        Returns None if the interpolator could not be built → falls back to linear.
+        """
         from src.geometry.affine_utils import build_5dof_pchip, sample_5dof_pchip
 
         ref_px = (self.frame_w / 2.0, self.frame_h / 2.0)
@@ -1408,10 +1385,10 @@ class PropagationPipeline:
         return filled
 
     def _fill_gaps_by_interpolation(self, frame_affine: np.ndarray, frame_valid: np.ndarray) -> int:
-        """5-DoF інтерполяція кадрів, пропущених через Keyframe Selection.
+        """5-DoF interpolation for frames skipped by keyframe selection.
 
-        Дефолт — посегментна лінійна. За прапорцем pchip_gap_fill — shape-preserving
-        PCHIP над усіма валідними кадрами (Етап 4), що прибирає «сходинки» на дугах.
+        Default: piecewise linear. With pchip_gap_fill: shape-preserving PCHIP
+        over all valid frames, which removes staircase artefacts on curved paths.
         """
         valid_ids = np.where(frame_valid)[0]
         if len(valid_ids) < 1:
@@ -1420,18 +1397,18 @@ class PropagationPipeline:
         if self.pchip_gap_fill and len(valid_ids) >= 2:
             pchip_filled = self._fill_gaps_pchip(frame_affine, frame_valid, valid_ids)
             if pchip_filled is not None:
-                return pchip_filled  # інакше — fallback на лінійну нижче
+                return pchip_filled  # otherwise fall back to linear below
 
         filled = 0
 
-        # Екстраполяція на початок
+        # Extrapolate before first valid frame
         first_valid = valid_ids[0]
         for mid in range(0, first_valid):
             frame_affine[mid] = frame_affine[first_valid].copy()
             frame_valid[mid] = True
             filled += 1
 
-        # Інтерполяція розривів всередині траєкторії
+        # Interpolate gaps within the trajectory
         if len(valid_ids) >= 2:
             for i in range(len(valid_ids) - 1):
                 left = valid_ids[i]
@@ -1440,19 +1417,18 @@ class PropagationPipeline:
                 if gap <= 1:
                     continue
 
-                # ВИКОРИСТОВУЄМО 5-DoF ДЕКОМПОЗИЦІЮ
+                # Use 5-DoF decomposition
                 det = np.linalg.det(frame_affine[left][:2, :2])
                 sign = -1.0 if det < 0 else 1.0
                 comp_left = np.array(decompose_affine_5dof(frame_affine[left]), dtype=np.float64)
                 comp_right = np.array(decompose_affine_5dof(frame_affine[right]), dtype=np.float64)
 
-                # Запобігаємо стрибкам кута (кут тепер під індексом 4)
+                # Prevent angle jumps (angle is at index 4)
                 angles = unwrap_angles([comp_left[4], comp_right[4]])
                 comp_left[4] = angles[0]
                 comp_right[4] = angles[1]
 
-                # Log-scale (RESEARCH 1.3): лінійна інтерполяція в log-просторі
-                # масштабу = геометрична інтерполяція самого масштабу.
+                # Log-scale interpolation: linear in log-space = geometric interpolation.
                 if self.log_scale_interp:
                     comp_left[2:4] = np.log(np.maximum(comp_left[2:4], 1e-12))
                     comp_right[2:4] = np.log(np.maximum(comp_right[2:4], 1e-12))
@@ -1461,21 +1437,21 @@ class PropagationPipeline:
                     t = (mid - left) / gap
                     comp_mid = comp_left * (1.0 - t) + comp_right * t
 
-                    # Розпаковуємо 5 змінних
+                    # Unpack 5 components
                     tx, ty, sx, sy, angle = comp_mid
                     if self.log_scale_interp:
                         sx, sy = float(np.exp(sx)), float(np.exp(sy))
                     sx = float(np.clip(sx, 1e-6, 1e6))
                     sy = float(np.clip(sy, 1e-6, 1e6))
 
-                    # ВИКОРИСТОВУЄМО 5-DoF КОМПОЗИЦІЮ ЗІ ЗБЕРЕЖЕННЯМ ВІДОБРАЖЕННЯ
+                    # 5-DoF compose with reflection preserved
                     frame_affine[mid] = compose_affine_5dof(
                         float(tx), float(ty), sx, sy, float(angle), sign=sign
                     )
                     frame_valid[mid] = True
                     filled += 1
 
-        # Екстраполяція на кінець
+        # Extrapolate after last valid frame
         last_valid = valid_ids[-1]
         for mid in range(last_valid + 1, len(frame_valid)):
             frame_affine[mid] = frame_affine[last_valid].copy()

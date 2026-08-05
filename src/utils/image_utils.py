@@ -4,7 +4,7 @@ from PyQt6.QtGui import QImage, QPixmap
 
 
 def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
-    """Перетворення зображення OpenCV (BGR) у QPixmap (RGB) для PyQt6"""
+    """Converts OpenCV (BGR) image to PyQt6 QPixmap (RGB)"""
     if cv_image is None or cv_image.size == 0:
         return QPixmap()
 
@@ -12,13 +12,13 @@ def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
         height, width, channel = cv_image.shape
         bytes_per_line = 3 * width
 
-        # A7: Format_BGR888 (Qt ≥ 5.14) читає BGR напряму — прибирає повний
-        # cvtColor(BGR2RGB) кадру на кожен виклик (30 разів/с на GUI-потоці).
+        # Format_BGR888 (Qt ≥ 5.14) reads BGR directly — eliminates a full
+        # cvtColor(BGR2RGB) per frame (called ~30 times/s on the GUI thread).
         buf = np.ascontiguousarray(cv_image)
         q_img = QImage(buf.data, width, height, bytes_per_line, QImage.Format.Format_BGR888)
 
-        # QPixmap.fromImage робить глибоку копію у власне сховище, поки buf
-        # живий у цьому scope — додатковий q_img.copy() був зайвою копією кадру.
+        # QPixmap.fromImage makes a deep copy into its own storage while buf
+        # is alive in this scope — the extra q_img.copy() was a redundant frame copy.
         return QPixmap.fromImage(q_img)
 
     elif len(cv_image.shape) == 2:
@@ -34,7 +34,7 @@ def opencv_to_qpixmap(cv_image: np.ndarray) -> QPixmap:
 
 
 def qpixmap_to_opencv(pixmap: QPixmap) -> np.ndarray:
-    """Перетворення QPixmap (RGB) у масив OpenCV (BGR)"""
+    """Converts QPixmap (RGB) to an OpenCV array (BGR)."""
     q_img = pixmap.toImage()
     q_img = q_img.convertToFormat(QImage.Format.Format_RGB888)
 
@@ -44,8 +44,7 @@ def qpixmap_to_opencv(pixmap: QPixmap) -> np.ndarray:
     ptr = q_img.bits()
     ptr.setsize(height * width * 3)
 
-    # ВИПРАВЛЕНО: робимо copy() щоб масив numpy не залежав від буфера
-    # QImage, який може бути знищений після виходу з функції
+    # Creates an independent numpy array copy to prevent loss of the QImage buffer.
     arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 3)).copy()
 
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)

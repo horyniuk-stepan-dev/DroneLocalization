@@ -20,15 +20,13 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-# Єдине джерело центр-базової 5-DoF PCHIP-форми — src.geometry.affine_utils
+# Single source of truth for 5-DoF center-parameterized PCHIP interpolation
 from src.geometry.affine_utils import build_5dof_pchip as _build_5dof_pchip
 from src.geometry.affine_utils import sample_5dof_pchip as _sample_5dof_pchip
 
 
 class AnchorCalibration:
-    """
-    Одна точка прив'язки GPS — конкретний кадр з афінною матрицею та повними QA-метриками.
-    """
+    """A single GPS anchor point bound to a specific frame with affine transformation and full QA metrics."""
 
     def __init__(
         self, frame_id: int, affine_matrix: np.ndarray, qa_data: dict[str, Any] | None = None
@@ -38,21 +36,21 @@ class AnchorCalibration:
         self.update_qa(qa_data or {})
 
     def update_qa(self, qa_data: dict[str, Any]) -> None:
-        """Оновлює QA метрики якоря без перестворення об'єкта."""
+        """Updates anchor QA metrics in-place without re-creating the object."""
         self.qa_data = qa_data
 
-        # Основні метрики якості
+        # Primary quality metrics
         self.rmse_m = float(self.qa_data.get("rmse_m", 0.0))
         self.median_err_m = float(self.qa_data.get("median_err_m", 0.0))
         self.max_err_m = float(self.qa_data.get("max_err_m", 0.0))
         self.inliers_count = int(self.qa_data.get("inliers_count", 0))
 
-        # Дані точок
+        # Point collections
         self.points_2d = self.qa_data.get("points_2d", [])  # [[x,y], ...]
         self.points_gps = self.qa_data.get("points_gps", [])  # [[lat,lon], ...]
         self.points_metric = self.qa_data.get("points_metric", [])  # [[mx,my], ...]
 
-        # Метадані та UX
+        # Metadata and UI flags
         self.transform_type = self.qa_data.get("transform_type", "unknown")
         self.projection_mode = self.qa_data.get("projection_mode", "WEB_MERCATOR")
         self.created_at = self.qa_data.get("created_at", datetime.now().isoformat())
@@ -88,10 +86,10 @@ class AnchorCalibration:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "AnchorCalibration":
-        # Підтримка зовсім старих форматів без qa_data
+        # Support legacy formats without qa_data
         qa = data.get("qa_data", {})
 
-        # Якщо це старий формат v1.0/v2.0, де деякі поля були плоскими
+        # Handle legacy v1.0/v2.0 flat dictionary layouts
         if not qa and "rmse_m" in data:
             qa = {
                 "rmse_m": data.get("rmse_m"),
@@ -109,7 +107,7 @@ class AnchorCalibration:
 
 
 class MultiAnchorCalibration:
-    """Менеджер декількох якорів калібрування з підтримкою версіонування та проєкцій"""
+    """Manages multiple calibration anchors with versioning, projection support, and PCHIP interpolation."""
 
     VERSION: str = "2.3"
 
@@ -120,8 +118,7 @@ class MultiAnchorCalibration:
     ) -> None:
         self.anchors: list[AnchorCalibration] = []
         self.converter = converter or CoordinateConverter("WEB_MERCATOR")
-        # Log-scale інтерполяція масштабу між якорями (RESEARCH 1.3). None →
-        # читаємо graph_optimization.log_scale_interp з APP_CONFIG (дефолт off).
+        # Log-scale scale interpolation between anchors. None -> read from APP_CONFIG default False.
         if log_scale_interp is None:
             try:
                 from config import APP_CONFIG, get_cfg
@@ -132,24 +129,24 @@ class MultiAnchorCalibration:
             except Exception:
                 log_scale_interp = False
         self._log_scale_interp = bool(log_scale_interp)
-        self._interp: Any = None  # кешований PCHIP-інтерполятор (build_5dof_pchip)
-        self._interp_sign: float = -1.0  # знак det якірних матриць (Y-flip)
-        self._interp_range: tuple[float, float] | None = None  # [перший, останній] якір
-        self._ref_px: tuple[float, float] = (0.0, 0.0)  # опорний піксель декомпозиції
-        self._frame_size: tuple[int, int] | None = None  # (width, height) кадру
+        self._interp: Any = None  # Cached PCHIP interpolator (build_5dof_pchip)
+        self._interp_sign: float = -1.0  # Determinant sign of anchor matrices (Y-flip)
+        self._interp_range: tuple[float, float] | None = None  # [first_frame, last_frame]
+        self._ref_px: tuple[float, float] = (0.0, 0.0)  # Decomposition reference pixel
+        self._frame_size: tuple[int, int] | None = None  # (width, height)
 
     def set_frame_size(self, width: int, height: int) -> None:
-        """Розмір кадру: інтерполяція параметризується навколо центру кадру."""
+        """Sets frame dimensions: interpolation is parameterized around the frame center."""
         new_size = (int(width), int(height))
         if new_size != self._frame_size and new_size[0] > 0 and new_size[1] > 0:
             self._frame_size = new_size
             self._rebuild_interpolators()
 
     def _reference_pixel(self) -> tuple[float, float]:
-        """Опорний піксель для декомпозиції (центр кадру або центроїд точок)."""
+        """Calculates the reference pixel for matrix decomposition (frame center or point centroid)."""
         if self._frame_size:
             return self._frame_size[0] / 2.0, self._frame_size[1] / 2.0
-        # Fallback: центроїд точок усіх якорів — стабільна точка всередині кадру
+        # Fallback: centroid of 2D points across all anchors
         pts = [p for a in self.anchors for p in (a.points_2d or [])]
         if pts:
             arr = np.asarray(pts, dtype=np.float64)
@@ -157,21 +154,11 @@ class MultiAnchorCalibration:
         return 0.0, 0.0
 
     def _rebuild_interpolators(self) -> None:
-        """
-        Перебудовує PCHIP-інтерполятор на основі 5-DoF декомпозиції якірних матриць.
+        """Rebuilds the 5-DoF PCHIP interpolator from anchor matrices.
 
-        ВИПРАВЛЕНО (критичний баг): попередня 4-DoF декомпозиція (tx, ty, scale,
-        angle) не кодувала віддзеркалення осі Y, а якірні матриці pixel→metric
-        ЗАВЖДИ мають det < 0 (піксельна вісь Y ↓, метрична ↑). Реконструйована
-        матриця виходила з det > 0 — Y-складова дзеркалилась, і позиції між
-        якорями їхали на десятки метрів, тоді як точно на якорі результат був
-        правильним → різкі стрибки біля якорів.
-
-        Тепер: інтерполюються (rx, ry, sx, sy, angle), де (rx, ry) — метрична
-        позиція ОПОРНОГО ПІКСЕЛЯ (центр кадру), а глобальний знак det
-        зберігається окремо і відновлюється при композиції. Параметризація
-        навколо центру кадру (а не пікселя (0,0)) прибирає "гойдання" центру
-        при зміні кута між якорями.
+        Interpolates (rx, ry, sx, sy, angle) where (rx, ry) is the metric position of the
+        reference pixel (frame center). The determinant sign is preserved and reapplied
+        during matrix composition to ensure proper orientation and coordinate system Y-flip.
         """
         self._interp = None
         self._interp_range = None
@@ -193,8 +180,7 @@ class MultiAnchorCalibration:
         cx, cy = self._reference_pixel()
         self._ref_px = (cx, cy)
 
-        # Спільний білдер (Етап 4): та сама центр-базова 5-DoF PCHIP-форма, що й у
-        # заповненні пропущених кадрів пропагації (src.geometry.affine_utils).
+        # Shared builder: 5-DoF center-parameterized PCHIP interpolation
         ids = [a.frame_id for a in self.anchors]
         affines = [a.affine_matrix for a in self.anchors]
         self._interp, self._interp_sign, self._interp_range = _build_5dof_pchip(
@@ -202,7 +188,7 @@ class MultiAnchorCalibration:
         )
 
     def _get_interpolated_matrix(self, frame_id: float) -> np.ndarray | None:
-        """Повертає інтерпольовану афінну матрицю 2x3 для заданого frame_id."""
+        """Returns the interpolated 2x3 affine matrix for a given frame_id."""
         return _sample_5dof_pchip(
             self._interp,
             self._interp_sign,
@@ -247,7 +233,7 @@ class MultiAnchorCalibration:
         return success
 
     def clear(self) -> None:
-        """Очищає всі якорі та скидає стан калібрування."""
+        """Clears all anchors and resets calibration state."""
         self.anchors.clear()
         self._interp = None
         self._interp_range = None
@@ -260,20 +246,19 @@ class MultiAnchorCalibration:
         if not self.is_calibrated:
             return None
 
-        # Якщо якір один — екстраполяція неможлива, повертаємо його координати
+        # Single anchor: extrapolation not supported, return direct conversion
         if len(self.anchors) == 1:
             return self.anchors[0].pixel_to_metric(x, y)
 
-        # Phase 1.2: Перевірка чи frame_id = один із якорів → reset drift
+        # Exact anchor hit: reset accumulated drift and return direct transformation
         exact_anchor = self.get_anchor(frame_id)
         if exact_anchor is not None:
-            # Точне потрапляння на якір = скидаємо накопичений drift
             logger.debug(
                 f"Exact anchor hit at frame {frame_id} — using direct affine (drift reset)"
             )
             return exact_anchor.pixel_to_metric(x, y)
 
-        # Decomposition-based PCHIP: інтерполяція через tx/ty/scale/angle
+        # PCHIP interpolation
         if self._interp is not None:
             M = self._get_interpolated_matrix(float(frame_id))
             if M is not None:
@@ -281,7 +266,7 @@ class MultiAnchorCalibration:
                 result = GeometryTransforms.apply_affine(pt, M)[0]
                 return float(result[0]), float(result[1])
 
-        # Fallback — лінійна інтерполяція
+        # Fallback linear interpolation
         for i in range(len(self.anchors) - 1):
             a1, a2 = self.anchors[i], self.anchors[i + 1]
             if a1.frame_id <= frame_id <= a2.frame_id:
@@ -297,24 +282,13 @@ class MultiAnchorCalibration:
         return None
 
     def set_gsd_calculator(self, gsd_calculator) -> None:
-        """Прив'язує калькулятор GSD — ІНФОРМАЦІЙНО (аудит 2026-08-01).
-
-        Викликається з Localizer, але сам ``_gsd`` ніде не читається: масштаб
-        приходить із афінних матриць якорів. Метод лишено як точку розширення
-        і для лога фактичного GSD; якщо він знадобиться для обчислень —
-        додавати разом із тестом, що це доводить.
-
-        Разом із цим приберано ``get_metric_position_with_depth`` і
-        ``set_reference_depth_scale``: у них не було ЖОДНОГО виклику, а перший
-        до того ж рахував depth-корекцію, логував її й повертав позицію БЕЗ
-        неї — назва обіцяла те, чого метод не робив.
-        """
+        """Links GSD calculator for metadata and inspection purposes."""
         self._gsd = gsd_calculator
         if self._gsd:
             logger.info(f"GSD Calculator linked: {self._gsd.gsd_m_per_px * 100:.2f} cm/px")
 
     def save(self, path: str) -> None:
-        """Збереження якорів та метаданих проєкції у JSON."""
+        """Saves anchors and projection metadata to JSON."""
         assert_project_writable(path)
         data = {
             "version": self.VERSION,
@@ -323,8 +297,7 @@ class MultiAnchorCalibration:
             "anchors": [a.to_dict() for a in self.anchors],
         }
 
-        # Атомарний запис: калібрування — критичні дані, обрізаний JSON
-        # при краші/конкурентному збереженні означає втрату всіх якорів.
+        # Atomic write to prevent file corruption
         from src.utils.atomic_io import atomic_write_bytes
 
         if _USE_ORJSON:
@@ -346,8 +319,7 @@ class MultiAnchorCalibration:
         with open(path, "rb") as f:
             content = f.read()
 
-        # HARDENING P1-6: transparently decrypt an at-rest-encrypted calibration.
-        # Auto-detected by header, so plaintext projects are unaffected.
+        # Transparently decrypt at-rest encrypted calibration
         if is_encrypted(content):
             content = decrypt_bytes(content, get_passphrase())
 
@@ -359,33 +331,29 @@ class MultiAnchorCalibration:
         self.anchors.clear()
         version = data.get("version", "1.0")
 
-        # 1. Відновлення проєкції
+        # Restore coordinate projection
         if "projection" in data:
             self.converter = CoordinateConverter.from_metadata(data["projection"])
         elif "reference_gps" in data and data["reference_gps"] is not None:
-            # Fallback для v2.0
             self.converter = CoordinateConverter("UTM", tuple(data["reference_gps"]))
         else:
-            # Fallback для v1.0 або відсутніх даних
             logger.warning(
                 "No projection metadata found in calibration file. Defaulting to WEB_MERCATOR fallback."
             )
             self.converter = CoordinateConverter("WEB_MERCATOR")
 
-        # 2. Завантаження якорів
+        # Load anchors
         if version == "1.0" and "affine_matrix" in data and "calib_frame_id" in data:
-            # Старий формат (один якір)
             anchor = AnchorCalibration(
                 frame_id=int(data.get("calib_frame_id", 0)),
                 affine_matrix=np.array(data["affine_matrix"], dtype=np.float64),
             )
             self.anchors.append(anchor)
         elif "anchors" in data:
-            # Новій формат (список якорів)
             for item in data["anchors"]:
                 self.anchors.append(AnchorCalibration.from_dict(item))
 
-        # Відновлення розміру кадру (для параметризації навколо центру)
+        # Restore frame dimensions
         fs = data.get("frame_size")
         if fs and len(fs) == 2 and int(fs[0]) > 0 and int(fs[1]) > 0:
             self._frame_size = (int(fs[0]), int(fs[1]))

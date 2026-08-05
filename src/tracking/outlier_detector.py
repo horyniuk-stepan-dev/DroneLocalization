@@ -26,25 +26,26 @@ class OutlierDetector:
         self.max_speed_mps = max_speed_mps
         self._consecutive_outliers = 0
         self._max_consecutive = max_consecutive
-        # Множник «проєкційні метри → справжні наземні» (Етап 6). 1.0 = стара
-        # поведінка побітово. Без нього WebMercator-відстані на 48° завищені у
-        # 1/cos(lat) ≈ 1.49×, тож max_speed_mps=120 реально гейтить на 80.6 м/с,
-        # а ~39% відсіювань на живому прогоні були чистими хибними спрацюваннями.
+        # Projection-to-ground-metres multiplier (ground_scale). 1.0 = legacy
+        # Without this correction WebMercator distances at 48° latitude are
+        # inflated by 1/cos(lat) ≈ 1.49×, so max_speed_mps=120 effectively gates
+        # at 80.6 m/s and ~39% of rejections on a live run were clean false positives.
         self._ground_scale = float(ground_scale)
-        # Z-score гілка. Заміряно на місії top 2026-07-31 (of_stride=1,
-        # of_local_speed=ON): з 70 спрацювань 47 дала вона, і ВСІ 23
-        # спрацювання на ПРАВИЛЬНИХ вимірах (distance 2.3-4.5 м при нормі
-        # 3.0 м) — теж її. Жодного справжнього зриву (>12 м) вона не спіймала:
-        # їх усі ловить фізичний max_speed. Причина — самопідтримна петля:
-        # гейт відкидає все, що вище mean_speed, тож у вікно потрапляють лише
-        # повільні виміри, mean падає (11.9-78 при реальних 89.2 м/с) і
-        # відкидається ще більше. Плюс std сідає на floor 1.0 і z сягає 159.
+        # Z-score branch. Measured on mission top 2026-07-31 (of_stride=1,
+        # of_local_speed=ON): of 70 rejections 47 came from this branch, and ALL
+        # 23 rejections on CORRECT measurements (distance 2.3-4.5 m at the 3.0 m
+        # nominal) — also from this branch. Not a single real jump (>12 m) was
+        # caught here: those are all caught by the physical max_speed guard.
+        # Root cause: a self-sustaining loop — the gate rejects everything above
+        # mean_speed, so only slow measurements enter the window, mean drops
+        # (11.9-78 m/s vs. the true 89.2 m/s) and even more gets rejected.
+        # Also std hits the 1.0 floor and z reaches 159.
         self._zscore_enabled = bool(zscore_enabled)
-        # Mahalanobis-гейт (флаг, дефолт off): χ² від коваріації інновації KF
-        # замість Z-score за швидкістю. Поріг за замовчуванням — χ²(2 ст.св.,
-        # p=0.999) = 13.816, тобто ~0.1% хибних відсіювань на коректній моделі.
-        # Гілка незалежна від Z-score: обидві можна тримати увімкненими, але
-        # сенс переходу саме в тому, щоб Z-score вимкнути.
+        # Mahalanobis gate (flag, default off): uses the χ² distance from the KF
+        # innovation covariance instead of the Z-score on speed. Default threshold
+        # is χ²(2 dof, p=0.999) = 13.816, i.e. ~0.1% false rejections on a
+        # correct model. Branch is independent from Z-score: both can be enabled,
+        # but the point of switching is to disable Z-score.
         self._mahalanobis_enabled = bool(mahalanobis_enabled)
         self._chi2_threshold = float(chi2_threshold)
 
@@ -54,22 +55,22 @@ class OutlierDetector:
         )
 
     def set_ground_scale(self, scale: float) -> None:
-        """Оновлює множник проєкція→наземні метри (cos(lat) для WebMercator).
+        """Updates the multiplier projection→ground meters (cos(lat) for WebMercator).
 
-        Викликається з локалізатора, коли є свіжа широта. Значення <= 0
-        ігнорується — краще лишити попереднє, ніж занулити всі швидкості.
+        Called from the localizer when a fresh latitude is available. Values <= 0
+        are ignored — it is better to keep the previous one than zero out all speeds.
         """
         s = float(scale)
         if s > 0.0:
             self._ground_scale = s
 
     def reset(self) -> None:
-        """Повне скидання стану (нова сесія трекінгу)."""
+        """Full state reset (new tracking session)."""
         self.window.clear()
         self._consecutive_outliers = 0
 
     def add_position(self, position: tuple, dt: float = 1.0, reset_consecutive: bool = True):
-        # Тепер зберігаємо і позицію, і dt (час, за який ця позиція була досягнута)
+        # Now we store both position and dt (time it took to reach this position)
         self.window.append((np.array(position, dtype=np.float64), max(dt, 0.01)))
         if reset_consecutive:
             self._consecutive_outliers = 0
@@ -81,24 +82,25 @@ class OutlierDetector:
         ref_position: tuple | None = None,
         maha_d2: float | None = None,
     ) -> bool:
-        """Перевірка вимірювання на аномальність.
+        """Anomaly detection for measurements.
 
-        ``ref_position`` — опорна точка для МИТТЄВОЇ швидкості. За замовчуванням
-        береться остання ПРИЙНЯТА позиція з вікна, але на OF-шляху це неправильно:
-        LK трекає завжди від keyframe (tracking_worker.py:486), тож зсув росте
-        лінійно від keyframe, тоді як dt лишається кроком одного OF-кадру. Бази
-        чисельника і знаменника різні -> швидкість завищується рівно в N разів,
-        де N — номер OF-кадру після keyframe. Заміряно на місії top 2026-07-31:
-        логовані 450-1271 м/с лягають на сітку N * 89.2 м/с при N=5..14, а між
-        keyframe-ами якраз вміщається 10 OF-кадрів.
+        ``ref_position`` — reference point for INSTANTANEOUS speed. By default
+        it takes the last ACCEPTED position from the window, but on the OF-path
+        this is incorrect: LK always tracks from a keyframe (tracking_worker.py:486),
+        so the shift grows linearly from the keyframe, while dt remains a step of
+        one OF-frame. Bases of the numerator and denominator differ -> speed is
+        inflated exactly by N times, where N is the number of the OF-frame after
+        the keyframe. Measured on mission top 2026-07-31: logged 450-1271 m/s fall
+        onto a grid N * 89.2 m/s at N=5..14, and exactly 10 OF-frames fit between
+        keyframe-s.
 
-        Передача попередньої СИРОЇ OF-позиції як ref_position робить розрахунок
-        локальним (кадр відносно кадру) і прибирає накопичення.
+        Passing the previous RAW OF-position as ref_position makes the calculation
+        local (frame relative to frame) and removes accumulation.
         """
-        # Mahalanobis-гілка не потребує вікна швидкостей: коваріація фільтра
-        # вже містить усю історію. Тому вона перевіряється ДО раннього виходу
-        # за довжиною вікна — інакше перші кадри після скидання лишались би
-        # без жодного гейта, крім фізичної швидкості.
+        # The Mahalanobis branch does not need a speed window: the filter
+        # covariance already encodes the full history. It is therefore checked
+        # BEFORE the early exit on window length — otherwise the first frames
+        # after a reset would have no gate except the physical speed limit.
         is_maha_outlier = (
             self._mahalanobis_enabled and maha_d2 is not None and maha_d2 > self._chi2_threshold
         )
@@ -129,15 +131,15 @@ class OutlierDetector:
             last_pos, _ = self.window[-1]
         safe_dt = max(dt, 0.01)
 
-        # 1. Перевірка максимально допустимої швидкості
-        # Відстані переводимо в СПРАВЖНІ наземні метри до порівняння з порогом,
-        # інакше поріг мовчки залежить від широти місії.
+        # 1. Maximum-speed check
+        # Distances are converted to TRUE ground metres before comparison with
+        # the threshold; otherwise the threshold silently depends on mission latitude.
         distance = float(np.linalg.norm(new_pos_np - last_pos)) * self._ground_scale
         instantaneous_speed = distance / safe_dt
 
         is_speed_outlier = instantaneous_speed > self.max_speed_mps
 
-        # 2. Статистичний Z-score тест (тепер за ШВИДКІСТЮ, а не за відстанню!)
+        # 2. Statistical Z-score test (now based on SPEED, not distance)
         history = list(self.window)
         speeds = []
         for i in range(1, len(history)):
@@ -151,7 +153,7 @@ class OutlierDetector:
 
         z_score = abs(instantaneous_speed - mean_speed) / std_speed
 
-        # 15.0 m/s - мінімальна дельта швидкості, при якій Z-score має сенс
+        # 15.0 m/s - minimum speed delta for which Z-score is meaningful
         is_zscore_outlier = self._zscore_enabled and (
             z_score > self.threshold_std and abs(instantaneous_speed - mean_speed) > 15.0
         )
@@ -159,7 +161,7 @@ class OutlierDetector:
         if is_speed_outlier or is_zscore_outlier or is_maha_outlier:
             self._consecutive_outliers += 1
 
-            # Якщо забагато підряд — дрон реально перемістився, скидаємо вікно
+            # Too many consecutive outliers — drone actually moved, reset window
             if self._consecutive_outliers >= self._max_consecutive:
                 logger.warning(
                     f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
@@ -169,7 +171,7 @@ class OutlierDetector:
                 )
                 self.window.clear()
                 self._consecutive_outliers = 0
-                return False  # Приймаємо нову позицію
+                return False  # Accept the new position
 
             if is_maha_outlier and not is_speed_outlier:
                 logger.warning(

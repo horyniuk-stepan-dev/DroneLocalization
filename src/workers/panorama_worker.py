@@ -21,16 +21,15 @@ class PanoramaWorker(QThread):
     def run(self):
         logger.info(f"Starting panorama generation from: {self.video_path}")
         try:
-            self.progress.emit(0, "Відкриття відео...")
+            self.progress.emit(0, "Opening video...")
 
-            # Використовуємо FFmpeg для надійності
             cap = cv2.VideoCapture(self.video_path, cv2.CAP_FFMPEG)
             if not cap.isOpened():
                 cap = cv2.VideoCapture(self.video_path)
                 if not cap.isOpened():
                     raise ValueError(
-                        f"Не вдалося відкрити відеофайл: {self.video_path}. "
-                        f"Переконайтесь, що файл існує і має підтримуваний кодек (MP4/H.264)."
+                        f"Failed to open video file: {self.video_path}. "
+                        f"Ensure file exists and has a supported codec (MP4/H.264)."
                     )
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -43,7 +42,6 @@ class PanoramaWorker(QThread):
                     break
 
                 if frame_count % self.frame_step == 0:
-                    # Зменшуємо кадр для економії пам'яті (4K→Full HD)
                     h, w = frame.shape[:2]
                     if w > 1920:
                         scale = 1920.0 / w
@@ -53,15 +51,15 @@ class PanoramaWorker(QThread):
                 frame_count += 1
 
                 if frame_count % 30 == 0:
-                    prog = int((frame_count / total_frames) * 50)  # Перші 50% прогресу - зчитування
-                    self.progress.emit(prog, f"Збирання кадрів: {len(frames_to_stitch)} шт.")
+                    prog = int((frame_count / total_frames) * 50)
+                    self.progress.emit(prog, f"Collecting frames: {len(frames_to_stitch)}")
 
             cap.release()
 
             if not self._is_running:
                 return
 
-            self.progress.emit(50, "Зшивання панорами (це може зайняти час)...")
+            self.progress.emit(50, "Stitching panorama (this may take a while)...")
             logger.info(f"Stitching {len(frames_to_stitch)} frames...")
 
             stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
@@ -69,19 +67,19 @@ class PanoramaWorker(QThread):
 
             if status == cv2.Stitcher_OK:
                 cv2.imwrite(self.output_path, panorama)
-                self.progress.emit(100, "Панораму збережено!")
+                self.progress.emit(100, "Panorama saved successfully!")
                 self.completed.emit(self.output_path)
             else:
                 status_names = {
-                    cv2.Stitcher_ERR_NEED_MORE_IMGS: "ERR_NEED_MORE_IMGS (недостатньо кадрів з перекриттям)",
-                    cv2.Stitcher_ERR_HOMOGRAPHY_EST_FAIL: "ERR_HOMOGRAPHY_EST_FAIL (не вдалося знайти гомографію)",
-                    cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL: "ERR_CAMERA_PARAMS_ADJUST_FAIL (помилка калібрування камери)",
+                    cv2.Stitcher_ERR_NEED_MORE_IMGS: "ERR_NEED_MORE_IMGS (insufficient overlapping frames)",
+                    cv2.Stitcher_ERR_HOMOGRAPHY_EST_FAIL: "ERR_HOMOGRAPHY_EST_FAIL (failed to estimate homography)",
+                    cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL: "ERR_CAMERA_PARAMS_ADJUST_FAIL (camera parameter adjustment failed)",
                 }
                 status_name = status_names.get(status, f"UNKNOWN_CODE_{status}")
                 raise ValueError(
-                    f"Помилка зшивання панорами: {status_name}. "
-                    f"Зібрано {len(frames_to_stitch)} кадрів, крок={self.frame_step}. "
-                    f"Спробуйте зменшити крок кадрів або переконатися, що кадри мають достатнє перекриття."
+                    f"Panorama stitching failed: {status_name}. "
+                    f"Collected {len(frames_to_stitch)} frames with step={self.frame_step}. "
+                    f"Try reducing frame step or ensuring sufficient visual overlap."
                 )
 
         except Exception as e:

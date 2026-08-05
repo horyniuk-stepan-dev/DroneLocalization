@@ -19,7 +19,7 @@ class TrackedObject:
 
 
 class ObjectTracker:
-    """Обгортка над ByteTrack для трекінгу об'єктів між кадрами."""
+    """Thin wrapper over ByteTrack for multi-object tracking between frames."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -121,7 +121,7 @@ class ObjectTracker:
         }
 
     def update(self, detections: list[dict], frame_shape: tuple) -> list[TrackedObject]:
-        """Оновити трекер новими детекціями. Повертає список відстежених об'єктів.
+        """Update tracker with new detections. Returns a list of tracked objects.
         detections: [{"class_id": int, "confidence": float, "bbox": [x1, y1, x2, y2]}, ...]
         """
         tracked_objects = []
@@ -176,7 +176,7 @@ class ObjectTracker:
         return tracked_objects
 
     def reset(self):
-        """Скинути стан трекера (при новій сесії)."""
+        """Reset tracker state (on a new session)."""
         self.tracker = sv.ByteTrack(
             track_activation_threshold=self.config.get("track_activation_threshold", 0.25),
             lost_track_buffer=self.config.get("lost_track_buffer", 30),

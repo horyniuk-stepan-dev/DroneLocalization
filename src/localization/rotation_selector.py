@@ -30,12 +30,8 @@ class RotationResult:
     candidates: list
     source_id: str | None
     best_scale: float = 1.0
-    # Аудит §2.2: кадр, ПОВЕРНУТИЙ і нормалізований під (angle, best_scale) —
-    # той самий, на якому рахувався глобальний дескриптор. Раніше він тут
-    # створювався і викидався, а Localizer._prepare_and_extract одразу робив
-    # rot90().copy() + normalize() ще раз (на 1080p це ~6 МБ memcpy + resize
-    # на кожен keyframe, на 4K ~25 МБ). Тепер повертаємо його разом із
-    # crop_info, щоб викликач міг перевикористати.
+    # Cache the rotated and normalised frame together with CropInfo
+    # to avoid repeated copying and resizing during subsequent feature extraction.
     frame: Any | None = None
     crop_info: Any | None = None
 
@@ -62,7 +58,7 @@ class RotationSelector:
         best_global_candidates = []
         best_source_id_per_angle: str | None = None
         best_scale: float = 1.0
-        # §2.2: кадр і crop_info переможної (кут, масштаб) пари — віддаємо назовні
+        # Winning (angle, scale) pair frame and crop_info — returned to caller
         best_frame: Any | None = None
         best_crop: Any | None = None
 
@@ -106,16 +102,16 @@ class RotationSelector:
 
         if not best_global_candidates:
             # A2: all rotations × all scales in ONE batched forward pass.
-            # ADDENDUM 2.1 (recovery_cascade): у два етапи — спершу лише кути
-            # на одному масштабі, повна піраміда лише за потреби.
+            # recovery_cascade: two-stage — angles only at single scale first;
+            # full pyramid only if needed.
             stages = self._plan_stages(angles_to_try, scale_candidates, scale_manager, use_cascade)
 
             for stage_combos in stages:
                 if not stage_combos:
                     continue
-                # rot90 кешується per-angle: інакше кадр копіювався б на
-                # кожну (кут, масштаб) пару замість одного разу на кут
-                # (на 4K це десятки МБ memcpy на кожну зайву копію).
+                # rot90 is cached per-angle: otherwise the frame would be
+                # copied for each (angle, scale) pair instead of once per angle
+                # (on 4K footage that is tens of MB of memcpy per extra copy).
                 rot_cache: dict[int, Any] = {}
                 prepared = [
                     self._prepare_frame(query_frame, a, sc, scale_manager, rot_cache)
@@ -145,8 +141,8 @@ class RotationSelector:
                             best_scale = sc
                             best_frame, best_crop = frm, crop
 
-                # Етап 1 дав достатньо впевнений збіг — решту піраміди
-                # (16 із 20 форвардів у типовій конфігурації) не рахуємо.
+                # Stage 1 yielded a confident enough match — skip the rest of the pyramid
+                # (16 out of 20 forward passes in a typical config).
                 if best_global_score >= rescan_min:
                     break
 
@@ -163,7 +159,7 @@ class RotationSelector:
             crop_info=best_crop,
         )
 
-    # ── ADDENDUM 2.1: планування етапів recovery ─────────────────────────────
+    # ── Recovery cascade planning ──────────────────────────────────────────────
 
     @staticmethod
     def _plan_stages(
@@ -172,20 +168,15 @@ class RotationSelector:
         scale_manager: Any,
         use_cascade: bool,
     ) -> list[list[tuple[int, float]]]:
-        """Комбінації (кут, масштаб), розбиті на етапи.
+        """Plans (angle, scale) combinations split across stages.
 
-        ``use_cascade=False`` → один етап із повним декартовим добутком
-        (ПОТОЧНА поведінка, побітово та сама послідовність).
+        ``use_cascade=False`` -> single stage with full Cartesian product.
+        ``use_cascade=True`` -> Stage 1: all angles x primary scale; Stage 2: remaining combinations.
+        The cascade cannot be slower than the standard behavior; it is designed to be faster.
 
-        ``use_cascade=True`` → етап 1: усі кути × ОДИН масштаб; етап 2: усі
-        ІНШІ комбінації. Ключова властивість — етап 2 не повторює вже
-        пораховане, тож найгірший випадок (етап 1 провалився) лишається рівно
-        стільки ж форвардів, скільки й зараз. Каскад не може бути повільнішим
-        за поточну поведінку — лише швидшим.
-
-        Опорний масштаб етапу 1: prior ScaleManager-а, якщо він є; інакше
-        перший елемент ``scale_candidates`` (``ScaleManager.candidates()`` уже
-        сортує піраміду за близькістю до depth-hint); інакше 1.0.
+        Reference scale for Stage 1: prior from ScaleManager if available; otherwise
+        the first element of ``scale_candidates`` (already sorted by proximity to depth-hint);
+        else 1.0.
         """
         combos = [(a, sc) for a in angles_to_try for sc in scale_candidates]
         if not use_cascade or len(scale_candidates) <= 1:
@@ -196,7 +187,7 @@ class RotationSelector:
         if prior is not None and prior in scale_candidates:
             primary = prior
         elif 1.0 in scale_candidates:
-            # Масштаб 1.0 — «як у БД»; найімовірніший, коли prior відсутній.
+            # Scale 1.0 — "as in DB"; most likely when prior is absent.
             primary = 1.0
         else:
             primary = scale_candidates[0]
@@ -213,16 +204,7 @@ class RotationSelector:
         scale_manager: Any,
         rot_cache: dict[int, Any] | None = None,
     ) -> tuple[Any, Any]:
-        """``(кадр, crop_info)``: повернутий на ``angle``, нормалізований до ``sc``.
-
-        ``rot_cache`` — спільний на етап словник {кут: повернутий кадр}:
-        повороти дорогі (копія повного кадру), а масштабів на кут кілька.
-
-        §2.2: ``crop_info`` більше не викидається — його повертає переможна пара
-        в ``RotationResult``, щоб Localizer не перераховував ротацію й resize.
-        Умова ``> 0.15`` і виклик ``normalize`` мають ЗБІГАТИСЯ з
-        ``Localizer._prepare_and_extract``, інакше кадри розійдуться.
-        """
+        """Returns ``(frame, crop_info)`` rotated by ``angle`` and normalized to ``sc``."""
         if rot_cache is not None and angle in rot_cache:
             rotated = rot_cache[angle]
         else:

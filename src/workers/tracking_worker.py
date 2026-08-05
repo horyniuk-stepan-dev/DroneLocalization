@@ -17,8 +17,7 @@ class RealtimeTrackingWorker(QThread):
 
     frame_ready = pyqtSignal(np.ndarray)
     location_found = pyqtSignal(float, float, float, int)
-    # HARDENING §4a: fired only on a fresh keyframe anchor (not an OF-propagated
-    # fix) — drives the broker's anchor-staleness DEGRADED clock.
+    # Precise keyframe localization signal (anchor_fix)
     anchor_fix = pyqtSignal()
     fps_updated = pyqtSignal(float)
     error = pyqtSignal(str)
@@ -26,7 +25,7 @@ class RealtimeTrackingWorker(QThread):
     fov_found = pyqtSignal(list)
     objects_detected = pyqtSignal(object)  # list[TrackedObject]
     objects_gps_updated = pyqtSignal(object)  # list[ObjectGPS]
-    debug_view_ready = pyqtSignal(str, np.ndarray)  # (channel_name, готове BGR-зображення)
+    debug_view_ready = pyqtSignal(str, np.ndarray)  # (channel_name, BGR image)
 
     def __init__(self, video_source: str, localizer, model_manager=None, config=None):
         super().__init__()
@@ -36,37 +35,28 @@ class RealtimeTrackingWorker(QThread):
         self.config = config or {}
         self._stop_event = threading.Event()
 
-        # S3-3: Інтервал ключових кадрів для локалізації
+        # Keyframe interval for localization
         self.keyframe_interval = get_cfg(self.config, "tracking.keyframe_interval", 5)
-        # Зберігаємо process_fps для метрик UI, але логіка базується на кадрах
         self.process_fps = get_cfg(
             self.config, "tracking.process_fps", 30.0 / self.keyframe_interval
         )
         self.tracking_config = get_cfg(self.config, "object_tracking", {})
-        # ADDENDUM 1.2: forward-backward фільтр треків optical flow. Дефолт off.
+        # Forward-backward optical flow check
         self.of_fb_check = get_cfg(self.config, "tracking.of_fb_check", False)
         self.of_fb_max_px = get_cfg(self.config, "tracking.of_fb_max_px", 2.0)
-        # PIPELINE_OPTIMIZATION_PLAN §B1/§B2. Обидва дефолти = стара поведінка.
         self.of_stride = max(1, int(get_cfg(self.config, "tracking.of_stride", 1)))
         self.of_half_res = bool(get_cfg(self.config, "tracking.of_half_res", False))
-        # Локальна швидкість на OF-шляху: dt має мірятись від ПОПЕРЕДНЬОГО
-        # OF-КАДРУ, а не від останньої УСПІШНОЇ локалізації — інакше він
-        # розходиться з ref_position у детекторі (той бере попередній сирий
-        # OF-вимір). Заміряно: 4 з 20 спрацювань мали dt=0.200 при опорі,
-        # знятому 0.1 c тому, тобто перевищення 1.9-5.0x на рівному місці.
         self.of_local_speed = bool(get_cfg(self.config, "tracking.of_local_speed", False))
 
-        # ── Debug views (вікна «очима моделей») ─────────────────────────────
-        # Порожній набір каналів ⇒ нуль overhead: колектор не створюється.
+        # ── Debug views ───────────────────────────────────────────────────────
         self._debug_lock = threading.Lock()
         self._debug_channels = set()
         self._debug_max_width = get_cfg(self.config, "debug_views.max_width", 640)
         self._debug_dino_pca = get_cfg(self.config, "debug_views.dino_pca_enabled", True)
-        self._debug_inflight = {}  # {канал: monotonic-час emit} — backpressure (self-healing)
-        self._debug_inflight_stale_sec = 1.0  # авто-скидання, якщо ack від GUI не прийшов
+        self._debug_inflight = {}  # {channel: monotonic emit time} — backpressure
+        self._debug_inflight_stale_sec = 1.0
 
-        # HARDENING P1-8: optional per-frame latency stats (measurement only,
-        # no effect on timing). Off by default = поточна поведінка.
+        # Latency Tracker when monitoring is enabled
         self._latency_tracker = None
         if get_cfg(self.config, "models.performance.log_latency_stats", False):
             from src.utils.latency_tracker import LatencyTracker
@@ -77,46 +67,29 @@ class RealtimeTrackingWorker(QThread):
             )
 
     def _models_to_pin(self) -> list[str]:
-        """Імена моделей, які треба закріпити у VRAM на час трекінгу.
-
-        Виводяться з ``models.local_extractor``, а не хардкодяться: назви мають
-        збігатися з ключами реєстру ModelManager ("aliked" | "rdd" | "xfeat",
-        "lightglue_<features>", "dinov2").
-
-        Дзеркалить ModelManager.load_local_extractor() і prewarm() ТОЧНО:
-        завантажувач розрізняє лише "rdd" і "xfeat", будь-що інше (зокрема
-        "superpoint") тихо падає на ALIKED. Якщо там колись зʼявиться новий
-        екстрактор, оновити треба обидва місця.
-        """
+        """Model names to pin in VRAM during tracking."""
         local = str(get_cfg(self.config, "models.local_extractor", "aliked")).lower()
         if local not in ("rdd", "xfeat"):
             if local != "aliked":
                 logger.warning(
-                    f"models.local_extractor={local!r} не підтримується "
-                    f"ModelManager.load_local_extractor() — фактично вантажиться "
-                    f"ALIKED, закріплюємо його ж"
+                    f"models.local_extractor={local!r} is not supported — defaulting to ALIKED"
                 )
             local = "aliked"
-        # XFeat матчиться власним MNN, окремий LightGlue йому не потрібен.
         if local == "xfeat":
             return ["xfeat", "dinov2"]
         return [local, "dinov2", f"lightglue_{local}"]
 
     def run(self):
-        # Fix #3: скидаємо стан сесії через публічний API (без приватних полів)
+        # Reset session state via public API
         if hasattr(self.localizer, "reset_session"):
             self.localizer.reset_session()
 
-        # Debug views: свіжий старт backpressure-стану для нової сесії
+        # Debug views: fresh backpressure state for new session
         with self._debug_lock:
             self._debug_inflight.clear()
 
         if self.model_manager:
-            # ВИПРАВЛЕНО: список був захардкоджений під ALIKED. При
-            # models.local_extractor = "rdd" | "xfeat" він закріплював моделі,
-            # які взагалі не вантажаться, а ті, що реально в роботі, лишались
-            # витискуваними — _ensure_vram_available вивантажував їх саме тоді,
-            # коли VRAM закінчувалась. Імена — ті самі, що в ModelManager.
+            # Pin active neural models in VRAM for selected local extractor
             self.model_manager.pin(self._models_to_pin())
 
         from src.tracking.object_projector import ObjectProjector
@@ -144,7 +117,7 @@ class RealtimeTrackingWorker(QThread):
             except Exception as e:
                 logger.error(f"Failed to initialize object tracking: {e}")
 
-        # Fix 6: Pre-warm fallback моделей при старті трекінгу
+        # Fix 6: Pre-warm fallback models when starting tracking
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
 
         logger.info(f"Starting tracking from source: {self.video_source}")
@@ -163,7 +136,7 @@ class RealtimeTrackingWorker(QThread):
                     f"Tracking cannot proceed without YOLO.",
                     exc_info=True,
                 )
-                self.error.emit(f"YOLO не вдалося завантажити: {e}")
+                self.error.emit(f"YOLO failed to load: {e}")
                 return
 
         from src.video.video_source import VideoSource, VideoSourceConfig
@@ -179,7 +152,7 @@ class RealtimeTrackingWorker(QThread):
                 f"Failed to open video source: {self.video_source}. "
                 f"Check that the source is available."
             )
-            self.error.emit(f"Не вдалося відкрити відеоджерело: {self.video_source}")
+            self.error.emit(f"Failed to open video source: {self.video_source}")
             return
 
         video_fps = video_src.fps
@@ -187,23 +160,14 @@ class RealtimeTrackingWorker(QThread):
             video_fps = 30.0
         frame_duration_sec = 1.0 / video_fps
 
-        # Замість time-based інтервалу використовуємо frame-based:
         frame_idx = 0
         prev_gray_for_of = None
-        prev_gray_half_for_of = None  # §B2: half-res копія keyframe-а для LK
+        prev_gray_half_for_of = None
         prev_pts_for_of = None
-        last_tracked_objects = []  # Кеш об'єктів з останнього ключового кадру для OF-кадрів
+        last_tracked_objects = []
 
-        # Зберігаємо останній час локалізації саме за ВІДЕО-часом, а не за процесорним
         last_localization_video_time = -1.0
-        # Час останнього ОБРОБЛЕНОГО keyframe-а (навіть якщо він був відхилений як outlier)
-        # Це потрібно для коректного dt в outlier_detector: якщо всі keyframe-и
-        # відхиляються, last_localization_video_time залишається -1, і dt = 0.033s,
-        # що штучно завищує швидкість у 5× (keyframe_interval=5).
         last_keyframe_video_time = -1.0
-        # Час ПОПЕРЕДНЬОГО обробленого OF-кадру (успішного чи ні) — база dt
-        # при of_local_speed. Скидається на кожному keyframe, бо LK там
-        # перезапускається і перший OF міряється саме від keyframe.
         last_of_video_time = -1.0
 
         stream_start_time = time.time()
@@ -214,30 +178,28 @@ class RealtimeTrackingWorker(QThread):
             ret, frame = video_src.read()
             if not ret:
                 logger.info("End of video stream or connection lost.")
-                self.status_update.emit("Відеопотік завершено або втрачено.")
+                self.status_update.emit("Video stream ended or connection lost.")
                 break
 
             if video_src.is_live:
                 current_video_time_sec = time.time() - stream_start_time
             else:
-                # Отримуємо поточний час САМОГО ВІДЕО у секундах (публічний API)
+                # Video timestamp in seconds
                 current_video_time_sec = video_src.pos_msec / 1000.0
-                # Fallback: деякі кодеки повертають 0 — рахуємо за номером кадру
+                # Fallback: estimate from frame index if position is 0
                 if current_video_time_sec <= 0:
                     current_video_time_sec = video_src.pos_frames * frame_duration_sec
 
-            # 1. Завжди відправляємо кадр в GUI для плавного відтворення (сирий BGR)
+            # 1. Always emit raw frame to GUI for smooth playback
             self.frame_ready.emit(frame)
 
             # S3-3: Optical Flow Pipeline
             curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             is_keyframe = frame_idx % self.keyframe_interval == 0
 
-            # Розрахунок dt — різний для KF та OF
+            # dt calculation logic
             _is_of_frame = not (is_keyframe or prev_pts_for_of is None)
             if is_keyframe or prev_pts_for_of is None:
-                # Для ключових кадрів: dt = час від ПОПЕРЕДНЬОГО ключового кадру
-                # (навіть якщо він був відхилений як outlier)
                 if last_keyframe_video_time < 0:
                     calculated_dt = self.keyframe_interval * frame_duration_sec
                 else:
@@ -245,9 +207,6 @@ class RealtimeTrackingWorker(QThread):
                     if calculated_dt <= 0:
                         calculated_dt = self.keyframe_interval * frame_duration_sec
             else:
-                # Для OF-кадрів: база dt має збігатися з базою ЗСУВУ.
-                # of_local_speed=True -> обидві беруться від попереднього
-                # OF-кадру. False -> стара поведінка (від успішної локалізації).
                 _dt_base = (
                     last_of_video_time if self.of_local_speed else last_localization_video_time
                 )
@@ -258,16 +217,6 @@ class RealtimeTrackingWorker(QThread):
                     if calculated_dt <= 0:
                         calculated_dt = frame_duration_sec
 
-            # База для наступного OF-кроку: беремо ПІСЛЯ того, як calculated_dt
-            # уже обчислено. На keyframe теж оновлюємо — ланцюг локальних
-            # порівнянь починається заново від нього.
-            #
-            # КРИТИЧНО: тільки для кадрів, на яких OF СПРАВДІ рахується.
-            # of_stride пропускає обробку нижче (рядок ~394), тож без цієї
-            # перевірки база часу рухалась на кожному кадрі, а база ЗСУВУ —
-            # раз на of_stride кадрів. Заміряно на місії top з of_stride=5:
-            # distance 17.5 м при dt=0.033 давало 526 м/с замість реальних
-            # 105 м/с — рівно у of_stride разів більше.
             _of_computed = _is_of_frame and (
                 self.of_stride <= 1 or (frame_idx % self.of_stride) == 0
             )
@@ -279,7 +228,6 @@ class RealtimeTrackingWorker(QThread):
 
             if is_keyframe or prev_pts_for_of is None:
                 # ====== HEAVY KEYFRAME LOCALIZATION ======
-                # Для обробки YOLO та анізотропних дескрипторів потрібен RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 static_mask = None
@@ -287,7 +235,7 @@ class RealtimeTrackingWorker(QThread):
                 if yolo_wrapper:
                     static_mask, detections = yolo_wrapper.detect_and_mask(frame_rgb)
 
-                # Debug views: знімок активних каналів + opt-in колектор.
+                # Debug views snapshot
                 with self._debug_lock:
                     active_debug = set(self._debug_channels)
                 debug_collector = None
@@ -319,31 +267,24 @@ class RealtimeTrackingWorker(QThread):
                         active_debug, frame_rgb, detections, static_mask, debug_collector
                     )
 
-                # Завжди оновлюємо час останнього keyframe, навіть якщо він rejected
                 last_keyframe_video_time = current_video_time_sec
 
-                # БАГФІКС (OF-шов): retrieval-only fallback не має H і не
-                # оновлює _last_state — ребейз OF-точок на ньому дав би OF
-                # з новими точками на старій гомографії.
                 if (
                     loc_result.get("success")
                     and loc_result.get("fallback_mode") != "retrieval_only"
                 ):
-                    # Зберігаємо стан для OF на наступні кадри
                     prev_gray_for_of = curr_gray
                     prev_gray_half_for_of = (
                         cv2.resize(curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
                         if self.of_half_res
                         else None
                     )
-                    # Трекаємо гарні точки (corners) для стабільного OF
                     prev_pts_for_of = cv2.goodFeaturesToTrack(
                         curr_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
                     )
 
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
-                    # ОНОВЛЕНО: Завжди оновлюємо кеш, навіть якщо порожній, щоб об'єкти могли зникати
                     last_tracked_objects = tracked_objects
                     self.objects_detected.emit(tracked_objects)
                     loc_state = getattr(self.localizer, "last_state", None)
@@ -353,13 +294,10 @@ class RealtimeTrackingWorker(QThread):
                         angle = loc_state.get("global_angle", 0)
 
                         if H is not None and affine is not None:
-                            # Фікс: масштабуємо об'єкти до нормалізованого простору гомографії
                             scale = loc_state.get(
                                 "scale", getattr(self.localizer, "_last_scale", 1.0)
                             )
 
-                            # Shallow copy достатньо: перезаписуємо лише center_px і bbox
-                            # (deepcopy на кожен об'єкт кожного keyframe — зайвий CPU)
                             from copy import copy as _shallow_copy
 
                             scaled_tracked_objects = []
@@ -387,29 +325,12 @@ class RealtimeTrackingWorker(QThread):
                                 logger.debug(
                                     f"Tracked {len(objects_gps)} objects (KF): {obj_summary}"
                                 )
-                            self.objects_gps_updated.emit(objects_gps)
-
-                # ВИПРАВЛЕНО (A1): раніше тут був torch.cuda.empty_cache() після
-                # КОЖНОГО keyframe — це синхронізує GPU і повертає блоки драйверу,
-                # через що наступні алокації йдуть повільним cudaMalloc (10–100 мс
-                # "податку" на keyframe). При OOM кеш чиститься у except-гілці вище.
             else:
                 # ====== OPTICAL FLOW TRACKING ======
-                # §B1: OF-кадри незалежні один від одного — кожен трекається
-                # ВІД keyframe-а (prev_gray_for_of / prev_pts_for_of нижче
-                # навмисно не оновлюються). Тому пропуск кожного N-го кадру не
-                # накопичує помилку: падає лише частота видачі позиції.
-                # Кадр усе одно вже відправлено в GUI (frame_ready вище).
                 if self.of_stride > 1 and (frame_idx % self.of_stride) != 0:
                     if object_tracker:
                         self.objects_detected.emit(last_tracked_objects)
                 elif prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
-                    # §B2: half-res LK. Заміряно на 1080p/200 точках: 3.08 →
-                    # 1.49 мс, тобто ~2.1× (не 4× — побудова піраміди й так
-                    # дешева), ціною вдвічі грубішого субпіксельного зсуву.
-                    # Координати повертаються у простір оригіналу одразу після
-                    # фільтрації, тож увесь код нижче лишається в оригінальних
-                    # пікселях і нічого про half-res не знає.
                     of_scale = (
                         0.5 if (self.of_half_res and prev_gray_half_for_of is not None) else 1.0
                     )
@@ -434,12 +355,7 @@ class RealtimeTrackingWorker(QThread):
                     )
                     keep = status.reshape(-1) == 1
 
-                    # ADDENDUM 1.2: forward-backward перевірка. Трек, який не
-                    # повертається у власну стартову точку, «сповз» на схожу
-                    # текстуру (рілля, ліс). RANSAC нижче його й так відкине —
-                    # але доти він сидить у знаменнику inlier_ratio і ЗАНИЖУЄ
-                    # flow_quality, від якого залежить R у Калмані. Тобто це
-                    # фікс чесності метрики якості, а не самої трансформації.
+                    # Forward-backward check
                     if self.of_fb_check and keep.any():
                         back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
                             g_curr,
@@ -449,39 +365,23 @@ class RealtimeTrackingWorker(QThread):
                             winSize=(15, 15),
                             maxLevel=2,
                         )
-                        # Поріг застосовується в РОБОЧІЙ роздільності: на
-                        # half-res він тим самим числом стає вдвічі
-                        # м'якшим у повних пікселях — що й треба, бо сама
-                        # точність LK там теж удвічі грубіша.
                         rt_err = np.linalg.norm(
                             back_pts.reshape(-1, 2) - pts_prev.reshape(-1, 2), axis=1
                         )
                         fb_ok = (back_status.reshape(-1) == 1) & (rt_err <= self.of_fb_max_px)
-                        # Захист: якщо перевірка зрізала майже все (різка зміна
-                        # експозиції, розмиття), лишаємо початковий набір —
-                        # краще шумний OF, ніж примусовий keyframe.
                         if int((keep & fb_ok).sum()) >= 10:
                             keep = keep & fb_ok
 
-                    # reshape(-1, 2) перед маскою: маска плоска (N,), а масиви
-                    # від goodFeaturesToTrack/LK мають форму (N, 1, 2).
-                    # Результат (M, 2) — точно як у попередньої версії
-                    # `curr_pts[status == 1]`, downstream не змінюється.
                     good_new = curr_pts.reshape(-1, 2)[keep]
                     good_old = pts_prev.reshape(-1, 2)[keep]
                     if of_scale != 1.0:
-                        # half-res → оригінальні пікселі
                         good_new = good_new / of_scale
                         good_old = good_old / of_scale
 
                     if len(good_new) > 10:
-                        # Зсув у пікселях (fallback, якщо симілярність не зійдеться)
                         flow_vectors = good_new - good_old
                         dx_px, dy_px = np.median(flow_vectors, axis=0)
 
-                        # B4: повна симілярність (R+T+S) замість чистої трансляції —
-                        # враховує обертання дрона та зміну висоти між keyframe-ами.
-                        # flow_quality (0..1) — чесна оцінка якості OF для Kalman R.
                         flow_affine = None
                         flow_quality = None
                         try:
@@ -498,10 +398,6 @@ class RealtimeTrackingWorker(QThread):
                                     n_norm = min(1.0, len(good_new) / 120.0)
                                     flow_quality = inlier_ratio * n_norm
                         except cv2.error as e:
-                            # Гарячий шлях: рівень debug навмисно. Наслідок збою
-                            # видимий далі як flow_quality=0, і без цього рядка
-                            # причина «поганого потоку» не відрізнялася від
-                            # справжнього зриву LK.
                             logger.debug(f"OF affine estimation failed: {e}")
 
                         try:
@@ -518,16 +414,10 @@ class RealtimeTrackingWorker(QThread):
                             logger.error(f"OF Localization error: {e}")
                             loc_result = {"success": False, "error": str(e)}
 
-                        # Оновлюємо стан так, щоб OF завжди рахувався ВІД КЛЮЧОВОГО КАДРУ,
-                        # Це усуває проблему накопичення помилок (drift).
-                        # Тому prev_gray_for_of та prev_pts_for_of не оновлюються тут!
-
-                        # На OF-кадрах: повторно emit останні відомі об'єкти для візуальної
-                        # безперервності (YOLO не запускається, тому нових детекцій немає)
                         if object_tracker:
                             self.objects_detected.emit(last_tracked_objects)
                     else:
-                        prev_pts_for_of = None  # Втрата точок — наступний кадр стане ключовим
+                        prev_pts_for_of = None
                 else:
                     prev_pts_for_of = None
 
@@ -538,9 +428,6 @@ class RealtimeTrackingWorker(QThread):
                     loc_result["confidence"],
                     loc_result["inliers"],
                 )
-                # HARDENING §4a: a fresh keyframe anchor (real re-localization)
-                # refreshes the broker's anchor-staleness clock; OF-propagated
-                # fixes do not, so a long OF coast honestly reads DEGRADED.
                 if not loc_result.get("is_of"):
                     self.anchor_fix.emit()
                 if loc_result.get("fov_polygon"):
@@ -548,30 +435,30 @@ class RealtimeTrackingWorker(QThread):
 
                 track_type = "OF" if loc_result.get("is_of") else "KF"
                 method_txt = (
-                    "Схожість" if loc_result.get("fallback_mode") == "retrieval_only" else "Inliers"
+                    "Similarity"
+                    if loc_result.get("fallback_mode") == "retrieval_only"
+                    else "Inliers"
                 )
                 score = loc_result.get("global_score", loc_result["inliers"])
 
                 self.status_update.emit(
-                    f"[{track_type}] Знайдено ({method_txt}: {score:.2f}, Кадр: {loc_result['matched_frame']})"
+                    f"[{track_type}] Found ({method_txt}: {score:.2f}, Frame: {loc_result['matched_frame']})"
                 )
 
                 last_localization_video_time = current_video_time_sec
 
-                # Мульти-режим: оновлюємо активні бази за поточною GPS-позицією
                 if hasattr(self.localizer, "db_manager") and self.localizer.db_manager is not None:
                     try:
                         self.localizer.db_manager.set_active_by_gps(
                             loc_result["lat"], loc_result["lon"]
                         )
-                        # Фонова перебудова FAISS-підмножини у GeoAwareRetriever-ах
                         self.localizer.db_manager.update_retriever_positions(
                             loc_result["lat"], loc_result["lon"]
                         )
                     except Exception as e:
                         logger.debug(f"set_active_by_gps failed: {e}")
             elif not loc_result.get("success") and loc_result.get("error") != "Not processed":
-                self.status_update.emit(f"Втрата: {loc_result.get('error', 'Невідома помилка')}")
+                self.status_update.emit(f"Lost: {loc_result.get('error', 'Unknown error')}")
 
             process_duration = time.time() - start_process
             if self._latency_tracker is not None:
@@ -580,7 +467,6 @@ class RealtimeTrackingWorker(QThread):
 
             frame_idx += 1
 
-            # 3. Синхронізація відтворення (тільки для файлів)
             if not video_src.is_live:
                 elapsed_in_loop = time.time() - loop_start
                 sleep_time = frame_duration_sec - elapsed_in_loop
@@ -591,7 +477,7 @@ class RealtimeTrackingWorker(QThread):
         logger.info("Tracking worker thread finished cleanly.")
 
     def _prewarm_fallback_models(self):
-        """Завантажує моделі заздалегідь, делегуючи у ModelManager."""
+        """Pre-warms models via ModelManager."""
         try:
             if not self.model_manager:
                 return
@@ -606,26 +492,12 @@ class RealtimeTrackingWorker(QThread):
             )
 
     def set_debug_channels(self, channels) -> None:
-        """GUI → worker: набір активних debug-каналів (thread-safe).
-
-        Порожній набір ⇒ нуль overhead. Викликається з GUI-потоку при зміні
-        видимості вікон і при старті трекінгу.
-        """
+        """GUI -> worker: active debug channels (thread-safe)."""
         with self._debug_lock:
             self._debug_channels = set(channels or [])
 
     def _render_debug(self, active, frame_rgb, detections, static_mask, collector) -> None:
-        """Рендерить активні debug-канали й emit-ить готові BGR-кадри у GUI.
-
-        Лише на keyframe-ах, у worker-потоці. Емітяться свіжі масиви (не аліаси
-        кадру/колектора), тож безпечно між потоками.
-
-        Backpressure «drop замість черги»: на канал одночасно ≤1 кадр «у льоті».
-        Поки GUI не підтвердив попередній (mark_debug_channel_free), нові кадри
-        цього каналу не рендеряться і не emit-яться — GUI-черга не росте, ми
-        показуємо найсвіжіший кадр, а не відстаємо. Кожен рендер у своєму try:
-        помилка одного вікна не валить локалізацію чи інші вікна.
-        """
+        """Renders active debug channels and emits BGR frames to GUI."""
         from src.workers import debug_renderers as dr
 
         mw = self._debug_max_width
@@ -634,8 +506,6 @@ class RealtimeTrackingWorker(QThread):
             now = time.monotonic()
             with self._debug_lock:
                 ts = self._debug_inflight.get(channel)
-                # Свіжий in-flight → drop. Застарілий (ack втрачено?) → self-heal,
-                # рендеримо знову, щоб канал не «замерзав» назавжди.
                 if ts is not None and (now - ts) < self._debug_inflight_stale_sec:
                     return
             try:
@@ -659,18 +529,14 @@ class RealtimeTrackingWorker(QThread):
             emit_if_free("depth", lambda: dr.render_depth(collector, mw))
 
     def mark_debug_channel_free(self, channel) -> None:
-        """GUI → worker: підтвердження, що кадр каналу спожито (thread-safe).
-
-        Знімає in-flight позначку, дозволяючи emit наступного кадру цього
-        каналу. Викликається зі слота _on_debug_view_ready у GUI-потоці.
-        """
+        """GUI -> worker: confirmation that channel frame was consumed (thread-safe)."""
         with self._debug_lock:
             self._debug_inflight.pop(channel, None)
 
     def stop(self):
         logger.info("Stopping tracking worker...")
         self._stop_event.set()
-        if not self.wait(5000):  # чекаємо максимум 5 секунд
+        if not self.wait(5000):
             logger.warning("Tracking worker did not finish within 5 seconds.")
         else:
             logger.info("Tracking worker successfully stopped.")

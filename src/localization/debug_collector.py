@@ -1,14 +1,13 @@
-"""Opt-in колектор даних для вікон візуалізації моделей (debug views).
+"""Opt-in data collector for model debug views.
 
-`Localizer.localize_frame(collector=...)` заповнює ці поля ЛИШЕ коли колектор
-переданий (тобто відкрите хоча б одне вікно matches/dino/depth). За
-замовчуванням `collector=None` — жодного додаткового коштування у гарячому
-шляху локалізації.
+`Localizer.localize_frame(collector=...)` fills these fields ONLY when collector
+is provided (i.e., at least one debug window matches/dino/depth is open). By
+default `collector=None` — zero additional overhead in hot localization path.
 
-Поля-запити (`want_*`) ставить worker перед викликом; поля-виходи заповнює
-Localizer у міру проходження кадру. Часткове заповнення — норма: якщо кадр
-відхилено рано (немає кандидатів), `rotated_frame` лишиться None і відповідні
-вікна просто не оновляться цього keyframe.
+Request fields (`want_*`) are set by worker before call; output fields are populated by
+Localizer as frame processing proceeds. Partial population is normal: if a frame
+is rejected early (no candidates), `rotated_frame` remains None and corresponding
+windows simply do not update for this keyframe.
 """
 
 from __future__ import annotations
@@ -20,37 +19,37 @@ import numpy as np
 
 @dataclass
 class DebugCollector:
-    # ── Запити від worker-а: що саме рахувати (дороге — лише за потреби) ─────
-    want_matches: bool = False  # keypoints / inlier-матчі / RMSE
-    want_dino_pca: bool = False  # патч-токени DINO для PCA-візуалізації (окремий forward)
-    want_depth: bool = False  # depth-мапа (окремий GPU-прохід)
+    # -- Worker requests: what to compute (expensive items only on demand) -----
+    want_matches: bool = False  # keypoints / inlier-matches / RMSE
+    want_dino_pca: bool = False  # DINO patch tokens for PCA visualization (separate forward)
+    want_depth: bool = False  # depth map (separate GPU pass)
 
-    # ── Вихід: повернутий + GSD-нормалізований кадр (RGB) ───────────────────
-    # У просторі саме цього кадру лежать keypoints/mkpts та патч-токени.
+    # -- Output: rotated + GSD-normalized frame (RGB) -------------------
+    # Keypoints/mkpts and patch tokens lie in the space of this frame.
     rotated_frame: np.ndarray | None = None
     query_features: dict | None = None  # {'keypoints', 'descriptors', 'image_size', ...}
 
-    # ── Вихід: точки / матчі ────────────────────────────────────────────────
+    # -- Output: points / matches ----------------------------------------
     mkpts_q_inliers: np.ndarray | None = None  # (M, 2) query-side inliers
     mkpts_r_inliers: np.ndarray | None = None  # (M, 2) reference-side inliers
     total_matches: int = 0
     inliers: int = 0
     rmse: float = 0.0
-    # ADDENDUM 1.1: просторовий розкид інлаєрів, min(σx,σy)/min(W,H).
-    # None = порахувати не вдалося. Норма ≈ 0.29, колапс у кут < 0.05.
+    # ADDENDUM 1.1: spatial inlier spread, min(sigma_x, sigma_y)/min(W, H).
+    # None = computation failed. Normal ~ 0.29, corner collapse < 0.05.
     spread: float | None = None
 
-    # ── Вихід: retrieval / rotation панель ──────────────────────────────────
+    # -- Output: retrieval / rotation panel ------------------------------
     candidate_id: int = -1
     retrieval_candidates: list = field(default_factory=list)  # [(frame_id, score), ...]
     global_angle: int = 0
     scale: float = 1.0
     global_score: float = 0.0
 
-    # ── Вихід: DINO PCA ─────────────────────────────────────────────────────
-    patch_tokens: np.ndarray | None = None  # (N, D) на CPU
+    # -- Output: DINO PCA ------------------------------------------------
+    patch_tokens: np.ndarray | None = None  # (N, D) on CPU
     patch_grid: tuple | None = None  # (h_p, w_p)
 
-    # ── Вихід: depth ────────────────────────────────────────────────────────
-    depth_map: np.ndarray | None = None  # (H, W) float32, відносна глибина
-    depth_scale: float | None = None  # відносний масштаб (1 / median depth)
+    # -- Output: depth ---------------------------------------------------
+    depth_map: np.ndarray | None = None  # (H, W) float32, relative depth
+    depth_scale: float | None = None  # relative scale (1 / median depth)

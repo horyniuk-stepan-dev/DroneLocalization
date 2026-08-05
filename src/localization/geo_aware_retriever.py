@@ -1,9 +1,8 @@
 """
-geo_aware_retriever.py — Геозалежний ретривер з фоновою перебудовою FAISS.
+geo_aware_retriever.py — Location-aware retriever with background FAISS rebuilds.
 
-Замінює FastRetrieval для джерел із frame_gps. При наявності
-просторового контексту будує FAISS IndexFlatIP тільки з підмножини
-кадрів в активному радіусі.
+Replaces FastRetrieval for sources with frame_gps. Given spatial context,
+builds FAISS IndexFlatIP over a subset of frames within active radius.
 """
 
 from __future__ import annotations
@@ -24,14 +23,14 @@ logger = get_logger(__name__)
 
 class GeoAwareRetriever:
     """
-    Геозалежний FAISS-ретривер з фоновою перебудовою індексу.
+    Location-aware FAISS retriever with background index rebuilding.
 
-    При виклику update_position():
-    - Визначає новий набір frame_id через SpatialIndex
-    - Якщо набір змінився — перебудовує FAISS у daemon-потоці
-    - Під час перебудови поточний індекс залишається активним
+    On update_position():
+    - Determines new set of frame_ids via SpatialIndex
+    - If set changed — rebuilds FAISS in daemon thread
+    - During rebuild current index remains active
 
-    Для джерел без frame_gps деградує до GlobalRetriever (повний масив).
+    Degrades to GlobalRetriever (full array) for sources without frame_gps.
     """
 
     def __init__(
@@ -41,18 +40,18 @@ class GeoAwareRetriever:
     ) -> None:
         """
         Args:
-            global_descriptors: Повний масив дескрипторів (N, D).
-            spatial_index:      SpatialIndex або None для fallback.
+            global_descriptors: Full descriptor array (N, D).
+            spatial_index:      SpatialIndex or None for fallback.
         """
         self._full_descriptors = global_descriptors
         self._spatial_index = spatial_index
         self._dim = global_descriptors.shape[1]
 
-        # Активний стан
+        # Active state
         self._active_frame_ids: list[int] = list(range(len(global_descriptors)))
         self._lock = threading.Lock()
 
-        # Починаємо з повного індексу
+        # Start with full index
         self._index = self._build_faiss_index(global_descriptors, self._active_frame_ids)
 
         if spatial_index is not None and spatial_index.is_available:
@@ -72,7 +71,7 @@ class GeoAwareRetriever:
         descriptors: np.ndarray,
         frame_ids: list[int],
     ) -> faiss.IndexIDMap:
-        """Будує FAISS IndexFlatIP з нормалізованих дескрипторів."""
+        """Builds FAISS IndexFlatIP from normalized descriptors."""
         base_index = faiss.IndexFlatIP(self._dim)
         index = faiss.IndexIDMap(base_index)
 
@@ -84,7 +83,7 @@ class GeoAwareRetriever:
         index.add_with_ids(normed.astype(np.float32), ids)
         return index
 
-    # ── Оновлення позиції ────────────────────────────────────────────────────
+    # -- Position update ----------------------------------------------------
 
     def update_position(self, lat: float, lon: float, radius_tiles: int = 2) -> bool:
         """
@@ -109,7 +108,7 @@ class GeoAwareRetriever:
             f"Active frames: {len(self._active_frame_ids)} → {len(new_frame_ids)}"
         )
 
-        # Перебудова у фоновому потоці
+        # Rebuild in background thread
         thread = threading.Thread(
             target=self._rebuild_in_background,
             args=(new_frame_ids,),
@@ -119,13 +118,13 @@ class GeoAwareRetriever:
         return True
 
     def _rebuild_in_background(self, new_frame_ids: list[int]) -> None:
-        """Перебудовує FAISS-індекс у daemon-потоці."""
+        """Rebuilds FAISS index in a daemon thread."""
         try:
-            # Збираємо дескриптори для підмножини
+            # Collect descriptors for subset
             descriptors = self._full_descriptors[new_frame_ids]
             new_index = self._build_faiss_index(descriptors, new_frame_ids)
 
-            # Атомарна заміна
+            # Atomic replacement
             with self._lock:
                 self._index = new_index
                 self._active_frame_ids = new_frame_ids
@@ -137,7 +136,7 @@ class GeoAwareRetriever:
                 exc_info=True,
             )
 
-    # ── Пошук ────────────────────────────────────────────────────────────────
+    # -- Search ---------------------------------------------------------------
 
     def find_similar_frames(
         self,
@@ -163,7 +162,7 @@ class GeoAwareRetriever:
         results = [(int(idx), float(score)) for idx, score in zip(ids[0], scores[0]) if idx != -1]
         return results
 
-    # ── Утиліти ──────────────────────────────────────────────────────────────
+    # -- Utilities ------------------------------------------------------------
 
     @property
     def num_active_frames(self) -> int:

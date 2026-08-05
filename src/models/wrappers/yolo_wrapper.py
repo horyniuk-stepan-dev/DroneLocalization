@@ -13,20 +13,14 @@ class YOLOWrapper:
     def __init__(self, model, device="cuda"):
         self.model = model
         self.device = device
-        # Класи COCO: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
+        # COCO classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
         self.dynamic_classes = {0, 1, 2, 3, 5, 7}
 
-        # FP16 для YOLO — прискорює інференс на ~40%
-        # Ultralytics керує FP16 через параметр half=True при виклику
         self.use_half = device == "cuda" and torch.cuda.is_available()
 
     @torch.no_grad()
     def detect_and_mask(self, image: np.ndarray) -> tuple:
-        """
-        Detect objects and create static mask (single image).
-        Делегує до batch-методу для уникнення дублювання логіки.
-        Detect objects and create static mask (single image).
-        Делегує до batch-методу для уникнення дублювання логіки.
+        """Detect objects and create static mask (single image).
 
         Returns:
             static_mask: Binary mask of static areas (255 for static, 0 for dynamic)
@@ -36,18 +30,13 @@ class YOLOWrapper:
 
     @torch.no_grad()
     def detect_and_mask_batch(self, images: list[np.ndarray]) -> list[tuple]:
-        """
-        Обробляє список зображень одним викликом YOLO.
-        Повертає list[(static_mask, detections)] того самого порядку.
+        """Processes a list of images in a single YOLO call.
+
+        Returns list of (static_mask, detections) in the same order.
         """
         if not images:
             return []
 
-        # verbose=False вимикає зайве логування кожного кадру в консоль
-        # half=True для FP16 інференсу
-        # conf=0.25: збалансований поріг — достатньо для дрібних об'єктів з висоти,
-        # і водночас не генерує масу хибних детекцій, які псують static_mask
-        # classes: обмежуємо детекцію лише потрібними класами (люди, авто)
         results = self.model(
             images, verbose=False, half=self.use_half, conf=0.25, classes=list(self.dynamic_classes)
         )

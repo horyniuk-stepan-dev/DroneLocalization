@@ -14,14 +14,7 @@ class PruningMixin:
     """Two-stage spatial-edge pruning. Pure move from PoseGraphOptimizer."""
 
     def _anchor_reachable(self, edges: list[GraphEdge]) -> set[int]:
-        """Множина вузлів, досяжних із будь-якого якоря по заданому набору ребер.
-
-        Сідаємо з anchor_states() (жорсткі fix_node + м'які add_anchor), а не з
-        _fixed_nodes: при soft_anchors=True жорстких вузлів НЕМАЄ взагалі, обидві
-        множини досяжності виходили порожні, порівняння trial == base ставало
-        тотожно істинним — і захист «ніколи не роз'єднаємо вузол від якорів»
-        тихо вимикався, дозволяючи prune відрізати цілий сегмент графа.
-        """
+        """Set of nodes reachable from any anchor over the specified edge set."""
         adj: dict[int, list[int]] = {}
         for e in edges:
             adj.setdefault(e.from_id, []).append(e.to_id)
@@ -39,13 +32,7 @@ class PruningMixin:
     def _prune_bad_spatial_edges(
         self, mad_k: float = 5.0, max_frac: float = 0.2
     ) -> list[GraphEdge]:
-        """Викидає spatial-викиди за MAD-порогом ВСЕРЕДИНІ класу spatial.
-
-        Захисні правила (Етап 3.3):
-          - викидаємо ЛИШЕ spatial (temporal-ланцюг — хребет графа);
-          - не більше max_frac від кількості spatial-ребер;
-          - ніколи, якщо це роз'єднає вузол від усіх якорів.
-        """
+        """Prunes spatial outliers using MAD threshold within the spatial edge class."""
         res = self.compute_edge_residuals()
         spatial_idx = [
             k
@@ -53,7 +40,7 @@ class PruningMixin:
             if e.edge_type == "spatial" and not np.isnan(res[k])
         ]
         if len(spatial_idx) < 3:
-            return []  # замало для оцінки MAD
+            return []  # Too few edges for MAD estimation
 
         sres = np.array([res[k] for k in spatial_idx])
         med = float(np.median(sres))
@@ -74,7 +61,7 @@ class PruningMixin:
         for k in candidates:
             trial = [e for j, e in enumerate(self._edges) if j != k and j not in removed_idx]
             if self._anchor_reachable(trial) == base_reach:
-                removed_idx.append(k)  # безпечно: нічого не роз'єднали
+                removed_idx.append(k)  # Safe: disconnected nothing
 
         if not removed_idx:
             return []
@@ -97,18 +84,7 @@ class PruningMixin:
         use_analytic_jac: bool,
         kinematic_prior_weight: float = 0.0,
     ) -> dict[int, np.ndarray]:
-        """GNC-переваження spatial-ребер (Етап 3) — плавна еволюція two-stage prune.
-
-        Замість бінарного викидання: раунди L2 із Geman-McClure-вагами
-        w' = w · σ²/(σ²+r²), де σ = µ·thr, thr = median + mad_k·1.4826·MAD резидуалів
-        ВЛАСНОГО (spatial) класу — той самий поріг, що й у prune (урок soft_l1:
-        temporal-ланцюг недоторканий, пороги класо-відносні). µ спадає від
-        опуклого (усі ваги≈1) до 1 (справжній GM), warm start між раундами.
-
-        ЧИСТА СЦЕНА (жоден spatial-резидуал не перевищує thr) → миттєвий вихід із
-        БАЗОВИМИ вагами → розв'язок ІДЕНТИЧНИЙ чистому L2 (нуль деградації).
-        Геометричний (незалежний від ваги) резидуал = ‖residual‖ / weight.
-        """
+        """GNC reweighting of spatial edges using Geman-McClure weights."""
         spatial_idx = [k for k, e in enumerate(self._edges) if e.edge_type == "spatial"]
         base_w = {k: float(self._edges[k].weight) for k in spatial_idx}
         if len(base_w) < 3:
@@ -123,7 +99,7 @@ class PruningMixin:
                     geo[k] = float(res[k]) / w_cur
             return geo
 
-        # Раунд-0 діагностика на БАЗОВИХ вагах (розв'язок уже є з головного L2).
+        # Round 0 diagnostics on base weights
         geo0 = _geom_residuals()
         if len(geo0) < 3:
             return self._export_results()
@@ -132,7 +108,7 @@ class PruningMixin:
         mad = float(np.median(np.abs(vals0 - med)))
         thr = med + mad_k * 1.4826 * mad
         if float(np.max(vals0)) <= thr * (1.0 + 1e-9):
-            return self._export_results()  # немає викидів → чиста сцена → no-op
+            return self._export_results()  # Clean scene: no outliers
 
         opt_kw = dict(
             max_iterations=max_iterations,
@@ -152,13 +128,12 @@ class PruningMixin:
                 if r is None:
                     continue
                 self._edges[k].weight = w0 * (sigma2 / (sigma2 + r * r))
-            self.optimize(**opt_kw)  # повторний L2, warm start із self._free_nodes
+            self.optimize(**opt_kw)  # Repeat L2 with warm start
             if mu <= 1.0:
                 break
             mu = max(1.0, mu / 1.4)
 
-        # Відновлюємо базові ваги (розв'язок уже в self._free_nodes; ваги — лише
-        # для GNC-ітерацій, звіти мають бачити оригінальні ваги ребер).
+        # Restore base weights
         for k, w0 in base_w.items():
             self._edges[k].weight = w0
         self._last_edge_residuals = None

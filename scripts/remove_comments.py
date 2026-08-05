@@ -5,8 +5,9 @@ import tokenize
 from pathlib import Path
 
 # Force UTF-8 encoding for standard output
-if sys.stdout.encoding.lower() != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+
 
 def remove_comments_and_docstrings(source_code: str) -> str:
     """
@@ -43,9 +44,18 @@ def remove_comments_and_docstrings(source_code: str) -> str:
             if token_type == tokenize.COMMENT:
                 pass
             # Пропускаємо docstrings (лише поза дужками/списками/словниками)
-            elif (token_type == tokenize.STRING and
-                  nesting_level == 0 and
-                  prev_toktype in (tokenize.INDENT, tokenize.NEWLINE, tokenize.NL, tokenize.ENCODING, tokenize.DEDENT)):
+            elif (
+                token_type == tokenize.STRING
+                and nesting_level == 0
+                and prev_toktype
+                in (
+                    tokenize.INDENT,
+                    tokenize.NEWLINE,
+                    tokenize.NL,
+                    tokenize.ENCODING,
+                    tokenize.DEDENT,
+                )
+            ):
                 pass
             else:
                 out_tokens.append(token_string)
@@ -66,19 +76,17 @@ def remove_comments_and_docstrings(source_code: str) -> str:
     cleaned_lines = [line for line in clean_code.splitlines() if line.strip()]
     return "\n".join(cleaned_lines) + "\n"
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Скрипт для акуратного видалення всіх коментарів та docstrings з Python файлів."
     )
+    parser.add_argument("input_file", type=Path, help="Шлях до файлу, який потрібно очистити")
     parser.add_argument(
-        "input_file",
+        "-o",
+        "--output",
         type=Path,
-        help="Шлях до файлу, який потрібно очистити"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=Path,
-        help="Шлях до вихідного файлу (за замовчуванням перезаписує вхідний)"
+        help="Шлях до вихідного файлу (за замовчуванням перезаписує вхідний)",
     )
 
     args = parser.parse_args()
@@ -89,7 +97,7 @@ def main() -> None:
         print(f"❌ Помилка: Файл '{input_path}' не знайдено.")
         return
 
-    if input_path.suffix != '.py':
+    if input_path.suffix != ".py":
         print(f"⚠️ Попередження: Файл '{input_path}' можливо не є Python скриптом.")
 
     try:
@@ -103,6 +111,7 @@ def main() -> None:
         print(f"✅ Успішно! Коментарі видалено. Результат збережено у: {output_path}")
     except Exception as e:
         print(f"❌ Сталася помилка під час обробки файлу: {e}")
+
 
 if __name__ == "__main__":
     main()

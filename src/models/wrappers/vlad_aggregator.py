@@ -1,22 +1,7 @@
-"""RESEARCH 2.1 (AnyLoc, arXiv:2308.00688): ненавчена VLAD-агрегація патч-токенів.
+"""Untrained VLAD aggregation of patch tokens (AnyLoc, arXiv:2308.00688).
 
-Замінює CLS-токен глобального дескриптора на VLAD поверх патч-токенів
-фундаментальної моделі: словник — k-means по токенах референсних кадрів,
-дескриптор — конкатенація нормованих кластерних залишків + PCA-whitening.
-
-Модуль свідомо без torch: fit/aggregate працюють на numpy (k-means — faiss,
-якщо доступний, інакше scipy), тому юніт-тестується без GPU і вантажиться
-у DatabaseBuilder / FeatureExtractor без додаткових залежностей.
-
-Пайплайн:
-    offline (scripts/build_vlad_vocab.py):
-        tokens_per_image = DINOv3.forward_features(...)  # (N, D) кожен
-        agg = VladAggregator(n_clusters=32, pca_dim=512)
-        agg.fit(list_of_tokens)
-        agg.save("vlad_vocab.npz")
-    online (FeatureExtractor):
-        agg = VladAggregator.load("vlad_vocab.npz")
-        desc = agg.aggregate(tokens)  # (out_dim,), L2-нормований
+Replaces the global descriptor CLS token with VLAD over foundation model patch tokens:
+vocabulary built via k-means over reference frame tokens, descriptor is concatenated normalized cluster residuals + PCA-whitening.
 """
 
 from __future__ import annotations
@@ -29,7 +14,7 @@ logger = get_logger(__name__)
 
 
 class VladAggregator:
-    """VLAD з жорстким призначенням + intra-нормалізація + PCA-whitening."""
+    """VLAD with hard assignment + intra-normalization + PCA-whitening."""
 
     def __init__(
         self,
@@ -48,33 +33,29 @@ class VladAggregator:
         self.pca_components: np.ndarray | None = None  # (pca_dim, K*D)
         self.pca_eigvals: np.ndarray | None = None  # (pca_dim,)
 
-    # ── Властивості ──────────────────────────────────────────────────────
-
     @property
     def is_fitted(self) -> bool:
         return self.centers is not None
 
     @property
     def out_dim(self) -> int:
-        """Розмірність фінального дескриптора."""
+        """Dimensionality of the final descriptor."""
         if self.centers is None:
             raise RuntimeError("VladAggregator is not fitted")
         if self.pca_components is not None:
             return int(self.pca_components.shape[0])
         return int(self.n_clusters * self.centers.shape[1])
 
-    # ── Fit ──────────────────────────────────────────────────────────────
-
     def fit(
         self,
         tokens_per_image: list[np.ndarray],
         max_kmeans_tokens: int = 200_000,
     ) -> VladAggregator:
-        """Будує словник (k-means) і PCA-whitening по референсних кадрах.
+        """Builds vocabulary (k-means) and PCA-whitening over reference frames.
 
         Args:
-            tokens_per_image: список (N_i, D) патч-токенів окремих кадрів.
-            max_kmeans_tokens: стеля вибірки токенів для k-means (пам'ять).
+            tokens_per_image: list of (N_i, D) patch tokens per frame.
+            max_kmeans_tokens: cap on sampled tokens for k-means.
         """
         if len(tokens_per_image) < 2:
             raise ValueError("fit() needs at least 2 images of tokens")
@@ -93,7 +74,7 @@ class VladAggregator:
             f"tokens={len(stacked)}, dim={stacked.shape[1]}"
         )
 
-        # PCA-whitening по VLAD-векторах референсних кадрів (як в AnyLoc).
+        # PCA-whitening over VLAD vectors of reference frames
         vlads = np.stack([self._vlad(t) for t in tokens_per_image])  # (M, K*D)
         n_samples, full_dim = vlads.shape
         eff_dim = min(self.pca_dim, n_samples - 1, full_dim)
@@ -111,16 +92,14 @@ class VladAggregator:
 
         self.pca_mean = vlads.mean(axis=0)
         centered = vlads - self.pca_mean
-        # SVD економного розміру: components — праві сингулярні вектори
         _, s, vt = np.linalg.svd(centered, full_matrices=False)
         self.pca_components = vt[:eff_dim].astype(np.float32)
-        # Дисперсія компонент; epsilon від ділення на ~0 для хвостових компонент
         self.pca_eigvals = (s[:eff_dim] ** 2 / max(n_samples - 1, 1)).astype(np.float32)
         logger.info(f"VLAD PCA-whitening fitted: {full_dim} → {eff_dim}")
         return self
 
     def _kmeans(self, tokens: np.ndarray) -> np.ndarray:
-        """k-means: faiss (швидко, GPU-able) з фолбеком на scipy."""
+        """k-means: faiss (fast, GPU-capable) with fallback to scipy."""
         try:
             import faiss
 
@@ -145,11 +124,8 @@ class VladAggregator:
             )
             return centers.astype(np.float32)
 
-    # ── Aggregate ────────────────────────────────────────────────────────
-
     def _filter_low_norm(self, tokens: np.ndarray) -> np.ndarray:
-        """Dustbin-сурогат (SALAD): відкидає частку токенів з найнижчою нормою
-        (небо, однорідні поверхні несуть мало просторової інформації)."""
+        """Discards low-norm tokens (uninformative background/sky regions)."""
         if self.low_norm_fraction <= 0.0 or len(tokens) < 8:
             return tokens
         norms = np.linalg.norm(tokens, axis=1)
@@ -158,14 +134,13 @@ class VladAggregator:
         return kept if len(kept) >= 4 else tokens
 
     def _vlad(self, tokens: np.ndarray) -> np.ndarray:
-        """VLAD-вектор без PCA: (K*D,) з intra- та глобальною L2-нормалізацією."""
+        """VLAD vector without PCA: (K*D,) with intra- and global L2-normalization."""
         if self.centers is None:
             raise RuntimeError("VladAggregator is not fitted")
         t = self._filter_low_norm(np.asarray(tokens, dtype=np.float32))
         k, d = self.centers.shape
 
-        # Жорстке призначення до найближчого центру: argmin ||t - c||²
-        # через розклад (економія пам'яті проти повної матриці відстаней)
+        # Hard assignment to nearest centroid
         dots = t @ self.centers.T  # (N, K)
         c_sq = np.sum(self.centers**2, axis=1)  # (K,)
         assign = np.argmax(dots - 0.5 * c_sq, axis=1)  # (N,)
@@ -176,7 +151,7 @@ class VladAggregator:
             if len(sel):
                 vlad[ci] = (sel - self.centers[ci]).sum(axis=0)
 
-        # Intra-нормалізація (по кластеру) — пригнічує burstiness
+        # Intra-normalization
         norms = np.linalg.norm(vlad, axis=1, keepdims=True)
         np.divide(vlad, norms, out=vlad, where=norms > 1e-12)
 
@@ -185,21 +160,19 @@ class VladAggregator:
         return flat / n if n > 1e-12 else flat
 
     def aggregate(self, tokens: np.ndarray) -> np.ndarray:
-        """Патч-токени (N, D) → глобальний дескриптор (out_dim,), L2-норм."""
+        """Patch tokens (N, D) -> global descriptor (out_dim,), L2-normalized."""
         v = self._vlad(tokens)
         if self.pca_components is not None:
             v = (v - self.pca_mean) @ self.pca_components.T
-            v = v / np.sqrt(self.pca_eigvals + 1e-8)  # whitening
+            v = v / np.sqrt(self.pca_eigvals + 1e-8)
             n = np.linalg.norm(v)
             if n > 1e-12:
                 v = v / n
         return v.astype(np.float32)
 
     def aggregate_batch(self, tokens_batch: np.ndarray | list[np.ndarray]) -> np.ndarray:
-        """(B, N, D) або список (N_i, D) → (B, out_dim)."""
+        """(B, N, D) or list of (N_i, D) -> (B, out_dim)."""
         return np.stack([self.aggregate(t) for t in tokens_batch])
-
-    # ── Persistence ──────────────────────────────────────────────────────
 
     def save(self, path: str) -> None:
         if self.centers is None:

@@ -1,18 +1,8 @@
-"""HARDENING P2-12: weight-integrity pinning (offline / air-gap assurance).
+"""Model weight integrity verification (SHA-256 Manifest Verification).
 
-The models are pre-staged offline; at startup we can verify every weight file
-against a pinned SHA-256 manifest and **fail closed** if any file is missing or
-altered. This detects a swapped/corrupted weight (supply-chain or on-disk
-tamper) before it is ever loaded — a single go/no-go preflight rather than a
-hook threaded through every model-load site.
-
-Modes (``models.performance.weight_integrity_mode``):
-- ``off``     — skip entirely (default; current behavior).
-- ``warn``    — log any mismatch/missing but continue.
-- ``enforce`` — raise on the first problem set; caller aborts startup.
-
-Generate the manifest with ``scripts/generate_weights_manifest.py`` after
-staging weights on the target, then commit/ship ``models/weights_manifest.json``.
+At startup, verifies the integrity of loaded neural-network model weights
+against their SHA-256 checksums and warns or blocks launch when corrupted
+or modified files are detected.
 """
 
 import hashlib

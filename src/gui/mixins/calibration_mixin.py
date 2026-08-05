@@ -34,11 +34,7 @@ logger = get_logger(__name__)
 
 
 def _materialize_keypoints_video(path: str) -> tuple[str, str | None]:
-    """Return a path the video reader can open, plus a temp file to wipe (or None).
-
-    HARDENING P1-6 SP3: a plaintext keypoint video is used in place (unchanged);
-    an encrypted one is decrypted to a temp file the caller must wipe. A missing
-    video is not an error — the dialog already handles its absence."""
+    """Повертає шлях до відеокадрів ключових точок, розшифровуючи зашифровані файли у тимчасовий файл."""
     src = Path(path)
     if not src.is_file():
         return path, None
@@ -61,13 +57,13 @@ class CalibrationMixin:
 
         anchors_data = [a.to_dict() for a in self.calibration.anchors]
 
-        # Параметри відповідності кадрів відео ↔ слотів БД.
-        # Без них діалог не може конвертувати номери кадрів і якорі
-        # прив'язуються до неправильних слотів (див. BUGREPORT №1).
+        # Video frame ↔ DB slot mapping parameters.
+        # Without these the dialog cannot convert frame numbers and anchors
+        # bind to incorrect slots.
         db_num_frames = self.database.get_num_frames()
         frame_step = int(self.database.metadata.get("frame_step", 0) or 0)
         if frame_step < 1:
-            # Старі БД без frame_step у метаданих — беремо з конфіга (може не збігатися!)
+            # Legacy DB without frame_step in metadata — fallback to config
             frame_step = int(get_cfg(self.config, "database.frame_step", 30))
             logger.warning(
                 f"DB metadata has no 'frame_step' — falling back to config value {frame_step}. "
@@ -115,9 +111,7 @@ class CalibrationMixin:
                 QMessageBox.warning(self, "Помилка", "Потрібно мінімум 4 точки для якоря!")
                 return
 
-            # ВИПРАВЛЕНО: WEB_MERCATOR-конвертер за замовчуванням завжди
-            # "_initialized", тому налаштований projection.default_mode (напр. UTM)
-            # мовчки ігнорувався. Перемикаємо режим, поки якорів ще немає.
+            # Initialize or switch coordinate projection mode (UTM / WEB_MERCATOR).
             mode = str(get_cfg(self.config, "projection.default_mode", "WEB_MERCATOR")).upper()
             conv = self.calibration.converter
             if not conv.is_initialized or (not self.calibration.anchors and conv.mode != mode):
@@ -125,7 +119,7 @@ class CalibrationMixin:
                 self.calibration.converter = CoordinateConverter(mode, reference_gps)
                 logger.info(f"Projection initialized for calibration: {mode}")
 
-            # Розмір кадру — потрібен для інтерполяції якорів навколо центру кадру
+            # Frame size — needed for anchor interpolation around frame center
             fw = int(self.database.metadata.get("frame_width", 0) or 0)
             fh = int(self.database.metadata.get("frame_height", 0) or 0)
             if fw > 0 and fh > 0 and hasattr(self.calibration, "set_frame_size"):
@@ -147,17 +141,8 @@ class CalibrationMixin:
                     proj.tolist(),
                 )
 
-            # ── ВИПРАВЛЕНО: детермінований фіт якоря ────────────────────────────
-            #
-            # Раніше: cv2.estimateAffine2D з RANSAC та порогом 3.0, який
-            # інтерпретується в одиницях ПРИЗНАЧЕННЯ (метрах!). Кліки з похибкою
-            # 1–3 м опинялися на межі порогу, і недетермінований RANSAC давав
-            # РІЗНІ матриці за тих самих точок між запусками → "нестабільний
-            # крок калібрації". Для 4–8 перевірених користувачем точок RANSAC
-            # недоречний — використовуємо least-squares по всіх точках.
-            #
-            # Система координат: піксельна вісь Y ↓, метрична (UTM/Mercator) Y ↑,
-            # тому фізично коректна матриця pixel→metric ЗАВЖДИ має det < 0.
+            # Deterministic LSQ fit for anchor pixel -> metric transformation.
+            # Coordinate system: pixel axis Y ↓, metric Y ↑, so valid matrix ALWAYS has det < 0.
             best_M = GeometryTransforms.estimate_affine_lsq(pts_2d_np, pts_metric_np)
             best_type = "affine_full_lsq"
 
@@ -174,9 +159,7 @@ class CalibrationMixin:
             det = float(best_M[0, 0] * best_M[1, 1] - best_M[0, 1] * best_M[1, 0])
             logger.info(f"Anchor {frame_id} affine determinant: {det:.6f}")
             if det > 0:
-                # det > 0 фізично неможливий для pixel→map: означає дзеркально
-                # переплутані вхідні дані. Раніше тут був лише warning у лог, і
-                # такий якір ламав глобальний sign у графовій оптимізації.
+                # det > 0 physically impossible for pixel->map (requires flipped Y axis)
                 QMessageBox.critical(
                     self,
                     "Помилка калібрування",
@@ -190,15 +173,11 @@ class CalibrationMixin:
 
             rmse_p, median_p, max_p, proj_p = calc_metrics(best_M, pts_2d_np, pts_metric_np)
 
-            # ── Перевірка порогів якості ────────────────────────────────────────
+            # Quality thresholds validation
             rmse_threshold = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
             max_err_threshold = get_cfg(self.config, "projection.anchor_max_error_m", 5.0)
 
-            # ── B6: Leave-one-out перевірка точок ────────────────────────────────
-            # Фітимо матрицю без кожної точки по черзі й міряємо, наскільки
-            # "викинута" точка не узгоджується з рештою. Сумарний RMSE маскує
-            # одну криву точку (неправильний клік / переплутана координата) —
-            # LOO показує її явно.
+            # Leave-one-out validation
             suspicious_points: list[tuple[int, float]] = []
             if 5 <= len(pts_2d_np) <= 12:
                 loo_errors: list[float] = []
@@ -262,7 +241,7 @@ class CalibrationMixin:
             else:
                 logger.success(f"Anchor {frame_id} QA passed: RMSE={rmse_p:.2f}m")
 
-            # ── Збереження результатів ──────────────────────────────────────────
+            # Save results
             qa_data = {
                 "rmse_m": rmse_p,
                 "median_err_m": median_p,
@@ -286,7 +265,7 @@ class CalibrationMixin:
             if hasattr(self, "_update_project_info_panel"):
                 self._update_project_info_panel()
 
-            # ── Діагностичний лог по точках ──────────────────────────────────────
+            # Point-by-point diagnostic logging
             logger.info(f"--- Anchor {frame_id} Point-by-Point Analysis ---")
             for j in range(len(pts_2d_np)):
                 p2d = pts_2d_np[j]
@@ -366,7 +345,7 @@ class CalibrationMixin:
         if not self.database:
             QMessageBox.warning(self, "Увага", "База даних не завантажена!")
             return
-        # Взаємне виключення з трекінгом: пропагація перезаписує HDF5.
+        # Mutual exclusion with tracking: propagation overwrites HDF5.
         tw = getattr(self, "tracking_worker", None)
         if tw is not None and tw.isRunning():
             QMessageBox.warning(
@@ -455,8 +434,7 @@ class CalibrationMixin:
 
         rmse_thresh = get_cfg(self.config, "projection.anchor_rmse_threshold_m", 3.0)
 
-        # УВАГА: frame_rmse з пропагації — це ПІКСЕЛІ репроєкції матчів між
-        # кадрами, а не метри (раніше підпис "м" вводив в оману)
+        # NOTE: frame_rmse from propagation is in reprojection pixels between frames, not meters
         report = (
             f"<b>Пропагація завершена!</b><br><br>"
             f"Валідних кадрів: <b>{valid_count} / {num_frames}</b> ({valid_count / num_frames * 100:.1f}%)<br>"
@@ -496,7 +474,7 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_verify_propagation(self):
-        """Візуалізація та звіт якості пропагації на мапі"""
+        """Visualizes propagation quality markers on the map."""
         if not self.database or not self.database.is_propagated:
             QMessageBox.warning(self, "Увага", "Дані пропагації не знайдено.")
             return
@@ -504,8 +482,7 @@ class CalibrationMixin:
         try:
             self.map_widget.clear_verification_markers()
             num_frames = self.database.get_num_frames()
-            # A8: тисячі Leaflet-маркерів одним JSON вішають QWebEngine —
-            # обмежуємо кількість точок до ~600 із рівномірним кроком
+            # Limit number of Leaflet markers to ~600 with uniform step
             step = max(1, num_frames // 600)
 
             rmse_data = getattr(self.database, "frame_rmse", None)
@@ -540,14 +517,14 @@ class CalibrationMixin:
                                 f"  {lbl}({px},{py}) -> metric({mx_d:.1f},{my_d:.1f}) -> GPS({lat_d:.6f},{lon_d:.6f})"
                             )
 
-                    # Центр кадру
+                    # Frame center
                     mx, my = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
                     )
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
-                    # Низ кадру (замінено 0.75 на h для точнішої орієнтації повного низу)
+                    # Frame bottom
                     mx_b, my_b = (
                         affine[0, 0] * (w / 2) + affine[0, 1] * h + affine[0, 2],
                         affine[1, 0] * (w / 2) + affine[1, 1] * h + affine[1, 2],
@@ -578,7 +555,7 @@ class CalibrationMixin:
                     elif rmse > 2.0 or dis > 3.0:
                         color = "orange"
 
-                    # Відмальовуємо тільки центр кадру
+                    # Render frame center marker only
                     points_to_show.append(
                         {
                             "lat": float(lat_c),
@@ -612,7 +589,7 @@ class CalibrationMixin:
     # ── Save / Load calibration ──────────────────────────────────────────────
 
     def _get_current_source_id(self) -> str:
-        """Повертає source_id поточного активного джерела (базуючись на db_path)."""
+        """Returns source_id of current active source (based on db_path)."""
         if not self.project_manager or not self.project_manager.is_loaded or not self.database:
             return "main"
 
@@ -625,18 +602,18 @@ class CalibrationMixin:
         return "main"
 
     def _get_calibration_save_path(self) -> str | None:
-        """Повертає шлях до calibration.json для поточного активного джерела.
+        """Returns calibration.json path for current active source.
 
-        Принцип: зіставляє `self.database.db_path` з `database_file` кожного
-        джерела в project settings, щоб знайти відповідний `calibration_file`.
-        Fallback: `project_manager.calibration_path` (корінь проєкту).
+        Matches `self.database.db_path` with `database_file` of each source in
+        project settings to locate the matching `calibration_file`.
+        Fallback: `project_manager.calibration_path` (project root).
         """
         if not self.project_manager or not self.project_manager.is_loaded:
             return None
 
         project_dir = self.project_manager.project_dir
 
-        # Пошук джерела відповідно до поточної БД
+        # Match source to current DB
         if self.database and self.project_manager.settings:
             current_db = str(Path(self.database.db_path).resolve())
             for src_dict in self.project_manager.settings.video_sources or []:
@@ -652,7 +629,7 @@ class CalibrationMixin:
                     )
                     return str(cal_path)
 
-        # Fallback — шлях на рівні проєкту
+        # Fallback — project-level path
         return self.project_manager.calibration_path
 
     @pyqtSlot()
@@ -663,7 +640,7 @@ class CalibrationMixin:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
 
-        # Дефолтний шлях — папка активного джерела
+        # Default path — active source folder
         default_path = self._get_calibration_save_path() or "calibration.json"
 
         path, _ = QFileDialog.getSaveFileName(
@@ -698,8 +675,7 @@ class CalibrationMixin:
             propagated = self.database and self.database.is_propagated
             self.control_panel.update_status("Калібрування завантажено")
 
-            # Автоматично зберігаємо копію в папці поточного джерела
-            # (навіть якщо файл завантажено з іншого місця або скопійовано вручну)
+            # Automatically save copy into current source folder
             source_cal_path = self._get_calibration_save_path()
             copied_to_source = False
             # An encrypted copy is immutable: load into memory for viewing, but
@@ -711,7 +687,7 @@ class CalibrationMixin:
                 norm_loaded = str(Path(path).resolve())
                 norm_source = str(Path(source_cal_path).resolve())
                 if norm_loaded != norm_source:
-                    # Файл прийшов не з папки джерела — копіюємо туди
+                    # Copy calibration file if loaded from external location
                     Path(source_cal_path).parent.mkdir(parents=True, exist_ok=True)
                     self.calibration.save(source_cal_path)
                     copied_to_source = True

@@ -1,11 +1,6 @@
-"""Тонка QThread-обгортка над :class:`PropagationPipeline`.
+"""QThread wrapper over PropagationPipeline.
 
-Уся математика графової пропагації живе в Qt-free ядрі
-``src/workers/propagation_pipeline.py``. Тут — лише міст між Qt-сигналами
-(``progress`` / ``completed`` / ``error``) і колбеками пайплайна + запуск у
-окремому потоці. Поведінка збережена 1:1: ті самі сигнали й тексти прогресу,
-``stop()``, ``start()`` / ``isRunning()`` (з QThread), і прямий синхронний
-виклик ``_propagate()`` (шлях бенчмарка/тестів).
+Connects PropagationPipeline callbacks to Qt signals (progress, completed, error).
 """
 
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -17,7 +12,7 @@ logger = get_logger(__name__)
 
 
 class CalibrationPropagationWorker(QThread):
-    """QThread-адаптер: емітить сигнали з колбеків PropagationPipeline."""
+    """QThread adapter: emits Qt signals from PropagationPipeline callbacks."""
 
     progress = pyqtSignal(int, str)
     completed = pyqtSignal()
@@ -39,8 +34,7 @@ class CalibrationPropagationWorker(QThread):
         self._pipeline.stop()
 
     def _propagate(self):
-        # Прямий синхронний виклик (бенчмарк/тести) — делегуємо в пайплайн.
-        # Сигнали летять через колбеки, під'єднані в __init__.
+        """Direct synchronous invocation (benchmarks/tests)."""
         self._pipeline._propagate()
 
     def run(self):

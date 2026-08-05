@@ -46,8 +46,6 @@ class DINOv3Wrapper(nn.Module):
         from transformers import AutoModel
 
         logger.info(f"Loading DINOv3 from HuggingFace: {model_id} (rev={revision or 'latest'})")
-        # trust_remote_code=True виконує код із репозиторію моделі. Без
-        # зафіксованого revision підміна репозиторію = виконання чужого коду.
         if not revision:
             logger.warning(
                 "DINOv3 loaded with trust_remote_code=True WITHOUT pinned revision — "
@@ -61,9 +59,7 @@ class DINOv3Wrapper(nn.Module):
         self._device = device
 
         hidden_size = self._model.config.hidden_size
-        # DINOv3 має register-токени між CLS та патч-токенами в last_hidden_state:
-        # [CLS, reg_1..reg_n, patch_1..patch_N]. Кількість читаємо з конфігу моделі,
-        # щоб не хардкодити (RESEARCH_INTEGRATION_PLAN 1.1).
+        # DINOv3 has register tokens between CLS and patch tokens: [CLS, reg_1..reg_n, patch_1..patch_N].
         self._num_register_tokens = int(getattr(self._model.config, "num_register_tokens", 0) or 0)
         logger.info(
             f"DINOv3 loaded: hidden_size={hidden_size}, "
@@ -84,8 +80,6 @@ class DINOv3Wrapper(nn.Module):
             cls_token: (B, 1024) float tensor.
         """
         outputs = self._model(pixel_values=pixel_values)
-        # HuggingFace ViT models expose last_hidden_state: (B, 1 + num_patches, hidden)
-        # Index 0 is the [CLS] token
         cls_token = outputs.last_hidden_state[:, 0, :]
         return cls_token
 
@@ -96,21 +90,16 @@ class DINOv3Wrapper(nn.Module):
 
         Returns dict with:
             'x_norm_clstoken':    (B, 1024)
-            'x_norm_patchtokens': (B, num_patches, 1024) — без CLS та register-токенів
+            'x_norm_patchtokens': (B, num_patches, 1024) — excluding CLS & register tokens
         """
         if layer is None:
             outputs = self._model(pixel_values=pixel_values)
             hidden_src = outputs.last_hidden_state
         else:
-            # RESEARCH 2.1 (AnyLoc): патч-токени з проміжного шару. Увага:
-            # hidden_states[layer] БЕЗ фінального LayerNorm — узгоджено з
-            # AnyLoc, який агрегує сирі проміжні токени; словник VLAD треба
-            # будувати з ТОГО САМОГО шару.
+            # AnyLoc intermediate layer patch tokens
             outputs = self._model(pixel_values=pixel_values, output_hidden_states=True)
             hidden_src = outputs.hidden_states[layer]
-        # (B, 1 + n_reg + N_patches, 1024): пропускаємо CLS і register-токени —
-        # register-токени не несуть просторової семантики і забруднювали б
-        # патч-агрегацію (CESP/VLAD). Раніше тут був зріз [:, 1:, :] — витік.
+        # Skip CLS and register tokens
         hidden = hidden_src
         n_skip = 1 + self._num_register_tokens
         return {

@@ -1,7 +1,7 @@
-# src/models/wrappers/masking_strategy.py
-#
-# Поліморфний інтерфейс маскування динамічних об'єктів (Strategy Pattern).
-# Дозволяє підміняти реалізацію (YOLO, EfficientViT-SAM, none) через конфіг.
+"""Dynamic object masking strategy interface (Strategy Pattern).
+
+Allows swapping masking implementations (YOLO, none) via config.
+"""
 
 from abc import ABC, abstractmethod
 
@@ -14,43 +14,21 @@ logger = get_logger(__name__)
 
 
 class MaskingStrategy(ABC):
-    """Абстрактний інтерфейс для стратегій маскування динамічних об'єктів."""
+    """Abstract interface for dynamic object masking strategies."""
 
     @abstractmethod
     def get_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
-        """Повертає бінарну маску: 255 = статичний фон, 0 = динамічний об'єкт.
-
-        Args:
-            frame_rgb: RGB зображення (H, W, 3), uint8
-
-        Returns:
-            Бінарна маска (H, W), uint8: 255 = статика, 0 = динаміка
-        """
+        """Returns binary mask: 255 = static background, 0 = dynamic object."""
 
     @abstractmethod
     def get_mask_batch(self, frames_rgb: list[np.ndarray]) -> list[np.ndarray]:
-        """Батчева обробка кадрів.
-
-        Args:
-            frames_rgb: список RGB зображень
-
-        Returns:
-            Список бінарних масок (одна на кадр)
-        """
+        """Batch processing of frames."""
 
 
 class YOLOMaskingStrategy(MaskingStrategy):
-    """Стратегія маскування через YOLO сегментацію.
-
-    Делегує обробку існуючому YOLOWrapper, зберігаючи всю логіку
-    micro-batching, over-masking та фільтрації за класами.
-    """
+    """Masking strategy using YOLO segmentation."""
 
     def __init__(self, yolo_wrapper):
-        """
-        Args:
-            yolo_wrapper: екземпляр YOLOWrapper (вже ініціалізований)
-        """
         self._wrapper = yolo_wrapper
         logger.info("YOLOMaskingStrategy initialized")
 
@@ -64,10 +42,7 @@ class YOLOMaskingStrategy(MaskingStrategy):
 
 
 class NoMaskingStrategy(MaskingStrategy):
-    """Заглушка без маскування — повертає повністю білу маску.
-
-    Використовується для тестів та режиму без YOLO.
-    """
+    """Fallback strategy without masking — returns fully static (white) mask."""
 
     def __init__(self):
         logger.info("NoMaskingStrategy initialized (masking disabled)")
@@ -85,16 +60,7 @@ def create_masking_strategy(
     model_manager=None,
     device: str = "cuda",
 ) -> MaskingStrategy:
-    """Фабрика стратегій маскування.
-
-    Args:
-        strategy_name: назва стратегії з конфігу ("yolo" | "none")
-        model_manager: ModelManager для завантаження моделей
-        device: пристрій для інференсу ("cuda" | "cpu")
-
-    Returns:
-        Екземпляр MaskingStrategy
-    """
+    """Factory for creating masking strategies."""
     if strategy_name == "yolo":
         if model_manager is None:
             raise ValueError("model_manager is required for YOLO masking strategy")

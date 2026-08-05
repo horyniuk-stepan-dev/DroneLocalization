@@ -7,7 +7,7 @@ logger = get_logger(__name__)
 
 
 class DatabaseGenerationWorker(QThread):
-    """Фоновий потік для генерації HDF5 бази даних (XFeat + DINOv2)"""
+    """Background thread for generating HDF5 database (XFeat + DINOv2)."""
 
     progress = pyqtSignal(int, str)
     frame_processed = pyqtSignal(int)
@@ -34,7 +34,7 @@ class DatabaseGenerationWorker(QThread):
         logger.info("DatabaseGenerationWorker thread started")
 
         try:
-            self.progress.emit(0, "Ініціалізація бази даних (XFeat + DINOv2)...")
+            self.progress.emit(0, "Initializing database (XFeat + DINOv2)...")
             logger.info("Initializing database builder...")
 
             builder = DatabaseBuilder(
@@ -45,8 +45,8 @@ class DatabaseGenerationWorker(QThread):
             def update_progress(percent: int):
                 if not self._is_running:
                     logger.warning("Database generation interrupted by user")
-                    raise InterruptedError("Обробку скасовано користувачем")
-                self.progress.emit(percent, f"Обробка кадрів... {percent}%")
+                    raise InterruptedError("Processing cancelled by user")
+                self.progress.emit(percent, f"Processing frames... {percent}%")
 
             logger.info("Starting video processing...")
             builder.build_from_video(
@@ -57,7 +57,7 @@ class DatabaseGenerationWorker(QThread):
             )
 
             if self._is_running:
-                self.progress.emit(100, "Базу даних успішно створено!")
+                self.progress.emit(100, "Database successfully generated!")
                 logger.success(f"Database generation completed: {self.output_path}")
                 self.completed.emit(self.output_path)
 
@@ -73,7 +73,7 @@ class DatabaseGenerationWorker(QThread):
                 f"Check that the video file is valid (MP4/H.264) and disk has sufficient space.",
                 exc_info=True,
             )
-            self.error.emit(f"Критична помилка: {str(e)}")
+            self.error.emit(f"Critical error: {str(e)}")
 
     def stop(self):
         logger.info("Stopping DatabaseGenerationWorker...")

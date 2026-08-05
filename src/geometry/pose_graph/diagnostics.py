@@ -19,7 +19,7 @@ class DiagnosticsMixin:
     """Residual stats, anchor stress, reports and GeoJSON. Pure move from PoseGraphOptimizer."""
 
     def _current_states_full(self) -> dict[int, np.ndarray]:
-        """Поточні стани всіх ІНІЦІАЛІЗОВАНИХ вузлів (fixed + досяжні free)."""
+        """Current states of all INITIALIZED nodes (fixed + reachable free)."""
         states: dict[int, np.ndarray] = dict(self._fixed_nodes)
         for fid, st in self._free_nodes.items():
             if fid in self._initialized_nodes:
@@ -27,7 +27,7 @@ class DiagnosticsMixin:
         return states
 
     def _single_edge_residual(self, si: np.ndarray, sj: np.ndarray, e: GraphEdge) -> np.ndarray:
-        """Зважений 5-вектор резидуала ребра — ТА САМА формула, що в _residuals_vec."""
+        """Weighted 5-vector edge residual — SAME formula as in _residuals_vec."""
         return edge_residual(
             si,
             sj,
@@ -42,10 +42,10 @@ class DiagnosticsMixin:
         )
 
     def compute_edge_residuals(self) -> np.ndarray:
-        """Норма зваженого резидуала на КОЖНЕ ребро (за поточними станами).
+        """Norm of weighted residual per EACH edge (based on current states).
 
-        result.fun уже містить ці числа під час оптимізації, але викидається —
-        тут відтворюємо їх для діагностики. NaN, якщо вузол ребра недосяжний.
+        result.fun already contains these numbers during optimization, but is discarded —
+        here we recreate them for diagnostics. NaN if edge node is unreachable.
         """
         states = self._current_states_full()
         res = np.full(len(self._edges), np.nan, dtype=np.float64)
@@ -58,7 +58,7 @@ class DiagnosticsMixin:
         return res
 
     def edge_residual_stats(self) -> dict:
-        """Статистика резидуалів ОКРЕМО для temporal і spatial (різні масштаби!)."""
+        """Residual statistics SEPARATELY for temporal and spatial (different scales!)."""
         res = self.compute_edge_residuals()
         out: dict[str, dict] = {}
         for cls in ("temporal", "spatial"):
@@ -81,9 +81,9 @@ class DiagnosticsMixin:
         return out
 
     def compute_anchor_stress(self) -> dict[int, float]:
-        """Для кожного якоря: середній резидуал інцидентних ребер / медіана графу.
+        """For each anchor: mean residual of incident edges / graph median.
 
-        Якір зі stress ≫ 1 конфліктує з графом (крива точка користувача).
+        An anchor with stress >> 1 conflicts with the graph (bad user point).
         """
         res = self._last_edge_residuals
         if res is None:
@@ -99,8 +99,8 @@ class DiagnosticsMixin:
             incident.setdefault(e.to_id, []).append(res[k])
 
         stress: dict[int, float] = {}
-        # anchor_states(): жорсткі + м'які. З _fixed_nodes при soft_anchors=True
-        # звіт anchor-stress зникав повністю (вузлів там немає).
+        # anchor_states() returns hard + soft anchors. Using only _fixed_nodes
+        # when soft_anchors=True caused the anchor-stress report to disappear entirely.
         for fid in self.anchor_states():
             rs = incident.get(fid, [])
             if not rs:
@@ -110,17 +110,17 @@ class DiagnosticsMixin:
         return stress
 
     def leave_one_out_anchor_check(self, threshold_m: float = 5.0) -> dict:
-        """LOO-валідація якорів (Етап 1.2, read-only).
+        """LOO-validation of anchors (read-only).
 
-        Для кожного якоря: спрогнозувати його стан temporal-ланцюгом від
-        НАЙБЛИЖЧОГО якоря з кожного боку (менший / більший frame_id), окремо.
-        disagreement = MIN по доступних боках → якір, що конфліктує з ОБОМА
-        сусідами (крива точка), спливає, а добрий сусід кривого лишається
-        normal (бо збігається зі своїм другим, добрим боком). Той самий
-        forward/inverse-предикт, що в BFS; anchor-stress лишається як пост-фактум.
+        For each anchor: predict its state via temporal chain from the NEAREST anchor
+        on each side (smaller / larger frame_id), separately.
+        disagreement = MIN over available sides -> an anchor conflicting with BOTH
+        neighbors (bad point) pops up, while a good neighbor of a bad point stays
+        normal (since it matches its second, good side). Same forward/inverse predict
+        as in BFS; anchor-stress remains post-factum.
 
-        Не мутує стан оптимізатора. {fid → {reachable, disagreement_m, flag}}.
-        Працює і з жорсткими (fix_node), і з м'якими (add_anchor) якорями.
+        Does not mutate optimizer state. {fid -> {reachable, disagreement_m, flag}}.
+        Works with both hard (fix_node) and soft (add_anchor) anchors.
         """
         anchors: dict[int, np.ndarray] = dict(self._fixed_nodes)
         for fid, (st, _w) in getattr(self, "_anchor_priors", {}).items():
@@ -134,8 +134,8 @@ class DiagnosticsMixin:
             adj.setdefault(e.to_id, []).append((e.from_id, e))
 
         def predict_from(seed: int, target: int):
-            """Чиста одометрична проєкція стану target від одного якоря seed
-            уздовж ребер (BFS, перше досягнення). None, якщо недосяжно."""
+            """Pure odometric projection of target state from single seed anchor
+            along edges (BFS, first reach). None if unreachable."""
             pred = {seed: anchors[seed]}
             visited = {seed}
             queue = deque([seed])
@@ -180,7 +180,7 @@ class DiagnosticsMixin:
         return results
 
     def diagnostics_report(self, top_n: int = 5, loo_threshold_m: float = 5.0) -> dict:
-        """Повний звіт пропагації (Етап 1.3): класи ребер, резидуали, топ-гірших,
+        """Full propagation report: edge classes, residuals, top worst,
         anchor stress, LOO-валідація якорів (1.2). Read-only — нуль впливу на розв'язок."""
         res = self.compute_edge_residuals()
         stats = self.edge_residual_stats()
@@ -214,7 +214,7 @@ class DiagnosticsMixin:
         }
 
     def format_diagnostics(self, top_n: int = 5, loo_threshold_m: float = 5.0) -> str:
-        """Текстовий звіт для лога/діалогу-підсумку."""
+        """Text report for log/summary dialog."""
         r = self.diagnostics_report(top_n=top_n, loo_threshold_m=loo_threshold_m)
         lines = [
             f"Ребер: {r['num_edges']} ({r['num_temporal']} temporal + "
@@ -248,15 +248,15 @@ class DiagnosticsMixin:
     def export_graph_geojson(
         self, converter, frame_w: int, frame_h: int, origin_xy: tuple = (0.0, 0.0)
     ) -> dict:
-        """origin_xy — Local Origin пропагації: внутрішні стани графа локальні,
+        """origin_xy — Local Origin of propagation: internal graph states are local,
         без цього зсуву GeoJSON опинявся біля (0°, 0°) (баг, сесія 2026-07-12)."""
         features = []
         results = self._export_results()
         cx, cy = frame_w / 2.0, frame_h / 2.0
         ox, oy = float(origin_xy[0]), float(origin_xy[1])
 
-        # Пер-ребровий резидуал у properties → на карті розфарбувати ребра
-        # за резидуалом (погані loop closures стає ВИДНО очима).
+        # Per-edge residual in properties → edges can be colour-coded on the map
+        # by residual magnitude (bad loop closures become visually obvious).
         edge_res = self.compute_edge_residuals()
         anchor_ids = set(self.anchor_states())  # жорсткі + м'які (soft_anchors)
 

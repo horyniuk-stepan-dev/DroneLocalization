@@ -387,19 +387,7 @@ class HardwareProfile:
             target[keys[-1]] = new_val
 
     def apply_torch_backends(self, deterministic: bool = False) -> None:
-        """Configure PyTorch global backend settings based on hardware.
-
-        Should be called once at startup, after detection. Sets:
-        - ``torch.backends.cudnn.benchmark`` for CNN workloads
-        - TF32 matmul/convolution on Ampere+ GPUs
-        - ``torch.set_num_threads`` for CPU parallelism
-        - ``cv2.setNumThreads`` for OpenCV parallelism
-
-        HARDENING P1-8: when ``deterministic`` is True, cuDNN benchmarking is
-        disabled to bound worst-case latency (no variable first-call autotuning,
-        no nondeterministic kernel selection). Trades some throughput for
-        predictability. Default False = current throughput-tuned behavior.
-        """
+        """Configures PyTorch and OpenCV computational options for hardware setup."""
         # ── CPU thread tuning ────────────────────────────────────────────────
         try:
             import torch

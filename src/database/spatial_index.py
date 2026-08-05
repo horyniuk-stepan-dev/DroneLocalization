@@ -1,8 +1,6 @@
-"""
-spatial_index.py — Просторовий тайловий індекс для геофільтрації кадрів.
+"""Spatial tile index for frame geo-filtering.
 
-Будується поверх даних frame_gps з HDF5. Не вимагає зовнішніх
-геосторонніх бібліотек (H3, S2 тощо).
+Built on frame_gps data from HDF5 database.
 """
 
 from __future__ import annotations
@@ -17,26 +15,11 @@ logger = get_logger(__name__)
 
 
 class SpatialIndex:
-    """
-    Тайловий просторовий індекс для швидкої геофільтрації кадрів.
-
-    Територія розбивається на рівні прямокутні тайли за формулою:
-        tile_key = (int(lat / tile_deg), int(lon / tile_deg))
-    де tile_deg ≈ 0.005° ≈ 500 метрів.
-
-    Для кожного тайлу зберігається список frame_id кадрів,
-    GPS-координати яких потрапляють у цей тайл.
-    """
+    """Tiled spatial index for fast frame geo-filtering."""
 
     TILE_DEG: float = 0.005  # ≈ 500m
 
     def __init__(self, frame_gps: np.ndarray, tile_deg: float | None = None) -> None:
-        """
-        Args:
-            frame_gps: Масив (N, 2) з [lat, lon] для кожного кадру.
-                       NaN значення ігноруються.
-            tile_deg:  Розмір тайлу у градусах. За замовчуванням 0.005° ≈ 500m.
-        """
         if tile_deg is not None:
             self.tile_deg = tile_deg
         else:
@@ -49,7 +32,7 @@ class SpatialIndex:
         self._build(frame_gps)
 
     def _build(self, frame_gps: np.ndarray) -> None:
-        """Будує індекс з масиву GPS-координат."""
+        """Builds index from GPS coordinate array."""
         for frame_id in range(len(frame_gps)):
             lat, lon = frame_gps[frame_id]
             if np.isnan(lat) or np.isnan(lon):
@@ -64,7 +47,7 @@ class SpatialIndex:
         )
 
     def _to_tile(self, lat: float, lon: float) -> tuple[int, int]:
-        """Конвертує GPS у ключ тайлу."""
+        """Converts GPS coordinate into tile key."""
         return int(lat / self.tile_deg), int(lon / self.tile_deg)
 
     def get_frame_ids_near(
@@ -73,20 +56,7 @@ class SpatialIndex:
         lon: float,
         radius_tiles: int = 2,
     ) -> list[int]:
-        """
-        Повертає об'єднаний список frame_id з квадрата тайлів навколо точки.
-
-        При radius_tiles=2 та tile_deg=0.005° це дає покриття
-        ≈ 2.5 км у кожному напрямку.
-
-        Args:
-            lat:           Широта центру пошуку.
-            lon:           Довгота центру пошуку.
-            radius_tiles:  Радіус пошуку у тайлах.
-
-        Returns:
-            Список frame_id кадрів у радіусі.
-        """
+        """Returns frame_ids in tile square surrounding target point."""
         center_t_lat, center_t_lon = self._to_tile(lat, lon)
         result: list[int] = []
 
@@ -99,7 +69,7 @@ class SpatialIndex:
         return result
 
     def get_frame_gps(self, frame_id: int) -> tuple[float, float] | None:
-        """Повертає (lat, lon) для frame_id або None."""
+        """Returns (lat, lon) for frame_id or None if invalid/missing."""
         if frame_id < 0 or frame_id >= len(self._frame_gps):
             return None
         lat, lon = self._frame_gps[frame_id]
@@ -109,15 +79,15 @@ class SpatialIndex:
 
     @property
     def num_indexed(self) -> int:
-        """Кількість проіндексованих кадрів."""
+        """Number of indexed frames."""
         return self._num_indexed
 
     @property
     def num_tiles(self) -> int:
-        """Кількість тайлів."""
+        """Number of tiles."""
         return len(self._tiles)
 
     @property
     def is_available(self) -> bool:
-        """True якщо індекс містить хоча б один кадр."""
+        """Returns True if index contains at least one frame."""
         return self._num_indexed > 0
