@@ -86,14 +86,30 @@ def merge_files(
     print(f"\nГотово! {copied} файлів об'єднано в {output}.")
 
 
+import argparse
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Merge Python source files into a single file.")
+    parser.add_argument("sources", nargs="*", help="Source files or directories to merge.")
+    parser.add_argument("-o", "--output", help="Output file path.")
+    parser.add_argument("-b", "--base", help="Base directory for relative paths.")
+
+    args = parser.parse_args()
+
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-    SOURCES = [
-        PROJECT_ROOT / "config",
-        PROJECT_ROOT / "src",
-        PROJECT_ROOT / "main.py",
-    ]
-    OUTPUT = PROJECT_ROOT / "scripts" / "allFiles" / "all_merged_new.py"
+    if args.sources:
+        sources = [Path(s) for s in args.sources]
+        output = Path(args.output) if args.output else PROJECT_ROOT / "scripts" / "allFiles" / "all_merged_new.py"
+        base_dir = Path(args.base) if args.base else None
+    else:
+        sources = [
+            PROJECT_ROOT / "config",
+            PROJECT_ROOT / "src",
+            PROJECT_ROOT / "main.py",
+        ]
+        output = PROJECT_ROOT / "scripts" / "allFiles" / "all_merged_new.py"
+        base_dir = None
 
-    merge_files(SOURCES, OUTPUT)
+    merge_files(sources, output, base_dir=base_dir)
+
