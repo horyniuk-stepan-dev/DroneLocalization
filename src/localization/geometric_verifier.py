@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import cv2
 import numpy as np
 
 from src.geometry.transformations import GeometryTransforms
@@ -44,6 +45,10 @@ class GeometricVerifier:
         early_stop_inliers: int,
         prefilter_enabled: bool = False,
         prefilter_keep: int = 2,
+        max_rmse_px: float = 4.0,
+        min_inlier_ratio: float = 0.2,
+        max_center_extrapolation: float = 0.1,
+        min_reference_eigenvalue: float = 1e-4,
     ) -> None:
         self.matcher = matcher
         self.min_matches = min_matches
@@ -54,6 +59,75 @@ class GeometricVerifier:
         self.early_stop_inliers = early_stop_inliers
         self.prefilter_enabled = prefilter_enabled
         self.prefilter_keep = prefilter_keep
+        self.max_rmse_px = float(max_rmse_px)
+        self.min_inlier_ratio = float(min_inlier_ratio)
+        self.max_center_extrapolation = float(max_center_extrapolation)
+        self.min_reference_eigenvalue = float(min_reference_eigenvalue)
+
+    def _has_spatial_support(
+        self,
+        query_features: dict,
+        pts_q_in: np.ndarray,
+        pts_r_in: np.ndarray,
+        H_query_to_ref: np.ndarray,
+    ) -> bool:
+        """Require inliers to support projecting the query image centre.
+
+        A low reprojection error only proves that a local patch is consistent.
+        It does not make extrapolation across the rest of the frame safe.  This
+        check rejects near-collinear reference geometry, centres far outside the
+        query inlier hull, and homographies with a pole inside the query frame.
+        """
+        size = np.asarray(query_features.get("image_size", []), dtype=float).ravel()
+        if size.size < 2 or not np.isfinite(size[:2]).all():
+            logger.debug("Rejecting geometry: query image_size is missing or invalid")
+            return False
+        height, width = map(float, size[:2])
+        if height <= 0 or width <= 0:
+            return False
+
+        q_points = np.asarray(pts_q_in, dtype=np.float32).reshape(-1, 2)
+        r_points = np.asarray(pts_r_in, dtype=np.float64).reshape(-1, 2)
+        if len(q_points) < 3 or len(r_points) < 3:
+            return False
+
+        hull = cv2.convexHull(q_points)
+        center = (width / 2.0, height / 2.0)
+        distance = cv2.pointPolygonTest(hull, center, True)
+        max_outside = self.max_center_extrapolation * float(np.hypot(width, height))
+        if distance < -max_outside:
+            logger.debug(
+                f"Rejecting geometry: query centre is {-distance:.1f}px outside "
+                f"inlier support (limit {max_outside:.1f}px)"
+            )
+            return False
+
+        extents = np.ptp(r_points, axis=0)
+        if np.min(extents) <= 1e-6:
+            logger.debug("Rejecting geometry: reference inliers are spatially degenerate")
+            return False
+        normalized = (r_points - r_points.mean(axis=0)) / extents
+        eigenvalues = np.linalg.eigvalsh(normalized.T @ normalized / len(normalized))
+        if eigenvalues[0] < self.min_reference_eigenvalue:
+            logger.debug(
+                f"Rejecting geometry: reference inliers are near-collinear "
+                f"(eigenvalue {eigenvalues[0]:.2e})"
+            )
+            return False
+
+        H = np.asarray(H_query_to_ref, dtype=np.float64)
+        if H.shape != (3, 3) or not np.isfinite(H).all():
+            return False
+        corners = np.array(
+            [[0.0, 0.0, 1.0], [width, 0.0, 1.0], [width, height, 1.0], [0.0, height, 1.0]]
+        )
+        denominators = corners @ H[2]
+        if not (
+            np.all(denominators > 1e-9) or np.all(denominators < -1e-9)
+        ):
+            logger.debug("Rejecting geometry: homography has a pole inside the query frame")
+            return False
+        return True
 
     def verify(
         self,
@@ -108,6 +182,24 @@ class GeometricVerifier:
                     rmse = float(
                         np.sqrt(np.mean(np.sum((pts_q_transformed - pts_r_in) ** 2, axis=1)))
                     )
+
+                    inlier_ratio = inliers / max(1, len(mkpts_q))
+                    if not np.isfinite(rmse) or rmse > self.max_rmse_px:
+                        logger.debug(
+                            f"Rejecting candidate {candidate_id}: RMSE {rmse:.2f}px > "
+                            f"{self.max_rmse_px:.2f}px"
+                        )
+                        continue
+                    if inlier_ratio < self.min_inlier_ratio:
+                        logger.debug(
+                            f"Rejecting candidate {candidate_id}: inlier ratio "
+                            f"{inlier_ratio:.3f} < {self.min_inlier_ratio:.3f}"
+                        )
+                        continue
+                    if not self._has_spatial_support(
+                        query_features, pts_q_in, pts_r_in, H_eval
+                    ):
+                        continue
 
                     if inliers > best_inliers and inliers >= self.min_matches:
                         best_inliers = inliers

@@ -92,6 +92,43 @@ class TestFilterStillSmooths:
         assert 200.0 < out[0] < 500.0
 
 
+class TestTrustedFixReanchor:
+    def test_sharp_turn_reanchors_when_filter_lag_exceeds_bound(self):
+        kf = TrajectoryFilter(process_noise=2.0, measurement_noise=5.0, dt=1.0)
+        for x in (0.0, 100.0, 200.0, 300.0):
+            kf.update((x, 0.0), dt=1.0)
+
+        # Platform stops/turns while the constant-velocity model predicts the
+        # next point near x=400.  Strong image geometry must remain authoritative.
+        out = kf.update((300.0, 100.0), dt=1.0, trusted_max_offset_m=5.0)
+
+        assert out == pytest.approx((300.0, 100.0))
+        assert kf.last_update_reanchored is True
+        assert tuple(kf.kf.x[2:, 0]) == pytest.approx((0.0, 100.0))
+
+    def test_weak_measurement_keeps_normal_smoothing(self):
+        kf = TrajectoryFilter(process_noise=2.0, measurement_noise=5.0, dt=1.0)
+        for x in (0.0, 100.0, 200.0, 300.0):
+            kf.update((x, 0.0), dt=1.0)
+
+        out = kf.update((300.0, 100.0), dt=1.0)
+
+        assert out != pytest.approx((300.0, 100.0))
+        assert kf.last_update_reanchored is False
+
+    def test_reset_clears_reanchor_state_and_raw_history(self):
+        kf = TrajectoryFilter(process_noise=2.0, measurement_noise=5.0, dt=1.0)
+        kf.update((0.0, 0.0), dt=1.0)
+        kf.update((100.0, 0.0), dt=1.0)
+        kf.update((100.0, 100.0), dt=1.0, trusted_max_offset_m=1.0)
+        assert kf.last_update_reanchored is True
+
+        kf.reset()
+
+        assert kf._last_raw is None
+        assert kf.last_update_reanchored is False
+
+
 class TestShiftUnaffectedBySeed:
     """shift() (used by the sliding-window smoother) must keep working
     exactly as before — it only touches position, never velocity."""

@@ -23,12 +23,12 @@ from src.geometry.affine_utils import (
     decompose_affine_5dof,
     unwrap_angles,
 )
+from src.geometry.calibration_provenance import anchored_graph_support, classify_calibration
 from src.geometry.point_spread import inlier_spread, spread_weight_factor
 from src.geometry.pose_graph.model_5dof import _predict_forward, _predict_inverse
 from src.geometry.pose_graph.vo_guards import (
     check_anchor_gaps,
     downweight_gap_edges,
-    select_gap_fallback_frames,
     temporal_edge_sane,
 )
 from src.geometry.pose_graph_optimizer import (
@@ -41,6 +41,10 @@ from src.security.project_scan import assert_project_writable
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+class PropagationCancelledError(Exception):
+    """Cooperative cancellation before committing calibration output."""
 
 
 class PropagationPipeline:
@@ -63,6 +67,7 @@ class PropagationPipeline:
         progress_callback=None,
         error_callback=None,
         completed_callback=None,
+        cancelled_callback=None,
     ):
         # Qt-free core of graph-based propagation. progress/error/completed
         # events are delivered via callbacks (CalibrationPropagationWorker
@@ -70,6 +75,7 @@ class PropagationPipeline:
         self._progress_cb = progress_callback
         self._error_cb = error_callback
         self._completed_cb = completed_callback
+        self._cancelled_cb = cancelled_callback
         self.database = database
         self.calibration = calibration
         self.matcher = matcher
@@ -207,8 +213,14 @@ class PropagationPipeline:
         self._is_running = False
 
     def _report_progress(self, pct, msg):
+        self._check_running()
         if self._progress_cb is not None:
             self._progress_cb(pct, msg)
+        self._check_running()
+
+    def _check_running(self):
+        if not self._is_running:
+            raise PropagationCancelledError()
 
     def _report_error(self, msg):
         if self._error_cb is not None:
@@ -221,6 +233,15 @@ class PropagationPipeline:
     # ─── Main method ─────────────────────────────────────────────────────────
 
     def _propagate(self):
+        try:
+            self._check_running()
+            self._run_propagation()
+        except PropagationCancelledError:
+            logger.info("Calibration propagation cancelled")
+            if self._cancelled_cb is not None:
+                self._cancelled_cb()
+
+    def _run_propagation(self):
         num_frames = self.database.get_num_frames()
         all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
         anchors = [a for a in all_anchors if a.frame_id < num_frames]
@@ -249,6 +270,7 @@ class PropagationPipeline:
         # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
         self._report_progress(0, "Prefetching features into RAM...")
         all_features = self._prefetch_features(num_frames)
+        self._check_running()
         if not all_features:
             # Two cases: (a) corrupted/unreadable file — _prefetch_features already
             # called _report_error with details; (b) no keyframe slots have features
@@ -272,6 +294,10 @@ class PropagationPipeline:
 
         self._report_progress(10, "Building temporal edges (sequential matching)...")
         temporal_count = self._build_temporal_edges(optimizer, all_features, num_frames)
+        self._check_running()
+        optimizer.set_orientation_from_affines(
+            {a.frame_id: a.affine_matrix for a in anchors if a.frame_id in all_features}
+        )
         logger.info(f"Phase 1 complete: {temporal_count} temporal edges")
 
         # Auto min_frame_gap: derived from median per-slot motion.
@@ -312,6 +338,7 @@ class PropagationPipeline:
         # ── Phase 2: Loop closure detection ──────────────────────────────────
         self._report_progress(30, "Searching spatial loop closures...")
         spatial_count = self._detect_loop_closures(optimizer, all_features, num_frames)
+        self._check_running()
         logger.info(f"Phase 2 complete: {spatial_count} spatial edges (loop closures)")
         logger.info(
             f"Graph: {optimizer.num_nodes} nodes, {optimizer.num_edges} edges "
@@ -321,34 +348,20 @@ class PropagationPipeline:
         # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
         self._report_progress(60, "Fixing GPS anchors (Local Origin)...")
 
-        # Snap anchors to the nearest keyframe slot (one that has features).
-        feature_ids = np.array(sorted(all_features.keys()), dtype=np.int64)
-        if len(feature_ids) == 0:
-            self._report_error("The database has no frames with features")
+        # An affine belongs to one exact image.  Applying it to a neighbouring
+        # keyframe silently moves the map, so missing anchor slots are a database
+        # contract error and must be rebuilt as required keyframes.
+        missing_anchor_ids = [a.frame_id for a in anchors if a.frame_id not in all_features]
+        if missing_anchor_ids:
+            self._report_error(
+                "Calibration anchors have no features at exact DB slots: "
+                f"{missing_anchor_ids}. Rebuild the database with "
+                f"database.required_frame_ids={missing_anchor_ids} (or pass the same IDs "
+                "as required_frame_ids to DatabaseBuilder). The affine matrices cannot "
+                "be transferred to neighbouring frames."
+            )
             return
-
-        anchor_nodes: dict[int, object] = {}
-        for anchor in anchors:
-            fid = anchor.frame_id
-            if fid not in all_features:
-                nearest = int(feature_ids[np.argmin(np.abs(feature_ids - fid))])
-                logger.warning(
-                    f"Anchor frame {fid} has no features (non-keyframe slot). "
-                    f"Snapping to nearest keyframe {nearest} (Δ={abs(nearest - fid)} slots)."
-                )
-                fid = nearest
-            if fid in anchor_nodes:
-                # Previously only a warning was issued and the duplicate anchor was
-                # silently discarded. Same class of silent loss as anchors outside
-                # DB bounds above — halt and inform the user.
-                self._report_error(
-                    f"Anchors of frames #{anchor_nodes[fid].frame_id} and #{anchor.frame_id} "
-                    f"snapped to the same DB keyframe slot "
-                    f"(#{fid}) — one would be silently discarded. Remove "
-                    f"the duplicate anchor or move it to a frame that has a keyframe."
-                )
-                return
-            anchor_nodes[fid] = anchor
+        anchor_nodes = {anchor.frame_id: anchor for anchor in anchors}
 
         # Establish local reference point for numerical stability (Local Center).
         # Use the metric translation of the first anchor as origin.
@@ -459,6 +472,7 @@ class PropagationPipeline:
             kinematic_prior_weight=self.kinematic_prior_weight,
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
+        self._check_running()
 
         # Propagation diagnostics: edge classes, residuals, worst frames, anchor stress
         try:
@@ -469,25 +483,27 @@ class PropagationPipeline:
         except Exception as diag_err:
             logger.warning(f"Diagnostics report failed: {diag_err}")
 
-        # Frames from inconsistent gaps → anchor interpolation.
-        # Computed in LOCAL coordinates (before origin is restored).
+        graph_supported, compact_component_ids, component_anchors = anchored_graph_support(
+            results.keys(), optimizer.edges, anchor_nodes
+        )
+        frame_components = np.full(self.database.get_num_frames(), -1, dtype=np.int32)
+        frame_components[: len(compact_component_ids)] = compact_component_ids
+
+        # A broken gap invalidates only slots that lack an optimized visual path
+        # to an exact anchor.  Optimized nodes on either anchored side of a cut
+        # remain geographically supported; replacing them with a straight
+        # interpolation destroyed valid curved-flight solutions.
         force_invalid: set[int] = set()
         if self.anchor_gap_check and flagged_gaps:
-            cxp, cyp = self.frame_w / 2.0, self.frame_h / 2.0
-            centers = {
-                fid: (
-                    float(aff[0, 0] * cxp + aff[0, 1] * cyp + aff[0, 2]),
-                    float(aff[1, 0] * cxp + aff[1, 1] * cyp + aff[1, 2]),
-                )
-                for fid, aff in results.items()
+            force_invalid = {
+                fid for start, end in flagged_gaps for fid in range(start + 1, end)
+                if fid not in graph_supported
             }
-            force_invalid = select_gap_fallback_frames(
-                centers, optimizer.anchor_states(), flagged_gaps, gap_max_dev
-            )
             if force_invalid:
-                logger.info(
-                    f"Stage 8.2: {len(force_invalid)} frames replaced by anchor interpolation "
-                    f"(deviation from anchor line > {gap_max_dev:.0f} m): "
+                logger.warning(
+                    f"Stage 8.2: {len(force_invalid)} unsupported slots inside "
+                    "broken/inconsistent anchor gaps are georeference-invalid and "
+                    "receive display-only interpolation: "
                     f"{sorted(force_invalid)}"
                 )
 
@@ -498,7 +514,16 @@ class PropagationPipeline:
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
         self._report_progress(85, "Saving results to HDF5...")
-        valid_count = self._save_to_hdf5(results, anchors, optimizer, force_invalid=force_invalid)
+        valid_count = self._save_to_hdf5(
+            results,
+            anchors,
+            optimizer,
+            force_invalid=force_invalid,
+            graph_supported=graph_supported,
+            frame_components=frame_components,
+            component_anchors=component_anchors,
+        )
+        self._check_running()
 
         # Export GeoJSON for visualisation
         if self.export_geojson and self.calibration.converter:
@@ -1059,6 +1084,9 @@ class PropagationPipeline:
         anchors,
         optimizer: PoseGraphOptimizer,
         force_invalid: set[int] | None = None,
+        graph_supported: set[int] | None = None,
+        frame_components: np.ndarray | None = None,
+        component_anchors: dict[int, list[int]] | None = None,
     ) -> int:
         """Save optimised affine matrices to HDF5.
 
@@ -1080,7 +1108,30 @@ class PropagationPipeline:
                 frame_affine[frame_id] = affine.astype(np.float64)
                 frame_valid[frame_id] = True
 
+        optimized_mask = frame_valid.copy()
+        supported_mask = np.zeros(num_frames, dtype=bool)
+        for frame_id in graph_supported or set():
+            if 0 <= frame_id < num_frames and optimized_mask[frame_id]:
+                supported_mask[frame_id] = True
         filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        frame_origin, frame_support_distance, frame_georef_status = classify_calibration(
+            frame_valid,
+            optimized_mask,
+            [a.frame_id for a in anchors],
+            invalid_ids=skip,
+            supported=supported_mask,
+        )
+        if frame_components is None:
+            frame_components = np.full(num_frames, -1, dtype=np.int32)
+        else:
+            frame_components = np.asarray(frame_components, dtype=np.int32)
+            if frame_components.shape != (num_frames,):
+                raise ValueError("frame_components must have one entry per DB slot")
+        anchor_counts = np.zeros(num_frames, dtype=np.uint16)
+        for frame_id in np.flatnonzero(frame_components >= 0):
+            anchor_counts[frame_id] = len(
+                (component_anchors or {}).get(int(frame_components[frame_id]), [])
+            )
         if filled_count > 0:
             logger.info(f"Interpolated coordinates for {filled_count} missing frames")
 
@@ -1168,13 +1219,33 @@ class PropagationPipeline:
         db_path = self.database.db_path
         # Guard against writing to encrypted deployment containers.
         assert_project_writable(db_path)
+        self._check_running()
         self.database.lock.acquire()
-        self.database.close()
         try:
+            self._check_running()
+            self.database.close()
             with h5py.File(db_path, "a") as f:
-                if "calibration" in f:
-                    del f["calibration"]
-                grp = f.create_group("calibration")
+                pending_calibration = "_calibration_pending"
+                backup_calibration = "_calibration_previous"
+                pending_gps = "_frame_gps_pending"
+                backup_gps = "_frame_gps_previous"
+
+                # A failed write must leave the last complete generation usable.
+                # Clean only scratch objects here; never delete the active group.
+                for scratch in (pending_calibration, pending_gps):
+                    if scratch in f:
+                        del f[scratch]
+                for active, backup in (
+                    ("calibration", backup_calibration),
+                    ("frame_gps", backup_gps),
+                ):
+                    if backup in f:
+                        if active not in f:
+                            f.move(backup, active)
+                        else:
+                            del f[backup]
+
+                grp = f.create_group(pending_calibration)
 
                 grp.attrs["version"] = "3.0"  # New version: graph optimisation
                 grp.attrs["num_anchors"] = len(anchors)
@@ -1185,6 +1256,15 @@ class PropagationPipeline:
                     self.calibration.converter.export_metadata()
                 )
                 grp.attrs["optimizer"] = "pose_graph_lm"
+                grp.attrs["provenance_version"] = 1
+                grp.attrs["frame_origin_codes"] = "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated"
+                grp.attrs["georef_status_version"] = 1
+                grp.attrs["frame_georef_status_codes"] = "0=unknown,1=supported,2=provisional,3=invalid"
+                grp.attrs["component_anchors_json"] = json.dumps(
+                    {str(key): value for key, value in (component_anchors or {}).items()}
+                )
+                grp.attrs["frame_rmse_units"] = "reference_pixels"
+                grp.attrs["disagreement_kind"] = "edge_prediction" if self.true_disagreement else "neighbor_tx_spread"
                 grp.attrs["num_temporal_edges"] = sum(
                     1 for e in optimizer.edges if e.edge_type == "temporal"
                 )
@@ -1197,6 +1277,17 @@ class PropagationPipeline:
                     "frame_valid", data=frame_valid.astype(np.uint8), compression="gzip"
                 )
                 grp.create_dataset("frame_rmse", data=frame_rmse, compression="gzip")
+                grp.create_dataset("frame_origin", data=frame_origin, compression="gzip")
+                grp.create_dataset(
+                    "frame_georef_status", data=frame_georef_status, compression="gzip"
+                )
+                grp.create_dataset(
+                    "frame_graph_component", data=frame_components, compression="gzip"
+                )
+                grp.create_dataset(
+                    "frame_support_anchor_count", data=anchor_counts, compression="gzip"
+                )
+                grp.create_dataset("frame_support_distance_slots", data=frame_support_distance, compression="gzip")
                 grp.create_dataset(
                     "frame_disagreement", data=frame_disagreement, compression="gzip"
                 )
@@ -1234,10 +1325,7 @@ class PropagationPipeline:
                                 if gps_first_error is None:
                                     gps_first_error = repr(e)
 
-                    # Remove old dataset if present
-                    if "frame_gps" in f:
-                        del f["frame_gps"]
-                    f.create_dataset("frame_gps", data=frame_gps, compression="gzip")
+                    f.create_dataset(pending_gps, data=frame_gps, compression="gzip")
                     logger.info(
                         f"Saved frame_gps: {gps_count}/{num_frames} frames with GPS coordinates"
                     )
@@ -1246,6 +1334,48 @@ class PropagationPipeline:
                             f"frame_gps: {gps_failed} frame(s) failed metric→GPS conversion "
                             f"and stay NaN. First error: {gps_first_error}"
                         )
+
+                if pending_gps not in f:
+                    # Do not retain coordinates from a previous calibration if
+                    # this generation has no initialized map converter.
+                    frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
+                    f.create_dataset(pending_gps, data=frame_gps, compression="gzip")
+
+                f.flush()
+                self._check_running()
+
+                moved_old: list[tuple[str, str]] = []
+                installed: list[str] = []
+                try:
+                    for active, backup, pending in (
+                        ("calibration", backup_calibration, pending_calibration),
+                        ("frame_gps", backup_gps, pending_gps),
+                    ):
+                        if active in f:
+                            f.move(active, backup)
+                            moved_old.append((active, backup))
+                        f.move(pending, active)
+                        installed.append(active)
+                    f.flush()
+                except Exception:
+                    # Best-effort rollback while the database is still closed
+                    # and protected by the loader lock.
+                    for active in reversed(installed):
+                        if active in f:
+                            del f[active]
+                    for active, backup in reversed(moved_old):
+                        if backup in f:
+                            f.move(backup, active)
+                    f.flush()
+                    raise
+                else:
+                    for backup in (backup_calibration, backup_gps):
+                        if backup in f:
+                            del f[backup]
+                    f.attrs["georef_generation"] = int(
+                        f.attrs.get("georef_generation", 0)
+                    ) + 1
+                    f.flush()
 
             valid_count = int(np.sum(frame_valid))
             logger.success(

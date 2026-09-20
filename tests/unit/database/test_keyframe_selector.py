@@ -87,6 +87,9 @@ class TestComputeInterFrameHomography:
         assert Hm is not None
         assert Hm.shape == (3, 3)
         assert Hm.dtype == np.float64
+        # The public contract is current frame b -> previous frame a.
+        projected = ks.GeometryTransforms.apply_homography(b, Hm)
+        assert np.max(np.linalg.norm(projected - a, axis=1)) < 1e-3
 
     def test_too_few_matches_returns_none(self):
         a = _grid(3, 3)[:10]  # 10 < 15
@@ -112,6 +115,19 @@ class TestOverlapFraction:
 
     def test_identity_is_full_overlap(self):
         assert ks.overlap_fraction(np.eye(3), W, H) == 1.0
+
+    @pytest.mark.parametrize("scale", [-1.0, 1e-5, 1e5])
+    def test_projective_scalar_does_not_change_overlap(self, scale):
+        assert ks.overlap_fraction(scale * np.eye(3), W, H) == pytest.approx(1.0)
+
+    def test_long_pose_product_is_renormalized(self):
+        pose = np.eye(3)
+        step = 1e-3 * _translation_H(0.25, -0.1)
+        for _ in range(500):
+            pose = ks.normalize_homography(pose @ step)
+            assert pose is not None
+        assert pose[2, 2] == pytest.approx(1.0)
+        assert np.all(np.isfinite(pose))
 
     def test_half_frame_shift_is_half_overlap(self):
         assert ks.overlap_fraction(_translation_H(W * 0.5, 0), W, H) == pytest.approx(0.5, abs=1e-3)

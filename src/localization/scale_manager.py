@@ -153,6 +153,10 @@ class ScaleManager:
 
         return pyramid
 
+    def full_candidates(self) -> list[float]:
+        """Recovery pyramid independent of a possibly stale temporal prior."""
+        return list(self._pyramid)
+
     def normalize(self, frame: np.ndarray, r: float) -> tuple[np.ndarray, CropInfo]:
         """Normalize *frame* to approximate the DB's GSD given scale ratio *r*.
 

@@ -3,6 +3,7 @@ BFS-ланцюгом ЛИШЕ по temporal-ребрах від якорів, Д
 """
 
 import numpy as np
+import pytest
 
 from src.geometry.pose_graph.model_5dof import _state_to_affine
 from src.geometry.pose_graph_optimizer import PoseGraphOptimizer
@@ -63,6 +64,25 @@ def test_prelim_non_mutating_and_empty():
         np.testing.assert_array_equal(opt._free_nodes[k], v)
     assert opt.preliminary_centers({}) == {}
     assert opt.preliminary_centers({999: _anchor(0.0, 0.0)}) == {}  # seed not a node
+
+
+def test_mirrored_seed_controls_preliminary_propagation_before_fix_node():
+    opt = PoseGraphOptimizer(1280, 720)
+    opt.add_node(0)
+    opt.add_node(1)
+    opt.add_edge(0, 1, _rel(0, 100), weight=1, edge_type="temporal")
+    seed = _state_to_affine(np.zeros(5), CX, CY, sign=-1)
+    centers = opt.preliminary_centers({0: seed})
+    np.testing.assert_allclose(centers[1], [0, -100], atol=1e-8)
+    assert opt.sign == 1  # preliminary estimates remain non-mutating
+    opt.set_orientation_from_affines({0: seed})
+    assert opt.sign == -1
+
+
+def test_mixed_anchor_orientation_is_rejected():
+    opt = _chain(2)
+    with pytest.raises(ValueError, match="inconsistent coordinate orientation"):
+        opt.preliminary_states({0: _anchor(0, 0), 1: np.array([[1, 0, 0], [0, -1, 0]])})
 
 
 if __name__ == "__main__":

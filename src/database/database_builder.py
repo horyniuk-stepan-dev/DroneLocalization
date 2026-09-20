@@ -108,6 +108,7 @@ class DatabaseBuilder:
         progress_callback=None,
         save_keypoint_video: bool = True,
         project_manager=None,
+        required_frame_ids: set[int] | None = None,
     ):
         """
         Process video and build database.
@@ -219,6 +220,7 @@ class DatabaseBuilder:
             num_patches=patchify.num_patches if patchify else 0,
             frame_step=source.frame_step,
             source_total_frames=source.total_frames,
+            source_path=video_path,
         )
 
         # Adaptive Keyframe Selection
@@ -240,6 +242,15 @@ class DatabaseBuilder:
                 f"Adaptive keyframe selection ENABLED "
                 f"(min_translation={get_cfg(self.config, 'database.keyframe_min_translation_px', 15.0)}px, "
                 f"min_rotation={get_cfg(self.config, 'database.keyframe_min_rotation_deg', 1.5)}°)"
+            )
+
+        configured_required = get_cfg(self.config, "database.required_frame_ids", []) or []
+        forced_frame_ids = {int(fid) for fid in configured_required}
+        forced_frame_ids.update(int(fid) for fid in (required_frame_ids or set()))
+        if forced_frame_ids:
+            logger.info(
+                "Calibration contract requires keyframes at slots: "
+                f"{sorted(forced_frame_ids)}"
             )
 
         processor = FrameProcessor(
@@ -264,6 +275,7 @@ class DatabaseBuilder:
             ),
             keyframe_max_gap_frames=max_gap_frames,
             progress_callback=progress_callback,
+            forced_frame_ids=forced_frame_ids,
         )
 
         # cuDNN benchmark is now set globally at startup by HardwareProfile.apply_torch_backends()
@@ -314,6 +326,10 @@ class DatabaseBuilder:
                             torch.cuda.empty_cache()
                     if idx == EOF_INDEX:
                         break
+
+                # EOF is also sent when the producer failed. Surface that error
+                # instead of accepting a silently truncated database.
+                source.raise_if_failed()
 
         except Exception as e:
             logger.error(

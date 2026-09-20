@@ -6,6 +6,7 @@ from src.geometry.transformations import GeometryTransforms
 from src.localization.candidate_retriever import CandidateRetriever
 from src.localization.failure_log import FAILURE_TYPES, FailureLogger
 from src.localization.geometric_verifier import GeometricVerifier
+from src.localization.layer_search import LayerSearch
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.localization.result_builder import ResultBuilder
 from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
@@ -154,6 +155,9 @@ class Localizer:
         self._trust_min_flow_q = float(
             get_cfg(self.config, "tracking.outlier_trust_min_flow_quality", 0.5)
         )
+        self._trusted_fix_max_filter_offset = float(
+            get_cfg(self.config, "tracking.trusted_fix_max_filter_offset_m", 5.0)
+        )
 
         # Fix #1: Guard against infinite loop when outside coverage bounds
         self._consecutive_failures = 0
@@ -162,6 +166,7 @@ class Localizer:
         # Normalizing input frame resolution to DB reference resolution
         self.normalizer = ResolutionNormalizer(ref_frame_width, ref_frame_height)
         self._last_scale = 1.0
+        self._last_state = None
 
         # A3: temporal prior on rotation angle — angle of last successful
         # localization; full 4-angle scan only on score dip or failure
@@ -169,6 +174,8 @@ class Localizer:
 
         # ── ScaleManager: GSD-ratio estimation for altitude-invariant localization ─
         self._scale_manager = ScaleManager(self.config)
+        self._layer_search = LayerSearch(self.config)
+        self._layer_clock = None
 
         # Depth-based scale hint (soft pyramid reorder; hint only, never a hard scale).
         self._db_depth_scale = getattr(self.database, "median_depth_scale", None)
@@ -234,6 +241,16 @@ class Localizer:
             self.early_stop_inliers,
             prefilter_enabled=get_cfg(self.config, "localization.candidate_prefilter", False),
             prefilter_keep=get_cfg(self.config, "localization.prefilter_keep", 2),
+            max_rmse_px=get_cfg(self.config, "localization.max_geometric_rmse_px", 4.0),
+            min_inlier_ratio=get_cfg(
+                self.config, "localization.geometric_min_inlier_ratio", 0.2
+            ),
+            max_center_extrapolation=get_cfg(
+                self.config, "localization.geometric_max_center_extrapolation", 0.1
+            ),
+            min_reference_eigenvalue=get_cfg(
+                self.config, "localization.geometric_min_reference_eigenvalue", 1e-4
+            ),
         )
         self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
         self._rotation_selector = RotationSelector(
@@ -299,6 +316,8 @@ class Localizer:
         self._last_best_angle = None
         self._last_state = None
         self._scale_manager.reset()
+        self._layer_search.reset()
+        self._layer_clock = None
         self._debug_depth_counter = 0
         self._tp_counter = 0
         self._tp_tries = 0
@@ -357,15 +376,109 @@ class Localizer:
             logger.debug(f"Debug depth skipped: {e}")
 
     def localize_frame(
+        self, query_frame, static_mask=None, dt=1.0, yaw_hint_deg=None,
+        collector=None, timestamp=None,
+    ) -> dict:
+        enabled = get_cfg(self.config, "localization.layer_search.enabled", False)
+        if enabled and self.db_manager is not None:
+            return self._localize_layers(
+                query_frame, static_mask, dt, yaw_hint_deg, collector, timestamp
+            )
+        previous = (self.database, self.calibration, self._active_source_id)
+        had_prior = self._scale_manager.prior is not None
+        result = self._localize_frame_impl(query_frame, static_mask, dt, yaw_hint_deg, collector)
+        if not result.get("success"):
+            self.database, self.calibration, self._active_source_id = previous
+        if had_prior and (
+            result.get("fallback_mode") == "retrieval_only"
+            or str(result.get("error", "")).startswith("Not enough valid inliers")
+        ):
+            self._scale_manager.invalidate()
+            self._last_best_angle = None
+            result = self._localize_frame_impl(query_frame, static_mask, dt, yaw_hint_deg, collector)
+            if not result.get("success"):
+                self.database, self.calibration, self._active_source_id = previous
+        if result.get("fallback_mode") == "retrieval_only":
+            self._consecutive_failures += 1
+            self._scale_manager.invalidate()
+        return result
+
+    def _localize_layers(self, query_frame, static_mask, dt, yaw_hint, collector, timestamp):
+        from copy import deepcopy
+
+        if self.calib_manager is None:
+            return {"success": False, "status": "lost", "error": "Layer calibration manager missing"}
+        now = (self._layer_clock or 0.0) + max(0.0, float(dt)) if timestamp is None else float(timestamp)
+        if not np.isfinite(now) or (self._layer_clock is not None and now <= self._layer_clock):
+            return {"success": False, "status": "stale", "error": "Non-increasing frame timestamp"}
+        self._layer_clock = now
+        frame, _ = self.normalizer.normalize(query_frame)
+        mask = self.normalizer.normalize_mask(static_mask) if static_mask is not None else None
+        observations = self._layer_search.search(self, frame, mask, now, yaw_hint)
+        chosen = self._layer_search.handoff.choose(observations, now)
+        diagnostics = dict(self._layer_search.last_diagnostics)
+        if chosen is None:
+            self._consecutive_failures += 1
+            if (self._layer_search.handoff.state == "LOST"
+                    or self._layer_search.handoff.reason == "ambiguous_geometry"):
+                self._last_state = None
+            return {
+                "success": False,
+                "status": "ambiguous" if self._layer_search.handoff.reason == "ambiguous_geometry" else "lost",
+                "error": self._layer_search.handoff.reason,
+                "layer_state": self._layer_search.handoff.state, "search": diagnostics,
+            }
+        previous = (self.database, self.calibration, self._active_source_id, self._scale_manager)
+        switching = chosen.source_id != self._active_source_id
+        filters = (self.trajectory_filter, self.outlier_detector, self._smoother)
+        previous_state = (self._last_state, self._last_best_angle, self._last_of_raw)
+        self.trajectory_filter = deepcopy(self.trajectory_filter)
+        self.outlier_detector = deepcopy(self.outlier_detector)
+        self._scale_manager = deepcopy(self._scale_manager)
+        if self._smoother is not None:
+            self._smoother = deepcopy(self._smoother)
+        self.database = self.db_manager.get_database(chosen.source_id)
+        self.calibration = self.calib_manager.get(chosen.source_id)
+        self._active_source_id = chosen.source_id
+        if switching:
+            # Metric projections can differ between layers. Start a fresh filter
+            # only after same-frame geodesic handoff checks; never mix raw units.
+            self.trajectory_filter.reset()
+            self.outlier_detector.reset()
+            if self._smoother is not None:
+                self._smoother.reset()
+            self._scale_manager = ScaleManager(self.config)
+        accepted = False
+        try:
+            result = self._localize_frame_impl(
+                query_frame, static_mask, dt, yaw_hint, collector, _verified=chosen.prepared
+            )
+            accepted = bool(result.get("success"))
+            if accepted:
+                self._layer_search.commit(chosen, now)
+                result["status"] = "confirmed"
+                result["source_changed"] = switching
+                result["coordinate_kind"] = "ground_observation"
+            result["layer_state"] = self._layer_search.handoff.state
+            result["search"] = diagnostics
+            return result
+        finally:
+            if not accepted:
+                self.database, self.calibration, self._active_source_id, self._scale_manager = previous
+                self.trajectory_filter, self.outlier_detector, self._smoother = filters
+                self._last_state, self._last_best_angle, self._last_of_raw = previous_state
+
+    def _localize_frame_impl(
         self,
         query_frame: np.ndarray,
         static_mask: np.ndarray = None,
         dt: float = 1.0,
         yaw_hint_deg: float | None = None,
         collector=None,
+        _verified=None,
     ) -> dict:
         # Fix #1: If too many consecutive failures occurred — return out_of_coverage
-        if self._consecutive_failures >= self._max_failures:
+        if _verified is None and self._consecutive_failures >= self._max_failures:
             self._consecutive_failures = 0
             self._log_failure(
                 FAILURE_TYPES["out_of_coverage"],
@@ -392,7 +505,8 @@ class Localizer:
         height, width = query_frame.shape[:2]
 
         # Depth hint: soft reorder of the scale pyramid toward the DB GSD (every N keyframes).
-        self._maybe_set_depth_hint(query_frame)
+        if _verified is None:
+            self._maybe_set_depth_hint(query_frame)
         # Debug: depth map for window (independent of localization success).
         self._maybe_collect_depth(query_frame, collector)
 
@@ -408,8 +522,8 @@ class Localizer:
         # ── §A1: attempt to localize WITHOUT global descriptor ──────────
         # yaw_hint_deg disables this path: external heading is new information
         # about orientation, it must be processed by full rotation path.
-        _tp = None
-        if self._temporal_prior and yaw_hint_deg is None:
+        _tp = _verified
+        if _tp is None and self._temporal_prior and yaw_hint_deg is None:
             self._tp_counter += 1
             audit = self._tp_audit_every
             if audit <= 0 or (self._tp_counter % audit) != 0:
@@ -544,6 +658,17 @@ class Localizer:
                 best_rotated_frame, best_global_candidates, top_k
             )
 
+            # Map trust participates in candidate selection, not only in final
+            # result assembly.  Otherwise an unsupported self-match can win the
+            # verifier and hide a slightly weaker supported candidate.
+            support_check = getattr(self.database, "is_frame_georef_supported", None)
+            if support_check is not None:
+                best_global_candidates = [
+                    candidate
+                    for candidate in best_global_candidates
+                    if support_check(int(candidate[0]))
+                ]
+
             if collector is not None:
                 collector.rotated_frame = best_rotated_frame
                 collector.query_features = best_query_features
@@ -650,6 +775,19 @@ class Localizer:
             }
 
         # ── Step 4: Obtaining candidate affine matrix ─────────────────────
+        support_check = getattr(self.database, "is_frame_georef_supported", None)
+        if support_check is not None and not support_check(best_candidate_id):
+            self._log_failure(
+                FAILURE_TYPES["No propagated calibration"],
+                details=f"Frame {best_candidate_id} georeference is not visually supported",
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"Frame {best_candidate_id} has provisional or invalid georeference; "
+                    "GPS output suppressed"
+                ),
+            }
         affine_ref = self.database.get_frame_affine(best_candidate_id)
         if affine_ref is None:
             target_id = (
@@ -692,7 +830,7 @@ class Localizer:
         # (Step 5) and scale-prior (update_from_homography) are computed in single
         # coordinate system. Without this, for r < 0.85 center is shifted by
         # ~(1-r)/2 frame, polygon inflated by 1/r, and prior collapses to 1.
-        if _crop_info is not None and _crop_info.resize_scale != 1.0:
+        if _crop_info is not None:
             n_h, n_w = best_rotated_frame.shape[:2]
             _A_norm = crop_to_affine(_crop_info, n_w, n_h)
             M_query_to_ref = M_query_to_ref @ _A_norm
@@ -803,12 +941,20 @@ class Localizer:
         )
 
         filtered_pt = self.trajectory_filter.update(
-            metric_pt, dt=dt, noise_scale=1.0 / max(confidence, 0.25)
+            metric_pt,
+            dt=dt,
+            noise_scale=1.0 / max(confidence, 0.25),
+            trusted_max_offset_m=(self._trusted_fix_max_filter_offset if _strong else None),
         )
         # RESEARCH 3.1: back-end smoother — fix window + OF-odometry;
         # KF correction by shift BEFORE writing to detector history and GPS/FOV,
         # so correction lands in THIS frame.
         if self._smoother is not None:
+            if self.trajectory_filter.last_update_reanchored:
+                # All old smoother nodes describe the superseded motion
+                # regime; keeping them would immediately pull the fresh KF
+                # anchor back toward the turn's stale constant-velocity path.
+                self._smoother.reset()
             corr = self._smoother.add_fix(
                 metric_pt,
                 dt=dt,
@@ -818,12 +964,25 @@ class Localizer:
                 kf_xy=filtered_pt,
             )
             if corr is not None:
-                self.trajectory_filter.shift(float(corr[0]), float(corr[1]))
-                filtered_pt = (
+                proposed_pt = (
                     float(filtered_pt[0]) + float(corr[0]),
                     float(filtered_pt[1]) + float(corr[1]),
                 )
-                logger.debug(f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m")
+                proposed_offset = float(np.linalg.norm(np.asarray(proposed_pt) - metric_pt))
+                if _strong and proposed_offset > self._trusted_fix_max_filter_offset:
+                    # Never let a delayed smoother correction violate the
+                    # same contract enforced by the front-end KF.
+                    self._smoother.reset()
+                    logger.debug(
+                        "Smoother correction discarded: trusted-fix offset "
+                        f"would be {proposed_offset:.2f} m"
+                    )
+                else:
+                    self.trajectory_filter.shift(float(corr[0]), float(corr[1]))
+                    filtered_pt = proposed_pt
+                    logger.debug(
+                        f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m"
+                    )
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         # New keyframe restarts LK, so chain of local OF comparisons
         # breaks: first OF after keyframe should measure shift FROM keyframe
@@ -833,6 +992,7 @@ class Localizer:
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
+        raw_lat, raw_lon = self.calibration.converter.metric_to_gps(mx, my)
         self._sync_ground_scale(lat)
         dx, dy = filtered_pt[0] - metric_pt[0], filtered_pt[1] - metric_pt[1]
 
@@ -875,6 +1035,11 @@ class Localizer:
             "confidence": confidence,
             "matched_frame": int(best_candidate_id),
             "inliers": int(best_inliers),
+            "raw_lat": raw_lat,
+            "raw_lon": raw_lon,
+            "raw_metric": [mx, my],
+            "scale_ratio": float(best_scale),
+            "rotation_deg": int(best_global_angle),
             "fov_polygon": gps_corners,
             "sample_spread_m": 0.0,
             "source_id": self._active_source_id,
@@ -1131,6 +1296,14 @@ class Localizer:
                 )
 
         feats = self.feature_extractor.extract_local_features(rotated, static_mask=rot_mask)
+        # ``image_size`` is part of the local-feature contract used both by
+        # LightGlue normalisation and by the spatial-support safety gate.  Keep
+        # compatibility with lightweight/custom extractors that only return
+        # keypoints and descriptors: the Localizer owns the prepared image and
+        # therefore knows this value exactly.
+        feats.setdefault(
+            "image_size", np.array([rotated.shape[0], rotated.shape[1]], dtype=np.int32)
+        )
         cache[key] = (rotated, rot_mask, crop_info, feats)
         return cache[key]
 
@@ -1154,6 +1327,9 @@ class Localizer:
                 if c < 0 or c in ids:
                     continue
                 try:
+                    support_check = getattr(self.database, "is_frame_georef_supported", None)
+                    if support_check is not None and not support_check(c):
+                        continue
                     if self.database.get_frame_affine(c) is None:
                         continue
                 except Exception as e:  # noqa: BLE001 — БД може не мати кадру

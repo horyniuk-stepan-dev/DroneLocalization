@@ -127,6 +127,48 @@ class TestCandidateSelection:
         ver = _verifier(matcher=FakeMatcher({}))
         assert ver.verify(_feats(10), [], FakeDB({})) is None
 
+    def test_absolute_rmse_gate_rejects_adaptively_inflated_fit(self, monkeypatch):
+        q, _ = _identity_matches(40, noise=0.0)
+        r = q + np.array([20.0, -15.0], dtype=np.float32)
+        db = FakeDB({1: _feats(40, fid=1)})
+        ver = _verifier(matcher=FakeMatcher({1: (q, r)}), max_rmse_px=4.0)
+
+        monkeypatch.setattr(
+            "src.localization.geometric_verifier.GeometryTransforms.estimate_homography",
+            lambda *args, **kwargs: (np.eye(3), np.ones((40, 1), dtype=np.uint8)),
+        )
+
+        assert ver.verify(_feats(40), [(1, 0.9)], db) is None
+
+    def test_rejects_off_center_patch_that_does_not_support_query_center(self, monkeypatch):
+        rng = np.random.default_rng(17)
+        q = rng.uniform(0.0, 40.0, (40, 2)).astype(np.float32)
+        r = q.copy()
+        db = FakeDB({1: _feats(40, fid=1)})
+        ver = _verifier(
+            matcher=FakeMatcher({1: (q, r)}), max_center_extrapolation=0.05
+        )
+        monkeypatch.setattr(
+            "src.localization.geometric_verifier.GeometryTransforms.estimate_homography",
+            lambda *args, **kwargs: (np.eye(3), np.ones((40, 1), dtype=np.uint8)),
+        )
+
+        assert ver.verify(_feats(40), [(1, 0.9)], db) is None
+
+    def test_rejects_homography_with_pole_inside_query_frame(self, monkeypatch):
+        q, _ = _identity_matches(40, noise=0.0, seed=19)
+        H = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-0.004, 0.0, 1.0]])
+        homogeneous = np.c_[q, np.ones(len(q))] @ H.T
+        r = (homogeneous[:, :2] / homogeneous[:, 2:]).astype(np.float32)
+        db = FakeDB({1: _feats(40, fid=1)})
+        ver = _verifier(matcher=FakeMatcher({1: (q, r)}))
+        monkeypatch.setattr(
+            "src.localization.geometric_verifier.GeometryTransforms.estimate_homography",
+            lambda *args, **kwargs: (H, np.ones((40, 1), dtype=np.uint8)),
+        )
+
+        assert ver.verify(_feats(40), [(1, 0.9)], db) is None
+
 
 class TestEarlyStop:
     def test_early_stop_skips_remaining_candidates(self):

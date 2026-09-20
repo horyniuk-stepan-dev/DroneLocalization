@@ -24,6 +24,7 @@ import numpy as np
 
 from config import get_cfg
 from src.utils.logging_utils import get_logger
+from src.database.keyframe_selector import normalize_homography
 
 logger = get_logger(__name__)
 
@@ -61,6 +62,7 @@ class FrameProcessor:
         overlap_gate: Callable | None = None,
         keyframe_max_gap_frames: int = 0,
         progress_callback: Callable | None = None,
+        forced_frame_ids: set[int] | None = None,
     ):
         self.feature_extractor = feature_extractor
         self.db_writer = db_writer
@@ -85,6 +87,7 @@ class FrameProcessor:
         self.overlap_gate = overlap_gate
         self.keyframe_max_gap_frames = keyframe_max_gap_frames
         self.progress_callback = progress_callback
+        self.forced_frame_ids = {int(fid) for fid in (forced_frame_ids or set()) if int(fid) >= 0}
 
         self.store_sift = get_cfg(self.config, "database.store_sift_features", False)
         self.sift_max_kps = get_cfg(self.config, "database.sift_max_keypoints", 2048)
@@ -140,7 +143,21 @@ class FrameProcessor:
         else:
             H_step = self.compute_inter_frame_h(self.prev_features, features)
             if H_step is not None:
-                self.current_pose = self.current_pose @ H_step.astype(np.float64)
+                composed = normalize_homography(
+                    self.current_pose.astype(np.float64) @ H_step.astype(np.float64)
+                )
+                if composed is None:
+                    logger.warning(
+                        f"Frame {p_idx}: accumulated pose became degenerate; "
+                        "starting a new pose segment"
+                    )
+                    self.current_pose = np.eye(3, dtype=np.float64)
+                    self._pose_at_last_keyframe = None
+                    save_this_frame = True
+                    H_step = None
+                else:
+                    self.current_pose = composed
+            if H_step is not None:
                 if not self.use_keyframe_selection:
                     save_this_frame = True
                 elif self.keyframe_criterion == "overlap":
@@ -148,8 +165,17 @@ class FrameProcessor:
                 else:
                     save_this_frame = self.is_significant_motion(H_step, self.width, self.height)
             else:
-                logger.warning(f"Frame {p_idx}: inter-frame match failed, reusing previous pose")
+                logger.warning(
+                    f"Frame {p_idx}: inter-frame match failed; starting a new pose segment"
+                )
+                self.current_pose = np.eye(3, dtype=np.float64)
+                self._pose_at_last_keyframe = None
                 save_this_frame = True
+
+        if p_idx in self.forced_frame_ids:
+            if not save_this_frame:
+                logger.info(f"Frame {p_idx}: forced keyframe required by calibration contract")
+            save_this_frame = True
 
         self.prev_features = features
 

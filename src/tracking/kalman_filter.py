@@ -24,6 +24,11 @@ class TrajectoryFilter:
         # measured on simulator flight) cause the filtered position to lag
         # behind raw fixes for several steps while the KF learns velocity.
         self._prev_raw: tuple[float, float] | None = None
+        # Latest raw visual fix.  Unlike ``_prev_raw`` (which exists only for
+        # the initial two-point seed), this is kept for the whole session so a
+        # trusted-fix re-anchor can also refresh velocity after a manoeuvre.
+        self._last_raw: tuple[float, float] | None = None
+        self.last_update_reanchored = False
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(
@@ -124,20 +129,38 @@ class TrajectoryFilter:
             return None
         return d2
 
-    def update(self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0) -> tuple:
+    def update(
+        self,
+        measurement: tuple,
+        dt: float = 1.0,
+        noise_scale: float = 1.0,
+        trusted_max_offset_m: float | None = None,
+    ) -> tuple:
         """noise_scale — adaptive measurement noise multiplier:
         > 1 for weak/relative measurements (low confidence, optical flow),
         1.0 for confident measurements. Allows the filter to trust poor
         measurements less.
+
+        ``trusted_max_offset_m`` bounds the distance between the filtered
+        result and a separately verified visual fix.  A constant-velocity
+        model can lag tens of metres during a sharp turn even when the image
+        homography is excellent.  In that case the filter is re-anchored to
+        the fix and its velocity is refreshed from the latest raw displacement.
+        Pass ``None`` for ordinary or weak measurements.
         """
-        z = np.array([[measurement[0]], [measurement[1]]])
+        measurement_xy = (float(measurement[0]), float(measurement[1]))
+        z = np.array([[measurement_xy[0]], [measurement_xy[1]]])
+        self.last_update_reanchored = False
 
         if not self.is_initialized:
-            self.kf.x = np.array([[measurement[0]], [measurement[1]], [0.0], [0.0]])
+            self.kf.x = np.array([[measurement_xy[0]], [measurement_xy[1]], [0.0], [0.0]])
             self.is_initialized = True
-            self._prev_raw = (float(measurement[0]), float(measurement[1]))
-            logger.info(f"Kalman filter initialized: ({measurement[0]:.2f}, {measurement[1]:.2f})")
-            return measurement
+            self._prev_raw = measurement_xy
+            self._last_raw = measurement_xy
+            logger.info(
+                f"Kalman filter initialized: ({measurement_xy[0]:.2f}, {measurement_xy[1]:.2f})"
+            )
+            return measurement_xy
 
         if self._prev_raw is not None:
             # Two-point seed: compute velocity from the FIRST pair of raw fixes
@@ -145,8 +168,8 @@ class TrajectoryFilter:
             # only once (immediately after initialisation) — afterwards the filter
             # tracks velocity on its own.
             safe_seed_dt = max(dt, 0.01)
-            vx = (measurement[0] - self._prev_raw[0]) / safe_seed_dt
-            vy = (measurement[1] - self._prev_raw[1]) / safe_seed_dt
+            vx = (measurement_xy[0] - self._prev_raw[0]) / safe_seed_dt
+            vy = (measurement_xy[1] - self._prev_raw[1]) / safe_seed_dt
             self.kf.x[2, 0] = vx
             self.kf.x[3, 0] = vy
             self._prev_raw = None
@@ -163,6 +186,34 @@ class TrajectoryFilter:
 
         filtered_x = float(self.kf.x[0, 0])
         filtered_y = float(self.kf.x[1, 0])
+
+        if trusted_max_offset_m is not None:
+            max_offset = float(trusted_max_offset_m)
+            offset = float(np.hypot(filtered_x - measurement_xy[0], filtered_y - measurement_xy[1]))
+            if np.isfinite(max_offset) and max_offset > 0.0 and offset > max_offset:
+                safe_dt = max(dt, 0.01)
+                if self._last_raw is None:
+                    vx = vy = 0.0
+                else:
+                    vx = (measurement_xy[0] - self._last_raw[0]) / safe_dt
+                    vy = (measurement_xy[1] - self._last_raw[1]) / safe_dt
+                self.kf.x = np.array(
+                    [[measurement_xy[0]], [measurement_xy[1]], [vx], [vy]], dtype=np.float64
+                )
+                # Remove stale position/velocity cross-covariance from the old
+                # motion regime.  Position uncertainty follows this fix's R;
+                # velocity stays deliberately loose for the next observation.
+                pos_var = max(float(self.kf.R[0, 0]), 1e-6)
+                vel_var = max(25.0, self.process_noise / safe_dt**2)
+                self.kf.P = np.diag([pos_var, pos_var, vel_var, vel_var])
+                filtered_x, filtered_y = measurement_xy
+                self.last_update_reanchored = True
+                logger.debug(
+                    f"Kalman re-anchored to trusted visual fix: offset={offset:.2f} m, "
+                    f"limit={max_offset:.2f} m, velocity=({vx:.2f}, {vy:.2f}) m/s"
+                )
+
+        self._last_raw = measurement_xy
 
         return filtered_x, filtered_y
 
@@ -183,6 +234,8 @@ class TrajectoryFilter:
         """
         self.is_initialized = False
         self._prev_raw = None
+        self._last_raw = None
+        self.last_update_reanchored = False
         self.kf.x = np.zeros((4, 1))
         self.kf.P = np.eye(4) * 1000.0
         logger.info("Kalman filter reset to initial state")

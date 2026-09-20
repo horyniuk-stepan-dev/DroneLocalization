@@ -254,6 +254,7 @@ class RealtimeTrackingWorker(QThread):
                         static_mask=static_mask,
                         dt=calculated_dt,
                         collector=debug_collector,
+                        timestamp=current_video_time_sec,
                     )
                 except Exception as e:
                     import torch
@@ -288,7 +289,8 @@ class RealtimeTrackingWorker(QThread):
                     last_tracked_objects = tracked_objects
                     self.objects_detected.emit(tracked_objects)
                     loc_state = getattr(self.localizer, "last_state", None)
-                    if object_projector and loc_state:
+                    if object_projector and loc_state and loc_result.get("success"):
+                        object_projector.calibration_manager = self.localizer.calibration
                         H = loc_state.get("H")
                         affine = loc_state.get("affine")
                         angle = loc_state.get("global_angle", 0)
@@ -318,6 +320,7 @@ class RealtimeTrackingWorker(QThread):
                                 int(frame.shape[1] * scale),
                                 int(frame.shape[0] * scale),
                             )
+                            self.objects_gps_updated.emit(objects_gps)
                             if objects_gps:
                                 obj_summary = ", ".join(
                                     [f"{obj.class_name} #{obj.track_id}" for obj in objects_gps]
@@ -325,6 +328,8 @@ class RealtimeTrackingWorker(QThread):
                                 logger.debug(
                                     f"Tracked {len(objects_gps)} objects (KF): {obj_summary}"
                                 )
+                    else:
+                        self.objects_gps_updated.emit([])
             else:
                 # ====== OPTICAL FLOW TRACKING ======
                 if self.of_stride > 1 and (frame_idx % self.of_stride) != 0:
@@ -428,7 +433,10 @@ class RealtimeTrackingWorker(QThread):
                     loc_result["confidence"],
                     loc_result["inliers"],
                 )
-                if not loc_result.get("is_of"):
+                if (
+                    not loc_result.get("is_of")
+                    and loc_result.get("fallback_mode") != "retrieval_only"
+                ):
                     self.anchor_fix.emit()
                 if loc_result.get("fov_polygon"):
                     self.fov_found.emit(loc_result["fov_polygon"])

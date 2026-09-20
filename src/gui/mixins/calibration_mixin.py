@@ -386,6 +386,7 @@ class CalibrationMixin:
         self.propagation_worker.progress.connect(self.on_propagation_progress)
         self.propagation_worker.completed.connect(self.on_propagation_completed)
         self.propagation_worker.error.connect(self.on_propagation_error)
+        self.propagation_worker.cancelled.connect(self.on_propagation_cancelled)
         self._propagation_dialog.canceled.connect(self.propagation_worker.stop)
         self.propagation_worker.start()
 
@@ -399,6 +400,13 @@ class CalibrationMixin:
             except Exception:
                 pass
         self.status_bar.showMessage(message)
+
+    @pyqtSlot()
+    def on_propagation_cancelled(self):
+        if self._propagation_dialog:
+            self._propagation_dialog.close()
+            self._propagation_dialog = None
+        self.status_bar.showMessage("Пропагацію скасовано")
 
     @pyqtSlot()
     def on_propagation_completed(self):

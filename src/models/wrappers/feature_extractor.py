@@ -291,16 +291,15 @@ class FeatureExtractor:
             valid = np.zeros(len(keypoints), dtype=bool)
             valid[in_bounds] = static_mask[iy[in_bounds], ix[in_bounds]] > 128
 
-            if valid.any():
-                keypoints = keypoints[valid]
-                descriptors = descriptors[valid]
-            else:
+            if not valid.any():
                 logger.warning(
                     f"All keypoints filtered out by YOLO mask! "
                     f"Image {image.shape[:2]}, total_kpts={len(keypoints)}, "
                     f"mask_static_ratio={np.mean(static_mask > 128):.1%}. "
                     f"The entire image may be covered by dynamic objects (vehicles, people)."
                 )
+            keypoints = keypoints[valid]
+            descriptors = descriptors[valid]
 
         return {
             "keypoints": keypoints,

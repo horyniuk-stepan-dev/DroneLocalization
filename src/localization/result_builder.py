@@ -98,6 +98,13 @@ class ResultBuilder:
             )
             return None
 
+        support_check = getattr(database, "is_frame_georef_supported", None)
+        if support_check is not None and not support_check(frame_id):
+            logger.debug(
+                f"Retrieval-only fallback rejected: frame {frame_id} georeference "
+                "is provisional or invalid"
+            )
+            return None
         affine_ref = database.get_frame_affine(frame_id)
         if affine_ref is None:
             logger.debug(
@@ -113,7 +120,9 @@ class ResultBuilder:
         lat, lon = calibration.converter.metric_to_gps(metric_pt[0], metric_pt[1])
 
         return {
-            "success": True,
+            "success": False,
+            "status": "candidate_only",
+            "error": "Retrieval candidate has no verified geometry",
             "lat": lat,
             "lon": lon,
             "confidence": 0.3,

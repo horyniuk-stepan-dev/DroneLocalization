@@ -87,7 +87,12 @@ class DatabaseMixin:
                 continue
         return None
 
-    def _start_database_generation(self, video_path: str, save_path: str):
+    def _start_database_generation(
+        self,
+        video_path: str,
+        save_path: str,
+        required_frame_ids: set[int] | None = None,
+    ):
         if self._refuse_if_encrypted_project("Генерація бази даних"):
             return
 
@@ -124,6 +129,7 @@ class DatabaseMixin:
             model_manager=self.model_manager,
             config=self.config,
             project_manager=self.project_manager,
+            required_frame_ids=required_frame_ids,
         )
         self.db_worker.progress.connect(self.on_db_progress)
         self.db_worker.completed.connect(self.on_db_completed)
@@ -539,7 +545,17 @@ class DatabaseMixin:
                 self.calibration.save(calib_path)
                 logger.info(f"Calibration saved before rebuild: {calib_path}")
 
-        self._start_database_generation(video_path, self.project_manager.database_path)
+        required_frame_ids = {int(anchor.frame_id) for anchor in self.calibration.anchors}
+        if required_frame_ids:
+            logger.info(
+                "Rebuild will preserve exact calibration anchor slots: "
+                f"{sorted(required_frame_ids)}"
+            )
+        self._start_database_generation(
+            video_path,
+            self.project_manager.database_path,
+            required_frame_ids=required_frame_ids,
+        )
 
     # ── Results export ───────────────────────────────────────────────────────────
 

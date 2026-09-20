@@ -101,6 +101,30 @@ class TestRefineMaskNeverGrows:
         src, dst, _ = _split_matches(10, 10)
         assert GeometryTransforms._refine_mask_mad(src, dst, np.eye(3), None, 2.5, 3.0) is None
 
+    def test_adaptive_threshold_never_relaxes_ransac_threshold(self, monkeypatch):
+        src, dst, mask = _split_matches(20, 20)
+        captured = {}
+
+        monkeypatch.setattr(
+            GeometryTransforms,
+            "compute_mad_threshold",
+            staticmethod(lambda *args, **kwargs: 500.0),
+        )
+        original = GeometryTransforms.reprojection_errors
+
+        def record_errors(*args, **kwargs):
+            errors = original(*args, **kwargs)
+            captured["errors"] = errors
+            return errors
+
+        monkeypatch.setattr(GeometryTransforms, "reprojection_errors", staticmethod(record_errors))
+        refined = GeometryTransforms._refine_mask_mad(
+            src, dst, np.eye(3), mask, 2.5, 3.0
+        )
+
+        expected = mask.ravel().astype(bool) & (captured["errors"] < 3.0)
+        assert np.array_equal(refined.ravel().astype(bool), expected)
+
 
 class TestEstimateHomographyIntegration:
     def test_mad_does_not_inflate_end_to_end(self):

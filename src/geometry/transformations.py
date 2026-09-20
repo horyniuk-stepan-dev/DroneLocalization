@@ -180,9 +180,15 @@ class GeometryTransforms:
         if n_base < GeometryTransforms._MIN_HOMOGRAPHY_PTS:
             return mask
 
-        mad_threshold = GeometryTransforms.compute_mad_threshold(
+        raw_mad_threshold = GeometryTransforms.compute_mad_threshold(
             src_pts, dst_pts, H, k=k, inlier_mask=base
         )
+        # MAD is a refinement of the estimator's acceptance region.  It must
+        # never relax that region: a bad model can have a very large residual
+        # median even among the points marked by USAC/PoseLib, which previously
+        # produced thresholds in the hundreds of pixels.  The mask still could
+        # not grow, but those bad points survived and looked like a strong fit.
+        mad_threshold = min(float(ransac_threshold), float(raw_mad_threshold))
         errors = GeometryTransforms.reprojection_errors(src_pts, dst_pts, H)
         refined = base & (errors < mad_threshold)
         n_ref = int(refined.sum())
@@ -196,7 +202,8 @@ class GeometryTransforms:
 
         logger.debug(
             f"MAD-RANSAC: initial_thresh={ransac_threshold:.1f} -> "
-            f"adaptive_thresh={mad_threshold:.2f} px, "
+            f"adaptive_thresh={mad_threshold:.2f} px "
+            f"(raw_mad={raw_mad_threshold:.2f}), "
             f"inliers={n_ref}/{n_base} (out of {len(base)} matches)"
         )
         return refined.astype(np.uint8).reshape(-1, 1)

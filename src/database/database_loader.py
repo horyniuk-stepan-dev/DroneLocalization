@@ -146,6 +146,7 @@ class DatabaseLoader:
         self.frame_rmse: np.ndarray | None = None  # (N,)      — RMSE per frame
         self.frame_disagreement: np.ndarray | None = None  # (N,)   — Disagreement between branches
         self.frame_matches: np.ndarray | None = None  # (N,)      — Keypoint count (inliers)
+        self.frame_georef_status: np.ndarray | None = None
         self.depth_scales: np.ndarray | None = None  # (N,) — 1/median_depth per frame (GSD hint)
 
         # GPS coordinates per frame and spatial index
@@ -285,6 +286,13 @@ class DatabaseLoader:
             raise
 
     def _load_propagation_data(self) -> None:
+        self.frame_origin = None
+        self.frame_georef_status = None
+        self.frame_support_distance_slots = None
+        self.frame_graph_component = None
+        self.frame_support_anchor_count = None
+        self.frame_rmse_units = None
+        self.disagreement_kind = None
         if self.db_file is None or "calibration" not in self.db_file:
             logger.info("No propagation data in database (not calibrated yet)")
             self.frame_affine = None
@@ -326,6 +334,24 @@ class DatabaseLoader:
             if "frame_affine" in grp:
                 self.frame_affine = grp["frame_affine"][:]
                 self.frame_valid = grp["frame_valid"][:].astype(bool)
+                self.frame_origin = grp["frame_origin"][:] if "frame_origin" in grp else None
+                self.frame_georef_status = (
+                    grp["frame_georef_status"][:] if "frame_georef_status" in grp else None
+                )
+                self.frame_support_distance_slots = (
+                    grp["frame_support_distance_slots"][:]
+                    if "frame_support_distance_slots" in grp else None
+                )
+                self.frame_graph_component = (
+                    grp["frame_graph_component"][:]
+                    if "frame_graph_component" in grp else None
+                )
+                self.frame_support_anchor_count = (
+                    grp["frame_support_anchor_count"][:]
+                    if "frame_support_anchor_count" in grp else None
+                )
+                self.frame_rmse_units = grp.attrs.get("frame_rmse_units")
+                self.disagreement_kind = grp.attrs.get("disagreement_kind")
 
                 # Quality metrics (QA)
                 self.frame_rmse = grp["frame_rmse"][:] if "frame_rmse" in grp else None
@@ -371,6 +397,15 @@ class DatabaseLoader:
         if not self.frame_valid[frame_id]:
             return None
         return self.frame_affine[frame_id]
+
+    def is_frame_georef_supported(self, frame_id: int) -> bool:
+        """Return True only for a visually supported geographic calibration."""
+        from src.geometry.calibration_provenance import GeoreferenceStatus
+
+        status = self.frame_georef_status
+        if status is None or frame_id < 0 or frame_id >= len(status):
+            return False
+        return int(status[frame_id]) == int(GeoreferenceStatus.SUPPORTED)
 
     @_synchronized
     def get_frame_size(self, frame_id: int) -> tuple[int, int]:

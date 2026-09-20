@@ -19,6 +19,7 @@ and preserved here 1:1:
 from __future__ import annotations
 
 import shutil
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -69,6 +70,7 @@ class DbWriter:
         num_patches: int = 0,
         frame_step: int = 1,
         source_total_frames: int = 0,
+        source_path: str = "",
     ):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
@@ -207,6 +209,20 @@ class DbWriter:
             # Frame sampling step: DB slot i = video frame i * frame_step
             g3.attrs["frame_step"] = int(frame_step)
             g3.attrs["source_total_frames"] = int(source_total_frames)
+            if source_path:
+                try:
+                    source = Path(source_path).resolve()
+                    digest = hashlib.sha256()
+                    with source.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    stat = source.stat()
+                    g3.attrs["source_path"] = str(source)
+                    g3.attrs["source_size_bytes"] = int(stat.st_size)
+                    g3.attrs["source_mtime_ns"] = int(stat.st_mtime_ns)
+                    g3.attrs["source_sha256"] = digest.hexdigest()
+                except Exception as source_err:
+                    logger.warning(f"Could not write source identity: {source_err}")
 
             # Schema fingerprint: a stable hash of every structure/content-
             # defining setting (models, dims, keypoint budget, scale, frame

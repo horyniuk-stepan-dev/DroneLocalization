@@ -16,6 +16,7 @@ class CalibrationPropagationWorker(QThread):
 
     progress = pyqtSignal(int, str)
     completed = pyqtSignal()
+    cancelled = pyqtSignal()
     error = pyqtSignal(str)
 
     def __init__(self, database, calibration, matcher, config=None):
@@ -28,6 +29,7 @@ class CalibrationPropagationWorker(QThread):
             progress_callback=self.progress.emit,
             error_callback=self.error.emit,
             completed_callback=self.completed.emit,
+            cancelled_callback=self.cancelled.emit,
         )
 
     def stop(self):

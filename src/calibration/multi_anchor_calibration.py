@@ -109,7 +109,7 @@ class AnchorCalibration:
 class MultiAnchorCalibration:
     """Manages multiple calibration anchors with versioning, projection support, and PCHIP interpolation."""
 
-    VERSION: str = "2.3"
+    VERSION: str = "2.4"
 
     def __init__(
         self,
@@ -134,6 +134,10 @@ class MultiAnchorCalibration:
         self._interp_range: tuple[float, float] | None = None  # [first_frame, last_frame]
         self._ref_px: tuple[float, float] = (0.0, 0.0)  # Decomposition reference pixel
         self._frame_size: tuple[int, int] | None = None  # (width, height)
+        self._format_version = self.VERSION
+        # Preserve producer-specific contract metadata (for example simulator
+        # keyframe selection) even when this class does not interpret it.
+        self.extra_metadata: dict[str, Any] = {}
 
     def set_frame_size(self, width: int, height: int) -> None:
         """Sets frame dimensions: interpolation is parameterized around the frame center."""
@@ -237,6 +241,8 @@ class MultiAnchorCalibration:
         self.anchors.clear()
         self._interp = None
         self._interp_range = None
+        self._format_version = self.VERSION
+        self.extra_metadata = {}
         from src.geometry.coordinates import CoordinateConverter
 
         self.converter = CoordinateConverter("WEB_MERCATOR")
@@ -290,12 +296,13 @@ class MultiAnchorCalibration:
     def save(self, path: str) -> None:
         """Saves anchors and projection metadata to JSON."""
         assert_project_writable(path)
-        data = {
-            "version": self.VERSION,
+        data = dict(self.extra_metadata)
+        data.update({
+            "version": self._format_version,
             "projection": self.converter.export_metadata(),
             "frame_size": list(self._frame_size) if self._frame_size else None,
             "anchors": [a.to_dict() for a in self.anchors],
-        }
+        })
 
         # Atomic write to prevent file corruption
         from src.utils.atomic_io import atomic_write_bytes
@@ -311,7 +318,7 @@ class MultiAnchorCalibration:
                 path, _json_lib.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
             )
         logger.success(
-            f"MultiAnchorCalibration saved: {path} (v{self.VERSION}, {len(self.anchors)} anchors)"
+            f"MultiAnchorCalibration saved: {path} (v{self._format_version}, {len(self.anchors)} anchors)"
         )
 
     def load(self, path: str) -> None:
@@ -329,7 +336,23 @@ class MultiAnchorCalibration:
             data = _json_lib.loads(content.decode("utf-8"))
 
         self.anchors.clear()
-        version = data.get("version", "1.0")
+        version = str(data.get("version", "1.0"))
+        try:
+            loaded_parts = tuple(int(part) for part in version.split("."))
+            current_parts = tuple(int(part) for part in self.VERSION.split("."))
+            self._format_version = version if loaded_parts >= current_parts else self.VERSION
+        except ValueError:
+            self._format_version = version
+        reserved = {
+            "version",
+            "projection",
+            "frame_size",
+            "anchors",
+            "reference_gps",
+            "affine_matrix",
+            "calib_frame_id",
+        }
+        self.extra_metadata = {key: value for key, value in data.items() if key not in reserved}
 
         # Restore coordinate projection
         if "projection" in data:

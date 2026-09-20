@@ -23,7 +23,15 @@
     "lat": 50.0026,
     "lon": 30.0036,
     "matched_frame": 4,
+    "raw_lat": 50.0026,
+    "raw_lon": 30.0036,
+    "raw_metric": [
+      360.0,
+      260.0
+    ],
+    "rotation_deg": 90,
     "sample_spread_m": 0.0,
+    "scale_ratio": 2.0,
     "source_id": null,
     "success": true
   },
@@ -52,7 +60,15 @@
     "lat": 50.0025,
     "lon": 30.0034,
     "matched_frame": 2,
+    "raw_lat": 50.0025,
+    "raw_lon": 30.0034,
+    "raw_metric": [
+      340.0,
+      250.0
+    ],
+    "rotation_deg": 180,
     "sample_spread_m": 0.0,
+    "scale_ratio": 1.0,
     "source_id": null,
     "success": true
   },
@@ -80,7 +96,15 @@
     "lat": 50.0025,
     "lon": 30.0034,
     "matched_frame": 2,
+    "raw_lat": 50.0025,
+    "raw_lon": 30.0034,
+    "raw_metric": [
+      340.0,
+      250.0
+    ],
+    "rotation_deg": 180,
     "sample_spread_m": 0.0,
+    "scale_ratio": 1.0,
     "source_id": null,
     "success": true
   },

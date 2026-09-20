@@ -1,6 +1,23 @@
 """Localization, tracking and homography configuration."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class LayerSearchConfig(BaseModel):
+    enabled: bool = False
+    candidates_per_source: int = Field(default=4, ge=1, le=32)
+    max_verifications: int = Field(default=32, ge=1, le=512)
+    budget_ms: float = Field(default=2000.0, gt=0)
+    confirmations: int = Field(default=2, ge=1, le=20)
+    switch_margin: float = Field(default=0.15, ge=0, le=2)
+    agreement_m: float = Field(default=30.0, gt=0)
+    lost_after_s: float = Field(default=3.0, gt=0)
+    min_spread: float = Field(default=0.015, ge=0, lt=1)
+    max_rmse_px: float = Field(default=4.0, gt=0)
+    min_inlier_ratio: float = Field(default=0.2, ge=0, le=1)
+    max_center_extrapolation: float = Field(default=0.1, ge=0, le=1)
+    scale_drift_per_s: float = Field(default=0.1, gt=0)
+    require_schema: bool = False
 
 
 class ConfidenceConfig(BaseModel):
@@ -12,8 +29,18 @@ class ConfidenceConfig(BaseModel):
 
 
 class LocalizationConfig(BaseModel):
+    layer_search: LayerSearchConfig = Field(default_factory=LayerSearchConfig)
     min_matches: int = 12
     min_inliers_accept: int = 10
+    # Absolute post-fit reprojection gate. Adaptive RANSAC may refine its own
+    # threshold, but it cannot redefine what is accurate enough to emit GPS.
+    max_geometric_rmse_px: float = Field(default=4.0, gt=0)
+    geometric_min_inlier_ratio: float = Field(default=0.2, ge=0, le=1)
+    # Maximum distance from the image centre to the inlier convex hull,
+    # expressed as a fraction of the image diagonal.  Prevents a correct local
+    # patch at one edge from authorizing an unsupported GPS projection.
+    geometric_max_center_extrapolation: float = Field(default=0.1, ge=0, le=1)
+    geometric_min_reference_eigenvalue: float = Field(default=1e-4, ge=0, le=1)
     # 0.75 = рекомендація Lowe's ratio test; 0.85 пропускало забагато хибних
     # збігів (конфіг перекривав фікс "БАГ 4" у matcher.py)
     ratio_threshold: float = 0.75
@@ -116,6 +143,11 @@ class LocalizationConfig(BaseModel):
 class TrackingConfig(BaseModel):
     kalman_process_noise: float = 2.0
     kalman_measurement_noise: float = 5.0
+    # A high-confidence homography is an absolute position observation.  The
+    # constant-velocity KF may lag it badly at a sharp turn, so cap that lag
+    # and re-anchor the state.  Applied only when
+    # outlier_trust_strong_evidence is enabled and its inlier threshold passes.
+    trusted_fix_max_filter_offset_m: float = 5.0
     outlier_window: int = 10
     # ── Пороги аутлаєр-детектора. ЧИТАЙ ПЕРЕД ЗМІНОЮ ────────────────────────
     # Виміряно на місії newzap (2026-07-31, 35 keyframe-локалізацій із 2048

@@ -59,6 +59,19 @@ class MultiDatabaseManager:
 
             try:
                 loader = DatabaseLoader(str(db_path))
+                layer = src.scale_layer
+                expected_schema = (
+                    layer.descriptor_schema_fingerprint if layer is not None else None
+                )
+                actual_schema = loader.metadata.get("schema_fingerprint")
+                if expected_schema and str(actual_schema or "") != expected_schema:
+                    logger.error(
+                        f"Source '{src.source_id}' declares descriptor schema "
+                        f"'{expected_schema}', but database contains '{actual_schema}'. "
+                        "Skipping this layer until it is rebuilt or its metadata is corrected."
+                    )
+                    loader.close()
+                    continue
                 self._databases[src.source_id] = loader
                 self._sources[src.source_id] = src
 
@@ -204,6 +217,48 @@ class MultiDatabaseManager:
             logger.info(f"Source '{src.source_id}' disabled and unloaded from memory.")
 
     # ── Retrieval ────────────────────────────────────────────────────────────
+
+    def get_matches_by_source(
+        self, global_desc: np.ndarray, top_k: int = 4, *, require_schema: bool = False
+    ) -> dict[str, list[tuple[int, float]]]:
+        """Retain a candidate quota per source for subsequent geometric comparison.
+
+        Check available descriptor semantics against the runtime configuration.
+        Legacy metadata may be allowed explicitly, but known mismatches never are.
+        This is a field-level check; old schemas do not identify checkpoint/vocab hashes.
+        """
+        import json
+
+        from src.database.schema_fingerprint import build_components
+
+        dimension = int(np.asarray(global_desc).size)
+        runtime = build_components(
+            self._config, descriptor_dim=dimension, local_descriptor_dim=0
+        )
+        fields = ("global_backend", "descriptor_dim", "vlad_enabled",
+                  "local_extractor", "dino_cpu_resize")
+        result = {}
+        for sid in sorted(self._active_source_ids, key=lambda s: (self._sources[s].priority, s)):
+            loader = self._databases.get(sid)
+            retriever = self._retrievers.get(sid)
+            if loader is None or retriever is None:
+                continue
+            raw = loader.metadata.get("schema_components")
+            try:
+                components = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+                if not isinstance(components, dict):
+                    components = {}
+                if require_schema and any(key not in components for key in fields):
+                    continue
+                if any(key in components and components[key] != runtime[key] for key in fields):
+                    logger.warning(f"Skipping incompatible localization source '{sid}'")
+                    continue
+                candidates = retriever.find_similar_frames(global_desc, top_k=top_k)
+                if candidates:
+                    result[sid] = candidates
+            except Exception as exc:
+                logger.warning(f"Layer retrieval failed for '{sid}': {exc}")
+        return result
 
     def get_best_match(
         self,

@@ -16,6 +16,41 @@ DEFAULT_INTER_FRAME_MIN_MATCHES = 15
 DEFAULT_INTER_FRAME_RANSAC_THRESH = 3.0
 
 
+def normalize_homography(H: np.ndarray | None) -> np.ndarray | None:
+    """Return a finite, full-rank homography in a deterministic projective gauge.
+
+    Homographies that differ only by a non-zero scalar describe the same mapping.
+    Keeping the arbitrary RANSAC scale in a long pose product makes determinant
+    checks and overlap decisions depend on that scale, so every accepted matrix is
+    canonicalised before it enters the pose chain.
+    """
+    if H is None:
+        return None
+    matrix = np.asarray(H, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        return None
+
+    norm = float(np.linalg.norm(matrix))
+    if norm <= np.finfo(np.float64).eps:
+        return None
+
+    # Prefer the usual H[2, 2] gauge when it is numerically meaningful.  The
+    # Frobenius fallback also handles valid homographies whose bottom-right entry
+    # is zero (for example, a projective pole outside the image).
+    if abs(matrix[2, 2]) > 1e-12 * norm:
+        matrix = matrix / matrix[2, 2]
+    else:
+        matrix = matrix / norm
+        pivot = np.unravel_index(np.argmax(np.abs(matrix)), matrix.shape)
+        if matrix[pivot] < 0:
+            matrix = -matrix
+
+    singular_values = np.linalg.svd(matrix, compute_uv=False)
+    if singular_values[-1] <= 1e-12 * singular_values[0]:
+        return None
+    return matrix
+
+
 def is_significant_motion(
     H: np.ndarray,
     frame_w: int,
@@ -28,9 +63,15 @@ def is_significant_motion(
     Checks if frame center translation via H >= min_translation_px OR rotation angle >= min_rotation_deg.
     Degenerate H (|det| < 1e-6) returns True.
     """
+    H = normalize_homography(H)
+    if H is None:
+        return True
+
     cx, cy = frame_w / 2.0, frame_h / 2.0
     p_src = np.array([cx, cy, 1.0], dtype=np.float64)
     p_dst = H.astype(np.float64) @ p_src
+    if abs(p_dst[2]) <= 1e-12:
+        return True
     p_dst /= p_dst[2]
     translation = np.linalg.norm(p_dst[:2] - np.array([cx, cy]))
 
@@ -50,11 +91,8 @@ def overlap_fraction(H: np.ndarray, frame_w: int, frame_h: int) -> float:
 
     H is accumulated homography projecting current frame coordinates to last saved keyframe coordinates.
     """
-    if H is None or not np.all(np.isfinite(H)):
-        return 0.0
-
-    H = np.asarray(H, dtype=np.float64)
-    if abs(np.linalg.det(H)) < 1e-9:
+    H = normalize_homography(H)
+    if H is None:
         return 0.0
 
     w, h = float(frame_w), float(frame_h)
@@ -65,7 +103,12 @@ def overlap_fraction(H: np.ndarray, frame_w: int, frame_h: int) -> float:
     homo = np.hstack([corners, np.ones((4, 1))])
     projected = homo @ H.T
 
-    if np.any(projected[:, 2] <= 1e-12) or not np.all(np.isfinite(projected)):
+    denominators = projected[:, 2]
+    if (
+        np.any(np.abs(denominators) <= 1e-12)
+        or not np.all(np.isfinite(projected))
+        or not (np.all(denominators > 0) or np.all(denominators < 0))
+    ):
         return 0.0
     projected = projected[:, :2] / projected[:, 2:3]
     if not np.all(np.isfinite(projected)):
@@ -108,9 +151,11 @@ def compute_inter_frame_homography(
     if len(mkpts_a) < min_matches:
         return None
 
+    # matcher.match(fa, fb) returns corresponding points in the first and
+    # second frame.  The pose chain consumes H(current=fb -> previous=fa).
     H, mask = GeometryTransforms.estimate_homography(
-        mkpts_a,
         mkpts_b,
+        mkpts_a,
         ransac_threshold=ransac_thresh,
         backend=homography_backend,
         use_mad_ransac=use_mad_ransac,
@@ -120,4 +165,4 @@ def compute_inter_frame_homography(
     if H is None or int(np.sum(mask)) < min_matches:
         return None
 
-    return H.astype(np.float64)
+    return normalize_homography(H)

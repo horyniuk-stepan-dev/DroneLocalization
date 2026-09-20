@@ -55,6 +55,7 @@ class VideoFrameSource:
         self._vr = None
         self._cap = None
         self._thread: Thread | None = None
+        self._prefetch_error: Exception | None = None
         self.use_decord = use_decord
 
         if self.use_decord:
@@ -129,6 +130,7 @@ class VideoFrameSource:
         Queue items are ``(slot_index, (frame_bgr, frame_rgb))``; the stream
         always terminates with ``(EOF_INDEX, None)``.
         """
+        self._prefetch_error = None
         queue: Queue = Queue(maxsize=self.prefetch_size)
         self._thread = Thread(
             target=self._prefetch_frames, args=(queue,), name="DbBuildPrefetch", daemon=True
@@ -137,6 +139,16 @@ class VideoFrameSource:
         return queue
 
     def _prefetch_frames(self, frame_queue: Queue) -> None:
+        try:
+            self._decode_frames(frame_queue)
+        except Exception as exc:
+            self._prefetch_error = exc
+            logger.error(f"Video prefetch failed: {exc}", exc_info=True)
+        finally:
+            # The consumer must always be released, including decoder failures.
+            frame_queue.put((EOF_INDEX, None))
+
+    def _decode_frames(self, frame_queue: Queue) -> None:
         if self.use_decord:
             # Decord provides batched read
             indices = list(range(0, self.total_frames, self.frame_step))
@@ -167,7 +179,12 @@ class VideoFrameSource:
                 orig_frame_idx = i // self.frame_step
                 frame_queue.put((orig_frame_idx, (frame, frame_rgb)))
 
-        frame_queue.put((EOF_INDEX, None))
+    def raise_if_failed(self) -> None:
+        """Raises a consumer-thread error after the EOF sentinel is received."""
+        if self._prefetch_error is not None:
+            raise RuntimeError(
+                f"Video decoding failed: {self._prefetch_error}"
+            ) from self._prefetch_error
 
     def join(self, timeout: float = 5) -> None:
         """Waits for the prefetch thread (no-op if it was never started)."""

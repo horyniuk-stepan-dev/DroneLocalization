@@ -242,6 +242,12 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         if not seeds:
             return {}
 
+        # Anchors are not fixed until a later pipeline phase. Infer handedness
+        # from the seed affines rather than the optimizer's default sign.
+        sign = self.orientation_from_affines(
+            {fid: seed_affines[fid] for fid in seeds}
+        )
+
         adj: dict[int, list] = {}
         for e in self._edges:
             if e.edge_type != "temporal":
@@ -258,12 +264,28 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 if nb in states:
                     continue
                 states[nb] = (
-                    _predict_forward(cur_state, e, self._sign)
+                    _predict_forward(cur_state, e, sign)
                     if e.from_id == cur
-                    else _predict_inverse(cur_state, e, self._sign)
+                    else _predict_inverse(cur_state, e, sign)
                 )
                 queue.append(nb)
         return states
+
+    @staticmethod
+    def orientation_from_affines(affines: dict[int, np.ndarray]) -> float:
+        """Reject degenerate/mixed anchor conventions instead of mirroring silently."""
+        signs = set()
+        for affine in affines.values():
+            determinant = float(np.linalg.det(np.asarray(affine, dtype=np.float64)[:2, :2]))
+            if not np.isfinite(determinant) or abs(determinant) < 1e-12:
+                raise ValueError("Calibration anchor has a degenerate affine")
+            signs.add(1.0 if determinant > 0 else -1.0)
+        if len(signs) > 1:
+            raise ValueError("Calibration anchors have inconsistent coordinate orientation")
+        return next(iter(signs), 1.0)
+
+    def set_orientation_from_affines(self, affines: dict[int, np.ndarray]) -> None:
+        self._sign = self.orientation_from_affines(affines)
 
     def preliminary_centers(self, seed_affines: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
         """Estimate metric centers — thin wrapper over preliminary_states."""

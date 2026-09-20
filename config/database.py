@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DatabaseConfig(BaseModel):
@@ -32,6 +32,10 @@ class DatabaseConfig(BaseModel):
     # would otherwise open exactly the anchor gap that broke the map in the
     # VO-guards stage-8 incident. 0 disables the limit.
     keyframe_max_gap_frames: int = 60
+    # Exact DB slots that must survive adaptive keyframe selection.  Simulator
+    # and surveyed-anchor workflows populate this from their calibration anchor
+    # IDs before building the database.
+    required_frame_ids: list[int] = Field(default_factory=list)
     use_decord: bool = True
     decode_batch_size: int = 32
     # A6: Depth-Anything на кожному K-му кадрі збудови (масштаб змінюється

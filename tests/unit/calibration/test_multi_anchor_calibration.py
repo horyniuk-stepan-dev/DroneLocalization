@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 
 from src.calibration.multi_anchor_calibration import AnchorCalibration, MultiAnchorCalibration
@@ -25,3 +27,25 @@ def test_interpolation_at_midpoint():
     assert result is not None
     assert abs(result[0] - 2.5) < 1e-4
     assert abs(result[1] - 2.5) < 1e-4
+
+
+def test_roundtrip_preserves_simulator_contract_metadata(tmp_path):
+    path = tmp_path / "calibration.json"
+    source = {
+        "version": "2.4",
+        "projection": {"mode": "WEB_MERCATOR"},
+        "frame_size": [1920, 1080],
+        "anchors": [],
+        "generator": {"name": "FlightSimulator", "version": "test"},
+        "keyframe_selection": {"slot_domain": "processed", "anchor_slots": [0, 8]},
+    }
+    path.write_text(json.dumps(source), encoding="utf-8")
+
+    calib = MultiAnchorCalibration()
+    calib.load(str(path))
+    calib.save(str(path))
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["version"] == "2.4"
+    assert saved["generator"] == source["generator"]
+    assert saved["keyframe_selection"] == source["keyframe_selection"]
