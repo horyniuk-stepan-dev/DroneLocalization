@@ -79,8 +79,19 @@ class OpenProjectDialog(QDialog):
         buttons_row = QHBoxLayout()
 
         self.btn_browse = QPushButton("📂 Інша папка...")
-        self.btn_browse.setToolTip("Відкрити проєкт з довільної папки")
+        self.btn_browse.setToolTip(
+            "Відкрити проєкт з довільної папки. Якщо обрана папка сама не є проєктом, "
+            "проєкти всередині неї буде імпортовано до списку"
+        )
         self.btn_browse.clicked.connect(self._on_browse)
+
+        self.btn_import = QPushButton("📥 Імпортувати...")
+        self.btn_import.setToolTip(
+            "Додати до списку наявні проєкти (папки з project.json), не відкриваючи їх.\n"
+            "Можна обрати саму папку проєкту або папку, що містить кілька проєктів "
+            "(пошук до 2 рівнів вкладеності)."
+        )
+        self.btn_import.clicked.connect(self._on_import)
 
         self.btn_remove = QPushButton("🗑 Видалити зі списку")
         self.btn_remove.setToolTip("Видаляє лише зі списку, файли залишаються")
@@ -99,6 +110,7 @@ class OpenProjectDialog(QDialog):
         self.btn_cancel.clicked.connect(self.reject)
 
         buttons_row.addWidget(self.btn_browse)
+        buttons_row.addWidget(self.btn_import)
         buttons_row.addWidget(self.btn_remove)
         buttons_row.addStretch()
         buttons_row.addWidget(self.btn_cancel)
@@ -161,7 +173,9 @@ class OpenProjectDialog(QDialog):
             self.project_list.addItem(item)
 
         if self.project_list.count() == 0:
-            item = QListWidgetItem("    (немає проєктів — створіть новий або відкрийте папку)")
+            item = QListWidgetItem(
+                "    (немає проєктів — створіть новий, відкрийте або імпортуйте папку)"
+            )
             item.setForeground(QColor("#999"))
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self.project_list.addItem(item)
@@ -194,11 +208,18 @@ class OpenProjectDialog(QDialog):
         except (ValueError, TypeError):
             pass
 
+        # Legacy projects keep database.h5 in the root, layered ones under sources/<id>/.
         db_size = "—"
-        db_path = Path(path) / "database.h5"
-        if db_path.exists():
-            size_mb = db_path.stat().st_size / (1024 * 1024)
-            db_size = f"{size_mb:.1f} MB"
+        try:
+            root = Path(path)
+            db_files = [root / "database.h5", *root.glob("sources/*/database.h5")]
+            sizes = [f.stat().st_size for f in db_files if f.is_file()]
+        except OSError:
+            sizes = []
+        if sizes:
+            db_size = f"{sum(sizes) / (1024 * 1024):.1f} MB"
+            if len(sizes) > 1:
+                db_size += f" (шарів: {len(sizes)})"
 
         self.lbl_preview.setText(
             f"<b>Назва:</b> {proj.get('name', '—')}<br>"
@@ -236,9 +257,70 @@ class OpenProjectDialog(QDialog):
 
     def _on_browse(self):
         path = QFileDialog.getExistingDirectory(self, "Виберіть папку проєкту", "")
-        if path:
+        if not path:
+            return
+        if (Path(path) / "project.json").is_file():
             self.selected_path = path
             self.accept()
+            return
+        # The usual slip is picking the folder that holds the projects: instead of
+        # failing on load, list what is inside and let the user pick.
+        self._import_from(path)
+
+    def _default_import_dir(self) -> str:
+        """Parent folder of the most recent project — projects usually sit together."""
+        for proj in self.registry.get_recent(limit=1):
+            parent = Path(proj.get("path", "")).parent
+            if parent.is_dir():
+                return str(parent)
+        return ""
+
+    def _on_import(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Папка проєкту або папка з проєктами", self._default_import_dir()
+        )
+        if path:
+            self._import_from(path)
+
+    def _import_from(self, folder: str):
+        """Registers every project found at/below ``folder`` and selects the first."""
+        projects = ProjectRegistry.find_projects(folder)
+        if not projects:
+            QMessageBox.warning(
+                self,
+                "Імпорт проєктів",
+                f"У папці не знайдено жодного проєкту (файлу project.json):\n{folder}\n\n"
+                f"Пошук охоплює саму папку і до 2 рівнів вкладених папок.",
+            )
+            return
+
+        result = self.registry.import_projects(projects)
+        self.search_input.clear()
+        self._populate_list()
+        self._select_path(result.added[0] if result.added else projects[0])
+
+        names = [p.name for p in projects]
+        shown = "\n".join(f"  • {n}" for n in names[:15])
+        if len(names) > 15:
+            shown += f"\n  … і ще {len(names) - 15}"
+        QMessageBox.information(
+            self,
+            "Імпорт проєктів",
+            f"Знайдено проєктів: {len(projects)}\n"
+            f"Додано до списку: {len(result.added)}\n"
+            f"Вже були у списку: {len(result.already_known)}\n\n{shown}",
+        )
+
+    def _select_path(self, path: str | Path):
+        """Makes the list item of the project at ``path`` current, if listed."""
+        target = str(Path(path).resolve()).casefold()
+        for row in range(self.project_list.count()):
+            item = self.project_list.item(row)
+            proj = item.data(Qt.ItemDataRole.UserRole)
+            if proj and str(Path(proj.get("path", "")).resolve()).casefold() == target:
+                self.project_list.setCurrentItem(item)
+                self.project_list.scrollToItem(item)
+                return
 
     def _on_remove(self):
         current = self.project_list.currentItem()

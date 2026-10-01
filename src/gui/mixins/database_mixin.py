@@ -4,9 +4,19 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from src.calibration.multi_calibration_manager import MultiCalibrationManager
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.calibration.multi_calibration_manager import (
+    MultiCalibrationManager,
+    save_layer_calibration,
+)
 from src.core.export_results import ResultExporter
+from src.core.layer_status import (
+    compute_layer_status,
+    find_layer_conflicts,
+    find_path_conflicts,
+)
 from src.core.project_registry import ProjectRegistry
+from src.core.project_video_source import ProjectVideoSource
 from src.database.database_loader import DatabaseLoader
 from src.database.multi_database_manager import MultiDatabaseManager
 from src.geometry.coordinates import CoordinateConverter
@@ -49,10 +59,16 @@ class DatabaseMixin:
         if not workspace_dir or not video_path:
             return
 
+        # A new project must not inherit the previous project's databases,
+        # managers or anchors: the old db_manager used to capture the new DB and
+        # the old anchors were saved into the new project's calibration.
+        self._reset_session_state()
+
         # Create project directory structure
         if not self.project_manager.create_project(workspace_dir, mission_data):
             QMessageBox.critical(self, "Помилка", "Не вдалося створити проєкт!")
             return
+        self.active_source_id = "main"
 
         # Register in the project registry
         self._get_registry().register(
@@ -62,7 +78,180 @@ class DatabaseMixin:
         )
 
         self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
-        self._start_database_generation(video_path, self.project_manager.database_path)
+        self._start_database_generation(
+            video_path, self.project_manager.database_path, source_id="main"
+        )
+
+    # ── Layer (video source) state ───────────────────────────────────────────
+    #
+    # One layer = one ProjectVideoSource with its own video, database.h5 and
+    # calibration.json. ``active_source_id`` is the single source of truth for
+    # "which layer the buttons act on"; self.database / self.calibration are
+    # always that layer's live objects — the same instances db_manager and
+    # calib_manager hold — and only _activate_source switches them, together.
+
+    def _is_multi_source(self) -> bool:
+        return getattr(self, "db_manager", None) is not None
+
+    def _wants_multi_source(self) -> bool:
+        """The rule the project loader has always used to choose the mode."""
+        settings = self.project_manager.settings if self.project_manager.is_loaded else None
+        if settings is None:
+            return False
+        sources = settings.get_enabled_sources()
+        return len(sources) > 1 or any(s.source_id != "main" for s in sources)
+
+    def _source_config(self, source_id: str | None) -> ProjectVideoSource | None:
+        if not source_id or not self.project_manager.is_loaded:
+            return None
+        settings = self.project_manager.settings
+        return settings.get_source(source_id) if settings else None
+
+    def _layer_ops_busy(self, action: str = "", quiet: bool = False) -> bool:
+        """True (and says why) while a worker that uses the layer databases runs."""
+        running = []
+        for attr, what in (
+            ("db_worker", "генерація БД"),
+            ("propagation_worker", "пропагація GPS"),
+            ("tracking_worker", "відстеження"),
+        ):
+            worker = getattr(self, attr, None)
+            if worker is not None and worker.isRunning():
+                running.append(what)
+        if not running:
+            return False
+        msg = f"{action or 'Дія'}: недоступно, поки виконується {', '.join(running)}."
+        if quiet:
+            self.status_bar.showMessage(msg, 6000)
+        else:
+            QMessageBox.information(self, "Зачекайте", msg)
+        return True
+
+    def _activate_source(self, source_id: str, *, quiet: bool = False) -> bool:
+        """Makes ``source_id`` the active layer; its DB and calibration switch together."""
+        src = self._source_config(source_id)
+        if src is None:
+            if not quiet:
+                QMessageBox.warning(self, "Помилка", f"Шар '{source_id}' не знайдено в проєкті!")
+            return False
+
+        if self._is_multi_source():
+            try:
+                # get_or_load: a layer disabled at open time or added later still
+                # gets its anchors from disk instead of an empty object whose first
+                # save would overwrite the file.
+                calibration = self.calib_manager.get_or_load(src, self.project_manager.project_dir)
+            except Exception as e:
+                logger.error(f"Cannot read calibration of layer '{source_id}': {e}", exc_info=True)
+                if not quiet:
+                    QMessageBox.critical(
+                        self,
+                        "Помилка калібрування",
+                        f"Не вдалося прочитати калібрування шару «{source_id}»:\n{e}\n\n"
+                        f"Файл не змінено. Виправте або перейменуйте його і повторіть.",
+                    )
+                return False
+            self.database = self.db_manager.get_database(source_id)  # None: no DB yet
+            self.calibration = calibration
+        elif source_id != (self.active_source_id or self._single_layer_id()):
+            # Single-source mode holds exactly one layer; the other rows are
+            # disabled layers. Switching would pair this DB with their files.
+            if not quiet:
+                QMessageBox.information(
+                    self,
+                    "Шар вимкнено",
+                    f"Шар «{source_id}» вимкнено. Увімкніть його "
+                    f"(ПКМ по шару → Увімкнути), щоб з ним працювати.",
+                )
+            return False
+
+        self.active_source_id = source_id
+        logger.info(
+            f"Active layer: '{source_id}' (db={'loaded' if self.database else 'none'}, "
+            f"anchors={len(self.calibration.anchors)})"
+        )
+        self._update_project_info_panel()
+        return True
+
+    def _single_layer_id(self) -> str:
+        """The layer single-source mode loads: 'main', else the first one."""
+        settings = self.project_manager.settings if self.project_manager.is_loaded else None
+        if settings is None or settings.get_source("main") is not None:
+            return "main"
+        first = next(iter(settings.source_configs()), None)
+        return first.source_id if first is not None else "main"
+
+    def _ensure_active(self, source_id: str) -> bool:
+        return source_id == self.active_source_id or self._activate_source(source_id)
+
+    def _close_layer_objects(self) -> None:
+        """Closes every open layer database and forgets all per-layer objects."""
+        try:
+            if getattr(self, "database", None) is not None:
+                self.database.close()
+            if getattr(self, "db_manager", None) is not None:
+                self.db_manager.close_all()
+        except Exception as e:
+            logger.warning(f"Error closing layer databases: {e}")
+        self.db_manager = None
+        self.calib_manager = None
+        self.database = None
+        self.calibration = MultiAnchorCalibration()
+        self.active_source_id = None
+
+    def _reset_session_state(self) -> None:
+        """Drops everything that belongs to the previously open project."""
+        self._close_layer_objects()
+        if getattr(self, "map_widget", None):
+            self.map_widget.clear_trajectory()
+            self.map_widget.clear_verification_markers()
+        if hasattr(self, "_tracking_results"):
+            self._tracking_results = []
+
+    def _load_project_layers(self, prefer_source_id: str | None = None) -> None:
+        """(Re)creates the per-layer objects of the loaded project and activates one.
+
+        Used on project open and whenever enabling/adding/removing a layer changes
+        the mode, so a new layer is usable immediately — same result as reopening.
+        """
+        settings = self.project_manager.settings
+        project_dir = self.project_manager.project_dir
+        self._close_layer_objects()
+
+        if self._wants_multi_source():
+            sources = settings.get_enabled_sources()
+            self.db_manager = MultiDatabaseManager(sources, project_dir, config=self.config)
+            self.calib_manager = MultiCalibrationManager()
+            self.calib_manager.load_all(sources, project_dir)
+            candidates = [prefer_source_id, *self.db_manager.all_source_ids]
+            candidates += [s.source_id for s in sources]
+            for sid in candidates:
+                if sid and self._activate_source(sid, quiet=True):
+                    break
+            logger.info(
+                f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
+                f"sources={self.db_manager.all_source_ids}, active='{self.active_source_id}'"
+            )
+        else:
+            src = settings.get_source(self._single_layer_id())
+            if src is not None:
+                sid = src.source_id
+                db_path = Path(project_dir) / src.database_file
+                cal_path = Path(project_dir) / src.calibration_file
+            else:
+                sid = "main"
+                db_path = Path(self.project_manager.database_path)
+                cal_path = Path(self.project_manager.calibration_path)
+            self.database = DatabaseLoader(str(db_path)) if db_path.exists() else None
+            self.calibration = MultiAnchorCalibration()
+            if cal_path.exists():
+                self.calibration.load(str(cal_path))
+            self.active_source_id = sid
+
+        # Projection: the DB (what propagation used) has priority over the JSON.
+        if self.database is not None and self.database.converter is not None:
+            self.calibration.converter = self.database.converter
+        self._update_project_info_panel()
 
     # ── Database generation ────────────────────────────────────────────────────────
 
@@ -92,12 +281,17 @@ class DatabaseMixin:
         video_path: str,
         save_path: str,
         required_frame_ids: set[int] | None = None,
+        source_id: str | None = None,
     ):
         if self._refuse_if_encrypted_project("Генерація бази даних"):
             return
 
+        sid = source_id or self._find_source_id_by_db_path(save_path)
+        self._db_build_source_id = sid
+
         # Do NOT initialize WEB_MERCATOR when starting database generation.
         # UTM converter will be initialized automatically after first GPS anchor.
+        # (Build actions activate the target layer first, so this is its calibration.)
         if not self.calibration.is_calibrated:
             self.calibration.converter = CoordinateConverter(
                 "UTM"
@@ -108,20 +302,21 @@ class DatabaseMixin:
         self.control_panel.update_progress(0)
         self.control_panel.set_db_generation_running(True)
 
-        # CRITICAL: Close and release the database file handle before overwriting/truncating it
-        if hasattr(self, "database") and self.database:
+        # CRITICAL: release exactly the database file that is about to be
+        # overwritten. Other layers stay open — closing the active loader while
+        # building another layer used to leave a dead HDF5 handle in db_manager.
+        if self._is_multi_source() and sid:
+            if self.database is not None and self.database is self.db_manager.get_database(sid):
+                self.database = None
+            # Unload also before overwriting vectors.lance
+            self.db_manager.unload_source(sid)
+        elif self.database is not None:
             try:
                 self.database.close()
                 logger.info("Current database closed before starting new generation.")
             except Exception as e:
                 logger.warning(f"Could not close database: {e}")
-        self.database = None
-
-        # Unload source from multi-manager before overwriting vectors.lance
-        if getattr(self, "db_manager", None):
-            sid = self._find_source_id_by_db_path(save_path)
-            if sid:
-                self.db_manager.unload_source(sid)
+            self.database = None
 
         self.db_worker = DatabaseGenerationWorker(
             video_path=video_path,
@@ -139,6 +334,7 @@ class DatabaseMixin:
         # Connect stop button
         self.control_panel.stop_db_generation_clicked.connect(self.on_stop_db_generation)
 
+        self._update_project_info_panel()
         self.db_worker.start()
 
     @pyqtSlot()
@@ -158,55 +354,55 @@ class DatabaseMixin:
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.current_database_path = db_path
+        sid = self._db_build_source_id or self._find_source_id_by_db_path(db_path)
+        self._db_build_source_id = None
 
-        if self.database:
-            self.database.close()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            # Reload source in db_manager for fresh LanceDB handle
-            reloaded = False
-            if getattr(self, "db_manager", None):
-                sid = self._find_source_id_by_db_path(db_path)
-                src = (
-                    self.project_manager.settings.get_source(sid)
-                    if sid and self.project_manager.settings
-                    else None
-                )
-                if src is not None and self.db_manager.reload_source(src):
-                    self.database = self.db_manager.get_database(sid)
-                    reloaded = True
-
-            if not reloaded:
+            if self._is_multi_source() and sid:
+                # Fresh loader + LanceDB handle for the rebuilt layer, then switch
+                # database AND calibration to it together.
+                src = self._source_config(sid)
+                if src is not None and src.enabled:
+                    self.db_manager.reload_source(src)
+                self._activate_source(sid)
+            else:
+                if self.database:
+                    self.database.close()
                 self.database = DatabaseLoader(db_path)
+                if sid:
+                    self.active_source_id = sid
         finally:
             QApplication.restoreOverrideCursor()
+        layer = sid or "main"
         self.control_panel.update_progress(100)
-        self.control_panel.update_status("Базу успішно створено")
+        self.control_panel.update_status(f"Базу шару «{layer}» успішно створено")
         self.status_bar.showMessage(
-            f"Проєкт: {self.project_manager.project_name} | База: {db_path}"
+            f"Проєкт: {self.project_manager.project_name} | Шар: {layer} | База: {db_path}"
         )
 
-        # Update registry and info panel
-        if self.project_manager.is_loaded:
-            self._get_registry().refresh_status(str(self.project_manager.project_dir))
-        self._update_project_info_panel()
+        self._after_layer_data_changed()
 
-        QMessageBox.information(self, "Успіх", "Проєкт та базу даних успішно згенеровано!")
+        QMessageBox.information(self, "Успіх", f"Базу даних шару «{layer}» успішно згенеровано!")
 
     @pyqtSlot(str)
     def on_db_error(self, error_msg: str):
+        self._db_build_source_id = None
         self.control_panel.set_db_generation_running(False)
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.control_panel.update_progress(0)
         self.control_panel.update_status("Помилка генерації")
+        self._update_project_info_panel()
         QMessageBox.critical(self, "Помилка", f"Помилка генерації:\n{error_msg}")
 
     @pyqtSlot()
     def on_db_cancelled(self):
+        self._db_build_source_id = None
         self.control_panel.set_db_generation_running(False)
         self.control_panel.update_status("Генерацію скасовано користувачем")
         self.control_panel.update_progress(0)
+        self._update_project_info_panel()
 
     # ── Project opening ────────────────────────────────────────────────────────
 
@@ -343,77 +539,44 @@ class DatabaseMixin:
             QMessageBox.critical(self, "Error", "Selected folder is not a valid project!")
             return
 
+        # Nothing of the previous project may survive — including on the
+        # "generate missing database" path below, where the old db_manager used
+        # to reload the OLD project's database under the new project's name.
+        self._reset_session_state()
+        self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+
+        loaded = False
         try:
-            db_path = self.project_manager.database_path
-
-            # Check whether the database file exists
-            if not Path(db_path).exists():
-                video_path = self.project_manager.settings.video_path
-                reply = QMessageBox.question(
-                    self,
-                    "Database missing",
-                    f"Project '{self.project_manager.project_name}' has no generated database.\n\n"
-                    f"Generate database now from video:\n{Path(video_path).name}?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            settings = self.project_manager.settings
+            if not self._wants_multi_source():
+                src = settings.get_source("main") or next(iter(settings.source_configs()), None)
+                db_path = (
+                    str(self.project_manager.project_dir / src.database_file)
+                    if src is not None
+                    else self.project_manager.database_path
                 )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.setWindowTitle(
-                        f"Drone Topometric Localizer - {self.project_manager.project_name}"
+                if not Path(db_path).exists():
+                    video_path = src.video_path if src is not None else settings.video_path
+                    reply = QMessageBox.question(
+                        self,
+                        "Database missing",
+                        f"Project '{self.project_manager.project_name}' has no generated database.\n\n"
+                        f"Generate database now from video:\n{Path(video_path).name}?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     )
-                    self._start_database_generation(video_path, db_path)
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.active_source_id = src.source_id if src is not None else "main"
+                        self._start_database_generation(
+                            video_path, db_path, source_id=self.active_source_id
+                        )
+                    else:
+                        self.status_bar.showMessage("Loading cancelled: missing database")
                     return
-                else:
-                    self.status_bar.showMessage("Loading cancelled: missing database")
-                    return
-
-            if self.database:
-                self.database.close()
-            # Shut down previous multi-source managers
-            if hasattr(self, "db_manager") and self.db_manager:
-                self.db_manager.close_all()
-
-            # Clear previous project state
-            if hasattr(self, "calibration") and self.calibration:
-                self.calibration.clear()
-
-            if hasattr(self, "map_widget") and self.map_widget:
-                self.map_widget.clear_trajectory()
-                self.map_widget.clear_verification_markers()
-
-            if hasattr(self, "_tracking_results"):
-                self._tracking_results = []
+            # Multi-source projects open even if some (or all) layers have no DB
+            # yet: such layers are listed as "Без БД" and can be built from the table.
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            sources = self.project_manager.settings.get_enabled_sources()
-            is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
-            if is_multi and len(sources) > 0:
-                # Multi-source mode
-                project_dir = self.project_manager.project_dir
-                self.db_manager = MultiDatabaseManager(sources, project_dir, config=self.config)
-                self.calib_manager = MultiCalibrationManager()
-                self.calib_manager.load_all(sources, project_dir)
-
-                # self.database — first source for UI compatibility
-                first_id = (
-                    self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
-                )
-                if first_id:
-                    self.database = self.db_manager.get_database(first_id)
-                    self.calibration = self.calib_manager.get(first_id)
-                else:
-                    raise RuntimeError("Multi-source project: no databases loaded")
-
-                logger.info(
-                    f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
-                    f"sources={self.db_manager.all_source_ids}"
-                )
-            else:
-                # Single-source mode (backwards compatibility)
-                self.db_manager = None
-                self.calib_manager = None
-                self.database = DatabaseLoader(db_path)
-
-            self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+            self._load_project_layers()
 
             # Update registry
             registry = self._get_registry()
@@ -425,35 +588,30 @@ class DatabaseMixin:
                 else "",
             )
 
-            # Load calibration if present (single mode)
-            if self.calib_manager is None:
-                calib_path = self.project_manager.calibration_path
-                if calib_path and Path(calib_path).exists():
-                    self.calibration.load(calib_path)
-
-            # Sync converter (DB priority, then calibration file)
-            if self.database and self.database.converter is not None:
-                self.calibration.converter = self.database.converter
-            elif self.calibration.converter and self.calibration.converter.is_initialized:
-                pass  # converter loaded from calibration.json
-
+            layer = self.active_source_id or "main"
             if self.database and self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
                 self.status_bar.showMessage(
-                    f"Project: {self.project_manager.project_name} (GPS: {n_valid}/{n_total} frames)"
+                    f"Project: {self.project_manager.project_name} | layer '{layer}' "
+                    f"(GPS: {n_valid}/{n_total} frames)"
                 )
             else:
                 self.status_bar.showMessage(
-                    f"Project: {self.project_manager.project_name} (no GPS propagation)"
+                    f"Project: {self.project_manager.project_name} | layer '{layer}' "
+                    f"(no GPS propagation)"
                 )
             self.control_panel.update_status("Project loaded")
             self._update_project_info_panel()
+            loaded = True
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project database:\n{e}")
         finally:
             QApplication.restoreOverrideCursor()
+
+        if loaded:
+            self._warn_layer_conflicts()
 
     # ── Propagation check ───────────────────────────────────────────────────────
 
@@ -503,6 +661,7 @@ class DatabaseMixin:
 
     @pyqtSlot()
     def on_rebuild_database(self):
+        """Rebuilds the database of the ACTIVE layer (not always the main one)."""
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Warning", "Please load the project first!")
             return
@@ -511,13 +670,28 @@ class DatabaseMixin:
         # that save is a write into the project and would otherwise raise.
         if self._refuse_if_encrypted_project("Database rebuild"):
             return
+        if self._layer_ops_busy("Перегенерація бази"):
+            return
 
-        video_path = self.project_manager.settings.video_path
+        sid = self._get_current_source_id()
+        src = self._source_config(sid)
+        if src is not None:
+            if not src.enabled:
+                QMessageBox.information(
+                    self, "Шар вимкнено", f"Увімкніть шар «{sid}» перед побудовою його бази."
+                )
+                return
+            video_path = src.video_path
+            db_path = str(self.project_manager.project_dir / src.database_file)
+        else:
+            video_path = self.project_manager.settings.video_path
+            db_path = self.project_manager.database_path
+
         if not video_path or not Path(video_path).exists():
             QMessageBox.warning(
                 self,
                 "Warning",
-                f"Project video not found:\n{video_path}\n\n"
+                f"Video of layer '{sid}' not found:\n{video_path}\n\n"
                 "Check the video path in project settings.",
             )
             return
@@ -525,25 +699,22 @@ class DatabaseMixin:
         reply = QMessageBox.question(
             self,
             "Database rebuild",
-            f"The database will be overwritten!\n\n"
+            f"The database of layer «{sid}» will be overwritten!\n\n"
             f"Video: {Path(video_path).name}\n"
-            f"Calibration will be saved.\n\n"
+            f"DB: {db_path}\n"
+            f"Calibration of this layer will be saved.\n\n"
             f"Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Save calibration before regeneration
+        # Save calibration before regeneration (into THIS layer's file)
         if self.calibration.is_calibrated:
-            calib_path = (
-                self._get_calibration_save_path()
-                if hasattr(self, "_get_calibration_save_path")
-                else self.project_manager.calibration_path
-            )
+            calib_path = self._get_calibration_save_path()
             if calib_path:
-                self.calibration.save(calib_path)
-                logger.info(f"Calibration saved before rebuild: {calib_path}")
+                save_layer_calibration(self.calibration, calib_path, sid)
+                logger.info(f"Calibration of layer '{sid}' saved before rebuild: {calib_path}")
 
         required_frame_ids = {int(anchor.frame_id) for anchor in self.calibration.anchors}
         if required_frame_ids:
@@ -551,10 +722,12 @@ class DatabaseMixin:
                 "Rebuild will preserve exact calibration anchor slots: "
                 f"{sorted(required_frame_ids)}"
             )
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._start_database_generation(
             video_path,
-            self.project_manager.database_path,
+            db_path,
             required_frame_ids=required_frame_ids,
+            source_id=sid,
         )
 
     # ── Results export ───────────────────────────────────────────────────────────
@@ -620,12 +793,23 @@ class DatabaseMixin:
 
     # ── Info panel ──────────────────────────────────────────────────────────────
 
+    def _after_layer_data_changed(self) -> None:
+        """Anchors, propagation or a layer's DB changed: refresh every status view."""
+        if self.project_manager.is_loaded:
+            try:
+                self._get_registry().refresh_status(str(self.project_manager.project_dir))
+            except Exception as e:
+                logger.warning(f"Project registry refresh failed: {e}")
+        self._update_project_info_panel()
+
     def _update_project_info_panel(self):
-        """Update the project info panel in control_panel."""
+        """Update the project info panel (data of the ACTIVE layer) and the layer table."""
         if not self.project_manager.is_loaded:
             self.control_panel.update_project_info()
             return
 
+        sid = self._get_current_source_id()
+        src = self._source_config(sid)
         num_frames = self.database.get_num_frames() if self.database else None
         num_anchors = len(self.calibration.anchors) if self.calibration else None
         num_propagated = None
@@ -634,196 +818,362 @@ class DatabaseMixin:
         if self.database and self.database.is_propagated:
             num_propagated = int(self.database.frame_valid.sum())
 
-        db_path = self.project_manager.database_path
+        if src is not None:
+            db_path = str(self.project_manager.project_dir / src.database_file)
+            video_path = src.video_path
+        else:
+            db_path = self.project_manager.database_path
+            video_path = self.project_manager.settings.video_path
         if db_path and Path(db_path).exists():
             db_size_mb = Path(db_path).stat().st_size / (1024 * 1024)
 
         self.control_panel.update_project_info(
             project_name=self.project_manager.project_name,
-            video_path=self.project_manager.settings.video_path
-            if self.project_manager.settings
-            else None,
+            video_path=video_path,
             num_frames=num_frames,
             num_anchors=num_anchors,
             num_propagated=num_propagated,
             db_size_mb=db_size_mb,
+            layer_id=sid,
         )
 
-        # Update video sources panel
+        # Update layer table
         self._refresh_sources_panel()
 
+    def _layer_snapshot(self):
+        """Live (database, calibration) of every layer + detected cross-layer conflicts."""
+        settings = self.project_manager.settings
+        project_dir = self.project_manager.project_dir
+        active_id = self._get_current_source_id()
+        sources = settings.source_configs()
+        databases: dict = {}
+        calibrations: dict = {}
+        for src in sources:
+            sid = src.source_id
+            db = cal = None
+            if self._is_multi_source():
+                db = self.db_manager.get_database(sid)
+                if src.enabled:
+                    try:
+                        cal = self.calib_manager.get_or_load(src, project_dir)
+                    except Exception as e:
+                        logger.warning(f"Layer '{sid}': calibration unreadable: {e}")
+            elif sid == active_id:
+                db, cal = self.database, self.calibration
+            databases[sid] = db
+            calibrations[sid] = cal
+        num_frames = {sid: db.get_num_frames() for sid, db in databases.items() if db is not None}
+        conflicts = find_layer_conflicts(
+            sources,
+            project_dir,
+            {sid: cal for sid, cal in calibrations.items() if cal is not None},
+            num_frames,
+        )
+        return sources, databases, calibrations, conflicts
+
+    def _layer_rows(self) -> list[dict]:
+        project_dir = self.project_manager.project_dir
+        active_id = self._get_current_source_id()
+        sources, databases, calibrations, conflicts = self._layer_snapshot()
+        conflict_msgs: dict[str, list[str]] = {}
+        for c in conflicts:
+            for sid in c.source_ids:
+                conflict_msgs.setdefault(sid, []).append(c.message)
+
+        rows = []
+        for src in sources:
+            sid = src.source_id
+            st = compute_layer_status(
+                src, project_dir, database=databases.get(sid), calibration=calibrations.get(sid)
+            )
+            lines = [f"Шар: {sid}" + (f" — {src.description}" if src.description else "")]
+            lines.append(f"Зона: {src.area_id} · пріоритет {src.priority}")
+            lines.append(f"Відео: {src.video_path}")
+            lines.append(f"БД: {src.database_file}")
+            lines.append(f"Калібрування: {src.calibration_file}")
+            layer = src.scale_layer
+            if layer is not None and layer.nominal_gsd_m_per_px:
+                lines.append(f"GSD ≈ {layer.nominal_gsd_m_per_px:.3f} м/px ({layer.scale_quality})")
+            lines.append(f"Статус: {st.label} — {st.hint}")
+            lines.extend(f"⚠ {msg}" for msg in conflict_msgs.get(sid, []))
+            rows.append(
+                {
+                    "source_id": sid,
+                    "area_id": src.area_id,
+                    "anchors": st.anchors_text,
+                    "gps": st.gps_text,
+                    "label": st.label,
+                    "state": st.state.value,
+                    "tooltip": "\n".join(lines),
+                    "enabled": st.enabled,
+                    "db_loaded": st.db_loaded,
+                    "has_db_file": st.has_db_file,
+                    "num_anchors": st.num_anchors or 0,
+                    "is_active": sid == active_id,
+                    "conflict": sid in conflict_msgs,
+                }
+            )
+        return rows
+
     def _refresh_sources_panel(self):
-        """Updates video sources table and active source badge in ControlPanel."""
+        """Updates the layer table and the active-layer badge in ControlPanel."""
         if not self.project_manager.is_loaded or not self.project_manager.settings:
             return
-        sources_raw = self.project_manager.settings.video_sources or []
-        project_dir = (
-            str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
-        )
-
-        # Get active source ID
         active_id = self._get_current_source_id()
-
-        # Get video_path for active source
-        video_path = ""
-        for src_dict in sources_raw:
-            if src_dict.get("source_id") == active_id:
-                video_path = src_dict.get("video_path", "")
-                break
-
-        # Fallback to default video_path if missing
-        if not video_path and self.project_manager.settings:
-            video_path = self.project_manager.settings.video_path
-
+        src = self._source_config(active_id)
+        video_path = src.video_path if src is not None else self.project_manager.settings.video_path
         self.control_panel.set_active_source(active_id, video_path or "")
 
-        # Check which sources are propagated
-        propagated_ids: set[str] = set()
-        if hasattr(self, "db_manager") and self.db_manager:
-            for sid in self.db_manager.all_source_ids:
-                db = self.db_manager.get_database(sid)
-                if db and db.is_propagated:
-                    propagated_ids.add(sid)
-        elif hasattr(self, "database") and self.database and self.database.is_propagated:
-            propagated_ids.add("main")
+        try:
+            rows = self._layer_rows()
+        except Exception as e:
+            logger.error(f"Layer table refresh failed: {e}", exc_info=True)
+            return
+        self.control_panel.update_sources_list(rows)
+        self.control_panel.set_active_layer_context(active_id, len(rows))
 
-        self.control_panel.update_sources_list(
-            sources_raw,
-            project_dir=project_dir,
-            active_source_id=active_id,
-            propagated_source_ids=propagated_ids,
+    def _warn_layer_conflicts(self) -> None:
+        """Warns (once, on open) if layer files look mixed up. Changes nothing."""
+        if not self.project_manager.is_loaded:
+            return
+        try:
+            conflicts = self._layer_snapshot()[3]
+        except Exception as e:
+            logger.warning(f"Layer conflict check failed: {e}")
+            return
+        if not conflicts:
+            return
+        for c in conflicts:
+            logger.error(f"Layer conflict ({c.kind}): {c.message}")
+        QMessageBox.warning(
+            self,
+            "Можливе змішування шарів",
+            "Схоже, що файли шарів переплутані:\n\n"
+            + "\n".join(f"• {c.message}" for c in conflicts)
+            + "\n\nАвтоматично нічого не змінено. Перевірте калібрування цих шарів "
+            "(ПКМ по шару → Калібрувати) або завантажте правильний JSON "
+            "(ПКМ → Завантажити калібрування).",
         )
 
-    # ── Multi-source slots ────────────────────────────────────────────────────
+    # ── Layer slots ──────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_add_video_source(self):
-        """Slot for 'Add Source' button."""
+        """Slot for 'Add layer' button."""
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Помилка", "Спочатку відкрийте або створіть проєкт!")
+            return
+        if self._refuse_if_encrypted_project("Додавання шару"):
+            return
+        if self._layer_ops_busy("Додавання шару"):
             return
 
         from src.gui.dialogs.add_video_source_dialog import AddVideoSourceDialog
 
-        # Collect existing area_ids
-        existing_areas = set()
-        for src in self.project_manager.settings.video_sources or []:
-            area = src.get("area_id", "")
-            if area:
-                existing_areas.add(area)
+        settings = self.project_manager.settings
+        project_dir = self.project_manager.project_dir
+        existing_areas = sorted(
+            {src.get("area_id", "") for src in settings.video_sources or []} - {""}
+        )
 
-        dialog = AddVideoSourceDialog(existing_area_ids=sorted(existing_areas), parent=self)
+        dialog = AddVideoSourceDialog(existing_area_ids=existing_areas, parent=self)
         if not dialog.exec():
             return
 
         new_source = dialog.get_source_config()
+        sid = new_source.source_id
 
-        # Duplicate check
-        if self.project_manager.settings.get_source(new_source.source_id) is not None:
+        # IDs become folder names; on Windows "Low" and "low" are one folder.
+        taken = {str(s.get("source_id", "")).casefold() for s in settings.video_sources or []}
+        if sid.casefold() in taken:
             QMessageBox.warning(
-                self, "Помилка", f"Джерело з ID '{new_source.source_id}' вже існує в проєкті!"
+                self,
+                "Помилка",
+                f"Шар з ID '{sid}' вже існує в проєкті (ID не розрізняють регістр)!",
+            )
+            return
+        clashes = [
+            c
+            for c in find_path_conflicts([*settings.source_configs(), new_source], project_dir)
+            if sid in c.source_ids
+        ]
+        if clashes:
+            QMessageBox.warning(
+                self,
+                "Конфлікт файлів",
+                "Новий шар ділив би файли з існуючим:\n\n"
+                + "\n".join(f"• {c.message}" for c in clashes),
             )
             return
 
-        # Add to project
-        self.project_manager.settings.add_source(new_source)
+        settings.add_source(new_source)
         self.project_manager.save_project()
-
-        # Create directory for this source
-        source_dir = self.project_manager.project_dir / "sources" / new_source.source_id
-        source_dir.mkdir(parents=True, exist_ok=True)
-
+        (project_dir / "sources" / sid).mkdir(parents=True, exist_ok=True)
         logger.info(
-            f"Video source added: {new_source.source_id} "
-            f"(area={new_source.area_id}, video={Path(new_source.video_path).name})"
+            f"Layer added: {sid} (area={new_source.area_id}, "
+            f"video={Path(new_source.video_path).name})"
         )
 
-        self._refresh_sources_panel()
-        self.status_bar.showMessage(
-            f"Додано відеоджерело '{new_source.source_id}'. "
-            f"Побудуйте БД через контекстне меню таблиці."
+        # A second layer switches the project to multi-source mode right away
+        # (previously the project had to be reopened before the layer worked).
+        if self._wants_multi_source() != self._is_multi_source():
+            self._reload_layers_keeping_active()
+        self._after_layer_data_changed()
+
+        reply = QMessageBox.question(
+            self,
+            "Новий шар",
+            f"Шар «{sid}» додано до проєкту.\n\n"
+            f"Побудувати для нього базу даних зараз?\n"
+            f"Відео: {Path(new_source.video_path).name}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.on_source_action(sid, "build_db")
+        else:
+            self.status_bar.showMessage(
+                f"Шар «{sid}» додано. Побудуйте його БД через ПКМ по шару в таблиці."
+            )
+
+    def _reload_layers_keeping_active(self, exclude: str | None = None) -> None:
+        prefer = self.active_source_id if self.active_source_id != exclude else None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._load_project_layers(prefer_source_id=prefer)
+        except Exception as e:
+            logger.error(f"Reloading project layers failed: {e}", exc_info=True)
+            QMessageBox.critical(self, "Помилка", f"Не вдалося перезавантажити шари:\n{e}")
+        finally:
+            QApplication.restoreOverrideCursor()
 
     @pyqtSlot(str)
     def on_active_source_changed(self, source_id: str):
-        """Обробка зміни активного джерела при кліку в таблиці."""
-        if not self.db_manager:
+        """Table click: make the clicked layer the active one."""
+        if not self.project_manager.is_loaded or source_id == self.active_source_id:
             return
-
-        if source_id not in self.db_manager.all_source_ids:
-            # Source is disabled or has no database
-            self.database = None
-            self.calibration = None
-            self.status_bar.showMessage(f"Джерело '{source_id}' вимкнено або недоступне")
-            self._update_project_info_panel()
+        if self._layer_ops_busy("Зміна активного шару", quiet=True):
+            self._refresh_sources_panel()  # put the selection back on the active layer
             return
-
-        self.database = self.db_manager.get_database(source_id)
-        self.calibration = self.calib_manager.get(source_id)
-        logger.info(f"Active source switched to: {source_id}")
-
-        self.status_bar.showMessage(f"Обрано джерело: {source_id}")
-        self._update_project_info_panel()
-        self._refresh_sources_panel()  # Щоб оновити підсвічування рядка в таблиці
+        if self._activate_source(source_id):
+            self.status_bar.showMessage(f"Активний шар: {source_id}")
+        else:
+            self._refresh_sources_panel()
 
     @pyqtSlot(str, str)
     def on_source_action(self, source_id: str, action: str):
-        """Обробка дій з контекстного меню таблиці джерел."""
+        """Layer table actions: each one acts on exactly the clicked layer."""
         if not self.project_manager.is_loaded:
             return
 
         settings = self.project_manager.settings
         source = settings.get_source(source_id)
         if source is None:
-            QMessageBox.warning(self, "Помилка", f"Джерело '{source_id}' не знайдено!")
+            QMessageBox.warning(self, "Помилка", f"Шар '{source_id}' не знайдено!")
             return
 
-        if action == "build_db":
-            # Generate database for this specific source
-            video_path = source.video_path
-            db_path = str(self.project_manager.project_dir / source.database_file)
-            db_dir = Path(db_path).parent
-            db_dir.mkdir(parents=True, exist_ok=True)
-            self._start_database_generation(video_path, db_path)
+        if action == "activate":
+            self.on_active_source_changed(source_id)
+            return
 
-        elif action == "calibrate":
-            # For now: open the standard calibration dialog
-            self.status_bar.showMessage(
-                f"Для калібрування '{source_id}' використовуйте стандартний калібрувальний інструмент."
-            )
+        if action in ("calibrate", "load_calibration", "propagate", "build_db"):
+            if self._layer_ops_busy():
+                return
+            if action == "build_db" and not source.enabled:
+                QMessageBox.information(
+                    self, "Шар вимкнено", f"Увімкніть шар «{source_id}» перед побудовою його бази."
+                )
+                return
+            # Activate first: every handler below works on the active layer only.
+            if not self._ensure_active(source_id):
+                return
+            if action == "calibrate":
+                self.on_calibrate()
+            elif action == "load_calibration":
+                self.on_load_calibration()
+            elif action == "propagate":
+                self.on_run_propagation()
+            else:
+                self._build_layer_database(source)
+            return
 
-        elif action == "toggle":
+        if action == "toggle":
+            if self._refuse_if_encrypted_project("Увімкнення/вимкнення шару"):
+                return
+            if self._layer_ops_busy("Увімкнення/вимкнення шару"):
+                return
             source.enabled = not source.enabled
             settings.update_source(source)
             self.project_manager.save_project()
 
-            if hasattr(self, "db_manager") and self.db_manager:
+            if self._wants_multi_source() != self._is_multi_source():
+                self._reload_layers_keeping_active(exclude=None if source.enabled else source_id)
+            elif self._is_multi_source():
                 self.db_manager.toggle_source(source)
+                if source_id == self.active_source_id:
+                    # Its loader was just opened/closed: re-pair DB + calibration.
+                    fallback = source_id
+                    if not source.enabled:
+                        fallback = next(
+                            (s for s in self.db_manager.all_source_ids if s != source_id),
+                            source_id,
+                        )
+                    self._activate_source(fallback, quiet=True)
 
-                # If the currently active source was disabled, switch to the first available one
-                if not source.enabled and self._get_current_source_id() == source_id:
-                    avail = self.db_manager.all_source_ids
-                    if avail:
-                        self.on_active_source_changed(avail[0])
-                    else:
-                        self.database = None
-                        self.calibration = None
-                        self._update_project_info_panel()
-
-            self._refresh_sources_panel()
+            self._after_layer_data_changed()
             state = "увімкнено" if source.enabled else "вимкнено"
-            self.status_bar.showMessage(f"Джерело '{source_id}' {state}")
+            self.status_bar.showMessage(f"Шар «{source_id}» {state}")
+            return
 
-        elif action == "remove":
+        if action == "remove":
+            if self._refuse_if_encrypted_project("Видалення шару"):
+                return
+            if self._layer_ops_busy("Видалення шару"):
+                return
+            if len(settings.video_sources or []) <= 1:
+                QMessageBox.information(
+                    self, "Видалення шару", "Це єдиний шар проєкту — його не можна видалити."
+                )
+                return
             reply = QMessageBox.question(
                 self,
-                "Видалення джерела",
-                f"Видалити відеоджерело '{source_id}'?\n\n"
-                f"Файли бази та калібрації НЕ будуть видалені з диску.",
+                "Видалення шару",
+                f"Видалити шар «{source_id}» з проєкту?\n\n"
+                f"Файли бази та калібрування НЕ будуть видалені з диску.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.StandardButton.Yes:
-                settings.remove_source(source_id)
-                self.project_manager.save_project()
-                self._refresh_sources_panel()
-                self.status_bar.showMessage(f"Джерело '{source_id}' видалено з проєкту")
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            settings.remove_source(source_id)
+            self.project_manager.save_project()
+            if self._wants_multi_source() != self._is_multi_source():
+                self._reload_layers_keeping_active(exclude=source_id)
+            elif self._is_multi_source():
+                self.db_manager.unload_source(source_id)
+                self.calib_manager.discard(source_id)
+                if source_id == self.active_source_id:
+                    self.active_source_id = None
+                    remaining = [*self.db_manager.all_source_ids]
+                    remaining += [s.source_id for s in settings.source_configs()]
+                    for sid in remaining:
+                        if self._activate_source(sid, quiet=True):
+                            break
+            self._after_layer_data_changed()
+            self.status_bar.showMessage(f"Шар «{source_id}» видалено з проєкту")
+
+    def _build_layer_database(self, source: ProjectVideoSource) -> None:
+        """Builds (or, if it exists, rebuilds) the DB of the already active layer."""
+        db_path = self.project_manager.project_dir / source.database_file
+        if db_path.exists():
+            # Same path as the "rebuild" button: confirmation + anchor slots kept.
+            self.on_rebuild_database()
+            return
+        if not source.video_path or not Path(source.video_path).exists():
+            QMessageBox.warning(
+                self,
+                "Відео не знайдено",
+                f"Відео шару «{source.source_id}» не знайдено:\n{source.video_path}",
+            )
+            return
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._start_database_generation(source.video_path, str(db_path), source_id=source.source_id)

@@ -1,3 +1,4 @@
+import html
 import re
 from collections import OrderedDict
 from pathlib import Path
@@ -59,11 +60,16 @@ class CalibrationDialog(QDialog):
         db_num_frames: int | None = None,
         frame_step: int = 1,
         keypoints_video_path: str | None = None,
+        layer_info: dict | None = None,
     ):
         super().__init__(parent)
         self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
         self.source_id = source_id
+        # Which layer is being calibrated (shown in a banner): area_id,
+        # description, video_path, database_file, calibration_file, gsd_m_per_px,
+        # num_layers. Optional so older callers keep working.
+        self.layer_info = dict(layer_info or {})
 
         # Video frame ↔ DB slot mapping.
         # DB indexed as video_frame // frame_step, so dialog must
@@ -93,7 +99,7 @@ class CalibrationDialog(QDialog):
         self._frame_cache = OrderedDict()
         self._MAX_CACHE_SIZE = 32
 
-        self.setWindowTitle(f"GPS Калібрування [{self.source_id}] — Мульти-якірний режим")
+        self.setWindowTitle(f"GPS Калібрування — шар «{self.source_id}» (мульти-якірний режим)")
         self.resize(1200, 800)
         self._init_ui()
         self._refresh_anchors_list()
@@ -104,8 +110,54 @@ class CalibrationDialog(QDialog):
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
+    def _build_layer_banner(self) -> QLabel:
+        """Помітна плашка: який саме шар (БД + файл калібрування) зараз калібрується."""
+        info = self.layer_info
+        esc = html.escape
+        head = f"🗺 Калібрується шар: <b>{esc(str(self.source_id))}</b>"
+        if info.get("area_id"):
+            head += f" &nbsp;·&nbsp; зона <b>{esc(str(info['area_id']))}</b>"
+        if info.get("num_layers", 0) > 1:
+            head += f" &nbsp;·&nbsp; шарів у проєкті: {info['num_layers']}"
+        if info.get("description"):
+            head += f" &nbsp;·&nbsp; <i>{esc(str(info['description']))}</i>"
+
+        details = []
+        if info.get("video_path"):
+            details.append(f"Відео: {esc(Path(str(info['video_path'])).name)}")
+        db_name = info.get("database_file") or Path(self.database_path).name
+        details.append(f"БД: {esc(str(db_name))}")
+        if self.db_num_frames:
+            details.append(f"{self.db_num_frames} слотів, крок {self.frame_step}")
+        if info.get("gsd_m_per_px"):
+            details.append(f"GSD ≈ {float(info['gsd_m_per_px']):.3f} м/px")
+        if info.get("calibration_file"):
+            details.append(f"якорі → {esc(str(info['calibration_file']))}")
+
+        banner = QLabel(
+            f"{head}<br><span style='font-size:11px; color:#5d4037;'>"
+            + " &nbsp;|&nbsp; ".join(details)
+            + "</span>"
+        )
+        banner.setTextFormat(Qt.TextFormat.RichText)
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel { background: #fff3e0; border: 1px solid #ffb74d; "
+            "border-left: 6px solid #ef6c00; border-radius: 4px; "
+            "padding: 6px 10px; font-size: 13px; color: #3e2723; }"
+        )
+        banner.setToolTip(
+            "Усі якорі з цього вікна зберігаються лише в калібрування цього шару, "
+            "а пропагація запускається лише по його базі даних."
+        )
+        return banner
+
     def _init_ui(self):
-        main_layout = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
+        self.layer_banner = self._build_layer_banner()
+        outer.addWidget(self.layer_banner)
+        main_layout = QHBoxLayout()
+        outer.addLayout(main_layout, stretch=1)
         self.setAcceptDrops(True)  # На майбутнє, якщо знадобиться
 
         # Left panel — video
@@ -263,7 +315,7 @@ class CalibrationDialog(QDialog):
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setWordWrap(True)
 
-        self.btn_done = QPushButton("Готово — запустити пропагацію по всій базі")
+        self.btn_done = QPushButton(f"Готово — запустити пропагацію для шару «{self.source_id}»")
         self.btn_done.setStyleSheet(
             "background:#2e7d32; color:white; font-weight:bold; padding:11px; font-size:13px;"
         )
@@ -438,7 +490,7 @@ class CalibrationDialog(QDialog):
         QMessageBox.information(
             self,
             "⚓ Якір додано",
-            f"Якір для кадру {frame_id} успішно збережено!",
+            f"Якір для кадру {frame_id} збережено в шар «{self.source_id}».",
         )
 
     # ── Video loading ────────────────────────────────────────────────────────

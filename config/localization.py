@@ -5,7 +5,12 @@ from pydantic import BaseModel, Field
 
 class LayerSearchConfig(BaseModel):
     enabled: bool = False
+    # Search work stays bounded when a project contains many reference sources.
+    # One slot is reserved for a rotating recovery probe outside the preferred
+    # active/nearby layers, so a stale spatial filter cannot hide a new layer.
+    max_sources_per_frame: int = Field(default=8, ge=2, le=256)
     candidates_per_source: int = Field(default=4, ge=1, le=32)
+    descriptor_batch_size: int = Field(default=4, ge=1, le=32)
     max_verifications: int = Field(default=32, ge=1, le=512)
     budget_ms: float = Field(default=2000.0, gt=0)
     confirmations: int = Field(default=2, ge=1, le=20)
@@ -18,6 +23,20 @@ class LayerSearchConfig(BaseModel):
     max_center_extrapolation: float = Field(default=0.1, ge=0, le=1)
     scale_drift_per_s: float = Field(default=0.1, gt=0)
     require_schema: bool = False
+    # Handoff motion gate: after a gap in the active layer's fixes (LOST, or it
+    # did not verify this frame) accept one observation within
+    # agreement_m + growth * gap of the constant-velocity track prediction,
+    # instead of waiting for `confirmations` fresh observations.
+    motion_gate: bool = False
+    motion_gate_growth_mps: float = Field(default=30.0, gt=0)
+    motion_gate_max_gap_s: float = Field(default=10.0, gt=0)
+    # Verify each retrieved frame once before retrying any frame at another scale.
+    diverse_candidates: bool = False
+    # Stop verifying once the active layer yields a strong, near-native-scale fix
+    # (1/ratio..ratio) that agrees with the confirmed track.
+    early_stop: bool = False
+    early_stop_min_quality: float = Field(default=150.0, ge=0)
+    early_stop_max_scale_ratio: float = Field(default=1.5, ge=1)
 
 
 class ConfidenceConfig(BaseModel):

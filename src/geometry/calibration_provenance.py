@@ -1,7 +1,7 @@
 """Per-slot calibration origin; availability is distinct from measured support."""
 
+from collections.abc import Iterable
 from enum import IntEnum
-from typing import Iterable
 
 import numpy as np
 
@@ -12,6 +12,7 @@ class CalibrationOrigin(IntEnum):
     OPTIMIZED = 2
     INTERPOLATED = 3
     EXTRAPOLATED = 4
+    ANCHOR_LINEAR_MODEL = 5
 
 
 class GeoreferenceStatus(IntEnum):

@@ -2,8 +2,38 @@
 
 Date: 2026-09-19
 
-Status: implementation completed through the correct-map, single-layer scale/tilt replay gate;
-cross-layer mission replay and held-out-area validation remain open.
+Status: P0–P4 complete; P5–P6 in progress. Independent same-area scale/tilt
+replay has been measured, while physical two-layer handoff, live frame-age
+measurement, and held-out-area validation remain open.
+
+Progress update (2026-09-25): an opt-in straight-leg anchor model repaired the
+separate 1688-slot `topnew` reference map (ground-centre p95 0.93 m; maximum
+four-corner affine error p95 3.99 m). See
+[`TOPNEW_ANCHOR_LINEAR_FALLBACK_EVALUATION.md`](TOPNEW_ANCHOR_LINEAR_FALLBACK_EVALUATION.md).
+This completes another reference-map gate. The separate same-area query replay
+confirmed 74/80 one-second slots (raw visual p95 1.38 m), with six misses all
+below 600 m AGL. A lower reference layer and physical handoff replay are the
+current P5–P6 tasks.
+
+Scale requirement added 2026-09-26: the solution must remain usable as the
+reference collection grows, not depend on an exact scan of every reference
+descriptor. The implementation now bounds expensive per-frame layer probing to
+eight sources by default and reserves a rotating probe outside the active,
+neighbor and geographic-prior set. Geometric verifications remain capped at 32
+per frame. Small Lance tables use an exact cosine search to avoid IVF-PQ score
+distortion; larger tables use indexed search with probes and exact reranking.
+These are search-work bounds, **not yet a demonstrated latency or recall
+guarantee at arbitrary database size**. Test indexed candidate recall and
+end-to-end localization at increasing frame and source counts, including cold
+start, stale geographic prior, route revisit and recovery after loss. Record
+index size, peak memory, source probes, descriptor queries, geometric checks,
+processing age and false confirmations. A correct frame absent from the ANN
+shortlist must be recovered by bounded regional/temporal proposals or an
+explicit wider recovery stage, not by unbounded `top_k` growth.
+
+Stopped checkpoint: [`STOP_CHECKPOINT_2026-09-26.md`](STOP_CHECKPOINT_2026-09-26.md)
+records the measured two-layer handoffs, failed sparse lower-map builds,
+current search costs, and remaining P5–P6 gates.
 
 Projects: `DroneLocalization` and the sibling `FlightSimulator`.
 

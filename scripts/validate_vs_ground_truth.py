@@ -63,6 +63,12 @@ def main() -> int:
         default=None,
         help="optional failing gate for supported-slot surface error in ground metres",
     )
+    ap.add_argument(
+        "--max-supported-corner-p95",
+        type=float,
+        default=None,
+        help="optional gate for max-of-four-corners affine error in ground metres",
+    )
     args = ap.parse_args()
 
     import h5py
@@ -121,6 +127,8 @@ def main() -> int:
         lat_mid, k_ground = float("nan"), 1.0
 
     ids, err, err_affine_model, d_ang, d_scale, georef_status = [], [], [], [], [], []
+    corner_max, corner_rms = [], []
+    corners_px = np.array([[0.0, 0.0], [fw, 0.0], [fw, fh], [0.0, fh]])
     for sid, s in sorted(slots.items()):
         if sid >= len(affine) or not valid[sid]:
             continue
@@ -131,6 +139,16 @@ def main() -> int:
         ids.append(sid)
         err.append(float(np.linalg.norm(c - g)) * k_ground)
         err_affine_model.append(float(np.linalg.norm(c - g_affine)) * k_ground)
+        if "affine" in s:
+            actual = np.asarray(s["affine"], dtype=np.float64)
+            estimated_corners = corners_px @ M[:, :2].T + M[:, 2]
+            actual_corners = corners_px @ actual[:, :2].T + actual[:, 2]
+            distances = np.linalg.norm(estimated_corners - actual_corners, axis=1) * k_ground
+            corner_max.append(float(np.max(distances)))
+            corner_rms.append(float(np.sqrt(np.mean(np.square(distances)))))
+        else:
+            corner_max.append(float("nan"))
+            corner_rms.append(float("nan"))
         georef_status.append(int(status[sid]) if sid < len(status) else 0)
 
         ang = math.degrees(math.atan2(M[1, 0], M[0, 0]))
@@ -145,6 +163,8 @@ def main() -> int:
     d_ang = np.asarray(d_ang)
     d_scale = np.asarray(d_scale)
     georef_status = np.asarray(georef_status, dtype=np.uint8)
+    corner_max = np.asarray(corner_max)
+    corner_rms = np.asarray(corner_rms)
     if err.size == 0:
         print("ERROR: no overlapping slots between DB and ground truth.")
         return 2
@@ -192,17 +212,24 @@ def main() -> int:
     print(_row("angle error (deg)", d_ang))
     print(_row("scale error (%)", d_scale))
 
+    if np.any(np.isfinite(corner_max)):
+        print("\nAFFINE FOOTPRINT ERROR VS SIMULATOR MODEL (ground metres)")
+        print(_row("max corner / all", corner_max[np.isfinite(corner_max)]))
+        print(_row("max corner / supported", corner_max[supported & np.isfinite(corner_max)]))
+        print(_row("corner RMS / supported", corner_rms[supported & np.isfinite(corner_rms)]))
+
     worst = ids[np.argsort(err)[::-1][:10]]
     print("\nworst slots: " + ", ".join(f"#{i}({err[ids == i][0]:.0f}m)" for i in worst))
 
     if args.csv:
         with open(args.csv, "w", encoding="utf-8") as f:
-            f.write("slot,is_anchor,georef_status,surface_err_m,affine_model_err_m,angle_err_deg,scale_err_pct\n")
-            for i, e, em, st, a, s in zip(
-                ids, err, err_affine_model, georef_status, d_ang, d_scale
+            f.write("slot,is_anchor,georef_status,surface_err_m,affine_model_err_m,angle_err_deg,scale_err_pct,corner_max_err_m,corner_rms_err_m\n")
+            for i, e, em, st, a, s, cm, cr in zip(
+                ids, err, err_affine_model, georef_status, d_ang, d_scale,
+                corner_max, corner_rms,
             ):
                 f.write(
-                    f"{i},{int(i in db_anchor_ids)},{st},{e:.3f},{em:.3f},{a:.4f},{s:.4f}\n"
+                    f"{i},{int(i in db_anchor_ids)},{st},{e:.3f},{em:.3f},{a:.4f},{s:.4f},{cm:.3f},{cr:.3f}\n"
                 )
         print(f"\nper-slot CSV written: {args.csv}")
 
@@ -212,6 +239,15 @@ def main() -> int:
             print(
                 f"\nFAIL: supported p95={observed:.3f} m exceeds "
                 f"{args.max_supported_p95:.3f} m"
+            )
+            return 1
+
+    if args.max_supported_corner_p95 is not None:
+        observed = _pct(corner_max[supported & np.isfinite(corner_max)], 95)
+        if not np.isfinite(observed) or observed > args.max_supported_corner_p95:
+            print(
+                f"\nFAIL: supported max-corner p95={observed:.3f} m exceeds "
+                f"{args.max_supported_corner_p95:.3f} m"
             )
             return 1
 

@@ -219,7 +219,12 @@ class MultiDatabaseManager:
     # ── Retrieval ────────────────────────────────────────────────────────────
 
     def get_matches_by_source(
-        self, global_desc: np.ndarray, top_k: int = 4, *, require_schema: bool = False
+        self,
+        global_desc: np.ndarray,
+        top_k: int = 4,
+        *,
+        require_schema: bool = False,
+        source_ids: list[str] | None = None,
     ) -> dict[str, list[tuple[int, float]]]:
         """Retain a candidate quota per source for subsequent geometric comparison.
 
@@ -238,7 +243,13 @@ class MultiDatabaseManager:
         fields = ("global_backend", "descriptor_dim", "vlad_enabled",
                   "local_extractor", "dino_cpu_resize")
         result = {}
-        for sid in sorted(self._active_source_ids, key=lambda s: (self._sources[s].priority, s)):
+        # Layer recovery may probe a loaded source outside the last GPS/area
+        # activation set. An explicit subset is still bounded by the caller.
+        eligible = self._active_source_ids if source_ids is None else set(source_ids)
+        for sid in sorted(
+            (sid for sid in eligible if sid in self._sources),
+            key=lambda s: (self._sources[s].priority, s),
+        ):
             loader = self._databases.get(sid)
             retriever = self._retrievers.get(sid)
             if loader is None or retriever is None:

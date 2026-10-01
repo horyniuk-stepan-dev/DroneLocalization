@@ -22,6 +22,9 @@ from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 from config import get_cfg
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.calibration.multi_calibration_manager import save_layer_calibration
+from src.core.layer_status import CALIBRATION_OWNER_KEY
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
@@ -49,10 +52,63 @@ def _materialize_keypoints_video(path: str) -> tuple[str, str | None]:
 class CalibrationMixin:
     # ── Calibration dialog ───────────────────────────────────────────────────
 
+    def _layer_info(self, source_id: str) -> dict:
+        """What the calibration dialog shows about the layer being calibrated."""
+        settings = self.project_manager.settings if self.project_manager.is_loaded else None
+        src = settings.get_source(source_id) if settings else None
+        info: dict = {"num_layers": len(settings.video_sources or []) if settings else 1}
+        if src is not None:
+            info.update(
+                area_id=src.area_id,
+                description=src.description,
+                video_path=src.video_path,
+                database_file=src.database_file,
+                calibration_file=src.calibration_file,
+            )
+            if src.scale_layer is not None and src.scale_layer.nominal_gsd_m_per_px:
+                info["gsd_m_per_px"] = src.scale_layer.nominal_gsd_m_per_px
+        return info
+
+    def _calibration_target_ok(self) -> bool:
+        """Anchors may only land in the layer the calibration dialog was opened for."""
+        target = getattr(self, "_calib_target", None)
+        if target is None:
+            return True
+        sid, calibration, database = target
+        current = self._get_current_source_id()
+        if sid == current and calibration is self.calibration and database is self.database:
+            return True
+        logger.error(
+            f"Calibration target mismatch: dialog layer '{sid}', active layer '{current}' — "
+            f"anchor change refused to keep layer calibrations apart"
+        )
+        QMessageBox.critical(
+            self,
+            "Інший шар",
+            f"Вікно калібрування відкрите для шару «{sid}», а активним став шар «{current}».\n\n"
+            f"Зміну не збережено, щоб не змішати калібрування шарів. "
+            f"Закрийте вікно і відкрийте калібрування потрібного шару знову.",
+        )
+        return False
+
     @pyqtSlot()
     def on_calibrate(self):
+        source_id = self._get_current_source_id()
         if not self.database or self.database.db_file is None:
-            QMessageBox.warning(self, "Помилка", "Спочатку завантажте або створіть базу даних!")
+            QMessageBox.warning(
+                self,
+                "Помилка",
+                f"Для шару «{source_id}» ще немає бази даних.\n\n"
+                f"Спочатку побудуйте її (ПКМ по шару → Побудувати базу даних).",
+            )
+            return
+        if self._get_calibration_save_path() is None:
+            QMessageBox.critical(
+                self,
+                "Помилка",
+                f"Не вдалося визначити файл калібрування шару «{source_id}» — "
+                f"перевірте calibration_file у project.json.",
+            )
             return
 
         anchors_data = [a.to_dict() for a in self.calibration.anchors]
@@ -75,14 +131,18 @@ class CalibrationMixin:
         # lifetime and wiped as soon as it closes.
         kp_video_path, kp_tempfile = _materialize_keypoints_video(kp_video_path)
 
+        # Bind the dialog to THIS layer's objects: every anchor change is checked
+        # against them, so an anchor can never be saved into another layer.
+        self._calib_target = (source_id, self.calibration, self.database)
         self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
             existing_anchors=anchors_data,
-            source_id=self._get_current_source_id(),
+            source_id=source_id,
             parent=self,
             db_num_frames=db_num_frames,
             frame_step=frame_step,
             keypoints_video_path=kp_video_path,
+            layer_info=self._layer_info(source_id),
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
         self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)
@@ -91,6 +151,7 @@ class CalibrationMixin:
             self._calib_dialog.exec()
         finally:
             self._calib_dialog = None
+            self._calib_target = None
             if kp_tempfile:
                 wipe_file(kp_tempfile)
                 logger.info("Decrypted keypoint video wiped")
@@ -101,6 +162,15 @@ class CalibrationMixin:
         # leave the anchor list out of sync with what is on disk. Viewing an
         # encrypted project's calibration stays allowed.
         if self._refuse_if_encrypted_project("Додавання якоря"):
+            return
+        if not self._calibration_target_ok():
+            return
+        source_id = self._get_current_source_id()
+        cal_path = self._get_calibration_save_path()
+        if self.project_manager and self.project_manager.is_loaded and not cal_path:
+            QMessageBox.critical(
+                self, "Помилка", f"Невідомий файл калібрування шару «{source_id}» — якір не додано."
+            )
             return
         try:
             points_2d = anchor_data.get("points_2d")
@@ -257,13 +327,12 @@ class CalibrationMixin:
 
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=best_M, qa_data=qa_data)
 
-            if self.project_manager and self.project_manager.is_loaded:
-                cal_path = self._get_calibration_save_path()
-                if cal_path:
-                    self.calibration.save(cal_path)
+            if cal_path:
+                save_layer_calibration(self.calibration, cal_path, source_id)
 
-            if hasattr(self, "_update_project_info_panel"):
-                self._update_project_info_panel()
+            # Layer table / info / registry reflect the new anchor immediately.
+            if hasattr(self, "_after_layer_data_changed"):
+                self._after_layer_data_changed()
 
             # Point-by-point diagnostic logging
             logger.info(f"--- Anchor {frame_id} Point-by-Point Analysis ---")
@@ -296,7 +365,9 @@ class CalibrationMixin:
                 f"RMSE={rmse_p:.3f}м | MedianErr={median_p:.3f}м | MaxErr={max_p:.3f}м"
             )
 
-            self.status_bar.showMessage(f"Додано якір (кадр {frame_id}, RMSE: {rmse_p:.2f}м)")
+            self.status_bar.showMessage(
+                f"Шар «{source_id}»: додано якір (кадр {frame_id}, RMSE: {rmse_p:.2f}м)"
+            )
 
             if hasattr(self, "_calib_dialog") and self._calib_dialog is not None:
                 saved_anchor = self.calibration.get_anchor(frame_id)
@@ -315,19 +386,23 @@ class CalibrationMixin:
         # raise and leave the anchor list out of sync with disk.
         if self._refuse_if_encrypted_project("Видалення якоря"):
             return
+        if not self._calibration_target_ok():
+            return
+        source_id = self._get_current_source_id()
         try:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
                     cal_path = self._get_calibration_save_path()
                     if cal_path:
-                        self.calibration.save(cal_path)
+                        save_layer_calibration(self.calibration, cal_path, source_id)
 
-                if hasattr(self, "_update_project_info_panel"):
-                    self._update_project_info_panel()
+                if hasattr(self, "_after_layer_data_changed"):
+                    self._after_layer_data_changed()
 
-                logger.info(f"Anchor {frame_id} removed from project")
+                logger.info(f"Anchor {frame_id} removed from layer '{source_id}'")
                 self.status_bar.showMessage(
-                    f"Якір {frame_id} видалено. Потрібно оновити пропагацію.", 5000
+                    f"Шар «{source_id}»: якір {frame_id} видалено. Потрібно оновити пропагацію.",
+                    5000,
                 )
         except Exception as e:
             logger.error(f"Failed to remove anchor: {e}", exc_info=True)
@@ -361,18 +436,25 @@ class CalibrationMixin:
             QMessageBox.critical(self, "Помилка", f"Не вдалося ініціалізувати матчер:\n{e}")
             return
 
+        source_id = self._get_current_source_id()
         anchor_ids = [a.frame_id for a in self.calibration.anchors]
         n_frames = self.database.get_num_frames()
-        logger.info(f"Propagation: {len(anchor_ids)} anchors {anchor_ids}, {n_frames} frames")
+        logger.info(
+            f"Propagation of layer '{source_id}': {len(anchor_ids)} anchors {anchor_ids}, "
+            f"{n_frames} frames"
+        )
+        # The report and the map check must use the layer that was propagated.
+        self._propagation_target = (source_id, self.database, self.calibration)
 
         self._propagation_dialog = QProgressDialog(
-            f"Пропагація GPS від {len(anchor_ids)} якорів на {n_frames} кадрів...",
+            f"Шар «{source_id}»: пропагація GPS від {len(anchor_ids)} якорів "
+            f"на {n_frames} кадрів...",
             "Скасувати",
             0,
             100,
             self,
         )
-        self._propagation_dialog.setWindowTitle("Розповсюдження GPS координат")
+        self._propagation_dialog.setWindowTitle(f"Розповсюдження GPS — шар «{source_id}»")
         self._propagation_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self._propagation_dialog.setMinimumDuration(0)
         self._propagation_dialog.setValue(0)
@@ -406,7 +488,10 @@ class CalibrationMixin:
         if self._propagation_dialog:
             self._propagation_dialog.close()
             self._propagation_dialog = None
+        self._propagation_target = None
         self.status_bar.showMessage("Пропагацію скасовано")
+        if hasattr(self, "_after_layer_data_changed"):
+            self._after_layer_data_changed()
 
     @pyqtSlot()
     def on_propagation_completed(self):
@@ -414,8 +499,18 @@ class CalibrationMixin:
             self._propagation_dialog.close()
             self._propagation_dialog = None
 
-        num_frames = self.database.get_num_frames()
-        valid_mask = self.database.frame_valid
+        target = getattr(self, "_propagation_target", None)
+        self._propagation_target = None
+        source_id, database = (
+            (target[0], target[1]) if target else (self._get_current_source_id(), self.database)
+        )
+
+        # Status first: the table must show the new state even while the report is open.
+        if hasattr(self, "_after_layer_data_changed"):
+            self._after_layer_data_changed()
+
+        num_frames = database.get_num_frames()
+        valid_mask = database.frame_valid
         valid_count = int(np.sum(valid_mask)) if valid_mask is not None else 0
 
         avg_rmse = 0.0
@@ -424,19 +519,19 @@ class CalibrationMixin:
         avg_matches = 0.0
 
         if valid_count > 0:
-            rmse_data = getattr(self.database, "frame_rmse", None)
+            rmse_data = getattr(database, "frame_rmse", None)
             if rmse_data is not None:
                 valid_rmse = rmse_data[valid_mask]
                 avg_rmse = float(np.mean(valid_rmse))
                 max_rmse = float(np.max(valid_rmse))
 
-            dis_data = getattr(self.database, "frame_disagreement", None)
+            dis_data = getattr(database, "frame_disagreement", None)
             if dis_data is not None:
                 dis_valid = dis_data[valid_mask]
                 if np.any(dis_valid > 0):
                     avg_dis = float(np.mean(dis_valid[dis_valid > 0]))
 
-            matches_data = getattr(self.database, "frame_matches", None)
+            matches_data = getattr(database, "frame_matches", None)
             if matches_data is not None:
                 avg_matches = float(np.mean(matches_data[valid_mask]))
 
@@ -444,14 +539,14 @@ class CalibrationMixin:
 
         # NOTE: frame_rmse from propagation is in reprojection pixels between frames, not meters
         report = (
-            f"<b>Пропагація завершена!</b><br><br>"
+            f"<b>Пропагація шару «{source_id}» завершена!</b><br><br>"
             f"Валідних кадрів: <b>{valid_count} / {num_frames}</b> ({valid_count / num_frames * 100:.1f}%)<br>"
             f"Середній RMSE матчингу: <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} px</b><br>"
             f"Середній матчинг: <b>{avg_matches:.1f} точок</b><br>"
         )
 
         log_msg = (
-            f"Пропагація завершена. "
+            f"Пропагація шару '{source_id}' завершена. "
             f"Валідних: {valid_count}/{num_frames} ({valid_count / num_frames * 100:.1f}%), "
             f"RMSE: {avg_rmse:.3f}px, "
             f"Матчинг: {avg_matches:.1f} точок"
@@ -471,13 +566,12 @@ class CalibrationMixin:
 
         QMessageBox.information(self, "Пропагація", report)
         self.status_bar.showMessage(
-            f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}px, Mat: {avg_matches:.0f}"
+            f"Шар «{source_id}»: пропагація готова: {valid_count} к., "
+            f"RMSE: {avg_rmse:.2f}px, Mat: {avg_matches:.0f}"
         )
 
-        if hasattr(self, "_update_project_info_panel"):
-            self._update_project_info_panel()
-
-        if self.map_widget:
+        # Map check only for the layer that was actually propagated.
+        if self.map_widget and database is self.database:
             self.on_verify_propagation()
 
     @pyqtSlot()
@@ -591,16 +685,22 @@ class CalibrationMixin:
         if self._propagation_dialog:
             self._propagation_dialog.close()
             self._propagation_dialog = None
+        self._propagation_target = None
+        if hasattr(self, "_after_layer_data_changed"):
+            self._after_layer_data_changed()
         logger.error(f"Propagation error: {error_msg}")
         QMessageBox.critical(self, "Помилка пропагації", error_msg)
 
     # ── Save / Load calibration ──────────────────────────────────────────────
 
     def _get_current_source_id(self) -> str:
-        """Returns source_id of current active source (based on db_path)."""
+        """Active layer id (DatabaseMixin._activate_source keeps it in sync)."""
+        active = getattr(self, "active_source_id", None)
+        if active:
+            return active
+        # Legacy fallback (no project / nothing activated yet): match the DB path.
         if not self.project_manager or not self.project_manager.is_loaded or not self.database:
             return "main"
-
         current_db = str(Path(self.database.db_path).resolve())
         project_dir = self.project_manager.project_dir
         for src_dict in self.project_manager.settings.video_sources or []:
@@ -610,35 +710,24 @@ class CalibrationMixin:
         return "main"
 
     def _get_calibration_save_path(self) -> str | None:
-        """Returns calibration.json path for current active source.
+        """calibration.json of the ACTIVE layer, or None if it cannot be determined.
 
-        Matches `self.database.db_path` with `database_file` of each source in
-        project settings to locate the matching `calibration_file`.
-        Fallback: `project_manager.calibration_path` (project root).
+        Resolved from the active layer's ``calibration_file`` — never guessed from
+        the database path, and never silently redirected to the main layer's file
+        (that fallback is how one layer's anchors ended up in another's file).
         """
         if not self.project_manager or not self.project_manager.is_loaded:
             return None
-
-        project_dir = self.project_manager.project_dir
-
-        # Match source to current DB
-        if self.database and self.project_manager.settings:
-            current_db = str(Path(self.database.db_path).resolve())
-            for src_dict in self.project_manager.settings.video_sources or []:
-                db_file = src_dict.get("database_file", "")
-                cal_file = src_dict.get("calibration_file", "")
-                if not db_file or not cal_file:
-                    continue
-                if str((project_dir / db_file).resolve()) == current_db:
-                    cal_path = project_dir / cal_file
-                    cal_path.parent.mkdir(parents=True, exist_ok=True)
-                    logger.debug(
-                        f"Calibration path: {cal_path} (source='{src_dict.get('source_id', '?')}')"
-                    )
-                    return str(cal_path)
-
-        # Fallback — project-level path
-        return self.project_manager.calibration_path
+        source_id = self._get_current_source_id()
+        settings = self.project_manager.settings
+        src = settings.get_source(source_id) if settings else None
+        if src is None or not src.calibration_file:
+            logger.error(f"No calibration_file for active layer '{source_id}'")
+            return None
+        cal_path = self.project_manager.project_dir / src.calibration_file
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Calibration path: {cal_path} (layer='{source_id}')")
+        return str(cal_path)
 
     @pyqtSlot()
     def on_save_calibration(self):
@@ -648,42 +737,106 @@ class CalibrationMixin:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
 
-        # Default path — active source folder
+        source_id = self._get_current_source_id()
+        # Default path — active layer folder
         default_path = self._get_calibration_save_path() or "calibration.json"
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
+            self, f"Зберегти калібрування шару «{source_id}»", default_path, "JSON Files (*.json)"
         )
         if not path:
             return
         try:
-            self.calibration.save(path)
+            # Stamped with the layer id: loading it into another layer warns.
+            save_layer_calibration(self.calibration, path, source_id)
             n = len(self.calibration.anchors)
-            self.status_bar.showMessage(f"Калібрування збережено: {path} ({n} якорів)")
+            self.status_bar.showMessage(
+                f"Калібрування шару «{source_id}» збережено: {path} ({n} якорів)"
+            )
             QMessageBox.information(
-                self, "Збережено", f"Калібрування збережено!\nЯкорів: {n}\nФайл: {path}"
+                self,
+                "Збережено",
+                f"Калібрування шару «{source_id}» збережено!\nЯкорів: {n}\nФайл: {path}",
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося зберегти:\n{e}")
 
+    def _calibration_load_issues(self, loaded: MultiAnchorCalibration, path: str, source_id: str):
+        """Reasons to believe ``loaded`` belongs to another layer (empty = looks fine)."""
+        issues = []
+        owner = loaded.extra_metadata.get(CALIBRATION_OWNER_KEY)
+        if owner and str(owner) != source_id:
+            issues.append(f"Файл записаний для шару «{owner}».")
+
+        if self.project_manager and self.project_manager.is_loaded:
+            try:
+                target = str(Path(path).resolve()).casefold()
+                for src in self.project_manager.settings.source_configs():
+                    if src.source_id == source_id or not src.calibration_file:
+                        continue
+                    other = self.project_manager.project_dir / src.calibration_file
+                    if str(other.resolve()).casefold() == target:
+                        issues.append(f"Це файл калібрування шару «{src.source_id}».")
+            except OSError:
+                pass
+
+        if self.database is not None:
+            n = self.database.get_num_frames()
+            bad = sorted(a.frame_id for a in loaded.anchors if not 0 <= int(a.frame_id) < n)
+            if n and bad:
+                issues.append(
+                    f"Якорі на кадрах {bad} виходять за межі БД шару «{source_id}» ({n} слотів)."
+                )
+        return issues
+
     @pyqtSlot()
     def on_load_calibration(self):
+        source_id = self._get_current_source_id()
         default_dir = ""
         if self.project_manager and self.project_manager.is_loaded:
             default_dir = str(self.project_manager.project_dir)
+            own = self._get_calibration_save_path()
+            if own:
+                default_dir = str(Path(own).parent)
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Завантажити калібрування", default_dir, "JSON Files (*.json);;All Files (*)"
+            self,
+            f"Завантажити калібрування в шар «{source_id}»",
+            default_dir,
+            "JSON Files (*.json);;All Files (*)",
         )
         if not path:
             return
         try:
-            self.calibration.load(path)
+            # Parse into a fresh object first: a wrong or broken file must not
+            # wipe the anchors of the active layer.
+            loaded = MultiAnchorCalibration()
+            loaded.load(path)
+
+            issues = self._calibration_load_issues(loaded, path, source_id)
+            if issues:
+                reply = QMessageBox.warning(
+                    self,
+                    "Калібрування іншого шару?",
+                    f"Цей файл, схоже, не належить шару «{source_id}»:\n\n"
+                    + "\n".join(f"• {msg}" for msg in issues)
+                    + f"\n\nВсе одно завантажити його в шар «{source_id}»?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            calib_manager = getattr(self, "calib_manager", None)
+            if calib_manager is not None:
+                calib_manager.set(source_id, loaded)
+            self.calibration = loaded
+
             ids = [a.frame_id for a in self.calibration.anchors]
             propagated = self.database and self.database.is_propagated
-            self.control_panel.update_status("Калібрування завантажено")
+            self.control_panel.update_status(f"Калібрування шару «{source_id}» завантажено")
 
-            # Automatically save copy into current source folder
+            # Automatically save copy into current layer folder
             source_cal_path = self._get_calibration_save_path()
             copied_to_source = False
             # An encrypted copy is immutable: load into memory for viewing, but
@@ -696,26 +849,29 @@ class CalibrationMixin:
                 norm_source = str(Path(source_cal_path).resolve())
                 if norm_loaded != norm_source:
                     # Copy calibration file if loaded from external location
-                    Path(source_cal_path).parent.mkdir(parents=True, exist_ok=True)
-                    self.calibration.save(source_cal_path)
+                    save_layer_calibration(self.calibration, source_cal_path, source_id)
                     copied_to_source = True
-                    logger.info(f"Calibration copied to source folder: {source_cal_path}")
+                    logger.info(
+                        f"Calibration copied to layer '{source_id}' folder: {source_cal_path}"
+                    )
                 else:
                     logger.debug("Calibration loaded directly from source folder, no copy needed.")
 
-            if hasattr(self, "_update_project_info_panel"):
-                self._update_project_info_panel()
+            if hasattr(self, "_after_layer_data_changed"):
+                self._after_layer_data_changed()
 
             copy_note = (
-                f"\n\n📋 Також збережено у папці джерела:\n{source_cal_path}"
+                f"\n\n📋 Також збережено у папці шару:\n{source_cal_path}"
                 if copied_to_source
                 else ""
             )
-            self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
+            self.status_bar.showMessage(
+                f"Шар «{source_id}»: калібрування {len(ids)} якорів, кадри {ids}"
+            )
             QMessageBox.information(
                 self,
                 "Успіх",
-                f"Завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
+                f"Шар «{source_id}»: завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
                 f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}"
                 f"{copy_note}",
             )

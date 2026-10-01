@@ -293,6 +293,9 @@ class DatabaseLoader:
         self.frame_support_anchor_count = None
         self.frame_rmse_units = None
         self.disagreement_kind = None
+        # JSON list of anchors the last propagation was computed from; lets the
+        # GUI tell "propagated" from "anchors changed since propagation".
+        self.propagation_anchors_json = None
         if self.db_file is None or "calibration" not in self.db_file:
             logger.info("No propagation data in database (not calibrated yet)")
             self.frame_affine = None
@@ -352,6 +355,7 @@ class DatabaseLoader:
                 )
                 self.frame_rmse_units = grp.attrs.get("frame_rmse_units")
                 self.disagreement_kind = grp.attrs.get("disagreement_kind")
+                self.propagation_anchors_json = grp.attrs.get("anchors_json")
 
                 # Quality metrics (QA)
                 self.frame_rmse = grp["frame_rmse"][:] if "frame_rmse" in grp else None

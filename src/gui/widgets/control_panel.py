@@ -22,6 +22,21 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Status colour per LayerState value (see src/core/layer_status.py).
+_LAYER_STATE_COLORS = {
+    "ready": "#2e7d32",
+    "not_propagated": "#9e6a00",
+    "stale": "#9e6a00",
+    "no_calibration": "#e65100",
+    "no_db": "#c62828",
+    "db_not_loaded": "#c62828",
+    "disabled": "#999999",
+}
+
+
+def _short(text: str, limit: int = 18) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
 
 class ControlPanel(QWidget):
     """Mission control sidebar — emits signals, holds no business logic."""
@@ -44,9 +59,9 @@ class ControlPanel(QWidget):
     toggle_objects_clicked = pyqtSignal(bool)
     add_source_clicked = pyqtSignal()
     active_source_changed = pyqtSignal(str)
-    source_action = pyqtSignal(
-        str, str
-    )  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
+    # (source_id, action): "activate" / "calibrate" / "load_calibration" /
+    # "propagate" / "build_db" / "toggle" / "remove"
+    source_action = pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -183,8 +198,8 @@ class ControlPanel(QWidget):
         status_layout.addWidget(self.lbl_status)
         status_layout.addWidget(self.progress_bar)
 
-        # Video Sources group (multi-source support)
-        self.sources_group = QGroupBox("Відеоджерела")
+        # Layers group: one layer = one video source with its own DB + calibration
+        self.sources_group = QGroupBox("Шари (відеоджерела)")
         sources_layout = QVBoxLayout(self.sources_group)
         sources_layout.setSpacing(6)
 
@@ -225,32 +240,40 @@ class ControlPanel(QWidget):
         self._lbl_source_video.setWordWrap(True)
         sources_layout.addWidget(self._lbl_source_video)
 
-        # ── Table (only for multi-source projects) ──
+        # ── Layer table (always shown while a project is open) ──
         self.sources_table = QTableWidget()
-        self.sources_table.setColumnCount(3)
-        self.sources_table.setHorizontalHeaderLabels(["Source ID", "Area", "Статус"])
-        self.sources_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        self.sources_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.sources_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
-        )
+        self.sources_table.setColumnCount(5)
+        self.sources_table.setHorizontalHeaderLabels(["Шар", "Зона", "Якорі", "GPS", "Статус"])
+        header = self.sources_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in (1, 2, 3, 4):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.sources_table.verticalHeader().setVisible(False)
         self.sources_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.sources_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.sources_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.sources_table.setMaximumHeight(120)
+        self.sources_table.setMinimumHeight(90)
+        self.sources_table.setMaximumHeight(200)
         self.sources_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.sources_table.customContextMenuRequested.connect(self._on_sources_context_menu)
         self.sources_table.itemSelectionChanged.connect(self._on_sources_selection_changed)
-        self.sources_table.setVisible(False)  # Прихований до відкриття мульти-проєкту
+        self.sources_table.itemDoubleClicked.connect(self._on_sources_double_clicked)
+        self.sources_table.setVisible(False)
         sources_layout.addWidget(self.sources_table)
 
+        self._lbl_sources_hint = QLabel(
+            "Клік — зробити шар активним · подвійний клік — калібрувати · ПКМ — дії"
+        )
+        self._lbl_sources_hint.setWordWrap(True)
+        self._lbl_sources_hint.setStyleSheet("font-size: 10px; color: #777; padding-left: 2px;")
+        self._lbl_sources_hint.setVisible(False)
+        sources_layout.addWidget(self._lbl_sources_hint)
+
         btn_row = QHBoxLayout()
-        self.btn_add_source = QPushButton("➕ Додати джерело")
-        self.btn_add_source.setToolTip("Додати нове відеоджерело до проєкту")
+        self.btn_add_source = QPushButton("➕ Додати шар")
+        self.btn_add_source.setToolTip(
+            "Додати новий шар (відео з іншої висоти/часу або нова зона) до проєкту"
+        )
         self.btn_add_source.clicked.connect(self.add_source_clicked)
         self.btn_add_source.setVisible(False)
         btn_row.addWidget(self.btn_add_source)
@@ -284,6 +307,9 @@ class ControlPanel(QWidget):
         self.btn_new_mission.setEnabled(not is_running)
         self.btn_load_db.setEnabled(not is_running)
         self.btn_rebuild_db.setEnabled(not is_running)
+        # The layer being built must stay the active one until the build ends.
+        self.sources_table.setEnabled(not is_running)
+        self.btn_add_source.setEnabled(not is_running)
 
     def set_tracking_enabled(self, enabled: bool):
         """
@@ -306,6 +332,8 @@ class ControlPanel(QWidget):
             self.btn_localize_image,
             self.btn_gen_pano,
             self.btn_export,
+            self.sources_table,
+            self.btn_add_source,
         ]:
             btn.setEnabled(enabled)
 
@@ -317,15 +345,20 @@ class ControlPanel(QWidget):
         num_anchors: int = None,
         num_propagated: int = None,
         db_size_mb: float = None,
+        layer_id: str | None = None,
     ):
-        """Оновити інформаційну панель проєкту."""
+        """Оновити інформаційну панель проєкту (дані — активного шару)."""
         if project_name is None:
             self.lbl_project_info.setText("Проєкт не завантажено")
             self.lbl_project_info.setStyleSheet("font-size: 11px; color: #222;")
             self.btn_rebuild_db.setEnabled(False)
+            self.sources_group.setVisible(False)
+            self.set_active_layer_context(None)
             return
 
         lines = [f"▶ <b>{project_name}</b>"]
+        if layer_id:
+            lines.append(f"🧭 Активний шар: <b>{layer_id}</b>")
         if video_path:
             lines.append(f"🎥 {Path(video_path).name}")
         if num_frames is not None:
@@ -344,85 +377,85 @@ class ControlPanel(QWidget):
 
     # ── Video Sources Panel ──────────────────────────────────────────────────
 
-    def update_sources_list(
-        self,
-        sources: list[dict],
-        project_dir: str = "",
-        active_source_id: str | None = None,
-        propagated_source_ids: set[str] | None = None,
-    ):
-        """Оновлює таблицю відеоджерел.
+    def update_sources_list(self, rows: list[dict]):
+        """Перемальовує таблицю шарів.
 
         Args:
-            sources: Список dict з полями source_id, area_id, enabled,
-                     database_file, calibration_file.
-            project_dir: Шлях до кореня проєкту для перевірки файлів.
-            active_source_id: ID поточного активного джерела (для підсвічування рядка).
-            propagated_source_ids: Множина source_id які вже мають пропагацію
-                                    в HDF5 (навіть без окремого calibration.json).
+            rows: один dict на шар (готує DatabaseMixin._layer_rows): source_id,
+                area_id, anchors, gps, label, state, tooltip, enabled, db_loaded,
+                has_db_file, num_anchors, is_active, conflict.
         """
-        propagated_source_ids = propagated_source_ids or set()
-        is_multi = len(sources) > 1 or any(s.get("source_id") != "main" for s in sources)
-        # Group is always visible when a project is open
         self.sources_group.setVisible(True)
-        # Table is only shown for multi-source projects
-        self.sources_table.setVisible(is_multi)
+        self.sources_table.setVisible(True)
+        self._lbl_sources_hint.setVisible(True)
         self.btn_add_source.setVisible(True)
 
-        if not is_multi:
+        bold = QFont()
+        bold.setBold(True)
+        active_bg = QColor("#e8f5e9")
+
+        # Programmatic re-selection of the active row must not look like a click.
+        self.sources_table.blockSignals(True)
+        try:
+            self.sources_table.clearSelection()
+            self.sources_table.setRowCount(len(rows))
+            active_row = -1
+            for r, row in enumerate(rows):
+                sid = row.get("source_id", "?")
+                is_active = bool(row.get("is_active"))
+                texts = [
+                    ("▶ " if is_active else "") + sid,
+                    row.get("area_id", ""),
+                    row.get("anchors", "—"),
+                    row.get("gps", "—"),
+                    row.get("label", ""),
+                ]
+                for col, text in enumerate(texts):
+                    item = QTableWidgetItem(text)
+                    item.setToolTip(row.get("tooltip", ""))
+                    if col == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, sid)
+                        if row.get("conflict"):
+                            item.setForeground(QColor("#c62828"))
+                    if col == 4:
+                        # Row state for the context menu (sid lives in column 0).
+                        item.setData(
+                            Qt.ItemDataRole.UserRole,
+                            {
+                                "enabled": bool(row.get("enabled", True)),
+                                "db_loaded": bool(row.get("db_loaded")),
+                                "has_db_file": bool(row.get("has_db_file")),
+                                "num_anchors": int(row.get("num_anchors") or 0),
+                                "is_active": is_active,
+                            },
+                        )
+                        item.setForeground(
+                            QColor(_LAYER_STATE_COLORS.get(row.get("state", ""), "#333333"))
+                        )
+                    if is_active:
+                        item.setFont(bold)
+                        item.setBackground(active_bg)
+                    self.sources_table.setItem(r, col, item)
+                if is_active:
+                    active_row = r
+            if active_row >= 0:
+                self.sources_table.selectRow(active_row)
+        finally:
+            self.sources_table.blockSignals(False)
+
+    def set_active_layer_context(self, source_id: str | None, num_layers: int = 1):
+        """Підписує кнопки, що діють на активний шар, його назвою."""
+        if not source_id or num_layers <= 1:
+            self.calib_group.setTitle("Калібрування GPS")
+            self.btn_calibrate.setText("Виконати калібрування (Video → Map)")
+            self.btn_load_calibrate.setText("Завантажити калібрування (JSON)")
+            self.btn_rebuild_db.setText("🔄 Перегенерувати базу")
             return
-
-        self.sources_table.setRowCount(len(sources))
-        for row, src in enumerate(sources):
-            sid = src.get("source_id", "?")
-            area = src.get("area_id", "?")
-            enabled = src.get("enabled", True)
-
-            # Determine status
-            status = "⏳ Очікує"
-            status_color = QColor("#888")
-            if project_dir:
-                db_path = Path(project_dir) / src.get("database_file", "")
-                cal_path = Path(project_dir) / src.get("calibration_file", "")
-                db_exists = db_path.exists()
-                # Calibration is considered done if:
-                # • a separate calibration.json exists, OR
-                # • propagation is already stored inside HDF5 (sid in propagated_source_ids)
-                is_calibrated = cal_path.exists() or sid in propagated_source_ids
-
-                if db_exists and is_calibrated:
-                    status = "✅ Готово"
-                    status_color = QColor("#2e7d32")
-                elif db_exists:
-                    status = "⚠ Без калібр."
-                    status_color = QColor("#e65100")
-                else:
-                    status = "❌ Без БД"
-                    status_color = QColor("#c62828")
-
-            if not enabled:
-                status = "🔇 Вимкнено"
-                status_color = QColor("#999")
-
-            item_sid = QTableWidgetItem(sid)
-            item_area = QTableWidgetItem(area)
-            item_status = QTableWidgetItem(status)
-            item_status.setForeground(status_color)
-
-            # Store source_id as UserRole data for context menu
-            item_sid.setData(Qt.ItemDataRole.UserRole, sid)
-
-            self.sources_table.setItem(row, 0, item_sid)
-            self.sources_table.setItem(row, 1, item_area)
-            self.sources_table.setItem(row, 2, item_status)
-
-            # Highlight active row
-            is_active = sid == active_source_id
-            bg = QColor("#e8f5e9") if is_active else QColor("transparent")
-            for col in range(3):
-                item = self.sources_table.item(row, col)
-                if item:
-                    item.setBackground(bg)
+        name = _short(source_id)
+        self.calib_group.setTitle(f"Калібрування GPS — шар «{name}»")
+        self.btn_calibrate.setText(f"Калібрувати шар «{name}» (Video → Map)")
+        self.btn_load_calibrate.setText(f"Завантажити калібрування шару «{name}»")
+        self.btn_rebuild_db.setText(f"🔄 Перегенерувати базу шару «{name}»")
 
     def set_active_source(
         self,
@@ -495,7 +528,7 @@ class ControlPanel(QWidget):
 
     @pyqtSlot("QPoint")
     def _on_sources_context_menu(self, pos):
-        """Контекстне меню для таблиці джерел."""
+        """Контекстне меню шару: усі дії виконуються саме для цього шару."""
         row = self.sources_table.rowAt(pos.y())
         if row < 0:
             return
@@ -506,28 +539,49 @@ class ControlPanel(QWidget):
         source_id = item.data(Qt.ItemDataRole.UserRole)
         if not source_id:
             return
+        state_item = self.sources_table.item(row, 4)
+        state = (state_item.data(Qt.ItemDataRole.UserRole) if state_item else None) or {}
+        enabled = state.get("enabled", True)
+        db_loaded = state.get("db_loaded", False)
 
         menu = QMenu(self)
-        act_build = menu.addAction("🔨 Побудувати базу даних")
-        act_calib = menu.addAction("📐 Калібрувати")
+        title = menu.addAction(f"Шар «{source_id}»")
+        title.setEnabled(False)
         menu.addSeparator()
-        act_toggle = menu.addAction("🔇 Увімкнути/Вимкнути")
-        menu.addSeparator()
-        act_remove = menu.addAction("🗑 Видалити")
 
-        action = menu.exec(self.sources_table.viewport().mapToGlobal(pos))
-        if action == act_build:
-            self.source_action.emit(source_id, "build_db")
-        elif action == act_calib:
-            self.source_action.emit(source_id, "calibrate")
-        elif action == act_toggle:
-            self.source_action.emit(source_id, "toggle")
-        elif action == act_remove:
-            self.source_action.emit(source_id, "remove")
+        def add(text: str, action: str, allowed: bool = True):
+            act = menu.addAction(text)
+            act.setData(action)
+            act.setEnabled(bool(allowed))
+            return act
+
+        add("▶ Зробити активним", "activate", not state.get("is_active"))
+        add("📐 Калібрувати…", "calibrate", enabled and db_loaded)
+        add("📂 Завантажити калібрування (JSON)…", "load_calibration", enabled)
+        add(
+            "🧭 Запустити пропагацію GPS",
+            "propagate",
+            enabled and db_loaded and state.get("num_anchors", 0) > 0,
+        )
+        menu.addSeparator()
+        add(
+            "🔨 Перебудувати базу даних…"
+            if state.get("has_db_file")
+            else "🔨 Побудувати базу даних",
+            "build_db",
+            enabled,
+        )
+        menu.addSeparator()
+        add("🔇 Вимкнути" if enabled else "🔈 Увімкнути", "toggle")
+        add("🗑 Видалити з проєкту…", "remove")
+
+        chosen = menu.exec(self.sources_table.viewport().mapToGlobal(pos))
+        if chosen is not None and chosen.data():
+            self.source_action.emit(source_id, str(chosen.data()))
 
     @pyqtSlot()
     def _on_sources_selection_changed(self):
-        """Обробка зміни вибраного рядка таблиці."""
+        """Клік по рядку робить шар активним."""
         selected_items = self.sources_table.selectedItems()
         if not selected_items:
             return
@@ -538,3 +592,13 @@ class ControlPanel(QWidget):
             source_id = item.data(Qt.ItemDataRole.UserRole)
             if source_id:
                 self.active_source_changed.emit(source_id)
+
+    @pyqtSlot(QTableWidgetItem)
+    def _on_sources_double_clicked(self, clicked: QTableWidgetItem):
+        """Подвійний клік — відкрити калібрування саме цього шару."""
+        item = self.sources_table.item(clicked.row(), 0)
+        if item is None:
+            return
+        source_id = item.data(Qt.ItemDataRole.UserRole)
+        if source_id:
+            self.source_action.emit(source_id, "calibrate")

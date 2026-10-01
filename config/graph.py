@@ -180,6 +180,21 @@ class GraphOptimizationConfig(BaseModel):
     anchor_gap_max_dev_m: float = 150.0
     anchor_gap_downweight: float = 0.05
 
+    # Opt-in for missions with several surveyed anchors on each straight leg.
+    # Three consecutive gaps of at least 20 slots must agree on their per-slot
+    # displacement vector within 1%. The model replaces graph estimates only
+    # inside those gaps; short turn intervals retain visual graph estimates.
+    # Hidden bends between anchors remain unobservable, so this is not a
+    # general solution for sparse or curved reference flights.
+    anchor_linear_fallback: bool = False
+    # Preserve surveyed affine parameters at exact anchor images after the
+    # graph's soft-anchor optimization. Useful when every reference image has
+    # an independently georeferenced transform; default keeps legacy output.
+    pin_exact_anchors: bool = False
+    anchor_linear_min_gap_slots: int = 20
+    anchor_linear_min_run_intervals: int = 3
+    anchor_linear_max_velocity_deviation: float = 0.01
+
     # ── ADDENDUM 1.1: просторовий розкид інлаєрів ребра. Дефолт off. ──
     # Ребро, всі інлаєри якого скупчені в кутку кадру, дає ill-conditioned H:
     # трансформація екстраполюється на решту кадру, а центр кадру далі

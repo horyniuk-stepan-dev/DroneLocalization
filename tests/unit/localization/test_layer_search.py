@@ -3,7 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from src.localization.layer_search import LayerHandoff, LayerObservation, ScaleBelief
+from src.database.multi_database_manager import MultiDatabaseManager
+from src.localization.layer_search import LayerHandoff, LayerObservation, LayerSearch, ScaleBelief
 from src.localization.localizer import Localizer
 
 
@@ -71,6 +72,107 @@ def test_scale_uncertainty_grows_with_observation_age():
     fresh, stale = belief.candidates(1, 0.1), belief.candidates(5, 0.1)
     assert fresh[0] == pytest.approx(1.4)
     assert stale[1] < fresh[1] < fresh[0] < fresh[2] < stale[2]
+
+
+def test_many_sources_keep_active_layer_and_rotate_recovery_probe():
+    configs = {
+        f"s{i:02d}": SimpleNamespace(scale_layer=None, geo_bounds=None)
+        for i in range(15)
+    }
+    manager = SimpleNamespace(
+        all_source_ids=list(configs),
+        get_source_config=configs.get,
+    )
+    search = LayerSearch({"localization": {"layer_search": {"max_sources_per_frame": 3}}})
+    search.handoff.commit(observation("s00"), 0)
+    probed = [search._select_sources(manager) for _ in range(8)]
+    assert all(len(selected) == 3 and selected[0] == "s00" for selected in probed)
+    assert set().union(*(set(selected) for selected in probed)) == set(configs)
+
+
+def test_source_routing_prefers_neighbor_and_nearby_without_excluding_others():
+    layer = SimpleNamespace(layer_id="high", neighbor_layer_ids=("low",))
+    configs = {
+        "high": SimpleNamespace(scale_layer=layer, geo_bounds=None),
+        "low": SimpleNamespace(
+            scale_layer=SimpleNamespace(layer_id="low"), geo_bounds=None
+        ),
+        "near": SimpleNamespace(
+            scale_layer=None, geo_bounds=(49.0, 29.0, 51.0, 31.0),
+            contains_point=lambda lat, lon: 49 <= lat <= 51 and 29 <= lon <= 31,
+        ),
+        "far": SimpleNamespace(scale_layer=None, geo_bounds=None),
+    }
+    manager = SimpleNamespace(all_source_ids=list(configs), get_source_config=configs.get)
+    search = LayerSearch({"localization": {"layer_search": {"max_sources_per_frame": 3}}})
+    search.handoff.commit(observation("high"), 0)
+    seen = [search._select_sources(manager) for _ in range(2)]
+    assert all(selected[:2] == ["high", "low"] for selected in seen)
+    assert {selected[2] for selected in seen} == {"near", "far"}
+
+
+def test_layer_probe_can_recover_source_outside_stale_active_filter():
+    class Retriever:
+        def __init__(self, frame):
+            self.frame = frame
+
+        def find_similar_frames(self, _query, top_k):
+            return [(self.frame, 0.8)][:top_k]
+
+    manager = MultiDatabaseManager.__new__(MultiDatabaseManager)
+    manager._sources = {
+        sid: SimpleNamespace(priority=0) for sid in ("active", "hidden")
+    }
+    manager._databases = {
+        sid: SimpleNamespace(metadata={}) for sid in ("active", "hidden")
+    }
+    manager._retrievers = {
+        "active": Retriever(1), "hidden": Retriever(2)
+    }
+    manager._active_source_ids = {"active"}
+    manager._config = {}
+    result = manager.get_matches_by_source(
+        np.array([1.0, 0.0], dtype=np.float32), 1, source_ids=["hidden"]
+    )
+    assert result == {"hidden": [(2, 0.8)]}
+
+
+def test_noop_scale_belief_does_not_repeat_identical_geometry(monkeypatch):
+    loc = localizer()
+    loc._layer_search.beliefs["b"] = ScaleBelief(0.0, 0.05, 0.0, 0)
+    original = loc._geometric_verifier.verify
+    attempted = []
+
+    def counted(features, candidates, database):
+        attempted.append((id(database), candidates[0][0]))
+        return original(features, candidates, database)
+
+    monkeypatch.setattr(loc._geometric_verifier, "verify", counted)
+    observations = loc._layer_search.search(
+        loc, np.zeros((100, 100, 3), dtype=np.uint8), None, 1.0
+    )
+    assert observations
+    assert len(attempted) == 2  # one candidate in each source, not 3x per source
+    assert loc._layer_search.last_diagnostics["verifications"] == 2
+
+
+def test_distinct_scale_descriptors_are_batched(monkeypatch):
+    loc = localizer()
+    loc._layer_search.beliefs["b"] = ScaleBelief(np.log(1.4), 0.1, 0.0, 0)
+    batches = []
+
+    def extract_multi(frames):
+        batches.append(len(frames))
+        return np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (len(frames), 1))
+
+    monkeypatch.setattr(
+        loc.feature_extractor, "extract_global_descriptors_multi", extract_multi,
+        raising=False,
+    )
+    loc._layer_search.search(loc, np.zeros((100, 100, 3), dtype=np.uint8), None, 1.0)
+    assert batches == [3]  # one belief ratio overlaps the no-op 1.0 scale
+
+
 
 
 class Extractor:
@@ -276,3 +378,166 @@ def test_off_center_patch_does_not_support_image_center(monkeypatch):
     monkeypatch.setattr(loc.feature_extractor, "extract_local_features", extract)
     result = loc.localize_frame(np.zeros((100, 100, 3), dtype=np.uint8), timestamp=0)
     assert not result["success"]
+
+
+# 50 m/s due east at 50 N, in degrees of longitude per second.
+EAST_50MPS = 50.0 / 71_687.0
+
+
+def moving_track(controller, source="a"):
+    controller.commit(observation(source, gps=(50.0, 30.0)), 0)
+    controller.commit(observation(source, gps=(50.0, 30.0 + EAST_50MPS)), 1)
+
+
+def test_motion_gate_accepts_single_track_consistent_fix_after_lost():
+    controller = LayerHandoff(confirmations=2, max_speed_mps=350, motion_gate=True)
+    moving_track(controller)
+    candidate = observation("b", gps=(50.0, 30.0 + 5 * EAST_50MPS))
+    assert controller.choose([candidate], 5) is candidate
+    assert controller.reason == "motion_gated"
+    assert controller.state == "TRACKING"
+
+
+def test_motion_gate_is_off_by_default():
+    controller = LayerHandoff(confirmations=2, max_speed_mps=350)
+    moving_track(controller)
+    candidate = observation("b", gps=(50.0, 30.0 + 5 * EAST_50MPS))
+    assert controller.choose([candidate], 5) is None
+    assert controller.reason == "awaiting_confirmation"
+
+
+def test_motion_gate_rejects_fix_off_the_predicted_track():
+    controller = LayerHandoff(confirmations=2, max_speed_mps=350, motion_gate=True)
+    moving_track(controller)
+    # Last confirmed position, 200 m behind the prediction; radius is 30 + 30 * 4 m.
+    stale = observation("b", gps=(50.0, 30.0 + EAST_50MPS))
+    assert controller.choose([stale], 5) is None
+    assert controller.reason == "awaiting_confirmation"
+
+
+def test_motion_gate_needs_a_velocity_estimate():
+    controller = LayerHandoff(confirmations=2, max_speed_mps=350, motion_gate=True)
+    controller.commit(observation("a"), 0)
+    assert controller.choose([observation("b")], 4) is None
+
+
+def test_motion_gate_expires_after_max_gap():
+    controller = LayerHandoff(
+        confirmations=2, max_speed_mps=350, motion_gate=True, motion_gate_max_gap_s=10
+    )
+    moving_track(controller)
+    candidate = observation("b", gps=(50.0, 30.0 + 21 * EAST_50MPS))
+    assert controller.choose([candidate], 21) is None
+
+
+def test_motion_gate_bridges_frame_where_active_layer_did_not_verify():
+    controller = LayerHandoff(confirmations=2, max_speed_mps=350, motion_gate=True)
+    moving_track(controller)
+    candidate = observation("b", gps=(50.0, 30.0 + 2 * EAST_50MPS))
+    assert controller.choose([candidate], 2) is candidate
+
+
+def test_motion_gate_keeps_discretionary_switch_behind_confirmations():
+    controller = LayerHandoff(confirmations=2, max_speed_mps=350, motion_gate=True)
+    moving_track(controller)
+    here = (50.0, 30.0 + 2 * EAST_50MPS)
+    old, new = observation("a", gps=here), observation("b", 50, gps=here)
+    assert controller.choose([old, new], 2) is old
+    assert controller.state == "HANDOFF_PENDING"
+
+
+def test_motion_gate_does_not_shortcut_bootstrap():
+    controller = LayerHandoff(confirmations=2, max_speed_mps=350, motion_gate=True)
+    assert controller.choose([observation("a")], 1) is None
+
+
+def test_layer_search_passes_motion_gate_settings():
+    search = LayerSearch(
+        {
+            "localization": {
+                "layer_search": {
+                    "motion_gate": True,
+                    "motion_gate_growth_mps": 12.0,
+                    "motion_gate_max_gap_s": 4.0,
+                }
+            }
+        }
+    )
+    assert search.handoff.motion_gate is True
+    assert search.handoff.motion_gate_growth_mps == 12.0
+    assert search.handoff.motion_gate_max_gap_s == 4.0
+
+
+def override_cfg(monkeypatch, search, **overrides):
+    original = search.cfg
+    monkeypatch.setattr(
+        search, "cfg", lambda key, default: overrides.get(key, original(key, default))
+    )
+
+
+class OnlyFrameOne(Database):
+    def get_local_features(self, candidate):
+        return {"valid": int(candidate) == 1}
+
+
+def verification_order(monkeypatch, diverse):
+    loc = localizer()
+    loc.db_manager.get_database = {"b": OnlyFrameOne(True)}.get
+    loc.db_manager.get_matches_by_source = lambda *_a, **_k: {"b": [(0, 0.9), (1, 0.5)]}
+    loc._layer_search.beliefs["b"] = ScaleBelief(np.log(1.4), 0.1, 0.0, 0)
+    override_cfg(monkeypatch, loc._layer_search, diverse_candidates=diverse, max_verifications=2)
+    original = loc._geometric_verifier.verify
+    attempted = []
+
+    def counted(features, candidates, database):
+        attempted.append(int(candidates[0][0]))
+        return original(features, candidates, database)
+
+    monkeypatch.setattr(loc._geometric_verifier, "verify", counted)
+    loc._layer_search.search(loc, np.zeros((100, 100, 3), dtype=np.uint8), None, 1.0)
+    return attempted
+
+
+def test_diverse_candidates_try_each_frame_before_rescaling_one(monkeypatch):
+    assert verification_order(monkeypatch, diverse=False) == [0, 0]
+    assert verification_order(monkeypatch, diverse=True) == [0, 1]
+
+
+def early_stop_localizer(monkeypatch, enabled, track=(50.0005, 30.0005)):
+    # Default track: the image centre through the identity map in localizer().
+    loc = localizer()
+    loc._layer_search.handoff.commit(observation("b", gps=track), 0.0)
+    loc._layer_search.handoff.commit(observation("b", gps=track), 1.0)
+    override_cfg(
+        monkeypatch,
+        loc._layer_search,
+        early_stop=enabled,
+        early_stop_min_quality=0.0,
+        early_stop_max_scale_ratio=1.5,
+    )
+    return loc
+
+
+def test_early_stop_ends_search_on_track_consistent_active_fix(monkeypatch):
+    loc = early_stop_localizer(monkeypatch, enabled=True)
+    observations = loc._layer_search.search(loc, np.zeros((100, 100, 3), dtype=np.uint8), None, 2.0)
+    assert [o.source_id for o in observations] == ["b"]
+    assert observations[0].scale_ratio == pytest.approx(1.0)
+    assert loc._layer_search.last_diagnostics["verifications"] == 1
+    assert loc._layer_search.last_diagnostics["early_stop"] is True
+
+
+def test_early_stop_off_verifies_every_source(monkeypatch):
+    loc = early_stop_localizer(monkeypatch, enabled=False)
+    loc._layer_search.search(loc, np.zeros((100, 100, 3), dtype=np.uint8), None, 2.0)
+    assert loc._layer_search.last_diagnostics["verifications"] == 2
+    assert loc._layer_search.last_diagnostics["early_stop"] is False
+
+
+def test_early_stop_ignores_fix_off_the_track(monkeypatch):
+    # Hovering 200 m north of the fix; the gate radius one second later is 60 m.
+    loc = early_stop_localizer(monkeypatch, enabled=True, track=(50.0005 + 0.0018, 30.0005))
+    assert loc._layer_search.handoff.predict(2.0) is not None
+    loc._layer_search.search(loc, np.zeros((100, 100, 3), dtype=np.uint8), None, 2.0)
+    assert loc._layer_search.last_diagnostics["early_stop"] is False
+    assert loc._layer_search.last_diagnostics["verifications"] == 2

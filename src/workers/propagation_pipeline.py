@@ -23,7 +23,16 @@ from src.geometry.affine_utils import (
     decompose_affine_5dof,
     unwrap_angles,
 )
-from src.geometry.calibration_provenance import anchored_graph_support, classify_calibration
+from src.geometry.anchor_linear_model import (
+    interpolate_linear_anchor_intervals,
+    linear_anchor_intervals,
+)
+from src.geometry.calibration_provenance import (
+    CalibrationOrigin,
+    GeoreferenceStatus,
+    anchored_graph_support,
+    classify_calibration,
+)
 from src.geometry.point_spread import inlier_spread, spread_weight_factor
 from src.geometry.pose_graph.model_5dof import _predict_forward, _predict_inverse
 from src.geometry.pose_graph.vo_guards import (
@@ -199,6 +208,17 @@ class PropagationPipeline:
         self.anchor_gap_check = get_cfg(self.config, go + "anchor_gap_check", False)
         self.anchor_gap_max_dev_m = get_cfg(self.config, go + "anchor_gap_max_dev_m", 150.0)
         self.anchor_gap_downweight = get_cfg(self.config, go + "anchor_gap_downweight", 0.05)
+        self.anchor_linear_fallback = get_cfg(self.config, go + "anchor_linear_fallback", False)
+        self.pin_exact_anchors = get_cfg(self.config, go + "pin_exact_anchors", False)
+        self.anchor_linear_min_gap_slots = get_cfg(
+            self.config, go + "anchor_linear_min_gap_slots", 20
+        )
+        self.anchor_linear_min_run_intervals = get_cfg(
+            self.config, go + "anchor_linear_min_run_intervals", 3
+        )
+        self.anchor_linear_max_velocity_deviation = get_cfg(
+            self.config, go + "anchor_linear_max_velocity_deviation", 0.01
+        )
 
         # Outlier rejection and pose-graph optimization settings
         self.true_disagreement = get_cfg(self.config, go + "true_disagreement", False)
@@ -512,6 +532,37 @@ class PropagationPipeline:
             results[fid][0, 2] += origin_tx
             results[fid][1, 2] += origin_ty
 
+        linear_intervals: list[tuple[int, int]] = []
+        linear_affines: dict[int, np.ndarray] = {}
+        if self.anchor_linear_fallback:
+            anchor_affines = {a.frame_id: a.affine_matrix for a in anchors}
+            linear_intervals = linear_anchor_intervals(
+                anchor_affines,
+                self.frame_w,
+                self.frame_h,
+                min_gap_slots=self.anchor_linear_min_gap_slots,
+                min_run_intervals=self.anchor_linear_min_run_intervals,
+                max_velocity_deviation=self.anchor_linear_max_velocity_deviation,
+            )
+            linear_affines = interpolate_linear_anchor_intervals(
+                anchor_affines, linear_intervals, self.frame_w, self.frame_h
+            )
+            interior_count = sum(
+                1 for fid in linear_affines if fid not in anchor_affines
+            )
+            logger.info(
+                f"Anchor-linear model: {len(linear_intervals)} stable intervals, "
+                f"{interior_count} interior slots"
+            )
+        if self.pin_exact_anchors:
+            # The pose graph uses soft anchor factors. For a surveyed reference
+            # image, its supplied affine is the geographic observation; do not
+            # replace it with a slightly shifted optimizer state. Reuse the
+            # save path's anchor handling so provenance and frame_gps agree.
+            linear_affines.update(
+                {a.frame_id: np.asarray(a.affine_matrix, dtype=np.float64) for a in anchors}
+            )
+
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
         self._report_progress(85, "Saving results to HDF5...")
         valid_count = self._save_to_hdf5(
@@ -522,6 +573,8 @@ class PropagationPipeline:
             graph_supported=graph_supported,
             frame_components=frame_components,
             component_anchors=component_anchors,
+            linear_affines=linear_affines,
+            linear_intervals=linear_intervals,
         )
         self._check_running()
 
@@ -1087,6 +1140,8 @@ class PropagationPipeline:
         graph_supported: set[int] | None = None,
         frame_components: np.ndarray | None = None,
         component_anchors: dict[int, list[int]] | None = None,
+        linear_affines: dict[int, np.ndarray] | None = None,
+        linear_intervals: list[tuple[int, int]] | None = None,
     ) -> int:
         """Save optimised affine matrices to HDF5.
 
@@ -1121,6 +1176,26 @@ class PropagationPipeline:
             invalid_ids=skip,
             supported=supported_mask,
         )
+        linear_support = np.zeros(num_frames, dtype=np.uint8)
+        anchor_ids = {a.frame_id for a in anchors}
+        for fid, affine in (linear_affines or {}).items():
+            if 0 <= fid < num_frames:
+                frame_affine[fid] = np.asarray(affine, dtype=np.float64)
+                frame_valid[fid] = True
+                frame_georef_status[fid] = GeoreferenceStatus.SUPPORTED
+                if fid in anchor_ids:
+                    # Soft graph anchors may differ in angle/scale from the
+                    # surveyed affine.  Pin the model boundary to that exact
+                    # affine so the last interpolated frame meets its anchor.
+                    frame_origin[fid] = CalibrationOrigin.ANCHOR
+                    frame_support_distance[fid] = 0
+                else:
+                    frame_origin[fid] = CalibrationOrigin.ANCHOR_LINEAR_MODEL
+                    linear_support[fid] = 1
+        for a, b in linear_intervals or []:
+            for fid in range(max(a + 1, 0), min(b, num_frames)):
+                if linear_support[fid]:
+                    frame_support_distance[fid] = min(fid - a, b - fid)
         if frame_components is None:
             frame_components = np.full(num_frames, -1, dtype=np.int32)
         else:
@@ -1257,7 +1332,21 @@ class PropagationPipeline:
                 )
                 grp.attrs["optimizer"] = "pose_graph_lm"
                 grp.attrs["provenance_version"] = 1
-                grp.attrs["frame_origin_codes"] = "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated"
+                grp.attrs["frame_origin_codes"] = "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated,5=anchor_linear_model"
+                grp.attrs["anchor_linear_model_intervals_json"] = json.dumps(
+                    linear_intervals or []
+                )
+                grp.attrs["anchor_linear_model_parameters_json"] = json.dumps(
+                    {
+                        "enabled": bool(self.anchor_linear_fallback),
+                        "min_gap_slots": int(self.anchor_linear_min_gap_slots),
+                        "min_run_intervals": int(self.anchor_linear_min_run_intervals),
+                        "max_velocity_deviation": float(
+                            self.anchor_linear_max_velocity_deviation
+                        ),
+                    }
+                )
+                grp.attrs["pin_exact_anchors"] = bool(self.pin_exact_anchors)
                 grp.attrs["georef_status_version"] = 1
                 grp.attrs["frame_georef_status_codes"] = "0=unknown,1=supported,2=provisional,3=invalid"
                 grp.attrs["component_anchors_json"] = json.dumps(
@@ -1278,6 +1367,9 @@ class PropagationPipeline:
                 )
                 grp.create_dataset("frame_rmse", data=frame_rmse, compression="gzip")
                 grp.create_dataset("frame_origin", data=frame_origin, compression="gzip")
+                grp.create_dataset(
+                    "frame_anchor_linear_support", data=linear_support, compression="gzip"
+                )
                 grp.create_dataset(
                     "frame_georef_status", data=frame_georef_status, compression="gzip"
                 )

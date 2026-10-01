@@ -103,9 +103,21 @@ class FastRetrieval:
 class LanceDBRetrieval:
     """Fast candidate search using LanceDB for vector similarity."""
 
+    # An exact scan is cheap at this size and avoids IVF-PQ distance distortion.
+    # Larger maps still use the index, with a bounded probe and exact rerank.
+    EXACT_SEARCH_MAX_ROWS = 5000
+    ANN_NPROBES = 16
+    ANN_REFINE_FACTOR = 4
+
     def __init__(self, lance_table):
         logger.info("Initializing LanceDBRetrieval using LanceDB table natively")
         self.lance_table = lance_table
+        self._row_count = None
+        if lance_table is not None:
+            try:
+                self._row_count = int(lance_table.count_rows())
+            except Exception as e:
+                logger.warning(f"LanceDB row count unavailable; using indexed search: {e}")
 
     def add_descriptor(self, query_desc: np.ndarray, frame_id: int):
         # LanceDB insertion is usually handled batch-wise in DatabaseLoader.
@@ -116,17 +128,44 @@ class LanceDBRetrieval:
             return []
 
         q = query_desc / (np.linalg.norm(query_desc) + 1e-8)
+        vector = q.astype(np.float32).flatten()
 
+        def new_query():
+            return self.lance_table.search(vector).metric("cosine")
+
+        exact = self._row_count is not None and self._row_count <= self.EXACT_SEARCH_MAX_ROWS
+        modes = ("exact", "refined") if exact else ("refined",)
+        for mode in modes:
+            try:
+                query = new_query()
+                if mode == "exact":
+                    query = query.bypass_vector_index()
+                else:
+                    query = query.nprobes(self.ANN_NPROBES).refine_factor(self.ANN_REFINE_FACTOR)
+                rows = query.limit(top_k).select(["frame_id", "_distance"]).to_list()
+                # Both modes return true cosine distance, including negative similarity.
+                return [
+                    (int(r["frame_id"]), float(np.clip(1.0 - r["_distance"], -1.0, 1.0)))
+                    for r in rows
+                ]
+            except Exception as e:
+                logger.warning(f"LanceDB {mode} search unavailable: {e}")
+
+        # Older LanceDB versions may lack refinement. Recompute cosine from the
+        # original vectors in a bounded ANN shortlist instead of trusting PQ distances.
         try:
-            res = (
-                self.lance_table.search(q.astype(np.float32).flatten())
-                .metric("cosine")
-                .limit(top_k)
-                .select(["frame_id", "_distance"])
+            rows = (
+                new_query()
+                .limit(top_k * self.ANN_REFINE_FACTOR)
+                .select(["frame_id", "vector"])
                 .to_list()
             )
-            # Returns [(frame_id, similarity)]
-            return [(int(r["frame_id"]), float(max(0.0, 1.0 - r["_distance"]))) for r in res]
+            rescored = []
+            for row in rows:
+                ref = np.asarray(row["vector"], dtype=np.float32)
+                similarity = float(np.dot(vector, ref) / (np.linalg.norm(ref) + 1e-8))
+                rescored.append((int(row["frame_id"]), float(np.clip(similarity, -1.0, 1.0))))
+            return sorted(rescored, key=lambda item: item[1], reverse=True)[:top_k]
         except Exception as e:
             logger.error(f"LanceDB query failed: {e}")
             return []

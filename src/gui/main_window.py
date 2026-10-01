@@ -28,6 +28,17 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         self.project_manager = ProjectManager()
         self.database: DatabaseLoader | None = None
         self.calibration = MultiAnchorCalibration()
+        # Multi-source managers are created only when a multi-source project is
+        # loaded (DatabaseMixin.on_load_database); None = single-source mode.
+        self.db_manager = None
+        self.calib_manager = None
+        # The layer (video source) every layer-scoped button acts on. The single
+        # source of truth: self.database / self.calibration are always this
+        # layer's live objects (DatabaseMixin._activate_source switches both).
+        self.active_source_id: str | None = None
+        self._db_build_source_id: str | None = None
+        self._calib_target = None  # (source_id, calibration, database) of the open dialog
+        self._propagation_target = None  # (source_id, database, calibration) being propagated
 
         self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
 
