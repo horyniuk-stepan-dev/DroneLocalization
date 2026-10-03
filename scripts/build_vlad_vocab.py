@@ -11,15 +11,22 @@ PCA-whitening і зберігає .npz, який вмикається через
 СЛОВНИК — НЕ ПРО-ПРОЄКТНИЙ. AnyLoc показує, що в аеродомені domain-specific
 словник б'є map-specific (підігнаний під одну карту). Тому подавайте сюди
 КІЛЬКА різних обльотів, а отриманий .npz фіксуйте як спільний ассет для всіх
-проєктів: `vocab_path` — глобальний ключ конфігу, а fingerprint бази не містить
-ідентичності словника, тож змішування баз із різними словниками не буде
-виявлене й дасть тихе сміття.
+проєктів.
 
-Семплінг: бюджет `--max-frames` ділиться між відео порівну, і всередині кожного
-кадри беруться рівномірно по ВСІЙ довжині (а не з початку).
+Vocabulary identity: the database schema fingerprint records the vocabulary's
+content hash (plus models.vlad.layer and low_norm_fraction), and a source built
+with another vocabulary is refused when the project is loaded. Replacing the
+vocabulary therefore means rebuilding every database that should stay
+queryable. The .npz records its provenance (sources, layer, input size, DINO
+resize, model revision); FeatureExtractor warns when the config differs.
+
+Sources: --video files and/or --images folders (searched recursively, e.g.
+exported frames or map tiles). The --max-frames budget is split evenly between
+sources and sampled evenly over the whole of each source.
 
 Запуск (Windows, у venv проєкту, потрібен GPU):
-    python scripts/build_vlad_vocab.py --video flight_a.mp4 flight_b.mp4 flight_c.mp4 \
+    python scripts/build_vlad_vocab.py --video flight_a.mp4 flight_b.mp4 \
+        --images D:/tiles/region_a D:/tiles/region_b \
         --output models/vlad_vocab_c32_p256_v2.npz --max-frames 3000 [--layer N]
 """
 
@@ -27,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -34,14 +42,80 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"})
+
+
+def split_budget(total: int, parts: int) -> list[int]:
+    """Split a frame budget evenly; the first parts take the remainder."""
+    base, rem = divmod(int(total), int(parts))
+    return [base + (1 if i < rem else 0) for i in range(parts)]
+
+
+def even_indices(total: int, quota: int) -> list[int]:
+    """Up to ``quota`` distinct indices spread evenly over the whole of range(total)."""
+    if total <= 0 or quota <= 0:
+        return []
+    quota = min(quota, total)
+    step = total / quota
+    return [int(k * step) for k in range(quota)]
+
+
+def list_images(folder: str | Path) -> list[Path]:
+    """Image files under ``folder`` (recursive, sorted)."""
+    root = Path(folder)
+    if not root.is_dir():
+        raise ValueError(f"image folder does not exist: {folder}")
+    files = sorted(
+        path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    )
+    if not files:
+        raise ValueError(f"no images in {folder}")
+    return files
+
+
+def iter_video_frames(path: str | Path, quota: int):
+    """RGB frames sampled evenly over the whole video."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise ValueError(f"cannot open video {path}")
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            raise ValueError(f"cannot determine the length of {path}")
+        for index in even_indices(total, quota):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = cap.read()
+            if not ok:
+                break
+            yield cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    finally:
+        cap.release()
+
+
+def iter_image_files(folder: str | Path, quota: int):
+    """RGB images sampled evenly over a folder's sorted file list."""
+    files = list_images(folder)
+    for index in even_indices(len(files), quota):
+        image = cv2.imread(str(files[index]), cv2.IMREAD_COLOR)
+        if image is None:
+            print(f"  WARNING: unreadable image skipped: {files[index]}")
+            continue
+        yield cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--video",
-        required=True,
         nargs="+",
+        default=[],
         help="Одне або КІЛЬКА референсних відео (кілька — краще, див. докстрінг)",
+    )
+    ap.add_argument(
+        "--images",
+        nargs="+",
+        default=[],
+        help="folder(s) of images or map tiles, searched recursively; each folder is one source",
     )
     ap.add_argument("--output", default="models/vlad_vocab.npz")
     ap.add_argument(
@@ -54,6 +128,8 @@ def main() -> int:
     ap.add_argument("--pca-dim", type=int, default=None, help="Перекрити models.vlad.pca_dim")
     ap.add_argument("--layer", type=int, default=None, help="Проміжний шар ViT (default: конфіг)")
     args = ap.parse_args()
+    if not args.video and not args.images:
+        ap.error("give at least one --video or --images source")
 
     import torch
     import torchvision.transforms as T
@@ -103,49 +179,45 @@ def main() -> int:
         f"Препроцес DINO: {'cv2 CPU-resize (INTER_AREA/CUBIC)' if cpu_resize else 'torchvision Resize(antialias)'} -> {s}x{s}"
     )
 
-    videos = list(args.video)
-    quota_base, rem = divmod(args.max_frames, len(videos))
-    if quota_base < 1:
-        print(f"ERROR: --max-frames {args.max_frames} менший за кількість відео ({len(videos)})")
+    sources = [("video", path) for path in args.video]
+    sources += [("images", path) for path in args.images]
+    quotas = split_budget(args.max_frames, len(sources))
+    if min(quotas) < 1:
+        print(
+            f"ERROR: --max-frames {args.max_frames} is smaller than the number of "
+            f"sources ({len(sources)})"
+        )
         return 1
 
     tokens_per_image: list[np.ndarray] = []
-    for vi, path in enumerate(videos):
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            print(f"ERROR: не вдалося відкрити відео {path}")
-            return 1
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total <= 0:
-            print(f"ERROR: не вдалося визначити довжину {path}")
-            cap.release()
-            return 1
-        quota = quota_base + (1 if vi < rem else 0)
-        # Рівномірно по ВСІЙ довжині. Стара схема (`idx % every` зі зупинкою на
-        # max_frames) обривалася на перших max_frames*every кадрах — словник
-        # бачив лише початок польоту.
-        step = max(1, total // max(quota, 1))
+    used_sources: list[dict] = []
+    for si, ((kind, path), quota) in enumerate(zip(sources, quotas)):
+        frames = (
+            iter_video_frames(path, quota) if kind == "video" else iter_image_files(path, quota)
+        )
         got = 0
-        for k in range(quota):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, min(k * step, total - 1))
-            ok, frame = cap.read()
-            if not ok:
-                break
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            t = prep(rgb)
-            with torch.no_grad():
-                feats = (
-                    model.forward_features(t, layer=layer)
-                    if layer is not None
-                    else model.forward_features(t)
-                )
-            tokens_per_image.append(feats["x_norm_patchtokens"][0].float().cpu().numpy())
-            got += 1
-            if got % 100 == 0:
-                print(f"  [{vi + 1}/{len(videos)}] зібрано {got}/{quota}")
-        cap.release()
-        print(f"  {path}: {got} кадрів із {total} (крок {step})")
+        try:
+            for rgb in frames:
+                t = prep(rgb)
+                with torch.no_grad():
+                    feats = (
+                        model.forward_features(t, layer=layer)
+                        if layer is not None
+                        else model.forward_features(t)
+                    )
+                tokens_per_image.append(feats["x_norm_patchtokens"][0].float().cpu().numpy())
+                got += 1
+                if got % 100 == 0:
+                    print(f"  [{si + 1}/{len(sources)}] {got}/{quota}")
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        used_sources.append({"kind": kind, "path": str(Path(path).resolve()), "frames": got})
+        print(f"  {kind} {path}: {got} frames (quota {quota})")
 
+    if len(tokens_per_image) < 2:
+        print(f"ERROR: only {len(tokens_per_image)} frame(s) collected; VLAD needs at least 2")
+        return 1
     print(f"Зібрано {len(tokens_per_image)} кадрів × {tokens_per_image[0].shape} токенів")
     if len(tokens_per_image) < pca_dim + 1:
         print(
@@ -161,7 +233,21 @@ def main() -> int:
     )
     agg.fit(tokens_per_image)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    agg.save(args.output)
+    agg.save(
+        args.output,
+        provenance={
+            "created": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "sources": used_sources,
+            "images": len(tokens_per_image),
+            "layer": layer,
+            "input_size": s,
+            "dino_cpu_resize": cpu_resize,
+            "hf_model_id": desc_cfg.hf_model_id,
+            "hf_revision": getattr(desc_cfg, "hf_revision", "") or "",
+            "n_clusters": n_clusters,
+            "pca_dim": pca_dim,
+        },
+    )
     print(f"Готово: {args.output} (out_dim={agg.out_dim})")
     print("Наступні кроки: увімкніть models.vlad.enabled + vocab_path і ПЕРЕБУДУЙТЕ базу даних.")
     return 0

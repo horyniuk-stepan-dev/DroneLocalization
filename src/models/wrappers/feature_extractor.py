@@ -40,6 +40,28 @@ class FeatureExtractor:
                     low_norm_fraction=get_cfg(config, "models.vlad.low_norm_fraction", 0.0),
                 )
                 self._vlad_layer = get_cfg(config, "models.vlad.layer", None)
+                from src.models.wrappers.vlad_aggregator import provenance_mismatches
+
+                active = get_active_descriptor_cfg(self.config)
+                differences = provenance_mismatches(
+                    self.vlad_aggregator.provenance,
+                    {
+                        "layer": self._vlad_layer,
+                        "input_size": int(active.input_size),
+                        "dino_cpu_resize": bool(
+                            get_cfg(config, "models.performance.dino_cpu_resize", False)
+                        ),
+                        "hf_model_id": getattr(active, "hf_model_id", None),
+                        "hf_revision": getattr(active, "hf_revision", "") or "",
+                    },
+                )
+                if differences:
+                    logger.warning(
+                        "VLAD vocabulary was built with other settings than the current "
+                        f"config ({'; '.join(differences)}). Descriptors stay consistent, "
+                        "but the vocabulary may fit worse; rebuild it with "
+                        "scripts/build_vlad_vocab.py."
+                    )
                 if cesp_module is not None:
                     logger.warning("Both VLAD and CESP enabled — VLAD takes precedence")
             else:

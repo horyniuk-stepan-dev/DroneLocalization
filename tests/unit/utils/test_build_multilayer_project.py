@@ -148,3 +148,36 @@ def test_resnap_never_stacks_two_anchors_on_one_keyframe(tmp_path):
     moves = bmp.resnap_anchors(run / "calibration.json", db, bmp.SimulatorRun(run), out)
     assert moves == [(4, 5), (6, None)]
     assert bmp.check_anchor_contract(out, db) == 1
+
+
+def test_config_overrides_reach_nested_keys_and_check_types():
+    from scripts.propagation_sweep import apply_overrides
+
+    config = {
+        "graph_optimization": {"isotropy_weight": 200.0},
+        "models": {"vlad": {"enabled": False, "vocab_path": None, "pca_dim": 256}},
+    }
+    result = apply_overrides(
+        config,
+        {
+            "graph_optimization.isotropy_weight": 10,
+            "models.vlad.enabled": True,
+            "models.vlad.vocab_path": "models/v1.npz",
+        },
+    )
+    assert result["models"]["vlad"] == {
+        "enabled": True,
+        "vocab_path": "models/v1.npz",
+        "pca_dim": 256,
+    }
+    assert result["graph_optimization"]["isotropy_weight"] == 10
+    assert config["models"]["vlad"]["enabled"] is False  # input untouched
+    for bad in (
+        {"models.vlad.no_such": 1},
+        {"models": 1},
+        {"models.vlad": {}},
+        {"models.vlad.enabled": 1},
+        {"models.vlad.pca_dim": "many"},
+    ):
+        with pytest.raises(ValueError):
+            apply_overrides(config, bad)

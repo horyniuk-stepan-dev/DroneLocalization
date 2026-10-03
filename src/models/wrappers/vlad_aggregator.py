@@ -6,6 +6,8 @@ vocabulary built via k-means over reference frame tokens, descriptor is concaten
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from src.utils.logging_utils import get_logger
@@ -32,6 +34,9 @@ class VladAggregator:
         self.pca_mean: np.ndarray | None = None  # (K*D,)
         self.pca_components: np.ndarray | None = None  # (pca_dim, K*D)
         self.pca_eigvals: np.ndarray | None = None  # (pca_dim,)
+        # How the vocabulary was built (sources, ViT layer, input size, ...); empty
+        # for vocabularies saved before provenance was recorded.
+        self.provenance: dict = {}
 
     @property
     def is_fitted(self) -> bool:
@@ -174,9 +179,11 @@ class VladAggregator:
         """(B, N, D) or list of (N_i, D) -> (B, out_dim)."""
         return np.stack([self.aggregate(t) for t in tokens_batch])
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, provenance: dict | None = None) -> None:
         if self.centers is None:
             raise RuntimeError("Nothing to save: not fitted")
+        if provenance is not None:
+            self.provenance = dict(provenance)
         np.savez_compressed(
             path,
             centers=self.centers,
@@ -187,6 +194,7 @@ class VladAggregator:
             pca_eigvals=self.pca_eigvals if self.pca_eigvals is not None else np.empty(0),
             meta=np.array([self.n_clusters, self.pca_dim, self.seed], dtype=np.int64),
             low_norm_fraction=np.float64(self.low_norm_fraction),
+            provenance_json=np.array(json.dumps(self.provenance, sort_keys=True)),
         )
         logger.info(f"VLAD vocabulary saved: {path} (out_dim={self.out_dim})")
 
@@ -205,5 +213,19 @@ class VladAggregator:
             agg.pca_mean = data["pca_mean"].astype(np.float32)
             agg.pca_components = data["pca_components"].astype(np.float32)
             agg.pca_eigvals = data["pca_eigvals"].astype(np.float32)
+        if "provenance_json" in data.files:
+            agg.provenance = json.loads(str(data["provenance_json"]))
         logger.info(f"VLAD vocabulary loaded: {path} | k={n_clusters}, out_dim={agg.out_dim}")
         return agg
+
+
+def provenance_mismatches(provenance: dict, expected: dict) -> list[str]:
+    """Settings recorded in a vocabulary's provenance that differ from ``expected``.
+
+    Keys missing from the provenance (older vocabularies) are not reported.
+    """
+    return [
+        f"{key}: vocabulary {provenance[key]!r} != config {value!r}"
+        for key, value in expected.items()
+        if key in provenance and provenance[key] != value
+    ]

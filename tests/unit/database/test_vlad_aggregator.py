@@ -84,3 +84,30 @@ def test_unfitted_raises():
         agg.aggregate(np.zeros((10, 8), dtype=np.float32))
     with pytest.raises(RuntimeError):
         _ = agg.out_dim
+
+
+def test_provenance_roundtrip_and_mismatches(tmp_path, fitted_agg):
+    from src.models.wrappers.vlad_aggregator import provenance_mismatches
+
+    agg, _world, _rng = fitted_agg
+    p = str(tmp_path / "vocab.npz")
+    provenance = {"layer": None, "input_size": 224, "sources": [{"kind": "video", "frames": 3}]}
+    agg.save(p, provenance=provenance)
+    loaded = VladAggregator.load(p)
+    assert loaded.provenance == provenance
+    assert provenance_mismatches(loaded.provenance, {"layer": None, "input_size": 224}) == []
+    diffs = provenance_mismatches(loaded.provenance, {"input_size": 256, "hf_revision": "x"})
+    assert len(diffs) == 1 and "input_size" in diffs[0]  # unknown keys are not reported
+
+
+def test_vocabulary_without_provenance_still_loads(tmp_path, fitted_agg):
+    agg, world, rng = fitted_agg
+    p = str(tmp_path / "old.npz")
+    agg.save(p)
+    data = dict(np.load(p, allow_pickle=False))
+    data.pop("provenance_json")
+    np.savez_compressed(p, **data)  # what vocabularies saved before 2026-10 look like
+    loaded = VladAggregator.load(p)
+    assert loaded.provenance == {}
+    tokens = _make_tokens(rng, world)
+    np.testing.assert_allclose(loaded.aggregate(tokens), agg.aggregate(tokens), atol=1e-6)

@@ -27,7 +27,6 @@ confirmed fixes (how far a step deviates from the true motion, i.e. "jumps").
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import hashlib
 import json
@@ -42,6 +41,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# One dotted-path override implementation for the replay, sweep and build scripts.
+from scripts.propagation_sweep import apply_overrides as apply_config_overrides  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -186,29 +188,6 @@ def layer_search_overrides(raw: Iterable[str] | None) -> dict:
     except Exception as exc:  # pydantic.ValidationError; keep the CLI message short
         raise ValueError(f"invalid --layer-search value: {exc}") from exc
     return {key: getattr(validated, key) for key in overrides}
-
-
-def apply_config_overrides(config: dict, overrides: dict) -> dict:
-    """Deep copy of ``config`` with dotted-path overrides of existing keys only."""
-    result = copy.deepcopy(config)
-    for name, value in overrides.items():
-        *parents, key = name.split(".")
-        node = result
-        for part in parents:
-            node = node.get(part) if isinstance(node, dict) else None
-        if not isinstance(node, dict) or key not in node:
-            raise ValueError(f"unknown config key: {name}")
-        current = node[key]
-        if current is not None and (
-            isinstance(current, dict)
-            or isinstance(current, bool) != isinstance(value, bool)
-            or (isinstance(current, int | float) and not isinstance(value, int | float))
-            or (isinstance(current, str) and not isinstance(value, str))
-            or (isinstance(current, list) and not isinstance(value, list))
-        ):
-            raise ValueError(f"{name}: {value!r} does not match type of {current!r}")
-        node[key] = value
-    return result
 
 
 def config_overrides(raw: Iterable[str] | None) -> dict:

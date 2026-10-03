@@ -395,8 +395,8 @@
             ]
         },
         "vlad": {
-            "enabled": true,
-            "vocab_path": "models/vlad_vocab_v1_c32_p256.npz",
+            "enabled": false,
+            "vocab_path": "models/vlad_vocab_c32_p256.npz",
             "n_clusters": 32,
             "pca_dim": 256,
             "layer": null,

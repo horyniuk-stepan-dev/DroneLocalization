@@ -47,18 +47,29 @@ MATCH_SECTIONS = ("localization", "homography", "models")
 
 
 def apply_overrides(config: dict, overrides: dict) -> dict:
-    """Deep copy of ``config`` with SECTION.KEY overrides of existing keys only."""
+    """Deep copy of ``config`` with dotted-path overrides of existing keys only.
+
+    Any depth (``graph_optimization.isotropy_weight``, ``models.vlad.enabled``). The new
+    value must have the type of the current one; a None leaf accepts any value.
+    """
     result = copy.deepcopy(config)
     for name, value in overrides.items():
-        section, dot, key = name.partition(".")
-        if not dot or not isinstance(result.get(section), dict) or key not in result[section]:
+        *parents, key = name.split(".")
+        node = result
+        for part in parents:
+            node = node.get(part) if isinstance(node, dict) else None
+        if not parents or not isinstance(node, dict) or key not in node:
             raise ValueError(f"unknown config key: {name}")
-        current = result[section][key]
-        if isinstance(current, bool) != isinstance(value, bool) or (
-            isinstance(current, int | float) and not isinstance(value, int | float)
+        current = node[key]
+        if current is not None and (
+            isinstance(current, dict)
+            or isinstance(current, bool) != isinstance(value, bool)
+            or (isinstance(current, int | float) and not isinstance(value, int | float))
+            or (isinstance(current, str) and not isinstance(value, str))
+            or (isinstance(current, list) and not isinstance(value, list))
         ):
             raise ValueError(f"{name}: {value!r} does not match type of {current!r}")
-        result[section][key] = value
+        node[key] = value
     return result
 
 
