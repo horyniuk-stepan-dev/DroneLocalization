@@ -2,6 +2,7 @@ import contextlib
 import math
 import os
 
+import cv2
 import numpy as np
 import torch
 import torchvision.transforms as T
@@ -132,6 +133,27 @@ class FeatureExtractor:
             self.stream_local = None
 
     @staticmethod
+    def _by_score(keypoints, descriptors, scores):
+        """Order keypoints by detector score, strongest first (torch or numpy).
+
+        ALIKED in threshold mode returns keypoints in raster order (top row
+        first). The database stores only the first database.max_keypoints_stored
+        of them, so with 2049..4095 detections the stored set covered only the
+        upper part of the frame (measured on tests/fixtures/flight_clip.mp4:
+        7 of 13 frames, stored keypoints ending at 51-90 % of the height).
+        Score order makes that truncation keep the strongest points anywhere in
+        the frame. LightGlue and MNN are permutation-invariant, so matching of
+        untruncated sets is unaffected.
+        """
+        if scores is None or len(scores) != len(keypoints) or len(keypoints) < 2:
+            return keypoints, descriptors
+        if isinstance(scores, torch.Tensor):
+            order = torch.argsort(scores, descending=True, stable=True)
+        else:
+            order = np.argsort(-np.asarray(scores), kind="stable")
+        return keypoints[order], descriptors[order]
+
+    @staticmethod
     def _patch_grid_side(n_tokens: int) -> int:
         """Side of square patch grid derived from patch token count."""
         side = int(math.isqrt(int(n_tokens)))
@@ -170,8 +192,31 @@ class FeatureExtractor:
             return self._dino_normalize(self._upload_chw(self._cpu_resize_dino(image)))
         return self.dinov2_transform(self._upload_chw(image))
 
+    @staticmethod
+    def _token_validity(valid_mask: np.ndarray | None, n_tokens: int) -> np.ndarray | None:
+        """Per-token validity from a pixel mask of the view (0/255).
+
+        The DINO input squashes the whole view to S×S, so the square patch grid
+        covers the view uniformly; a token is valid when at least half of its
+        area is valid. None / fully valid → None (aggregate everything).
+        """
+        if valid_mask is None:
+            return None
+        side = int(math.isqrt(int(n_tokens)))
+        if side * side != int(n_tokens) or side == 0:
+            return None
+        small = cv2.resize(
+            (np.asarray(valid_mask) > 128).astype(np.float32),
+            (side, side),
+            interpolation=cv2.INTER_AREA,
+        )
+        valid = (small >= 0.5).ravel()
+        return None if valid.all() else valid
+
     @torch.no_grad()
-    def _vlad_descriptors(self, dino_input: torch.Tensor) -> np.ndarray:
+    def _vlad_descriptors(
+        self, dino_input: torch.Tensor, valid_masks: list | None = None
+    ) -> np.ndarray:
         """(B, 3, S, S) -> (B, out_dim) via VLAD patch token aggregation."""
         kwargs = {}
         if self._vlad_layer is not None:
@@ -182,16 +227,27 @@ class FeatureExtractor:
             except TypeError:
                 features = self.global_model.forward_features(dino_input)
         tokens = features["x_norm_patchtokens"].float().cpu().numpy()
-        return self.vlad_aggregator.aggregate_batch(tokens)
+        if valid_masks is None:
+            return self.vlad_aggregator.aggregate_batch(tokens)
+        token_valid = [self._token_validity(m, tokens.shape[1]) for m in valid_masks]
+        return self.vlad_aggregator.aggregate_batch(tokens, token_valid)
 
     @torch.no_grad()
-    def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
+    def extract_global_descriptor(
+        self, image: np.ndarray, valid_mask: np.ndarray | None = None
+    ) -> np.ndarray:
+        """``valid_mask`` (0/255, image-sized): pixels that belong to the frame.
+
+        Only VLAD can use it (tokens outside are not aggregated); CLS and CESP
+        see the whole input.
+        """
         with Telemetry.profile("dinov2"):
             logger.debug("Extracting global descriptor with DINOv2...")
             dino_input = self._dino_input(image)
 
         if self.vlad_aggregator is not None:
-            return self._vlad_descriptors(dino_input)[0]
+            masks = None if valid_mask is None else [valid_mask]
+            return self._vlad_descriptors(dino_input, masks)[0]
 
         if self.cesp_module is not None:
             with torch.amp.autocast(
@@ -211,8 +267,14 @@ class FeatureExtractor:
         return global_desc
 
     @torch.no_grad()
-    def extract_global_descriptors_multi(self, images: list[np.ndarray]) -> np.ndarray:
-        """Extracts global descriptors for a list of images in a single forward pass."""
+    def extract_global_descriptors_multi(
+        self, images: list[np.ndarray], valid_masks: list | None = None
+    ) -> np.ndarray:
+        """Extracts global descriptors for a list of images in a single forward pass.
+
+        ``valid_masks``: optional per-image validity masks (see
+        ``extract_global_descriptor``); used by VLAD only.
+        """
         if not images:
             return np.empty((0, 0), dtype=np.float32)
 
@@ -238,9 +300,13 @@ class FeatureExtractor:
                 chunks = (batch,)
 
             outs = []
+            start = 0
             for chunk in chunks:
+                n = int(chunk.shape[0])
+                masks = None if valid_masks is None else list(valid_masks[start : start + n])
+                start += n
                 if self.vlad_aggregator is not None:
-                    outs.append(np.asarray(self._vlad_descriptors(chunk)))
+                    outs.append(np.asarray(self._vlad_descriptors(chunk, masks)))
                 elif self.cesp_module is not None:
                     with torch.amp.autocast(
                         self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
@@ -292,13 +358,20 @@ class FeatureExtractor:
             if is_xfeat:
                 top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
                 xf = self.local_model.detectAndCompute(rgb_tensor, top_k=top_k)[0]
-                keypoints = xf["keypoints"].cpu().numpy()
-                descriptors = xf["descriptors"].cpu().numpy()
+                kp_t, desc_t = self._by_score(xf["keypoints"], xf["descriptors"], xf.get("scores"))
+                keypoints = kp_t.cpu().numpy()
+                descriptors = desc_t.cpu().numpy()
             else:
                 with contextlib.nullcontext():
                     aliked_out = self.local_model({"image": rgb_tensor})
-                keypoints = aliked_out["keypoints"][0].cpu().numpy()
-                descriptors = aliked_out["descriptors"][0].cpu().numpy()
+                scores = aliked_out.get("keypoint_scores")
+                kp_t, desc_t = self._by_score(
+                    aliked_out["keypoints"][0],
+                    aliked_out["descriptors"][0],
+                    scores[0] if scores is not None else None,
+                )
+                keypoints = kp_t.cpu().numpy()
+                descriptors = desc_t.cpu().numpy()
 
         if scale_factor != 1.0:
             keypoints = keypoints / scale_factor
@@ -438,15 +511,24 @@ class FeatureExtractor:
                         input_dict, top_k=get_cfg(self.config, "models.xfeat.top_k", 2048)
                     )
                     for res in xfeat_out:
-                        out_kpts.append(res["keypoints"].float())
-                        out_descs.append(res["descriptors"].float())
+                        kp_t, desc_t = self._by_score(
+                            res["keypoints"], res["descriptors"], res.get("scores")
+                        )
+                        out_kpts.append(kp_t.float())
+                        out_descs.append(desc_t.float())
                 else:
                     for b in range(B):
                         single_img = local_batch[b : b + 1]
                         aliked_in = {"image": single_img}
                         aliked_out = self.local_model(aliked_in)
-                        out_kpts.append(aliked_out["keypoints"][0].float())
-                        out_descs.append(aliked_out["descriptors"][0].float())
+                        scores = aliked_out.get("keypoint_scores")
+                        kp_t, desc_t = self._by_score(
+                            aliked_out["keypoints"][0],
+                            aliked_out["descriptors"][0],
+                            scores[0] if scores is not None else None,
+                        )
+                        out_kpts.append(kp_t.float())
+                        out_descs.append(desc_t.float())
 
         if self.device == "cuda":
             torch.cuda.synchronize()

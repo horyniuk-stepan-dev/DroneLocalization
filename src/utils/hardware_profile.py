@@ -61,7 +61,6 @@ TUNABLE_KEYS: frozenset[str] = frozenset(
         "models.vram_management.max_vram_ratio",
         "models.performance.torch_compile",
         "models.performance.fp16_enabled",
-        "models.performance.propagation_max_workers",
         "database.yolo_batch_size",
         "database.prefetch_queue_size",
         "database.decode_batch_size",
@@ -362,14 +361,8 @@ class HardwareProfile:
             f"{tier}-tier: decode batch {decode_batches[tier]}",
         )
 
-        # Propagation workers — match physical cores (capped)
-        prop_workers = min(cpu.physical_cores, 8)
-        _propose(
-            "models.performance.propagation_max_workers",
-            4,
-            prop_workers,
-            f"{cpu.physical_cores} physical cores → {prop_workers} propagation workers",
-        )
+        # (propagation_max_workers removed 2026-10: no code consumed it —
+        # propagation matches pairs sequentially on one GPU.)
 
         return overrides
 

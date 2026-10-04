@@ -55,6 +55,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         # Soft anchor priors: frame_id -> (state_anchor 5-vector, w_a)
         self._anchor_priors: dict[int, tuple[np.ndarray, float]] = {}
 
+        # Unary log-scale priors (terrain model): frame_id -> (target log GSD, weight).
+        # r = weight·cx·(½(log_sx + log_sy) − target); empty = block absent.
+        self._scale_priors: dict[int, tuple[float, float]] = {}
+
     @property
     def num_nodes(self) -> int:
         return len(self._node_ids)
@@ -121,6 +125,25 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
     def sign(self) -> float:
         """Determinant sign (-1.0 for mirrored calibration matrices)."""
         return self._sign
+
+    def set_scale_priors(self, priors: dict[int, tuple[float, float]]) -> None:
+        """Replaces the unary log-scale priors {frame_id: (target_log_scale, weight)}."""
+        self._scale_priors = {
+            int(fid): (float(t), float(w))
+            for fid, (t, w) in priors.items()
+            if np.isfinite(t) and np.isfinite(w) and w > 0
+        }
+
+    def is_free(self, frame_id: int) -> bool:
+        return frame_id in self._free_nodes and frame_id not in self._fixed_nodes
+
+    def node_states(self) -> dict[int, np.ndarray]:
+        """Current states of every initialized node (fixed and free), copies."""
+        states = {fid: st.copy() for fid, st in self._fixed_nodes.items()}
+        for fid, st in self._free_nodes.items():
+            if fid in self._initialized_nodes:
+                states[fid] = st.copy()
+        return states
 
     def anchor_states(self) -> dict[int, np.ndarray]:
         """Returns states of all fixed and soft anchors."""
@@ -430,7 +453,18 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         )
         n_kin = len(kin_ids)
 
-        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5 + 2 * n_kin
+        # Unary log-scale priors (terrain): only for free nodes; empty → block absent.
+        sp_var_idx: list[int] = []
+        sp_target: list[float] = []
+        sp_w: list[float] = []
+        for fid, (t, w) in sorted(self._scale_priors.items()):
+            if fid in id_to_var:
+                sp_var_idx.append(id_to_var[fid])
+                sp_target.append(t)
+                sp_w.append(w * self.cx)
+        n_sp = len(sp_var_idx)
+
+        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5 + 2 * n_kin + n_sp
         jac_sp = self._build_jac_sparsity(
             valid_edges,
             id_to_var,
@@ -442,6 +476,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 (id_to_var.get(a, -1), id_to_var.get(b, -1), id_to_var.get(c, -1))
                 for a, b, c in kin_ids
             ],
+            scale_prior_var_idx=sp_var_idx,
         )
 
         logger.info(
@@ -509,6 +544,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             "kin_alpha": np.array(kin_alpha_l, dtype=np.float64),
             "kin_w": np.array(kin_w_l, dtype=np.float64),
             "n_kin": n_kin,
+            "sp_var_idx": np.array(sp_var_idx, dtype=np.int64),
+            "sp_target": np.array(sp_target, dtype=np.float64),
+            "sp_w": np.array(sp_w, dtype=np.float64),
+            "n_sp": n_sp,
             "callback": progress_callback,
         }
 
@@ -668,6 +707,11 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             wk = d["kin_w"][:, None]
             parts.append((wk * (al * ca + (1.0 - al) * cc - cb)).ravel())
 
+        if d.get("n_sp", 0) > 0:
+            # Terrain log-scale prior: r = w·(½(log_sx + log_sy) − target).
+            sp = x_reshaped[d["sp_var_idx"]]
+            parts.append(d["sp_w"] * (0.5 * (sp[:, 2] + sp[:, 3]) - d["sp_target"]))
+
         return np.concatenate(parts)
 
     def _jacobian_vec(self, x: np.ndarray, d: dict):
@@ -794,12 +838,21 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                     add(base_k[m] + 0, 5 * f_idx[m] + 0, coef[m])
                     add(base_k[m] + 1, 5 * f_idx[m] + 1, coef[m])
 
+        # Terrain log-scale prior: ½·w on log_sx and log_sy of the node.
+        n_sp = int(d.get("n_sp", 0))
+        if n_sp > 0:
+            sv = d["sp_var_idx"]
+            half_w = 0.5 * d["sp_w"]
+            s_rows = 5 * n_edges + n_free + 5 * n_anch + 2 * n_kin + np.arange(n_sp)
+            add(s_rows, 5 * sv + 2, half_w)
+            add(s_rows, 5 * sv + 3, half_w)
+
         rows = np.concatenate(rows)
         cols = np.concatenate(cols)
         data = np.concatenate(data)
         J = coo_matrix(
             (data, (rows, cols)),
-            shape=(5 * n_edges + n_free + 5 * n_anch + 2 * n_kin, 5 * n_free),
+            shape=(5 * n_edges + n_free + 5 * n_anch + 2 * n_kin + n_sp, 5 * n_free),
             dtype=np.float64,
         )
         return J.tocsr()
@@ -813,6 +866,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         n_edges,
         anchor_var_idx=None,
         kin_free=None,
+        scale_prior_var_idx=None,
     ):
         # COO constructor (list-based rows/cols) is faster than element-wise lil
         # on large graphs. Sparsity pattern is IDENTICAL to the previous version.
@@ -859,6 +913,12 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 if f_idx >= 0:
                     rows += [base_k + 2 * t, base_k + 2 * t + 1]
                     cols += [5 * f_idx + 0, 5 * f_idx + 1]
+
+        # Terrain log-scale prior: 1 row per prior, log_sx and log_sy of the node.
+        base_s = base_k + 2 * len(kin_free or [])
+        for t, v in enumerate(scale_prior_var_idx or []):
+            rows += [base_s + t, base_s + t]
+            cols += [5 * v + 2, 5 * v + 3]
 
         data = np.ones(len(rows), dtype=np.int8)
         sp = coo_matrix((data, (rows, cols)), shape=(n_residuals, n_vars), dtype=np.int8)

@@ -31,6 +31,23 @@ class VideoSourceConfig:
     # Without it a consumer slower than the stream chronically lags behind real time.
     drop_late_frames: bool = True
 
+    @classmethod
+    def from_app_config(cls, source: str, config) -> "VideoSourceConfig":
+        """Source + the live_stream.* section of the app config (dict or AppConfig).
+
+        Before 2026-10 the tracking worker built VideoSourceConfig(source=...)
+        only, so live_stream.reconnect_attempts / reconnect_delay_sec /
+        buffer_size in user_config.json never took effect.
+        """
+        from config import get_cfg
+
+        return cls(
+            source=str(source),
+            reconnect_attempts=int(get_cfg(config, "live_stream.reconnect_attempts", 5)),
+            reconnect_delay_sec=float(get_cfg(config, "live_stream.reconnect_delay_sec", 2.0)),
+            buffer_size=int(get_cfg(config, "live_stream.buffer_size", 1)),
+        )
+
 
 class VideoSource:
     """Thin wrapper over cv2.VideoCapture with auto-reconnect and source-type detection."""

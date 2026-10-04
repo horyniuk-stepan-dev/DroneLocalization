@@ -112,10 +112,26 @@ class RealtimeTrackingWorker(QThread):
             )
             try:
                 object_tracker = ObjectTracker(tracker_cfg)
-                object_projector = ObjectProjector(self.localizer.calibration)
-                logger.info("Object tracking enabled")
+                if tracker_cfg.get("project_to_gps", True):
+                    object_projector = ObjectProjector(self.localizer.calibration)
+                logger.info(
+                    "Object tracking enabled "
+                    f"(classes={tracker_cfg.get('tracked_classes') or 'all'}, "
+                    f"gps={'on' if object_projector else 'off'})"
+                )
             except Exception as e:
                 logger.error(f"Failed to initialize object tracking: {e}")
+
+        # Optional drone telemetry (flight_data.source; default "none" = vision only).
+        from src.flight_data import build_flight_prior
+
+        try:
+            flight_prior = build_flight_prior(self.config)
+        except Exception as e:  # a broken log must not stop vision-only tracking
+            logger.error(f"Flight data disabled: {e}")
+            flight_prior = None
+        if flight_prior is not None:
+            logger.info("Flight data: heading prior enabled for keyframes")
 
         # Fix 6: Pre-warm fallback models when starting tracking
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
@@ -144,7 +160,7 @@ class RealtimeTrackingWorker(QThread):
         if isinstance(self.video_source, VideoSource):
             video_src = self.video_source
         else:
-            v_config = VideoSourceConfig(source=str(self.video_source))
+            v_config = VideoSourceConfig.from_app_config(self.video_source, self.config)
             video_src = VideoSource(v_config)
 
         if not video_src.is_opened:
@@ -248,11 +264,17 @@ class RealtimeTrackingWorker(QThread):
                         want_depth="depth" in active_debug,
                     )
 
+                yaw_hint = (
+                    flight_prior.yaw_hint_deg(current_video_time_sec)
+                    if flight_prior is not None
+                    else None
+                )
                 try:
                     loc_result = self.localizer.localize_frame(
                         frame_rgb,
                         static_mask=static_mask,
                         dt=calculated_dt,
+                        yaw_hint_deg=yaw_hint,
                         collector=debug_collector,
                         timestamp=current_video_time_sec,
                     )

@@ -47,7 +47,6 @@ class TestConfigSectionsExist:
             "localization",
             "tracking",
             "preprocessing",
-            "gui",
             "models",
             "projection",
         ],

@@ -49,6 +49,8 @@ class GeometricVerifier:
         min_inlier_ratio: float = 0.2,
         max_center_extrapolation: float = 0.1,
         min_reference_eigenvalue: float = 1e-4,
+        ransac_max_iters: int = 2000,
+        ransac_confidence: float = 0.99,
     ) -> None:
         self.matcher = matcher
         self.min_matches = min_matches
@@ -63,6 +65,8 @@ class GeometricVerifier:
         self.min_inlier_ratio = float(min_inlier_ratio)
         self.max_center_extrapolation = float(max_center_extrapolation)
         self.min_reference_eigenvalue = float(min_reference_eigenvalue)
+        self.ransac_max_iters = int(ransac_max_iters)
+        self.ransac_confidence = float(ransac_confidence)
 
     def _has_spatial_support(
         self,
@@ -167,6 +171,8 @@ class GeometricVerifier:
                         mkpts_q,
                         mkpts_r,
                         ransac_threshold=self.ransac_thresh,
+                        max_iters=self.ransac_max_iters,
+                        confidence=self.ransac_confidence,
                         backend=self.homography_backend,
                         use_mad_ransac=self.use_mad_ransac,
                         mad_k_factor=self.mad_k_factor,

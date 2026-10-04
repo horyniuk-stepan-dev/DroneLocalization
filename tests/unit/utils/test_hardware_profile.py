@@ -69,7 +69,6 @@ def _default_config() -> dict:
             "vram_management": {"max_vram_ratio": 0.8},
             "performance": {
                 "auto_tune": True,
-                "propagation_max_workers": 4,
                 "torch_compile": False,
                 "fp16_enabled": True,
             },
@@ -169,13 +168,12 @@ class TestAutoTune:
 
         assert "models.aliked.max_keypoints" not in overrides
 
-    def test_propagation_workers_scaled_to_cores(self):
+    def test_no_override_for_removed_propagation_workers(self):
+        """propagation_max_workers was removed (no consumer) — never proposed."""
         profile = _make_profile(12.0, 12)
         overrides = profile.auto_tune(_default_config())
 
-        assert "models.performance.propagation_max_workers" in overrides
-        _, new_val, _ = overrides["models.performance.propagation_max_workers"]
-        assert new_val == 8  # capped at 8
+        assert "models.performance.propagation_max_workers" not in overrides
 
 
 # ── HardwareProfile.detect() integration ────────────────────────────────────

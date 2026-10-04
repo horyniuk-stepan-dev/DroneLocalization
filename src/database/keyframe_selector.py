@@ -145,6 +145,8 @@ def compute_inter_frame_homography(
     homography_backend: str = "opencv",
     use_mad_ransac: bool = True,
     mad_k_factor: float = 2.5,
+    max_iters: int = 2000,
+    confidence: float = 0.99,
 ) -> np.ndarray | None:
     """Estimates H(fb -> fa) as 3x3 float64, returning None if match count is insufficient."""
     mkpts_a, mkpts_b = matcher.match(fa, fb)
@@ -157,6 +159,8 @@ def compute_inter_frame_homography(
         mkpts_b,
         mkpts_a,
         ransac_threshold=ransac_thresh,
+        max_iters=max_iters,
+        confidence=confidence,
         backend=homography_backend,
         use_mad_ransac=use_mad_ransac,
         mad_k_factor=mad_k_factor,

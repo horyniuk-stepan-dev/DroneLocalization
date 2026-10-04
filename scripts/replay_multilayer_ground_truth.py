@@ -53,6 +53,19 @@ class SourceSpec:
     calibration: Path
 
 
+def to_rgb(frame):
+    """cv2 decodes BGR; the database builder and the tracking worker hand the
+    localizer RGB (cvtColor BGR2RGB). Until 2026-10-04 the replay passed BGR, so
+    every replay measured a colour-swapped query against RGB maps."""
+    import numpy as np
+
+    if isinstance(frame, np.ndarray) and frame.ndim == 3 and frame.shape[2] == 3:
+        import cv2
+
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return frame
+
+
 def positive_int(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -130,6 +143,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "repeatable, validated against AppConfig, recorded in the report inputs",
     )
     parser.add_argument(
+        "--flight-data",
+        type=Path,
+        default=None,
+        help="telemetry CSV whose heading feeds the rotation prior (yaw hint) of every "
+        "slot, like flight_data.source=csv in the app; GT is still never passed",
+    )
+    parser.add_argument(
+        "--flight-data-preset",
+        choices=["flightsim", "generic"],
+        default="flightsim",
+        help="column layout of --flight-data (flightsim = FlightSimulator telemetry.csv)",
+    )
+    parser.add_argument(
         "--legacy-search",
         action="store_true",
         help="replay with localization.layer_search.enabled=false (the multi-source "
@@ -152,7 +178,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.source_validation, {source.source_id for source in args.sources}
         )
         args.altitude_edges = altitude_edges(args.altitude_edge)
-        for path in (args.video, args.gt):
+        for path in (args.video, args.gt) + ((args.flight_data,) if args.flight_data else ()):
             if not path.is_file():
                 raise ValueError(f"input file does not exist: {path}")
     except ValueError as exc:
@@ -477,6 +503,7 @@ def replay_slots(
     distance: Callable = distance_m,
     false_confirmation_m: float | None = None,
     legacy: bool = False,
+    flight_prior=None,
 ) -> list[dict]:
     import cv2
 
@@ -498,7 +525,12 @@ def replay_slots(
             started = clock()
             try:
                 # Image and time only: no query GT, altitude, or camera pose.
-                result = localizer.localize_frame(frame, dt=dt, timestamp=timestamp)
+                # Optional telemetry heading (--flight-data) acts as a prior only.
+                hint = flight_prior.yaw_hint_deg(timestamp) if flight_prior is not None else None
+                extra = {"yaw_hint_deg": hint} if hint is not None else {}
+                result = localizer.localize_frame(
+                    to_rgb(frame), dt=dt, timestamp=timestamp, **extra
+                )
             except Exception as exc:
                 result = {
                     "success": False,
@@ -813,6 +845,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not capture.isOpened():
             raise ValueError(f"query video could not be opened: {args.video}")
+        flight_prior = None
+        if args.flight_data is not None:
+            from src.flight_data import CsvFlightData, FlightPrior
+
+            flight_prior = FlightPrior(
+                CsvFlightData(args.flight_data, preset=args.flight_data_preset),
+                localizer.config,
+            )
         rows = replay_slots(
             slots,
             capture,
@@ -820,6 +860,7 @@ def main(argv: list[str] | None = None) -> int:
             {source.source_id for source in args.sources},
             false_confirmation_m=args.false_confirmation_m,
             legacy=args.legacy_search,
+            flight_prior=flight_prior,
         )
     finally:
         capture.release()
@@ -851,6 +892,8 @@ def main(argv: list[str] | None = None) -> int:
             "layer_search_overrides": args.layer_search_overrides,
             "config_overrides": args.config_overrides,
             "legacy_search": args.legacy_search,
+            "flight_data": str(args.flight_data) if args.flight_data else None,
+            "flight_data_preset": args.flight_data_preset if args.flight_data else None,
         },
         "timing_mode": "chronological_unpaced; processing_ms excludes video decode",
         "single_source_smoke_run": len(args.sources) == 1,

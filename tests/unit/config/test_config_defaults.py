@@ -13,7 +13,6 @@ def test_config_structure():
         "localization",
         "tracking",
         "preprocessing",
-        "gui",
         "projection",
         "database",
         "homography",
@@ -42,10 +41,9 @@ def test_config_types():
     assert isinstance(APP_CONFIG["global_descriptor"]["dinov2"]["descriptor_dim"], int)
     assert isinstance(APP_CONFIG["localization"]["ransac_threshold"], float)
     assert isinstance(APP_CONFIG["tracking"]["process_fps"], int | float)
-    assert isinstance(APP_CONFIG["preprocessing"]["histogram_matching"], bool)
     assert isinstance(APP_CONFIG["preprocessing"]["clahe_tile_grid"], list)
     assert isinstance(APP_CONFIG["homography"]["backend"], str)
-    assert isinstance(APP_CONFIG["homography"]["ransac_threshold"], float)
+    assert isinstance(APP_CONFIG["homography"]["max_iters"], int)
 
 
 def test_auto_create_default_config(tmp_path, monkeypatch):

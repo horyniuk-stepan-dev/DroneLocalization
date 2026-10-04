@@ -1,5 +1,7 @@
 """Localization, tracking and homography configuration."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -72,6 +74,24 @@ class LocalizationConfig(BaseModel):
     # (1 DINO-forward замість 4). Якщо retrieval-score prior-кута нижчий за цей
     # поріг — повний батчований скан 4 кутів.
     rotation_rescan_min_score: float = 0.70
+    # ── Query rotation (src/localization/query_rotation.py) ──
+    # "quarter"    — legacy: only 0/90/180/270 via np.rot90 (current behaviour).
+    # "continuous" — any angle: bootstrap scans every rotation_scan_step_deg,
+    #                steady state applies the angle measured on the previous fix
+    #                (or the telemetry yaw), so ALIKED/LightGlue see ~0° residual.
+    #                The view keeps the reference frame size, so DINO sees the
+    #                same aspect as the database at every angle.
+    rotation_mode: Literal["quarter", "continuous"] = "quarter"
+    # Bootstrap / recovery scan step (45 → 8 angles, 30 → 12). Residual after
+    # the scan is at most step/2; the refine pass below removes it.
+    rotation_scan_step_deg: float = Field(default=45.0, gt=0, le=180)
+    # After a verified match whose residual rotation exceeds this, re-extract
+    # the query at the corrected angle and re-verify that candidate once
+    # (more inliers, better geometry). 0 disables the refine pass.
+    rotation_refine_min_deg: float = Field(default=12.0, ge=0)
+    # Erosion of the valid area of a rotated view: keypoints on the artificial
+    # border of the rotated frame are dropped.
+    rotation_border_erode_px: int = Field(default=8, ge=0)
     enable_lightglue_fallback: bool = True
     # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ──
     # Одноразовий перезапуск матчингу через SIFT, коли ALIKED дав
@@ -112,6 +132,13 @@ class LocalizationConfig(BaseModel):
     spread_ref: float = 0.15
     # Нижня межа множника — вироджена хмара не обнуляє confidence.
     spread_floor: float = 0.35
+    # Як часто (у keyframe-ах) логувати статистику розкиду (spread stats).
+    spread_log_every: int = 50
+
+    # Після стількох поспіль невдалих keyframe-ів локалізатор повертає
+    # out_of_coverage і скидає пріори кута/масштабу (наступний кадр — повний скан).
+    # Читався з 2026-07, але не був оголошений — user_config не міг його змінити.
+    max_consecutive_failures: int = 10
 
     # ── ADDENDUM 2.1: каскадний recovery замість повного добутку. Дефолт off. ──
     # off = ПОТОЧНА поведінка: 4 кути × 5 масштабів = 20 ViT-forward одним батчем.
@@ -324,7 +351,9 @@ class TrackingConfig(BaseModel):
 
 class HomographyConfig(BaseModel):
     backend: str = "opencv"  # "poselib" | "opencv"
-    ransac_threshold: float = 3.0
+    # ransac_threshold REMOVED (2026-10): never read. The thresholds in use are
+    # localization.ransac_threshold (localization + propagation) and
+    # database.inter_frame_ransac_thresh (database build).
     max_iters: int = 2000
     confidence: float = 0.99
     use_mad_ransac: bool = True  # Адаптивне уточнення порогу через MAD

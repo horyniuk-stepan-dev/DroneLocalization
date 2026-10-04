@@ -1,9 +1,5 @@
 {
     "live_stream": {
-        "enabled": false,
-        "source_type": "file",
-        "rtsp_url": "",
-        "usb_device": 0,
         "reconnect_attempts": 5,
         "reconnect_delay_sec": 2.0,
         "buffer_size": 1
@@ -102,7 +98,10 @@
         "sift_max_keypoints": 2048,
         "lancedb_batch_size": 64,
         "lancedb_index_min_frames": 256,
-        "yolo_batch_size": 4
+        "yolo_batch_size": 4,
+        "hdf5_compression": "lzf",
+        "hdf5_chunk_frames": 64,
+        "max_keypoints_stored": 2048
     },
     "localization": {
         "layer_search": {
@@ -143,6 +142,10 @@
         "retrieval_only_min_score": 0.9,
         "auto_rotation": true,
         "rotation_rescan_min_score": 0.7,
+        "rotation_mode": "quarter",
+        "rotation_scan_step_deg": 45.0,
+        "rotation_refine_min_deg": 12.0,
+        "rotation_border_erode_px": 8,
         "enable_lightglue_fallback": true,
         "sift_fallback": false,
         "sift_fallback_max_candidates": 3,
@@ -185,6 +188,8 @@
         "spread_confidence_enabled": true,
         "spread_ref": 0.15,
         "spread_floor": 0.35,
+        "spread_log_every": 50,
+        "max_consecutive_failures": 10,
         "recovery_cascade": true,
         "candidate_prefilter": true,
         "prefilter_keep": 2,
@@ -238,14 +243,7 @@
             8,
             8
         ],
-        "histogram_matching": false,
-        "reference_image_path": "config/reference_style.png",
         "masking_strategy": "yolo"
-    },
-    "gui": {
-        "video_fps": 30,
-        "verify_display_mode": "center",
-        "verify_label_mode": "number"
     },
     "debug_views": {
         "max_width": 640,
@@ -262,128 +260,79 @@
         "local_extractor": "aliked",
         "yolo": {
             "model_path": "models/yolo11n-seg.pt",
-            "vram_required_mb": 200.0,
-            "description": "YOLOv11n-seg (Nano) for dynamic object masking"
+            "vram_required_mb": 200.0
+        },
+        "depth_estimator": {
+            "backend": "depth_anything_v2"
         },
         "xfeat": {
             "hub_repo": "verlab/accelerated_features",
             "hub_model": "XFeat",
             "top_k": 2048,
-            "vram_required_mb": 300.0,
-            "model_path": "",
-            "backend": "git",
-            "auto_convert": true,
-            "dtype": "float16",
-            "max_keypoints": 4096,
-            "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "preset": "fast",
+            "vram_required_mb": 300.0
         },
         "aliked": {
-            "hub_repo": "",
-            "hub_model": "",
-            "top_k": 2048,
-            "vram_required_mb": 400.0,
-            "model_path": "",
-            "backend": "git",
-            "auto_convert": true,
-            "dtype": "float16",
+            "model_name": "aliked-n16",
             "max_keypoints": 4096,
-            "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "detection_threshold": 0.2,
+            "nms_radius": 2,
+            "vram_required_mb": 400.0
         },
         "rdd": {
-            "hub_repo": "",
-            "hub_model": "",
-            "top_k": 2048,
-            "vram_required_mb": 500.0,
             "model_path": "models/RDD-v2.pth",
-            "backend": "git",
-            "auto_convert": true,
-            "dtype": "float16",
             "max_keypoints": 4096,
-            "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "vram_required_mb": 500.0
         },
         "superpoint": {
-            "hub_repo": "",
-            "hub_model": "",
-            "top_k": 2048,
-            "vram_required_mb": 500.0,
-            "model_path": "",
-            "backend": "git",
-            "auto_convert": true,
-            "dtype": "float16",
             "max_keypoints": 4096,
             "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "detection_threshold": 0.0005,
+            "vram_required_mb": 500.0
         },
         "lightglue": {
-            "hub_repo": "",
-            "hub_model": "",
-            "top_k": 2048,
-            "vram_required_mb": 800.0,
             "model_path": "models/lightglue_aliked.pth",
             "backend": "git",
             "auto_convert": false,
-            "dtype": "float16",
-            "max_keypoints": 4096,
-            "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "vram_required_mb": 800.0,
+            "depth_confidence": 0.95,
+            "width_confidence": 0.99,
+            "filter_threshold": 0.1,
+            "flash": true,
+            "mixed_precision": false
         },
         "lightglue_superpoint": {
-            "hub_repo": "",
-            "hub_model": "",
-            "top_k": 2048,
-            "vram_required_mb": 800.0,
             "model_path": "models/lightglue_superpoint.pth",
             "backend": "git",
             "auto_convert": false,
-            "dtype": "float16",
-            "max_keypoints": 4096,
-            "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "vram_required_mb": 800.0,
+            "depth_confidence": 0.95,
+            "width_confidence": 0.99,
+            "filter_threshold": 0.1,
+            "flash": true,
+            "mixed_precision": false
         },
         "lightglue_rdd": {
-            "hub_repo": "",
-            "hub_model": "",
-            "top_k": 2048,
-            "vram_required_mb": 800.0,
             "model_path": "models/RDD_lg-v2.pth",
             "backend": "git",
             "auto_convert": false,
-            "dtype": "float16",
-            "max_keypoints": 4096,
-            "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "vram_required_mb": 800.0,
+            "depth_confidence": 0.95,
+            "width_confidence": 0.99,
+            "filter_threshold": 0.1,
+            "flash": true,
+            "mixed_precision": false
         },
         "lightglue_sift": {
-            "hub_repo": "",
-            "hub_model": "",
-            "top_k": 2048,
-            "vram_required_mb": 800.0,
             "model_path": "",
             "backend": "git",
             "auto_convert": false,
-            "dtype": "float16",
-            "max_keypoints": 4096,
-            "nms_radius": 4,
-            "depth_confidence": -1.0,
-            "width_confidence": -1.0,
-            "detection_threshold": 0.001
+            "vram_required_mb": 800.0,
+            "depth_confidence": 0.95,
+            "width_confidence": 0.99,
+            "filter_threshold": 0.1,
+            "flash": true,
+            "mixed_precision": false
         },
         "cesp": {
             "enabled": false,
@@ -408,8 +357,6 @@
         },
         "performance": {
             "auto_tune": true,
-            "auto_tune_vram_headroom": 0.0,
-            "propagation_max_workers": 8,
             "fp16_enabled": false,
             "global_batch_max": 4,
             "dino_cpu_resize": true,
@@ -424,22 +371,16 @@
             "weight_integrity_mode": "off"
         },
         "engines_cache": {
-            "engine_cache_dir": "models/engines/",
-            "auto_compile": false
+            "engine_cache_dir": "models/engines/"
         }
     },
     "projection": {
         "default_mode": "UTM",
-        "strict_projection": true,
-        "fallback_to_webmercator": true,
         "anchor_rmse_threshold_m": 3.0,
-        "anchor_max_error_m": 5.0,
-        "localizer_sample_points": 9,
-        "localizer_expected_spread_m": 150.0
+        "anchor_max_error_m": 5.0
     },
     "homography": {
         "backend": "poselib",
-        "ransac_threshold": 3.0,
         "max_iters": 2000,
         "confidence": 0.99,
         "use_mad_ransac": true,
@@ -506,12 +447,32 @@
         "edge_gate_min_spread": 0.03,
         "true_disagreement": false,
         "ground_scale_thresholds": false,
-        "isotropy_weight": 10.0
+        "isotropy_weight": 10.0,
+        "terrain_scale_prior": true,
+        "terrain_prior_weight": 10.0,
+        "terrain_edge_correction": true,
+        "terrain_altitude_model": "piecewise",
+        "terrain_dem_source": "terrarium",
+        "terrain_dem_path": "",
+        "terrain_dem_zoom": 13,
+        "terrain_dem_download": true,
+        "terrain_focal_px": 0.0,
+        "terrain_iterations": 2
     },
     "propagation": {
         "max_skip_frames": 3,
         "rotation_retry": false,
         "skip_bridges": false,
         "mnn_fallback": false
+    },
+    "flight_data": {
+        "source": "none",
+        "csv_path": "",
+        "csv_preset": "generic",
+        "time_offset_s": 0.0,
+        "max_gap_s": 1.0,
+        "use_heading": true,
+        "reference_heading_deg": 0.0,
+        "camera_yaw_offset_deg": 0.0
     }
 }

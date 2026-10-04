@@ -43,25 +43,81 @@ class GlobalDescriptorConfig(BaseModel):
 
 
 class YoloConfig(BaseModel):
+    """YOLOv11n-seg (Nano) for dynamic object masking."""
+
     model_path: str = "models/yolo11n-seg.pt"
     vram_required_mb: float = 200.0
-    description: str = "YOLOv11n-seg (Nano) for dynamic object masking"
 
 
-class ModelSettings(BaseModel):
-    hub_repo: str | None = ""
-    hub_model: str | None = ""
+class DepthEstimatorConfig(BaseModel):
+    """Monocular depth during the database build (metadata/depth_scales) and for
+    localization.scale_use_depth_hint. "none" skips the model entirely."""
+
+    backend: str = "depth_anything_v2"  # "depth_anything_v2" | "none"
+
+
+# ── Local feature models ───────────────────────────────────────────────────────
+# One schema per model: every field below is passed to that model's loader.
+# (Until 2026-10 all extractors and matchers shared one generic ModelSettings,
+# so most of its fields — nms_radius / detection_threshold for ALIKED,
+# depth/width_confidence for LightGlue, dtype, hub_* for local models — were
+# written to user_config.json but never reached the model.)
+#
+# Defaults equal the values the code ACTUALLY ran with before the split
+# (the lightglue library defaults), so moving to these classes changes nothing.
+
+
+class AlikedSettings(BaseModel):
+    """ALIKED (lightglue.ALIKED). Feeds both the database build and localization."""
+
+    model_name: str = "aliked-n16"
+    max_keypoints: int = 4096
+    # > 0: threshold mode — keypoints with score > threshold, capped at
+    # max_keypoints. <= 0: exact top-k (always max_keypoints points).
+    # Changing it changes the keypoint set: rebuild databases for a fair A/B.
+    detection_threshold: float = 0.2
+    nms_radius: int = 2
+    vram_required_mb: float = 400.0
+
+
+class XFeatSettings(BaseModel):
+    hub_repo: str = "verlab/accelerated_features"
+    hub_model: str = "XFeat"
     top_k: int = 2048
-    vram_required_mb: float = 500.0
-    model_path: str | None = ""
-    backend: str = "git"  # "git" | "torchscript" | "tensorrt"
-    auto_convert: bool = True
-    dtype: str = "float16"  # "float16" | "float32"
+    # quality_preset of forks that support it ("fast" | ...); ignored otherwise.
+    preset: str = "fast"
+    vram_required_mb: float = 300.0
+
+
+class SuperPointSettings(BaseModel):
     max_keypoints: int = 4096
     nms_radius: int = 4
-    depth_confidence: float = -1.0
-    width_confidence: float = -1.0
-    detection_threshold: float = 0.001
+    detection_threshold: float = 0.0005
+    vram_required_mb: float = 500.0
+
+
+class RddSettings(BaseModel):
+    model_path: str = "models/RDD-v2.pth"
+    max_keypoints: int = 4096
+    vram_required_mb: float = 500.0
+
+
+class LightGlueSettings(BaseModel):
+    """LightGlue matcher (one block per feature type)."""
+
+    model_path: str | None = ""
+    backend: str = "git"  # "git" | "torchscript" | "tensorrt"
+    auto_convert: bool = False
+    vram_required_mb: float = 800.0
+    # Adaptive early exit (lightglue: depth_confidence). -1 disables it.
+    depth_confidence: float = 0.95
+    # Point pruning (lightglue: width_confidence); active on CUDA with
+    # >= 1024 keypoints. -1 disables it.
+    width_confidence: float = 0.99
+    # Matches with assignment score below this are dropped.
+    filter_threshold: float = 0.1
+    flash: bool = True  # FlashAttention when available
+    mixed_precision: bool = False  # lightglue "mp"
 
 
 class CespConfig(BaseModel):
@@ -99,15 +155,14 @@ class VramManagementConfig(BaseModel):
 
 class ModelsCacheConfig(BaseModel):
     engine_cache_dir: str = "models/engines/"
-    auto_compile: bool = False
+    # auto_compile REMOVED (2026-10): nothing compiled engines on demand; build
+    # them with scripts/compile_dinov2_trt.py.
 
 
 class PerformanceConfig(BaseModel):
     auto_tune: bool = True  # Auto-detect hardware and tune batch sizes, threads, VRAM limits
-    auto_tune_vram_headroom: float = (
-        0.0  # Extra VRAM (MB) to reserve beyond tier default (0 = auto)
-    )
-    propagation_max_workers: int = 4
+    # auto_tune_vram_headroom and propagation_max_workers REMOVED (2026-10):
+    # nothing read them — propagation matches pairs sequentially on one GPU.
     fp16_enabled: bool = True
     # ADDENDUM §3 (слабкі GPU): максимальний батч ViT-форварда в
     # extract_global_descriptors_multi (recovery: до 20 кадрів разом).
@@ -192,46 +247,16 @@ class ModelsConfig(BaseModel):
         default_factory=get_default_local_extractor
     )  # "aliked" | "rdd" | "xfeat"
     yolo: YoloConfig = YoloConfig()
-    xfeat: ModelSettings = ModelSettings(
-        hub_repo="verlab/accelerated_features",
-        hub_model="XFeat",
-        top_k=2048,
-        vram_required_mb=300.0,
-    )
-    aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
-    rdd: ModelSettings = ModelSettings(
-        vram_required_mb=500.0,
-        model_path="models/RDD-v2.pth",
-        max_keypoints=4096,
-    )
-    superpoint: ModelSettings = ModelSettings(
-        nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
-    )
-    lightglue: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        # git backend: official weights download into TORCH_HOME (models/.cache)
-        model_path="",
-        auto_convert=False,
-    )
-    lightglue_superpoint: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        # git backend: official weights download into TORCH_HOME (models/.cache)
-        model_path="",
-        auto_convert=False,
-    )
-    lightglue_rdd: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        model_path="models/RDD_lg-v2.pth",
-        auto_convert=False,
-    )
-    lightglue_sift: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        auto_convert=False,
-    )
+    depth_estimator: DepthEstimatorConfig = DepthEstimatorConfig()
+    xfeat: XFeatSettings = XFeatSettings()
+    aliked: AlikedSettings = AlikedSettings()
+    rdd: RddSettings = RddSettings()
+    superpoint: SuperPointSettings = SuperPointSettings()
+    # git backend: official weights download into TORCH_HOME (models/.cache)
+    lightglue: LightGlueSettings = LightGlueSettings()
+    lightglue_superpoint: LightGlueSettings = LightGlueSettings()
+    lightglue_rdd: LightGlueSettings = LightGlueSettings(model_path="models/RDD_lg-v2.pth")
+    lightglue_sift: LightGlueSettings = LightGlueSettings()
     cesp: CespConfig = CespConfig()
     vlad: VladConfig = VladConfig()
     vram_management: VramManagementConfig = VramManagementConfig()

@@ -144,7 +144,9 @@ def main() -> int:
     pca_dim = args.pca_dim or get_cfg(APP_CONFIG, "models.vlad.pca_dim", 512)
     layer = args.layer if args.layer is not None else get_cfg(APP_CONFIG, "models.vlad.layer", None)
 
-    backend = get_cfg(APP_CONFIG, "models.global_descriptor.backend", "dinov3")
+    # global_descriptor is a top-level section; the old "models.global_descriptor"
+    # path never existed, so this check always saw the default "dinov3".
+    backend = get_cfg(APP_CONFIG, "global_descriptor.backend", "dinov3")
     if backend != "dinov3":
         print(f"ERROR: словник VLAD підтримано лише для DINOv3 (зараз backend={backend})")
         return 1

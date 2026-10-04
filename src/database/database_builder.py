@@ -522,6 +522,8 @@ class DatabaseBuilder:
             homography_backend=get_cfg(self.config, "homography.backend", "opencv"),
             use_mad_ransac=get_cfg(self.config, "homography.use_mad_ransac", True),
             mad_k_factor=get_cfg(self.config, "homography.mad_k_factor", 2.5),
+            max_iters=int(get_cfg(self.config, "homography.max_iters", 2000)),
+            confidence=float(get_cfg(self.config, "homography.confidence", 0.99)),
         )
 
     def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:

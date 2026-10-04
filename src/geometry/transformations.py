@@ -312,13 +312,23 @@ class GeometryTransforms:
         if H is None:
             return None, None
 
-        # Convert inlier mask to (N, 1) uint8 format — OpenCV analog
-        inliers = info.get("inliers", [])
+        # Convert inlier mask to (N, 1) uint8 format — OpenCV analog.
+        # PoseLib returns info["inliers"] as one bool PER POINT, not a list of
+        # indices. The old loop ``mask[idx] = 1`` indexed with those bools:
+        # numpy treats a scalar True as "select everything", so any inlier set
+        # the WHOLE mask to 1 — every match counted as an inlier. With
+        # homography.use_mad_ransac=true the MAD refinement re-thresholded all
+        # points under H and hid this; with it off, outliers went straight into
+        # the inlier count, the RMSE gate and the spread estimate.
         n_pts = len(pts_src)
-        mask = np.zeros((n_pts, 1), dtype=np.uint8)
-        for idx in inliers:
-            if 0 <= idx < n_pts:
-                mask[idx] = 1
+        flags = np.asarray(info.get("inliers", []), dtype=bool).ravel()
+        if flags.size != n_pts:
+            logger.warning(
+                f"PoseLib inlier mask has {flags.size} entries for {n_pts} points — "
+                "falling back to OpenCV"
+            )
+            return None, None
+        mask = flags.astype(np.uint8).reshape(-1, 1)
 
         return np.array(H, dtype=np.float64), mask
 

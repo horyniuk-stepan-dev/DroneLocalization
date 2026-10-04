@@ -74,8 +74,10 @@ class DbWriter:
     ):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
-        chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
-        max_kps = get_cfg(self.config, "database.max_keypoints_stored", 2048)
+        if compression in (None, "", "none"):
+            compression = None  # h5py: no compression filter
+        chunk_f = int(get_cfg(self.config, "database.hdf5_chunk_frames", 64))
+        max_kps = int(get_cfg(self.config, "database.max_keypoints_stored", 2048))
         local_desc_dim = self.local_descriptor_dim
 
         logger.info(

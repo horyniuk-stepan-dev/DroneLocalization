@@ -304,3 +304,16 @@ def test_legacy_results_count_as_confirmed_and_steps_are_scored():
         slots, FakeCapture(), FakeLegacyLocalizer(), {"a"}, clock=lambda: next(ticks)
     )
     assert strict[0]["status"] == "invalid_result" and not strict[0]["confirmed"]
+
+
+def test_replay_hands_the_localizer_rgb_like_the_app():
+    """cv2 decodes BGR; the DB builder and TrackingWorker pass RGB to the models."""
+    import numpy as np
+
+    from scripts.replay_multilayer_ground_truth import to_rgb
+
+    bgr = np.zeros((2, 2, 3), np.uint8)
+    bgr[..., 0] = 255  # blue in BGR
+    rgb = to_rgb(bgr)
+    assert rgb[0, 0, 2] == 255 and rgb[0, 0, 0] == 0
+    assert to_rgb("image-0") == "image-0"  # non-image test doubles pass through

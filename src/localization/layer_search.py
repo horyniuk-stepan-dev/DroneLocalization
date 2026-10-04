@@ -17,7 +17,8 @@ from pyproj import Geod
 from config import get_cfg
 from src.geometry.calibration_provenance import CalibrationOrigin, GeoreferenceStatus
 from src.geometry.transformations import GeometryTransforms
-from src.localization.rotation_selector import RotationSelector
+from src.localization.query_rotation import norm_deg, rotation_matrix
+from src.localization.rotation_selector import RotationSelector, extract_globals
 from src.localization.scale_manager import crop_to_affine
 
 _GEOD = Geod(ellps="WGS84")
@@ -53,7 +54,7 @@ class ScaleBelief:
     log_ratio: float
     sigma: float
     timestamp: float
-    angle: int
+    angle: float  # k*90 in quarter mode, any value in continuous mode
 
     def candidates(self, now, drift):
         sigma = min(0.7, self.sigma + drift * max(0.0, now - self.timestamp))
@@ -297,9 +298,18 @@ class LayerSearch:
         max_verifications = self.cfg("max_verifications", 32)
         top_k = self.cfg("candidates_per_source", 4)
         source_ids = self._select_sources(localizer.db_manager)
-        angles = [0, 90, 180, 270] if localizer.enable_auto_rotation else [0]
+        continuous = bool(getattr(localizer, "_rot_continuous", False))
+        if not localizer.enable_auto_rotation:
+            angles = [0]
+        elif continuous:
+            angles = list(localizer._rot_scan)
+        else:
+            angles = [0, 90, 180, 270]
         if yaw_hint is not None and localizer.enable_auto_rotation:
-            angle = (int(round(yaw_hint / 90)) * 90) % 360
+            if continuous:
+                angle = norm_deg(yaw_hint)
+            else:
+                angle = (int(round(yaw_hint / 90)) * 90) % 360
             angles = [angle] + [a for a in angles if a != angle]
         primary = [(angle, 1.0) for angle in angles]
         for belief in self.beliefs.values():
@@ -346,24 +356,30 @@ class LayerSearch:
                     exhausted = True
                     break
                 chunk = planned[offset : offset + batch_size]
-                prepared_chunk = [
-                    RotationSelector._prepare_frame(
-                        frame, angle, scale, localizer._scale_manager
-                    )
-                    for angle, scale, _ in chunk
-                ]
-                frames = [item[0] for item in prepared_chunk]
-                if len(frames) > 1 and hasattr(
-                    localizer.feature_extractor, "extract_global_descriptors_multi"
-                ):
-                    descriptors = localizer.feature_extractor.extract_global_descriptors_multi(
-                        frames
-                    )
-                else:
-                    descriptors = [
-                        localizer.feature_extractor.extract_global_descriptor(item)
-                        for item in frames
+                if continuous:
+                    views = [
+                        RotationSelector._prepare_view(
+                            frame,
+                            angle,
+                            scale,
+                            localizer._scale_manager,
+                            None,
+                            getattr(localizer, "_rot_erode", 8),
+                        )
+                        for angle, scale, _ in chunk
                     ]
+                    prepared_chunk = [(v[0], v[1]) for v in views]
+                    valids = [v[2] for v in views]
+                else:
+                    prepared_chunk = [
+                        RotationSelector._prepare_frame(
+                            frame, angle, scale, localizer._scale_manager
+                        )
+                        for angle, scale, _ in chunk
+                    ]
+                    valids = None
+                frames = [item[0] for item in prepared_chunk]
+                descriptors = extract_globals(localizer.feature_extractor, frames, valids)
                 for (angle, scale, key), (prepared, crop), desc in zip(
                     chunk, prepared_chunk, descriptors
                 ):
@@ -524,7 +540,12 @@ class LayerSearch:
         if crop is not None:
             H = H @ crop_to_affine(crop, frm.shape[1], frm.shape[0])
         h, w = shape[:2]
-        if angle in (90, 270):
+        continuous = bool(getattr(localizer, "_rot_continuous", False))
+        if continuous:
+            # Same-size rotated view: fold the rotation in, so H maps ORIGINAL
+            # frame pixels and w/h stay the frame's (view centre = frame centre).
+            H = H @ rotation_matrix(angle, w, h)
+        elif angle in (90, 270):
             h, w = w, h
         # Matching a small off-centre patch does not support arbitrary projection
         # of the image centre. Measure distance in the actual matcher frame,

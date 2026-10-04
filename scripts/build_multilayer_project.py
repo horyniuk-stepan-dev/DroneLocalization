@@ -259,7 +259,45 @@ def propagate(db_path: Path, calibration_path: Path, config: dict, manager) -> N
         raise BuildError(f"propagation failed: {errors or 'no completion signal'}")
 
 
-def write_project(project: Path, name: str, layers: list[dict], area: str) -> Path:
+def recording_camera(run: SimulatorRun) -> dict:
+    """Camera block of the recording's manifest (focal/sensor mm, image size), or {}."""
+    try:
+        data = json.loads(run.manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return dict((data.get("config") or {}).get("camera") or {})
+
+
+def terrain_layer_config(config: dict, project: Path, camera: dict, db_path: Path) -> dict:
+    """Per-layer config for the terrain terms: project DEM cache and exact focal in px.
+
+    No-op unless graph_optimization.terrain_scale_prior is on. The DEM cache is
+    shared by all layers (<project>/terrain); the focal length comes from the
+    simulator camera and the database's frame width.
+    """
+    import copy
+
+    import h5py
+
+    go = config.get("graph_optimization") or {}
+    if not go.get("terrain_scale_prior"):
+        return config
+    out = copy.deepcopy(config)
+    g = out["graph_optimization"]
+    if g.get("terrain_dem_source", "terrarium") == "terrarium" and not g.get("terrain_dem_path"):
+        g["terrain_dem_path"] = str(project / "terrain")
+    focal, sensor = camera.get("focal_length_mm"), camera.get("sensor_width_mm")
+    if not g.get("terrain_focal_px") and focal and sensor:
+        with h5py.File(db_path, "r") as db:
+            width = int(db["metadata"].attrs.get("frame_width", 0))
+        if width > 0:
+            g["terrain_focal_px"] = float(focal) / float(sensor) * width
+    return out
+
+
+def write_project(
+    project: Path, name: str, layers: list[dict], area: str, camera: dict | None = None
+) -> Path:
     from src.core.project import ProjectSettings
     from src.core.project_video_source import ProjectVideoSource
     from src.utils.atomic_io import atomic_write_text
@@ -288,6 +326,11 @@ def write_project(project: Path, name: str, layers: list[dict], area: str) -> Pa
         video_sources=sources,
         altitude_m=first["altitude"],
     )
+    camera = camera or {}
+    if camera.get("focal_length_mm") and camera.get("sensor_width_mm"):
+        settings.focal_length_mm = float(camera["focal_length_mm"])
+        settings.sensor_width_mm = float(camera["sensor_width_mm"])
+        settings.image_width_px = int(camera.get("image_width_px") or settings.image_width_px)
     for sub in ("panoramas", "test_photos", "test_videos"):
         (project / sub).mkdir(exist_ok=True)
     path = project / "project.json"
@@ -320,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         config["graph_optimization"]["pin_exact_anchors"] = True
     manager = ModelManager(config=config)
 
-    layers, summary = [], {}
+    layers, summary, first_camera = [], {}, {}
     for sid, altitude, sim_dir in args.layer:
         run = SimulatorRun(Path(sim_dir).resolve())
         print(f"== layer {sid} ({altitude} m) from {run.folder}", flush=True)
@@ -353,15 +396,18 @@ def main(argv: list[str] | None = None) -> int:
             calibration = MultiAnchorCalibration()
             calibration.load(str(sim_calibration))
             save_layer_calibration(calibration, cal_path, sid)
+        camera = recording_camera(run)
+        first_camera = first_camera or camera
         if not (args.resume and is_propagated(db_path)):
-            propagate(db_path, cal_path, config, manager)
+            layer_config = terrain_layer_config(config, project, camera, db_path)
+            propagate(db_path, cal_path, layer_config, manager)
 
         report = map_error_report(db_path, run) if run.ground_truth.is_file() else None
         summary[sid] = {"anchors": n_anchors, "map_error_vs_gt": report}
         print(json.dumps({sid: summary[sid]}, indent=2, ensure_ascii=False), flush=True)
         layers.append({"id": sid, "altitude": float(altitude), "video": str(video)})
 
-    path = write_project(project, args.name or project.name, layers, args.area)
+    path = write_project(project, args.name or project.name, layers, args.area, first_camera)
     print(f"Project written: {path}")
     return 0
 

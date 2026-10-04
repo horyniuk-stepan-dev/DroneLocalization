@@ -1,5 +1,7 @@
 """Application-level configuration and the top-level AppConfig aggregator."""
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 from config.database import DatabaseConfig
@@ -11,17 +13,14 @@ from config.models import GlobalDescriptorConfig, ModelsConfig
 class PreprocessingConfig(BaseModel):
     clahe_clip_limit: float = 3.0
     clahe_tile_grid: list[int] = [8, 8]
-    # УВАГА: histogram matching ще НЕ реалізований в ImagePreprocessor
-    # (працює лише CLAHE). Прапорець вимкнено, щоб не вводити в оману.
-    histogram_matching: bool = False
-    reference_image_path: str = "config/reference_style.png"
+    # histogram_matching / reference_image_path ВИДАЛЕНО (2026-10): histogram
+    # matching ніколи не був реалізований в ImagePreprocessor (лише CLAHE).
     masking_strategy: str = "yolo"
 
 
-class GuiConfig(BaseModel):
-    video_fps: int = 30
-    verify_display_mode: str = "center"  # "center" | "center_corners" | "full"
-    verify_label_mode: str = "number"
+# Секцію gui (video_fps, verify_display_mode, verify_label_mode) ВИДАЛЕНО
+# (2026-10): діалог налаштувань показував ці поля, але жоден код їх не читав
+# (FPS береться з відео, вигляд перевірки якорів фіксований).
 
 
 class DebugViewsConfig(BaseModel):
@@ -49,6 +48,9 @@ class ObjectTrackingConfig(BaseModel):
     track_activation_threshold: float = 0.25
     lost_track_buffer: int = 30
     minimum_matching_threshold: float = 0.8
+    # COCO ids to track. YOLO detects only the dynamic classes it masks
+    # (person, bicycle, car, motorcycle, bus, truck), so ids outside that set
+    # never appear. Empty list = track every detected class.
     tracked_classes: list[int] = [
         0,
         1,
@@ -57,19 +59,44 @@ class ObjectTrackingConfig(BaseModel):
         5,
         7,
     ]  # COCO: person, bicycle, car, motorcycle, bus, truck
-    show_on_video: bool = True
-    show_on_map: bool = True
-    project_to_gps: bool = True
+    show_on_video: bool = True  # boxes on the video widget
+    show_on_map: bool = True  # markers on the map (export keeps every object)
+    project_to_gps: bool = True  # False = track in the image only, no GPS
 
 
 class LiveStreamConfig(BaseModel):
-    enabled: bool = False
-    source_type: str = "file"  # "file" | "rtsp" | "usb"
-    rtsp_url: str = ""
-    usb_device: int = 0
+    """Live / file video input (src/video/video_source.py).
+
+    The source itself comes from the project (video sources) or --source;
+    enabled / source_type / rtsp_url / usb_device were never read and were
+    removed (2026-10). The type is detected from the source string.
+    """
+
     reconnect_attempts: int = 5
     reconnect_delay_sec: float = 2.0
     buffer_size: int = 1
+
+
+class FlightDataConfig(BaseModel):
+    """Optional drone telemetry (src/flight_data). Default: none — vision only.
+
+    Used as a PRIOR only: heading → rotation prior of each keyframe (a wrong
+    heading costs one retrieval pass, then the vision scan takes over).
+    """
+
+    source: Literal["none", "csv"] = "none"
+    csv_path: str = ""
+    # "generic": time_s, heading_deg, alt_agl_m, alt_msl_m, pitch_deg, roll_deg,
+    # lat, lon. "flightsim": FlightSimulator telemetry.csv (timestamp, yaw_rad, alt_z).
+    csv_preset: Literal["generic", "flightsim"] = "generic"
+    time_offset_s: float = 0.0  # log time = video time + offset
+    max_gap_s: float = 1.0  # no row within this → no sample (stale data is not used)
+    use_heading: bool = True
+    # Heading the TOP of the reference frames pointed to (heading-hold layers: 0).
+    reference_heading_deg: float = 0.0
+    # Camera mounted rotated relative to the nose (clockwise, degrees);
+    # scripts/fit_yaw_offset.py estimates it from a continuous-mode replay.
+    camera_yaw_offset_deg: float = 0.0
 
 
 class NetworkApiConfig(BaseModel):
@@ -124,10 +151,10 @@ class AppConfig(BaseModel):
     localization: LocalizationConfig = LocalizationConfig()
     tracking: TrackingConfig = TrackingConfig()
     preprocessing: PreprocessingConfig = PreprocessingConfig()
-    gui: GuiConfig = GuiConfig()
     debug_views: DebugViewsConfig = DebugViewsConfig()
     models: ModelsConfig = ModelsConfig()
     projection: ProjectionConfig = ProjectionConfig()
     homography: HomographyConfig = HomographyConfig()
     graph_optimization: GraphOptimizationConfig = GraphOptimizationConfig()
     propagation: PropagationConfig = PropagationConfig()
+    flight_data: FlightDataConfig = FlightDataConfig()

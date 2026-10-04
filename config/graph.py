@@ -1,6 +1,8 @@
 """Graph-optimization and projection configuration."""
 
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 class ProjectionConfig(BaseModel):
@@ -9,15 +11,13 @@ class ProjectionConfig(BaseModel):
     # з реальними метрами. Існуючі калібрування зберігають свою проєкцію
     # з файлу — зміна впливає лише на нові.
     default_mode: str = "UTM"
-    strict_projection: bool = True
-    fallback_to_webmercator: bool = True
     anchor_rmse_threshold_m: float = 3.0
     anchor_max_error_m: float = 5.0
     # propagation_disagreement_threshold_m ВИДАЛЕНО: жоден код його не читав.
     # Живий поріг розбіжності якорів — graph_optimization.anchor_loo_threshold_m
     # (див. PoseGraphDiagnostics.leave_one_out_anchor_check).
-    localizer_sample_points: int = 9
-    localizer_expected_spread_m: float = 150.0
+    # strict_projection, fallback_to_webmercator, localizer_sample_points,
+    # localizer_expected_spread_m ВИДАЛЕНО (2026-10): жоден код їх не читав.
 
 
 class PropagationConfig(BaseModel):
@@ -233,3 +233,32 @@ class GraphOptimizationConfig(BaseModel):
     # без ключа. Тримає модель фактично similarity (sx≈sy); зменшення дозволяє
     # справжню анізотропію, але робить _predict_inverse менш точним.
     isotropy_weight: float = 200.0
+
+    # ── Рельєф (terrain scale prior, 2026-10-04). Дефолт off = поточна поведінка. ──
+    # Пласка 5-DoF модель кадру не бачить рельєфу: при сталій висоті польоту
+    # сусідні кадри дивляться на ту саму землю (масштаб ребра ≈ 1), а GSD кадру
+    # = (H − DEM під кадром)/f змінюється. Ланцюг між рідкими якорями тримає
+    # масштаб якоря → похибка росте вздовж галсу (testtopboch_hh: до 460 м).
+    # on: DEM з відкритих джерел (кешується в <проєкт>/terrain), висота польоту
+    # H з якорів (H_a = GSD_a·f + DEM_a), унарний prior масштабу кожного вузла і
+    # корекція ребер на висоту зони перекриття. Див. src/geometry/terrain_scale.py.
+    terrain_scale_prior: bool = False
+    # Вага унарного prior: r = w·cx·(log GSD − log((H − DEM)/f)), як у scale-резидуалі
+    # ребра (вага temporal-ребра ≈ √inliers/(1+rmse), типово 5–15). 0 = лише корекція ребер.
+    terrain_prior_weight: float = 10.0
+    terrain_edge_correction: bool = True
+    # piecewise: H лінійно між якорями (повільна зміна висоти); constant: медіана
+    # (чистий баро-утримання висоти).
+    terrain_altitude_model: Literal["piecewise", "constant"] = "piecewise"
+    # terrarium: AWS Terrain Tiles (PNG, без GDAL), кеш = terrain_dem_path або
+    # <проєкт>/terrain; file: terrain_dem_path = GeoTIFF (метри або terrarium RGB).
+    terrain_dem_source: Literal["terrarium", "file"] = "terrarium"
+    terrain_dem_path: str = ""
+    terrain_dem_zoom: int = Field(13, ge=8, le=15)
+    terrain_dem_download: bool = True
+    # Фокусна у пікселях кадру БД; 0 = з project.json (focal_length_mm /
+    # sensor_width_mm × ширина кадру). Хибна f масштабує лише поправку рельєфу.
+    terrain_focal_px: float = Field(0.0, ge=0.0)
+    # Скільки разів перерахувати DEM-члени за оновленими позиціями й перерозв'язати
+    # граф (після базового розв'язку без рельєфу).
+    terrain_iterations: int = Field(2, ge=1, le=5)

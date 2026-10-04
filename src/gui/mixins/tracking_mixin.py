@@ -363,6 +363,8 @@ class TrackingMixin:
 
     @pyqtSlot(object)
     def on_objects_detected(self, objects: list):
+        if not get_cfg(self.config, "object_tracking.show_on_video", True):
+            return
         if hasattr(self.video_widget, "draw_tracked_objects"):
             self.video_widget.draw_tracked_objects(objects)
 
@@ -392,6 +394,10 @@ class TrackingMixin:
                 }
             )
 
+        # Export (_object_tracking_results) keeps every object; the flag only
+        # controls the map markers.
+        if not get_cfg(self.config, "object_tracking.show_on_map", True):
+            return
         if hasattr(self.map_widget, "update_object_markers"):
             self.map_widget.update_object_markers(points_to_show)
 

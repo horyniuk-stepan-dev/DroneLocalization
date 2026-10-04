@@ -23,6 +23,9 @@ class ObjectTracker:
 
     def __init__(self, config: dict):
         self.config = config
+        # object_tracking.tracked_classes: empty / None = every detected class.
+        classes = self.config.get("tracked_classes")
+        self._tracked_classes = {int(c) for c in classes} if classes else None
 
         if sv is None:
             raise ImportError(
@@ -125,6 +128,9 @@ class ObjectTracker:
         detections: [{"class_id": int, "confidence": float, "bbox": [x1, y1, x2, y2]}, ...]
         """
         tracked_objects = []
+
+        if self._tracked_classes is not None and detections:
+            detections = [d for d in detections if int(d["class_id"]) in self._tracked_classes]
 
         if not detections:
             # supervision requires sv.Detections object even if empty to update track states

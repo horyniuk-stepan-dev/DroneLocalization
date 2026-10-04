@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from config import get_cfg
+from src.localization.query_rotation import is_continuous, rotate_view
 from src.utils.logging_utils import get_logger
 from src.utils.telemetry import Telemetry
 
@@ -25,7 +26,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class RotationResult:
-    angle: int
+    angle: float  # multiples of 90 in "quarter" mode, any value in "continuous"
     score: float
     candidates: list
     source_id: str | None
@@ -34,6 +35,28 @@ class RotationResult:
     # to avoid repeated copying and resizing during subsequent feature extraction.
     frame: Any | None = None
     crop_info: Any | None = None
+    # continuous mode: 0/255 map of the view pixels that come from the frame
+    valid: Any | None = None
+
+
+def extract_globals(extractor: Any, frames: list, valid_masks: list | None) -> list:
+    """Batched global descriptors; validity masks only when the extractor takes them."""
+    multi = len(frames) > 1 and hasattr(extractor, "extract_global_descriptors_multi")
+    if valid_masks is not None:
+        try:
+            if multi:
+                return list(
+                    extractor.extract_global_descriptors_multi(frames, valid_masks=valid_masks)
+                )
+            return [
+                extractor.extract_global_descriptor(f, valid_mask=m)
+                for f, m in zip(frames, valid_masks)
+            ]
+        except TypeError:
+            pass  # extractor without mask support (fakes, older wrappers)
+    if multi:
+        return list(extractor.extract_global_descriptors_multi(frames))
+    return [extractor.extract_global_descriptor(f) for f in frames]
 
 
 class RotationSelector:
@@ -43,6 +66,8 @@ class RotationSelector:
         self.feature_extractor = feature_extractor
         self._candidate_retriever = candidate_retriever
         self.config = config
+        self.continuous = is_continuous(config)
+        self.erode_px = int(get_cfg(config, "localization.rotation_border_erode_px", 8))
 
     def select(
         self,
@@ -61,6 +86,7 @@ class RotationSelector:
         # Winning (angle, scale) pair frame and crop_info — returned to caller
         best_frame: Any | None = None
         best_crop: Any | None = None
+        best_valid: Any | None = None
 
         rescan_min = get_cfg(self.config, "localization.rotation_rescan_min_score", 0.70)
         use_cascade = get_cfg(self.config, "localization.recovery_cascade", False)
@@ -80,10 +106,12 @@ class RotationSelector:
             # We try the prior angle with each scale candidate (usually 1).
             prior_scales = scale_candidates if len(scale_candidates) == 1 else [scale_candidates[0]]
             for sc in prior_scales:
-                rotated_frame, crop_info = self._prepare_frame(
+                rotated_frame, crop_info, valid = self._prepare(
                     query_frame, prior_angle, sc, scale_manager
                 )
-                global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
+                global_desc = extract_globals(
+                    self.feature_extractor, [rotated_frame], None if valid is None else [valid]
+                )[0]
                 with Telemetry.profile("retrieval"):
                     src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
                 if candidates and candidates[0][1] >= min(rescan_min, scale_rescan_min):
@@ -93,7 +121,7 @@ class RotationSelector:
                         best_global_candidates = candidates
                         best_source_id_per_angle = src_id
                         best_scale = sc
-                        best_frame, best_crop = rotated_frame, crop_info
+                        best_frame, best_crop, best_valid = rotated_frame, crop_info, valid
                 else:
                     logger.debug(
                         f"Prior angle {prior_angle}° scale {sc:.2f} score too low "
@@ -112,22 +140,20 @@ class RotationSelector:
                 # rot90 is cached per-angle: otherwise the frame would be
                 # copied for each (angle, scale) pair instead of once per angle
                 # (on 4K footage that is tens of MB of memcpy per extra copy).
-                rot_cache: dict[int, Any] = {}
+                rot_cache: dict[Any, Any] = {}
                 prepared = [
-                    self._prepare_frame(query_frame, a, sc, scale_manager, rot_cache)
+                    self._prepare(query_frame, a, sc, scale_manager, rot_cache)
                     for a, sc in stage_combos
                 ]
                 frames = [p[0] for p in prepared]
+                valids = [p[2] for p in prepared] if self.continuous else None
 
                 # Batch extraction
-                if len(frames) > 1 and hasattr(
-                    self.feature_extractor, "extract_global_descriptors_multi"
-                ):
-                    descs = self.feature_extractor.extract_global_descriptors_multi(frames)
-                else:
-                    descs = [self.feature_extractor.extract_global_descriptor(f) for f in frames]
+                descs = extract_globals(self.feature_extractor, frames, valids)
 
-                for (angle, sc), global_desc, (frm, crop) in zip(stage_combos, descs, prepared):
+                for (angle, sc), global_desc, (frm, crop, valid) in zip(
+                    stage_combos, descs, prepared
+                ):
                     with Telemetry.profile("retrieval"):
                         src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
 
@@ -139,7 +165,7 @@ class RotationSelector:
                             best_global_candidates = candidates
                             best_source_id_per_angle = src_id
                             best_scale = sc
-                            best_frame, best_crop = frm, crop
+                            best_frame, best_crop, best_valid = frm, crop, valid
 
                 # Stage 1 yielded a confident enough match — skip the rest of the pyramid
                 # (16 out of 20 forward passes in a typical config).
@@ -157,6 +183,7 @@ class RotationSelector:
             best_scale=best_scale,
             frame=best_frame,
             crop_info=best_crop,
+            valid=best_valid,
         )
 
     # ── Recovery cascade planning ──────────────────────────────────────────────
@@ -195,6 +222,49 @@ class RotationSelector:
         stage1 = [c for c in combos if c[1] == primary]
         stage2 = [c for c in combos if c[1] != primary]
         return [stage1, stage2]
+
+    def _prepare(
+        self,
+        query_frame: Any,
+        angle: float,
+        sc: float,
+        scale_manager: Any,
+        rot_cache: dict | None = None,
+    ) -> tuple[Any, Any, Any]:
+        """``(frame, crop_info, valid)`` for the configured rotation mode."""
+        if self.continuous:
+            return self._prepare_view(
+                query_frame, angle, sc, scale_manager, rot_cache, self.erode_px
+            )
+        frame, crop = self._prepare_frame(query_frame, int(angle), sc, scale_manager, rot_cache)
+        return frame, crop, None
+
+    @staticmethod
+    def _prepare_view(
+        query_frame: Any,
+        angle: float,
+        sc: float,
+        scale_manager: Any,
+        rot_cache: dict | None = None,
+        erode_px: int = 8,
+    ) -> tuple[Any, Any, Any]:
+        """Continuous mode: same-size rotated view, then GSD normalisation.
+
+        Returns ``(frame, crop_info, valid)``; ``valid`` follows the frame through
+        the same crop/resize so it stays pixel-aligned with it.
+        """
+        key = ("view", round(float(angle), 3))
+        if rot_cache is not None and key in rot_cache:
+            view, valid = rot_cache[key]
+        else:
+            view, _, valid = rotate_view(query_frame, angle, None, erode_px)
+            if rot_cache is not None:
+                rot_cache[key] = (view, valid)
+        if scale_manager is not None and abs(sc - 1.0) > 0.15:
+            frame, crop = scale_manager.normalize(view, sc)
+            valid_n, _ = scale_manager.normalize(valid, sc)
+            return frame, crop, valid_n
+        return view, None, valid
 
     @staticmethod
     def _prepare_frame(

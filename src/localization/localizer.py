@@ -8,6 +8,15 @@ from src.localization.failure_log import FAILURE_TYPES, FailureLogger
 from src.localization.geometric_verifier import GeometricVerifier
 from src.localization.layer_search import LayerSearch
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
+from src.localization.query_rotation import (
+    angle_distance_deg,
+    is_continuous,
+    next_prior_deg,
+    norm_deg,
+    rotation_matrix,
+    scan_angles,
+    view_mask,
+)
 from src.localization.result_builder import ResultBuilder
 from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
 from src.localization.rotation_selector import RotationSelector
@@ -53,6 +62,8 @@ class Localizer:
         self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
         self.use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
         self.mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
+        self.ransac_max_iters = int(get_cfg(self.config, "homography.max_iters", 2000))
+        self.ransac_confidence = float(get_cfg(self.config, "homography.confidence", 0.99))
 
         self.trajectory_filter = TrajectoryFilter(
             process_noise=get_cfg(self.config, "tracking.kalman_process_noise", 2.0),
@@ -170,7 +181,22 @@ class Localizer:
 
         # A3: temporal prior on rotation angle — angle of last successful
         # localization; full 4-angle scan only on score dip or failure
-        self._last_best_angle: int | None = None
+        self._last_best_angle: float | None = None
+
+        # localization.rotation_mode (src/localization/query_rotation.py)
+        self._rot_continuous = is_continuous(self.config)
+        self._rot_scan = scan_angles(
+            get_cfg(self.config, "localization.rotation_scan_step_deg", 45.0)
+        )
+        self._rot_refine_min = float(
+            get_cfg(self.config, "localization.rotation_refine_min_deg", 12.0)
+        )
+        self._rot_erode = int(get_cfg(self.config, "localization.rotation_border_erode_px", 8))
+        if self._rot_continuous:
+            logger.info(
+                f"Rotation mode: continuous (scan {self._rot_scan}, "
+                f"refine > {self._rot_refine_min:.0f} deg)"
+            )
 
         # ── ScaleManager: GSD-ratio estimation for altitude-invariant localization ─
         self._scale_manager = ScaleManager(self.config)
@@ -251,6 +277,8 @@ class Localizer:
             min_reference_eigenvalue=get_cfg(
                 self.config, "localization.geometric_min_reference_eigenvalue", 1e-4
             ),
+            ransac_max_iters=self.ransac_max_iters,
+            ransac_confidence=self.ransac_confidence,
         )
         self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
         self._rotation_selector = RotationSelector(
@@ -329,6 +357,9 @@ class Localizer:
         """Soft depth-based reorder of the scale pyramid (every N keyframes; hint only)."""
         if not self._use_depth_hint or self._db_depth_scale is None:
             return
+        depth_backend = get_cfg(self.config, "models.depth_estimator.backend", "depth_anything_v2")
+        if depth_backend == "none":
+            return
         self._depth_hint_counter += 1
         if (self._depth_hint_counter - 1) % max(1, self._depth_hint_every_n) != 0:
             return
@@ -337,7 +368,7 @@ class Localizer:
                 from src.depth.depth_estimator import DepthEstimator
 
                 device = getattr(self.model_manager, "device", "cuda")
-                self._depth_estimator = DepthEstimator.build(device=device)
+                self._depth_estimator = DepthEstimator.build(backend=depth_backend, device=device)
             q_scale = self._depth_estimator.get_relative_scale(frame)
             self._scale_manager.set_depth_hint(q_scale, self._db_depth_scale)
         except Exception as e:
@@ -510,7 +541,12 @@ class Localizer:
         # Debug: depth map for window (independent of localization success).
         self._maybe_collect_depth(query_frame, collector)
 
-        angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
+        if not self.enable_auto_rotation:
+            angles_to_try = [0]
+        elif self._rot_continuous:
+            angles_to_try = list(self._rot_scan)
+        else:
+            angles_to_try = [0, 90, 180, 270]
 
         top_k = self.retrieval_top_k
 
@@ -557,7 +593,7 @@ class Localizer:
             best_source_id_per_angle = self._active_source_id
             if collector is not None:
                 collector.global_score = best_global_score
-                collector.global_angle = int(best_global_angle)
+                collector.global_angle = self._angle_out(best_global_angle)
                 collector.scale = float(best_scale)
                 collector.retrieval_candidates = [
                     (int(cid), float(sc)) for cid, sc in best_global_candidates
@@ -571,16 +607,20 @@ class Localizer:
             )
         else:
             # ── RESEARCH 2.3: external yaw-hint (simulator / telemetry) ────────
-            # yaw_hint_deg — CW angle in degrees to rotate the frame to match
-            # DB orientation (north-up); conversion from drone heading
-            # is done by caller. Quantized to 90 degrees — full rotation path operates with
-            # k*90. False hint self-heals: if retrieval-score of prior-angle
-            # is lower than rotation_rescan_min_score, RotationSelector performs
-            # full batched 4-angle scan.
+            # yaw_hint_deg — angle to rotate the frame by to match the DB
+            # orientation, in the np.rot90 / cv2.getRotationMatrix2D sense
+            # (positive = counter-clockwise on screen); src/telemetry converts a
+            # compass heading into it. "quarter" mode quantizes it to k*90;
+            # "continuous" uses it as is. A false hint self-heals: if the
+            # retrieval score at the prior angle is below rotation_rescan_min_score,
+            # RotationSelector falls back to the full scan.
             prior_angle = self._last_best_angle
             use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
             if yaw_hint_deg is not None and self.enable_auto_rotation:
-                prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
+                if self._rot_continuous:
+                    prior_angle = norm_deg(yaw_hint_deg)
+                else:
+                    prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
                 use_prior = True
                 logger.debug(f"Yaw hint {yaw_hint_deg:.1f}° → prior rotation {prior_angle}°")
 
@@ -611,7 +651,7 @@ class Localizer:
 
             if collector is not None:
                 collector.global_score = float(best_global_score)
-                collector.global_angle = int(best_global_angle)
+                collector.global_angle = self._angle_out(best_global_angle)
                 collector.scale = float(best_scale)
                 collector.retrieval_candidates = [
                     (int(cid), float(sc)) for cid, sc in best_global_candidates
@@ -685,6 +725,34 @@ class Localizer:
             ver = self._geometric_verifier.verify(
                 best_query_features, best_global_candidates, self.database
             )
+
+        # ── Continuous rotation: remove the residual the scan step left ──────
+        # The scan lands within step/2 of the true heading; the verified
+        # homography measures the rest. One re-extraction at the corrected angle
+        # turns e.g. a 20° residual (~half the inliers, see query_rotation) into
+        # ~0°. Kept only if it verifies the same frame with more inliers.
+        if (
+            ver is not None
+            and self._rot_continuous
+            and self.enable_auto_rotation
+            and self._rot_refine_min > 0
+        ):
+            refined = self._refine_rotation(
+                query_frame, static_mask, best_global_angle, best_scale, ver, _feat_cache
+            )
+            if refined is not None:
+                (
+                    ver,
+                    best_global_angle,
+                    best_rotated_frame,
+                    best_rotated_mask,
+                    _crop_info,
+                    best_query_features,
+                ) = refined
+                if collector is not None:
+                    collector.global_angle = self._angle_out(best_global_angle)
+                    collector.rotated_frame = best_rotated_frame
+                    collector.query_features = best_query_features
         if ver is not None:
             best_inliers = ver.inliers
             best_candidate_id = ver.candidate_id
@@ -810,11 +878,15 @@ class Localizer:
                 ),
             }
 
-        # Dimensions of rotated normalized image
-        if best_global_angle in (90, 270):
+        # Dimensions of rotated normalized image. Continuous mode keeps the
+        # view the size of the frame and folds the rotation into H below, so
+        # everything downstream works in ORIGINAL frame coordinates.
+        if not self._rot_continuous and best_global_angle in (90, 270):
             rot_height, rot_width = width, height
         else:
             rot_height, rot_width = height, width
+        # Rotation measured by this match (view -> reference), for the next prior.
+        H_view_to_ref = best_H_query_to_ref
 
         M_query_to_ref = best_H_query_to_ref
         if M_query_to_ref is None:
@@ -844,13 +916,26 @@ class Localizer:
                     np.asarray(best_mkpts_q_inliers, dtype=np.float64), _A_inv
                 )
 
+        # Continuous mode: view -> original frame. After this, M maps ORIGINAL
+        # (resolution-normalised) frame pixels to the reference frame and the
+        # rest of the pipeline treats the keyframe as unrotated (angle 0).
+        downstream_angle = best_global_angle
+        if self._rot_continuous:
+            R_view = rotation_matrix(best_global_angle, width, height)
+            M_query_to_ref = M_query_to_ref @ R_view
+            if best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
+                best_mkpts_q_inliers = GeometryTransforms.apply_homography(
+                    np.asarray(best_mkpts_q_inliers, dtype=np.float64), np.linalg.inv(R_view)
+                )
+            downstream_angle = 0
+
         # ── Step 5: State for Optical Flow (commit — AFTER outlier gate) ─────
         pending_state = {
             "H": M_query_to_ref,
             "affine": affine_ref,
             "candidate_id": best_candidate_id,
             "inliers": best_inliers,
-            "global_angle": best_global_angle,
+            "global_angle": downstream_angle,
             "source_id": self._active_source_id,
             # Normalization scale of THIS SPECIFIC keyframe: OF operates in
             # frame system belonging to H (fresh self._last_scale on
@@ -1023,7 +1108,13 @@ class Localizer:
         )
 
         # A3: remember angle for temporal prior of next keyframe
-        self._last_best_angle = best_global_angle
+        if self._rot_continuous:
+            # Angle at which this match would have had zero residual rotation:
+            # in steady flight the next keyframe is then aligned to within the
+            # heading change between two keyframes.
+            self._last_best_angle = next_prior_deg(best_global_angle, H_view_to_ref)
+        else:
+            self._last_best_angle = best_global_angle
 
         # Scale prior: extract scale from H for the next keyframe
         self._scale_manager.update_from_homography(M_query_to_ref, rot_width, rot_height)
@@ -1039,7 +1130,7 @@ class Localizer:
             "raw_lon": raw_lon,
             "raw_metric": [mx, my],
             "scale_ratio": float(best_scale),
-            "rotation_deg": int(best_global_angle),
+            "rotation_deg": self._angle_out(best_global_angle),
             "fov_polygon": gps_corners,
             "sample_spread_m": 0.0,
             "source_id": self._active_source_id,
@@ -1244,6 +1335,39 @@ class Localizer:
 
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── Continuous rotation helpers (localization.rotation_mode) ─────────────
+
+    def _angle_out(self, angle) -> float | int:
+        """Angle as reported/collected: int (k*90) in quarter mode, float otherwise."""
+        return round(float(angle), 2) if self._rot_continuous else int(angle)
+
+    def _refine_rotation(self, query_frame, static_mask, angle, scale, ver, cache):
+        """Re-verify ``ver``'s frame at the residual-corrected angle.
+
+        Returns ``(ver, angle, frame, mask, crop_info, features)`` when the
+        corrected view verifies the same reference frame with more inliers,
+        else None.
+        """
+        target = next_prior_deg(angle, ver.H_query_to_ref)
+        residual = angle_distance_deg(target, angle)
+        if residual < self._rot_refine_min:
+            return None
+        frame, mask, crop, feats = self._prepare_and_extract(
+            query_frame, static_mask, target, scale, cache
+        )
+        ver2 = self._geometric_verifier.verify(feats, [(int(ver.candidate_id), 0.0)], self.database)
+        if ver2 is None or ver2.inliers <= ver.inliers:
+            logger.debug(
+                f"Rotation refine {angle:.1f}° -> {target:.1f}° kept the original "
+                f"({ver.inliers} vs {getattr(ver2, 'inliers', 0)} inliers)"
+            )
+            return None
+        logger.debug(
+            f"Rotation refine {angle:.1f}° -> {target:.1f}° (residual {residual:.1f}°): "
+            f"inliers {ver.inliers} -> {ver2.inliers}"
+        )
+        return ver2, target, frame, mask, crop, feats
+
     # ── PIPELINE_OPTIMIZATION_PLAN §A1 ──────────────────────────────────────
 
     def _prepare_and_extract(
@@ -1268,6 +1392,10 @@ class Localizer:
         і ALIKED — на 1080p це мінус ~6 МБ memcpy і один resize на keyframe.
         Маску все одно доводиться готувати окремо: селектор її не бачить.
         """
+        if self._rot_continuous:
+            return self._prepare_and_extract_view(
+                query_frame, static_mask, angle, scale, cache, prepared
+            )
         key = (int(angle), round(float(scale), 3))
         cached = cache.get(key)
         if cached is not None:
@@ -1305,6 +1433,41 @@ class Localizer:
             "image_size", np.array([rotated.shape[0], rotated.shape[1]], dtype=np.int32)
         )
         cache[key] = (rotated, rot_mask, crop_info, feats)
+        return cache[key]
+
+    def _prepare_and_extract_view(
+        self,
+        query_frame: np.ndarray,
+        static_mask: np.ndarray | None,
+        angle: float,
+        scale: float,
+        cache: dict,
+        prepared: tuple | None = None,
+    ) -> tuple:
+        """Continuous-mode twin of ``_prepare_and_extract``.
+
+        Same-size rotated view (query_rotation.rotate_view) → GSD normalisation
+        → ALIKED, with keypoints restricted to the part of the view that comes
+        from the frame (and to the static/YOLO mask).
+        """
+        key = ("view", round(float(angle), 2), round(float(scale), 3))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        from src.localization.rotation_selector import RotationSelector
+
+        if prepared is not None and prepared[0] is not None:
+            frame, crop_info = prepared[0], prepared[1]
+        else:
+            frame, crop_info, _ = RotationSelector._prepare_view(
+                query_frame, angle, scale, self._scale_manager, None, self._rot_erode
+            )
+        mask = view_mask(query_frame.shape[:2], angle, static_mask, self._rot_erode)
+        if mask is not None and abs(float(scale) - 1.0) > 0.15:
+            mask, _ = self._scale_manager.normalize(mask, float(scale))
+        feats = self.feature_extractor.extract_local_features(frame, static_mask=mask)
+        feats.setdefault("image_size", np.array([frame.shape[0], frame.shape[1]], dtype=np.int32))
+        cache[key] = (frame, mask, crop_info, feats)
         return cache[key]
 
     def _tp_neighbour_ids(self) -> list[int]:
@@ -1387,7 +1550,8 @@ class Localizer:
             )
             return None
 
-        return (ver, int(angle), float(scale), rotated, rot_mask, crop_info, feats, probe)
+        out_angle = float(angle) if self._rot_continuous else int(angle)
+        return (ver, out_angle, float(scale), rotated, rot_mask, crop_info, feats, probe)
 
     def _compute_confidence(
         self,
@@ -1482,6 +1646,8 @@ class Localizer:
                     mkq,
                     mkr,
                     ransac_threshold=self.ransac_thresh,
+                    max_iters=self.ransac_max_iters,
+                    confidence=self.ransac_confidence,
                     backend=self.homography_backend,
                     use_mad_ransac=self.use_mad_ransac,
                     mad_k_factor=self.mad_k_factor,

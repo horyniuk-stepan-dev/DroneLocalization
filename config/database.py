@@ -48,4 +48,10 @@ class DatabaseConfig(BaseModel):
     sift_max_keypoints: int = 2048
     lancedb_batch_size: int = 64
     lancedb_index_min_frames: int = 256
+    # HDF5 layout (db_writer). Read since schema v2 but undeclared until 2026-10,
+    # so user_config could not change them. max_keypoints_stored is part of the
+    # schema fingerprint: databases built with another value are refused.
+    hdf5_compression: str = "lzf"  # "lzf" | "gzip" | "none"
+    hdf5_chunk_frames: int = 64
+    max_keypoints_stored: int = 2048
     yolo_batch_size: int = 1

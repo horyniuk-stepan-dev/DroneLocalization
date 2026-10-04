@@ -181,3 +181,41 @@ def test_config_overrides_reach_nested_keys_and_check_types():
     ):
         with pytest.raises(ValueError):
             apply_overrides(config, bad)
+
+
+def test_terrain_layer_config_sets_shared_dem_cache_and_focal(tmp_path):
+    from scripts.layer_gt_tools import SimulatorRun
+
+    run = tmp_path / "run"
+    run.mkdir()
+    camera = {"focal_length_mm": 13.2, "sensor_width_mm": 8.8, "image_width_px": 1280}
+    (run / "manifest.json").write_text(json.dumps({"config": {"camera": camera}}), encoding="utf-8")
+    assert bmp.recording_camera(SimulatorRun(run)) == camera
+    assert bmp.recording_camera(SimulatorRun(tmp_path / "missing")) == {}
+
+    db = tmp_path / "db.h5"
+    with h5py.File(db, "w") as f:
+        f.create_group("metadata").attrs["frame_width"] = 1280
+    off = {"graph_optimization": {"terrain_scale_prior": False}}
+    assert bmp.terrain_layer_config(off, tmp_path, camera, db) is off
+    on = {
+        "graph_optimization": {
+            "terrain_scale_prior": True,
+            "terrain_dem_path": "",
+            "terrain_focal_px": 0.0,
+        }
+    }
+    out = bmp.terrain_layer_config(on, tmp_path / "proj", camera, db)
+    assert out["graph_optimization"]["terrain_dem_path"] == str(tmp_path / "proj" / "terrain")
+    assert out["graph_optimization"]["terrain_focal_px"] == pytest.approx(1920.0)
+    assert on["graph_optimization"]["terrain_focal_px"] == 0.0  # input untouched
+    fixed = {
+        "graph_optimization": {
+            "terrain_scale_prior": True,
+            "terrain_dem_path": "X",
+            "terrain_focal_px": 1500.0,
+        }
+    }
+    out2 = bmp.terrain_layer_config(fixed, tmp_path, camera, db)
+    assert out2["graph_optimization"]["terrain_dem_path"] == "X"
+    assert out2["graph_optimization"]["terrain_focal_px"] == 1500.0

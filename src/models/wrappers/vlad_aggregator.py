@@ -164,8 +164,21 @@ class VladAggregator:
         n = np.linalg.norm(flat)
         return flat / n if n > 1e-12 else flat
 
-    def aggregate(self, tokens: np.ndarray) -> np.ndarray:
-        """Patch tokens (N, D) -> global descriptor (out_dim,), L2-normalized."""
+    # A partially valid view (rotated query: black wedges outside the frame)
+    # aggregates only its valid tokens; below this count all tokens are kept.
+    MIN_VALID_TOKENS = 16
+
+    def aggregate(self, tokens: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
+        """Patch tokens (N, D) -> global descriptor (out_dim,), L2-normalized.
+
+        ``valid`` (N,) bool selects the tokens to aggregate (None = all).
+        VLAD is a sum over tokens, so a subset is a well-defined descriptor of
+        the visible content; the database side always passes None.
+        """
+        if valid is not None:
+            valid = np.asarray(valid, dtype=bool).ravel()
+            if valid.shape[0] == len(tokens) and int(valid.sum()) >= self.MIN_VALID_TOKENS:
+                tokens = np.asarray(tokens)[valid]
         v = self._vlad(tokens)
         if self.pca_components is not None:
             v = (v - self.pca_mean) @ self.pca_components.T
@@ -175,9 +188,15 @@ class VladAggregator:
                 v = v / n
         return v.astype(np.float32)
 
-    def aggregate_batch(self, tokens_batch: np.ndarray | list[np.ndarray]) -> np.ndarray:
+    def aggregate_batch(
+        self,
+        tokens_batch: np.ndarray | list[np.ndarray],
+        valid_batch: list[np.ndarray | None] | None = None,
+    ) -> np.ndarray:
         """(B, N, D) or list of (N_i, D) -> (B, out_dim)."""
-        return np.stack([self.aggregate(t) for t in tokens_batch])
+        if valid_batch is None:
+            return np.stack([self.aggregate(t) for t in tokens_batch])
+        return np.stack([self.aggregate(t, v) for t, v in zip(tokens_batch, valid_batch)])
 
     def save(self, path: str, provenance: dict | None = None) -> None:
         if self.centers is None:

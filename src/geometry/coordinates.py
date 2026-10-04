@@ -123,6 +123,20 @@ class CoordinateConverter:
         lon, lat = self._transformer_to_gps.transform(x, y)
         return float(lat), float(lon)
 
+    def metric_to_gps_array(self, x, y):
+        """Vectorised metric_to_gps: arrays of x, y -> (lat, lon) arrays."""
+        import numpy as np
+
+        if not self._initialized:
+            if self._mode == "WEB_MERCATOR":
+                self._initialize_projection(0.0, 0.0)
+            else:
+                raise RuntimeError("CoordinateConverter is not initialized.")
+        lon, lat = self._transformer_to_gps.transform(
+            np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+        )
+        return np.asarray(lat, dtype=np.float64), np.asarray(lon, dtype=np.float64)
+
     def export_metadata(self) -> dict[str, Any]:
         """Export settings for serialization."""
         return {"mode": self._mode, "reference_gps": self._reference_gps}

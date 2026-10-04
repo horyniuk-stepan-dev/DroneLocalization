@@ -108,6 +108,8 @@ def main() -> int:
             previous_timestamp = timestamp
             started = time.perf_counter()
             # No GT field, altitude, camera pose or heading enters this call.
+            # RGB like the database builder and the tracking worker (cv2 gives BGR).
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             result = localizer.localize_frame(frame, dt=dt, timestamp=timestamp)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             target = tuple(map(float, slot["ground_center_gps"]))

@@ -63,6 +63,31 @@ except ImportError:
 logger = get_logger(__name__)
 
 
+def lightglue_conf(block) -> dict:
+    """LightGlue constructor options from a models.lightglue* config block.
+
+    Defaults are the lightglue library defaults, i.e. what ran before these
+    keys were wired (2026-10).
+    """
+    return {
+        "depth_confidence": float(get_cfg(block, "depth_confidence", 0.95)),
+        "width_confidence": float(get_cfg(block, "width_confidence", 0.99)),
+        "filter_threshold": float(get_cfg(block, "filter_threshold", 0.1)),
+        "flash": bool(get_cfg(block, "flash", True)),
+        "mp": bool(get_cfg(block, "mixed_precision", False)),
+    }
+
+
+def aliked_conf_from(config) -> dict:
+    """ALIKED constructor options from models.aliked (library defaults otherwise)."""
+    return {
+        "model_name": str(get_cfg(config, "models.aliked.model_name", "aliked-n16")),
+        "max_num_keypoints": int(get_cfg(config, "models.aliked.max_keypoints", 4096)),
+        "detection_threshold": float(get_cfg(config, "models.aliked.detection_threshold", 0.2)),
+        "nms_radius": int(get_cfg(config, "models.aliked.nms_radius", 2)),
+    }
+
+
 class ModelManager:
     def __init__(self, config=None, device="cuda"):
         self.config = config or {}
@@ -298,7 +323,7 @@ class ModelManager:
                 logger.info(f"Loading XFeat model ({repo}/{model_name})...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    preset = get_cfg(self.config, "models.xfeat.xfeat_preset", "fast")
+                    preset = get_cfg(self.config, "models.xfeat.preset", "fast")
                     try:
                         # Attempt to pass quality_preset if supported by User's XFeat fork
                         model = torch.hub.load(
@@ -342,6 +367,9 @@ class ModelManager:
                         "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
                         "max_num_keypoints": get_cfg(
                             self.config, "models.superpoint.max_keypoints", 4096
+                        ),
+                        "detection_threshold": get_cfg(
+                            self.config, "models.superpoint.detection_threshold", 0.0005
                         ),
                     }
                     model = SuperPoint(**sp_config).eval().to(self.device)
@@ -453,7 +481,11 @@ class ModelManager:
 
                         # For RDD, use SuperPoint architecture (256-dim), as 'rdd' is not native to the library
                         lg_feature_type = "superpoint" if features == "rdd" else features
-                        model = LightGlue(features=lg_feature_type).eval().to(self.device)
+                        lg_conf = lightglue_conf(config)
+                        logger.info(f"LightGlue ({features}) conf: {lg_conf}")
+                        model = (
+                            LightGlue(features=lg_feature_type, **lg_conf).eval().to(self.device)
+                        )
 
                         # If custom weights provided (e.g., for RDD), load them
                         if model_path and os.path.exists(model_path):
@@ -628,15 +660,16 @@ class ModelManager:
         with self._model_lock:
             if name not in self.models:
                 vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
-                max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
+                aliked_conf = aliked_conf_from(self.config)
+                max_keypoints = aliked_conf["max_num_keypoints"]
 
-                logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
+                logger.info(f"Loading ALIKED model ({aliked_conf})...")
                 self._ensure_vram_available(vram_req)
                 try:
                     if ALIKED is None:
                         raise ImportError("lightglue.ALIKED not found")
 
-                    model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
+                    model = ALIKED(**aliked_conf).eval().to(self.device)
 
                     if self._is_torch_compile_supported():
                         try:

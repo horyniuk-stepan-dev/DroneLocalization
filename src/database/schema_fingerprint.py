@@ -108,10 +108,8 @@ def build_components(
     def g(path: str, default: Any) -> Any:
         return get_cfg(config, path, default)
 
-    # global_descriptor lives at top level; fall back to models.* for safety.
-    backend = g("global_descriptor.backend", None)
-    if backend is None:
-        backend = g("models.global_descriptor.backend", "dinov3")
+    # global_descriptor lives at top level ("models.global_descriptor" never existed).
+    backend = g("global_descriptor.backend", "dinov3")
 
     vlad_enabled = bool(g("models.vlad.enabled", False))
     vlad_layer = g("models.vlad.layer", None)

@@ -96,6 +96,8 @@ class PropagationPipeline:
         self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
         self.use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
         self.mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
+        self.ransac_max_iters = int(get_cfg(self.config, "homography.max_iters", 2000))
+        self.ransac_confidence = float(get_cfg(self.config, "homography.confidence", 0.99))
 
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
@@ -226,6 +228,19 @@ class PropagationPipeline:
         self.isotropy_weight = get_cfg(self.config, go + "isotropy_weight", 200.0)
         self.skip_bridges = get_cfg(self.config, "propagation.skip_bridges", False)
         self.mnn_fallback = get_cfg(self.config, "propagation.mnn_fallback", False)
+        # Terrain (relief) terms; off = current behaviour. See terrain_scale.py.
+        self.terrain_prior = get_cfg(self.config, go + "terrain_scale_prior", False)
+        self.terrain_prior_weight = float(get_cfg(self.config, go + "terrain_prior_weight", 10.0))
+        self.terrain_edge_correction = get_cfg(self.config, go + "terrain_edge_correction", True)
+        self.terrain_altitude_model = get_cfg(
+            self.config, go + "terrain_altitude_model", "piecewise"
+        )
+        self.terrain_dem_source = get_cfg(self.config, go + "terrain_dem_source", "terrarium")
+        self.terrain_dem_path = get_cfg(self.config, go + "terrain_dem_path", "")
+        self.terrain_dem_zoom = int(get_cfg(self.config, go + "terrain_dem_zoom", 13))
+        self.terrain_dem_download = get_cfg(self.config, go + "terrain_dem_download", True)
+        self.terrain_focal_px = float(get_cfg(self.config, go + "terrain_focal_px", 0.0))
+        self.terrain_iterations = int(get_cfg(self.config, go + "terrain_iterations", 2))
         self._n_rotation_retry = 0
         self._origin_xy = (0.0, 0.0)
 
@@ -493,6 +508,25 @@ class PropagationPipeline:
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
         self._check_running()
+
+        # ── Phase 4b: terrain terms (flag-gated) ─────────────────────────────
+        # Re-solves from the relief-free solution: DEM footprints need positions
+        # that are already roughly right, and pruning has already happened.
+        if self.terrain_prior:
+            self._report_progress(78, "Terrain relief: DEM scale terms...")
+            terrain = self._build_terrain_terms(optimizer)
+            if terrain is not None:
+                for it in range(self.terrain_iterations):
+                    stats = terrain.apply(optimizer)
+                    logger.info(f"Terrain pass {it + 1}/{self.terrain_iterations}: {stats}")
+                    results = optimizer.optimize(
+                        max_iterations=self.max_iters,
+                        tolerance=self.tolerance,
+                        progress_callback=lambda msg: self._report_progress(78, msg),
+                        use_analytic_jac=self.use_analytic_jac,
+                        kinematic_prior_weight=self.kinematic_prior_weight,
+                    )
+                    self._check_running()
 
         # Propagation diagnostics: edge classes, residuals, worst frames, anchor stress
         try:
@@ -1507,6 +1541,115 @@ class PropagationPipeline:
             logger.warning(f"Ground scale factor unavailable ({e}) — using 1.0")
             return 1.0
 
+    def _terrain_focal_px(self) -> float:
+        """Focal length in DB-frame pixels: config, else project.json, else defaults."""
+        if self.terrain_focal_px > 0:
+            return self.terrain_focal_px
+        from src.geometry.dem import find_project_dir
+
+        focal_mm, sensor_mm, origin = 13.2, 8.8, "default camera 13.2/8.8 mm"
+        project = find_project_dir(self.database.db_path)
+        if project is not None:
+            try:
+                data = json.loads((project / "project.json").read_text(encoding="utf-8"))
+                focal_mm = float(data.get("focal_length_mm", focal_mm))
+                sensor_mm = float(data.get("sensor_width_mm", sensor_mm))
+                origin = f"project.json {focal_mm}/{sensor_mm} mm"
+            except Exception as e:  # encrypted or malformed manifest
+                logger.warning(f"Terrain: project.json camera unreadable ({e})")
+        f_px = focal_mm / sensor_mm * float(self.frame_w)
+        logger.info(f"Terrain: focal {f_px:.1f} px ({origin}, frame width {self.frame_w})")
+        return f_px
+
+    def _build_terrain_terms(self, optimizer):
+        """DEM + altitude profile for the terrain terms; None (logged) when unavailable."""
+        from pathlib import Path
+
+        from src.geometry.dem import find_project_dir, resolve_dem
+        from src.geometry.terrain_scale import (
+            AltitudeProfile,
+            TerrainScaleModel,
+            TerrainTerms,
+            altitude_terrain_slope,
+            anchor_altitudes,
+            fit_constant_altitude,
+            metric_to_latlon,
+        )
+
+        converter = getattr(self.calibration, "converter", None)
+        if converter is None:
+            logger.warning("Terrain: calibration has no coordinate converter — skipped")
+            return None
+        states = optimizer.node_states()
+        if not states:
+            return None
+        ox, oy = self._origin_xy
+        diag = 0.5 * float(np.hypot(self.frame_w, self.frame_h))
+        pts_x, pts_y = [], []
+        for st in states.values():
+            r = diag * float(np.exp(0.5 * (st[2] + st[3])))
+            for dx, dy in ((-r, -r), (r, r), (-r, r), (r, -r)):
+                pts_x.append(st[0] + ox + dx)
+                pts_y.append(st[1] + oy + dy)
+        lat, lon = metric_to_latlon(np.array(pts_x), np.array(pts_y), converter)
+        bbox = (float(lat.min()), float(lon.min()), float(lat.max()), float(lon.max()))
+        project = find_project_dir(self.database.db_path)
+        cache = (project or Path(self.database.db_path).parent) / "terrain"
+        dem = resolve_dem(
+            self.terrain_dem_source,
+            self.terrain_dem_path,
+            self.terrain_dem_zoom,
+            bbox,
+            cache,
+            download=self.terrain_dem_download,
+        )
+        if dem is None:
+            logger.warning("Terrain: no DEM — propagation result is relief-free")
+            return None
+        model = TerrainScaleModel(
+            dem=dem,
+            converter=converter,
+            origin_xy=(ox, oy),
+            frame_w=self.frame_w,
+            frame_h=self.frame_h,
+            f_px=self._terrain_focal_px(),
+            sign=optimizer.sign,
+        )
+        anchors = anchor_altitudes(model, optimizer.anchor_states())
+        ok = np.isfinite(anchors["alt"])
+        if not np.any(ok):
+            logger.warning("Terrain: no anchor has DEM under it — skipped")
+            return None
+        alt = anchors["alt"][ok]
+        logger.info(
+            f"Terrain: DEM {dem.source}, {int(ok.sum())} anchors, flight altitude from anchors "
+            f"median {np.median(alt):.1f} m (min {alt.min():.1f}, max {alt.max():.1f}), "
+            f"DEM under anchors {np.nanmin(anchors['dem']):.1f}–{np.nanmax(anchors['dem']):.1f} m"
+        )
+        follow = altitude_terrain_slope(anchors["alt"], anchors["dem"])
+        if follow is not None and follow > 0.5:
+            logger.warning(
+                f"Terrain: anchor altitudes follow the DEM (dH/dDEM = {follow:.2f}) — looks like "
+                "terrain-following flight, where the flat per-frame model already holds; "
+                "terrain terms skipped"
+            )
+            return None
+        fit = fit_constant_altitude(anchors["gsd"], anchors["dem"])
+        if fit is not None:
+            logger.info(
+                f"Terrain check: anchors alone imply focal {fit[0]:.0f} px and constant "
+                f"altitude {fit[1]:.0f} m (used: {model.f_px:.0f} px)"
+            )
+        profile = AltitudeProfile(
+            np.asarray(anchors["ids"])[ok], alt, mode=self.terrain_altitude_model
+        )
+        return TerrainTerms(
+            model,
+            profile,
+            prior_weight=self.terrain_prior_weight,
+            edge_correction=self.terrain_edge_correction,
+        )
+
     def _load_previous_affines(self) -> dict[int, np.ndarray]:
         """Load frame_affine from the previous HDF5 calibration for warm start."""
         try:
@@ -1549,6 +1692,8 @@ class PropagationPipeline:
                 mkpts_a,
                 mkpts_b,
                 ransac_threshold=self.ransac_thresh,
+                max_iters=self.ransac_max_iters,
+                confidence=self.ransac_confidence,
                 backend=self.homography_backend,
                 use_mad_ransac=self.use_mad_ransac,
                 mad_k_factor=self.mad_k_factor,
