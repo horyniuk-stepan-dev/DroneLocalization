@@ -166,6 +166,10 @@ class DatabaseMixin:
             return False
 
         self.active_source_id = source_id
+        if self.database is not None and self.database.converter is not None:
+            self.calibration.converter = self.database.converter
+        if getattr(self, "map_widget", None):
+            self.map_widget.set_coordinate_mode(self.calibration.converter.mode, reset=True)
         logger.info(
             f"Active layer: '{source_id}' (db={'loaded' if self.database else 'none'}, "
             f"anchors={len(self.calibration.anchors)})"
@@ -251,6 +255,8 @@ class DatabaseMixin:
         # Projection: the DB (what propagation used) has priority over the JSON.
         if self.database is not None and self.database.converter is not None:
             self.calibration.converter = self.database.converter
+        if getattr(self, "map_widget", None):
+            self.map_widget.set_coordinate_mode(self.calibration.converter.mode, reset=True)
         self._update_project_info_panel()
 
     # ── Database generation ────────────────────────────────────────────────────────
@@ -292,7 +298,7 @@ class DatabaseMixin:
         # Do NOT initialize WEB_MERCATOR when starting database generation.
         # UTM converter will be initialized automatically after first GPS anchor.
         # (Build actions activate the target layer first, so this is its calibration.)
-        if not self.calibration.is_calibrated:
+        if not self.calibration.is_calibrated and self.calibration.converter.mode != "LOCAL":
             self.calibration.converter = CoordinateConverter(
                 "UTM"
             )  # ref_gps=None → auto on first anchor
@@ -592,9 +598,10 @@ class DatabaseMixin:
             if self.database and self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
+                kind = "Local X/Y" if self.calibration.converter.mode == "LOCAL" else "GPS"
                 self.status_bar.showMessage(
                     f"Project: {self.project_manager.project_name} | layer '{layer}' "
-                    f"(GPS: {n_valid}/{n_total} frames)"
+                    f"({kind}: {n_valid}/{n_total} frames)"
                 )
             else:
                 self.status_bar.showMessage(
@@ -738,11 +745,12 @@ class DatabaseMixin:
             QMessageBox.warning(self, "Warning", "No results to export!\n\nPerform tracking first.")
             return
 
+        local_results = any(r.get("coordinate_kind") == "local_planar" for r in self._tracking_results)
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export results",
             "tracking_results",
-            "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
+            "CSV (*.csv)" if local_results else "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
         )
         if not path:
             return

@@ -40,6 +40,12 @@ class MapBridge(QObject):
 
     # JS -> Python: Map Click
     mapClickedSignal = pyqtSignal(float, float)
+    readySignal = pyqtSignal(str)
+
+    @pyqtSlot(str)
+    def ready(self, mode: str):
+        """Flush updates only after the page has connected its signal handlers."""
+        self.readySignal.emit(mode)
 
     @pyqtSlot(float, float)
     def mapClicked(self, lat: float, lon: float):
@@ -61,6 +67,10 @@ class MapWidget(QWebEngineView):
 
         self.bridge = MapBridge()
         self.bridge.mapClickedSignal.connect(self.mapClicked)  # Re-emit for convenience
+        self.bridge.readySignal.connect(self._on_map_ready)
+        self._coordinate_mode = "GEOGRAPHIC"
+        self._map_ready = False
+        self._pending_updates = []
 
         self._channel = QWebChannel()
         self._channel.registerObject("mapBridge", self.bridge)
@@ -71,9 +81,13 @@ class MapWidget(QWebEngineView):
     # ── Map loading ──────────────────────────────────────────────────────────
 
     def _load_map(self):
-        if _MAP_PATH.exists():
-            self.setUrl(QUrl.fromLocalFile(str(_MAP_PATH)))
-            logger.info(f"Map loaded: {_MAP_PATH}")
+        map_path = (
+            _MAP_PATH.with_name("local_map.html") if self._coordinate_mode == "LOCAL" else _MAP_PATH
+        )
+        self._map_ready = False
+        if map_path.exists():
+            self.setUrl(QUrl.fromLocalFile(str(map_path)))
+            logger.info(f"Map loaded: {map_path}")
         else:
             logger.error(f"Map template not found: {_MAP_PATH}")
             self.setHtml(
@@ -88,17 +102,38 @@ class MapWidget(QWebEngineView):
 
     # ── Public API ───────────────────────────────────────────────────────────
 
+    def set_coordinate_mode(self, mode: str, *, reset: bool = False):
+        mode = "LOCAL" if mode == "LOCAL" else "GEOGRAPHIC"
+        if mode != self._coordinate_mode or reset:
+            self._coordinate_mode = mode
+            self._pending_updates.clear()
+            self._load_map()
+
+    def _emit_update(self, signal: str, *args):
+        if self._map_ready:
+            getattr(self.bridge, signal).emit(*args)
+        else:
+            self._pending_updates.append((signal, args))
+
+    def _on_map_ready(self, mode: str):
+        if mode != self._coordinate_mode:
+            return
+        self._map_ready = True
+        pending, self._pending_updates = self._pending_updates, []
+        for signal, args in pending:
+            getattr(self.bridge, signal).emit(*args)
+
     @pyqtSlot(float, float)
     def update_marker(self, lat: float, lon: float):
-        self.bridge.updateMarkerSignal.emit(lat, lon)
+        self._emit_update("updateMarkerSignal", lat, lon)
 
     @pyqtSlot(float, float)
     def add_trajectory_point(self, lat: float, lon: float):
-        self.bridge.addTrajectorySignal.emit(lat, lon)
+        self._emit_update("addTrajectorySignal", lat, lon)
 
     @pyqtSlot()
     def clear_trajectory(self):
-        self.bridge.clearTrajectorySignal.emit()
+        self._emit_update("clearTrajectorySignal")
 
     @pyqtSlot(list)
     def update_fov(self, fov: list):
@@ -110,7 +145,8 @@ class MapWidget(QWebEngineView):
             return
 
         try:
-            self.bridge.updateFOVSignal.emit(
+            self._emit_update(
+                "updateFOVSignal",
                 float(fov[0][0]),
                 float(fov[0][1]),
                 float(fov[1][0]),
@@ -136,7 +172,8 @@ class MapWidget(QWebEngineView):
         lat_bl: float,
         lon_bl: float,
     ):
-        self.bridge.setPanoramaSignal.emit(
+        self._emit_update(
+            "setPanoramaSignal",
             data_url,
             lat_tl,
             lon_tl,
@@ -153,19 +190,19 @@ class MapWidget(QWebEngineView):
         """
         Accepts points as list of dicts [{'lat': float, 'lon': float, 'label': str}]
         """
-        self.bridge.showVerificationMarkersSignal.emit(json.dumps(points))
+        self._emit_update("showVerificationMarkersSignal", json.dumps(points))
 
     @pyqtSlot()
     def clear_verification_markers(self):
-        self.bridge.clearVerificationMarkersSignal.emit()
+        self._emit_update("clearVerificationMarkersSignal")
 
     @pyqtSlot(list)
     def update_object_markers(self, points: list):
         """
         Accepts points as list of dicts [{'lat': float, 'lon': float, 'label': str, 'class_name': str}]
         """
-        self.bridge.updateObjectMarkersSignal.emit(json.dumps(points))
+        self._emit_update("updateObjectMarkersSignal", json.dumps(points))
 
     @pyqtSlot(bool)
     def set_objects_visible(self, visible: bool):
-        self.bridge.toggleObjectMarkersSignal.emit(visible)
+        self._emit_update("toggleObjectMarkersSignal", visible)

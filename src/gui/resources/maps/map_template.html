@@ -296,6 +296,7 @@
                     });
 
                     console.log("QWebChannel bridge connected");
+                    bridge.ready("GEOGRAPHIC");
                 });
             } else if (retriesLeft > 0) {
                 setTimeout(function() { initWebChannel(retriesLeft - 1); }, 100);

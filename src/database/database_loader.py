@@ -244,6 +244,7 @@ class DatabaseLoader:
                 self.depth_scales = None
 
             # Load frame_gps if present (multi-source geo-localisation)
+            self.spatial_index = None
             if "frame_gps" in self.db_file:
                 self.frame_gps = self.db_file["frame_gps"][:]
                 # Check whether any non-NaN values exist

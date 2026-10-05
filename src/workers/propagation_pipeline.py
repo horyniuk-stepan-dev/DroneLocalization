@@ -90,6 +90,7 @@ class PropagationPipeline:
         self.matcher = matcher
         self.config = config or {}
         self._is_running = True
+        self.relative_mode = getattr(getattr(calibration, "converter", None), "mode", "") == "LOCAL"
 
         self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
@@ -277,8 +278,15 @@ class PropagationPipeline:
                 self._cancelled_cb()
 
     def _run_propagation(self):
+        if self.relative_mode:
+            # A single gauge fixes arbitrary translation/rotation/scale. Geographic
+            # priors, old solutions and geographic exports have no meaning here.
+            self.terrain_prior = self.export_geojson = self.warm_start = False
+            self.soft_anchors = self.anchor_gap_check = self.anchor_linear_fallback = False
+            self.pin_exact_anchors = False
+            self.use_bfs = True
         num_frames = self.database.get_num_frames()
-        all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        all_anchors = [] if self.relative_mode else sorted(self.calibration.anchors, key=lambda a: a.frame_id)
         anchors = [a for a in all_anchors if a.frame_id < num_frames]
 
         # Validate that all anchors refer to slots within the database.
@@ -292,7 +300,7 @@ class PropagationPipeline:
             )
             return
 
-        if not anchors:
+        if not anchors and not self.relative_mode:
             self._report_error("No calibration anchors")
             return
 
@@ -323,6 +331,14 @@ class PropagationPipeline:
         optimizer = PoseGraphOptimizer(
             self.frame_w, self.frame_h, isotropy_weight=self.isotropy_weight
         )
+        if self.relative_mode:
+            from src.calibration.multi_anchor_calibration import AnchorCalibration
+
+            seed = min(all_features)
+            anchors = [AnchorCalibration(seed, np.array([
+                [1.0, 0.0, -self.frame_w / 2],
+                [0.0, -1.0, self.frame_h / 2],
+            ]), {"transform_type": "relative_gauge", "projection_mode": "LOCAL"})]
         for i in range(num_frames):
             if i in all_features:
                 optimizer.add_node(i)
@@ -381,7 +397,7 @@ class PropagationPipeline:
         )
 
         # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
-        self._report_progress(60, "Fixing GPS anchors (Local Origin)...")
+        self._report_progress(60, "Fixing local coordinate origin..." if self.relative_mode else "Fixing GPS anchors (Local Origin)...")
 
         # An affine belongs to one exact image.  Applying it to a neighbouring
         # keyframe silently moves the map, so missing anchor slots are a database
@@ -598,6 +614,14 @@ class PropagationPipeline:
             )
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
+        if self.relative_mode:
+            from src.geometry.relative_map import normalize_relative_map
+
+            results = {fid: matrix for fid, matrix in results.items() if fid in graph_supported}
+            if len(results) < 2:
+                self._report_error("Local map needs at least two visually connected frames. Use denser video sampling.")
+                return
+            results, _ = normalize_relative_map(results, self.frame_w, self.frame_h)
         self._report_progress(85, "Saving results to HDF5...")
         valid_count = self._save_to_hdf5(
             results,
@@ -1202,7 +1226,7 @@ class PropagationPipeline:
         for frame_id in graph_supported or set():
             if 0 <= frame_id < num_frames and optimized_mask[frame_id]:
                 supported_mask[frame_id] = True
-        filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        filled_count = 0 if self.relative_mode else self._fill_gaps_by_interpolation(frame_affine, frame_valid)
         frame_origin, frame_support_distance, frame_georef_status = classify_calibration(
             frame_valid,
             optimized_mask,
@@ -1357,9 +1381,14 @@ class PropagationPipeline:
                 grp = f.create_group(pending_calibration)
 
                 grp.attrs["version"] = "3.0"  # New version: graph optimisation
-                grp.attrs["num_anchors"] = len(anchors)
+                grp.attrs["coordinate_kind"] = "local_planar" if self.relative_mode else "geographic"
+                grp.attrs["coordinate_units"] = "arbitrary" if self.relative_mode else "projected_metres"
+                if self.relative_mode:
+                    grp.attrs["relative_extent"] = 100.0
+                    grp.attrs["gauge_frame_id"] = anchors[0].frame_id
+                grp.attrs["num_anchors"] = 0 if self.relative_mode else len(anchors)
                 grp.attrs["anchors_json"] = json.dumps(
-                    [a.to_dict() for a in anchors], ensure_ascii=False
+                    [] if self.relative_mode else [a.to_dict() for a in anchors], ensure_ascii=False
                 )
                 grp.attrs["projection_json"] = json.dumps(
                     self.calibration.converter.export_metadata()
@@ -1420,7 +1449,7 @@ class PropagationPipeline:
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
                 # Compute and save frame_gps (lat/lon per frame) for SpatialIndex
-                if self.calibration.converter and self.calibration.converter.is_initialized:
+                if self.calibration.converter and self.calibration.converter.is_initialized and not self.relative_mode:
                     frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
                     gps_count = 0
                     gps_failed = 0

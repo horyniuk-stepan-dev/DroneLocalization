@@ -38,6 +38,7 @@ class TrackingMixin:
 
         # Pass model_manager in config for SuperPoint+LightGlue fallback
         localizer_config = {**self.config, "_model_manager": self.model_manager}
+        self.map_widget.set_coordinate_mode(self.calibration.converter.mode)
 
         # Multi-source support: pass managers if available
         db_manager = getattr(self, "db_manager", None)
@@ -168,6 +169,7 @@ class TrackingMixin:
         self.tracking_worker.debug_view_ready.connect(self._on_debug_view_ready)
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
+            self.coordinates_broker.set_coordinate_mode(self.calibration.converter.mode)
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
             self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
             self.tracking_worker.objects_gps_updated.connect(
@@ -286,7 +288,8 @@ class TrackingMixin:
                 if "fov_polygon" in result and result["fov_polygon"] is not None:
                     self.map_widget.update_fov(result["fov_polygon"])
 
-                msg = f"{status_prefix}: {lat:.6f}, {lon:.6f} | Впевненість: {conf:.2f} | Якір: {anchor} | Джерело: {source_id}"
+                coords = f"X={lon:.3f}, Y={lat:.3f}" if localizer.relative_mode else f"{lat:.6f}, {lon:.6f}"
+                msg = f"{status_prefix}: {coords} | Впевненість: {conf:.2f} | Якір: {anchor} | Джерело: {source_id}"
                 self.status_bar.showMessage(msg)
                 self.control_panel.update_status(f"Локалізовано ({conf:.2f})")
 
@@ -298,7 +301,9 @@ class TrackingMixin:
                     else "Координати знайдено!\n\n"
                 )
                 msg_text += (
-                    f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
+                    (f"X: {lon:.3f}\nY: {lat:.3f}\nУмовні одиниці, без GPS\n"
+                     if localizer.relative_mode else f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n")
+                    +
                     f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
                     f"Якір: кадр {anchor}\n"
                     f"Джерело: {source_id}"
@@ -320,7 +325,7 @@ class TrackingMixin:
 
                 if msg_box.clickedButton() == copy_btn:
                     cb = QApplication.clipboard()
-                    cb.setText(f"{lat:.6f}, {lon:.6f}")
+                    cb.setText(f"X={lon:.3f}, Y={lat:.3f}" if localizer.relative_mode else f"{lat:.6f}, {lon:.6f}")
 
             else:
                 err = result.get("error", "Невідома помилка")
@@ -355,11 +360,16 @@ class TrackingMixin:
                 "timestamp": str(np.datetime64("now")),
             }
         )
+        if self.calibration.converter.mode == "LOCAL":
+            row = self._tracking_results[-1]
+            row.pop("lat", None)
+            row.pop("lon", None)
+            row.update(x=lon, y=lat, coordinate_kind="local_planar", coordinate_units="arbitrary")
         if len(self._tracking_results) == 1:
             self.control_panel.btn_export.setEnabled(True)
-        self.status_bar.showMessage(
-            f"Локалізація: {lat:.6f}, {lon:.6f} | Впевненість: {confidence:.2f} | Точок: {inliers}"
-        )
+        coords = (f"X={lon:.3f}, Y={lat:.3f}" if self.calibration.converter.mode == "LOCAL"
+                  else f"{lat:.6f}, {lon:.6f}")
+        self.status_bar.showMessage(f"Локалізація: {coords} | Впевненість: {confidence:.2f} | Точок: {inliers}")
 
     @pyqtSlot(object)
     def on_objects_detected(self, objects: list):
@@ -393,6 +403,10 @@ class TrackingMixin:
                     "timestamp": str(np.datetime64("now")),
                 }
             )
+            if self.calibration.converter.mode == "LOCAL":
+                row = self._object_tracking_results[-1]
+                row["x"], row["y"] = row.pop("lon"), row.pop("lat")
+                row.update(coordinate_kind="local_planar", coordinate_units="arbitrary")
 
         # Export (_object_tracking_results) keeps every object; the flag only
         # controls the map markers.

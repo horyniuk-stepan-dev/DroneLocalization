@@ -73,13 +73,18 @@ class LayerStatus:
     num_anchors: int | None  # None = calibration not loaded (unknown)
     num_valid: int | None  # frames with GPS after propagation
     num_frames: int | None  # DB slots
+    coordinate_mode: str = "GEOGRAPHIC"
 
     @property
     def label(self) -> str:
+        if self.state == LayerState.READY and self.coordinate_mode == "LOCAL":
+            return "✅ Локальна X/Y"
         return _LABELS[self.state]
 
     @property
     def hint(self) -> str:
+        if self.state == LayerState.READY and self.coordinate_mode == "LOCAL":
+            return "Відносна карта з міжкадрових зв’язків. Умовні X/Y, без GPS і метричного масштабу."
         return _HINTS[self.state]
 
     @property
@@ -205,6 +210,7 @@ def compute_layer_status(
         num_anchors=num_anchors,
         num_valid=num_valid,
         num_frames=num_frames,
+        coordinate_mode=getattr(getattr(database, "converter", None), "mode", "GEOGRAPHIC"),
     )
 
 

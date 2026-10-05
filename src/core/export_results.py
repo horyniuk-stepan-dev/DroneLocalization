@@ -31,11 +31,19 @@ class ResultExporter:
             "matched_frame",
             "inliers",
         ]
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            if all(r.get("coordinate_kind") == "local_planar" for r in results):
+                fieldnames = [k for k in fieldnames if k not in ("lat", "lon")]
+            fieldnames += ["x", "y", "coordinate_kind", "coordinate_units"]
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for row in results:
+                row = dict(row)
+                if row.get("coordinate_kind") == "local_planar":
+                    row.pop("lat", None)
+                    row.pop("lon", None)
                 writer.writerow(row)
 
         logger.success(f"Exported {len(results)} results to CSV: {output_path}")
@@ -43,6 +51,8 @@ class ResultExporter:
     @staticmethod
     def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
         """Exports localization results to GeoJSON format including FOV polygons."""
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            raise ValueError("Local maps have no GPS coordinates. Export as CSV instead.")
         assert_project_writable(output_path)
         features = []
         for r in results:
@@ -96,6 +106,8 @@ class ResultExporter:
         results: list[dict[str, Any]], output_path: str, name: str = "Drone Track"
     ) -> None:
         """Exports localization trajectory and points to KML (Google Earth)."""
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            raise ValueError("Local maps have no GPS coordinates. Export as CSV instead.")
         assert_project_writable(output_path)
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
@@ -168,16 +180,26 @@ class ResultExporter:
             return
         assert_project_writable(output_path)
         fieldnames = ["track_id", "class_name", "timestamp", "lat", "lon", "confidence"]
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            if all(r.get("coordinate_kind") == "local_planar" for r in results):
+                fieldnames = [k for k in fieldnames if k not in ("lat", "lon")]
+            fieldnames += ["x", "y", "coordinate_kind", "coordinate_units"]
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for row in results:
+                row = dict(row)
+                if row.get("coordinate_kind") == "local_planar":
+                    row.pop("lat", None)
+                    row.pop("lon", None)
                 writer.writerow(row)
         logger.success(f"Exported {len(results)} objects to CSV: {output_path}")
 
     @staticmethod
     def export_objects_geojson(results: list[dict[str, Any]], output_path: str) -> None:
         """Exports tracked objects to GeoJSON format."""
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            raise ValueError("Local maps have no GPS coordinates. Export as CSV instead.")
         if not results:
             return
         assert_project_writable(output_path)

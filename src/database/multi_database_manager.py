@@ -277,6 +277,9 @@ class MultiDatabaseManager:
             retriever = self._retrievers.get(sid)
             if loader is None or retriever is None:
                 continue
+            if getattr(getattr(loader, "converter", None), "mode", "") == "LOCAL":
+                # Independently built local maps have unrelated coordinate gauges.
+                continue
             raw = loader.metadata.get("schema_components")
             try:
                 components = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
@@ -318,6 +321,9 @@ class MultiDatabaseManager:
         )
 
         for source_id in sorted_ids:
+            loader = self._databases.get(source_id)
+            if getattr(getattr(loader, "converter", None), "mode", "") == "LOCAL":
+                continue
             retriever = self._retrievers.get(source_id)
             if retriever is None:
                 continue

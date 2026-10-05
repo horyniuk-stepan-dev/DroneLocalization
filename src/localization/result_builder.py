@@ -63,6 +63,10 @@ class ResultBuilder:
             min(rmse, rmse_norm) / rmse_norm * 0.5 + min(disagreement, diag_norm) / diag_norm * 0.5
         )
         stability_score = float(np.clip(stability_score, 0.0, 1.0))
+        if getattr(getattr(database, "converter", None), "mode", "") == "LOCAL":
+            # Graph disagreement has arbitrary scale here. Use the pixel fit
+            # residual, which is independent of the chosen local map extent.
+            stability_score = float(np.clip(1.0 - rmse / rmse_norm, 0.0, 1.0))
 
         ratio_score = float(best_inliers / (total_matches + 1e-6))
         rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))

@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Локальна карта</title>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        html, body { margin: 0; width: 100%; height: 100%; overflow: hidden;
+            background: #161e29; color: #e5edf6; font: 13px system-ui, sans-serif; }
+        canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+        .legend { position: absolute; top: 12px; left: 12px; background: #161e29e8;
+            border: 1px solid #44546a; border-radius: 6px; padding: 10px; pointer-events: none; }
+        .muted { color: #acbdd0; margin-top: 4px; }
+        #position { position: absolute; bottom: 12px; left: 12px; background: #161e29e8; padding: 6px; }
+        button { position: absolute; right: 12px; top: 12px; padding: 7px 12px;
+            border: 1px solid #52667e; border-radius: 5px; background: #26364b; color: white; cursor: pointer; }
+        .panorama-toggle { position: absolute; right: 12px; top: 52px; padding: 7px;
+            background: #161e29e8; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <canvas id="map"></canvas>
+    <div class="legend"><b>Локальна карта · X/Y</b>
+        <div class="muted">Умовні одиниці · без GPS</div>
+        <div class="muted">Колесо — масштаб · перетягування — переміщення</div>
+    </div>
+    <button id="fit">Показати все</button>
+    <label class="panorama-toggle" hidden><input id="panorama-visible" type="checkbox" checked> Панорама</label>
+    <div id="position">Побудована карта: 0–100 зі збереженням пропорцій</div>
+    <script>
+        "use strict";
+        const canvas = document.getElementById("map"), ctx = canvas.getContext("2d");
+        const position = document.getElementById("position");
+        let bridge, width, height, scale, center = [50, 50], span = 120;
+        let path = [], verification = [], objects = [], showObjects = true, marker = null, fov = [];
+        let dragging = null, moved = false;
+        let panorama = null, panoramaRequest = 0, showPanorama = true;
+        // The shared Qt transport uses (vertical, horizontal): local (y, x).
+        const point = (y, x) => [Number(x), Number(y)];
+        const finite = p => p.length === 2 && p.every(Number.isFinite);
+        const screen = p => [width / 2 + (p[0] - center[0]) * scale,
+                             height / 2 - (p[1] - center[1]) * scale];
+        const world = (x, y) => [center[0] + (x - width / 2) / scale,
+                                 center[1] - (y - height / 2) / scale];
+        function line(points, color, close = false) {
+            if (!points.length) return;
+            ctx.beginPath();
+            points.forEach((p, i) => { const s = screen(p); i ? ctx.lineTo(...s) : ctx.moveTo(...s); });
+            if (close) { ctx.closePath(); ctx.fillStyle = "#53d7a522"; ctx.fill(); }
+            ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+        }
+        function dot(p, color, label, radius = 4) {
+            const s = screen(p);
+            ctx.beginPath(); ctx.arc(...s, radius, 0, 2 * Math.PI);
+            ctx.fillStyle = color; ctx.fill();
+            if (label) { ctx.font = "12px system-ui"; ctx.fillText(label, s[0] + 7, s[1] - 7); }
+        }
+        function drawPanorama() {
+            if (!panorama || !showPanorama) return;
+            const [tl, tr, , bl] = panorama.corners.map(screen);
+            const image = panorama.image;
+            ctx.save();
+            // Panorama corners come from one affine in map coordinates.
+            // Compose with the current view so pan/zoom keeps the overlay fixed.
+            ctx.transform((tr[0] - tl[0]) / image.width, (tr[1] - tl[1]) / image.width,
+                          (bl[0] - tl[0]) / image.height, (bl[1] - tl[1]) / image.height,
+                          tl[0], tl[1]);
+            ctx.drawImage(image, 0, 0);
+            ctx.restore();
+        }
+        function setPanorama(dataUrl, ...coords) {
+            const corners = [];
+            for (let i = 0; i < coords.length; i += 2) corners.push(point(coords[i], coords[i + 1]));
+            if (corners.length !== 4 || !corners.every(finite)) return;
+            const request = ++panoramaRequest, image = new Image();
+            image.onload = () => {
+                if (request !== panoramaRequest) return;
+                panorama = {image, corners}; showPanorama = true;
+                document.getElementById("panorama-visible").checked = true;
+                document.querySelector(".panorama-toggle").hidden = false;
+                fit();
+            };
+            image.onerror = () => { position.textContent = "Не вдалося відобразити панораму"; };
+            image.src = dataUrl;
+        }
+        function draw() {
+            width = canvas.clientWidth; height = canvas.clientHeight;
+            const ratio = window.devicePixelRatio || 1;
+            canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
+            ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+            scale = Math.max(1, Math.min(width, height)) / span;
+            ctx.clearRect(0, 0, width, height);
+            drawPanorama();
+            const step = Math.pow(10, Math.floor(Math.log10(span / 5)));
+            const lo = world(0, height), hi = world(width, 0);
+            ctx.font = "11px system-ui";
+            for (let x = Math.ceil(lo[0] / step) * step; x <= hi[0]; x += step) {
+                const sx = screen([x, 0])[0];
+                ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, height);
+                ctx.strokeStyle = "#2f3e50"; ctx.lineWidth = 1; ctx.stroke();
+                ctx.fillStyle = "#8399b3"; ctx.fillText(x.toFixed(step < 1 ? 2 : 0), sx + 3, height - 30);
+            }
+            for (let y = Math.ceil(lo[1] / step) * step; y <= hi[1]; y += step) {
+                const sy = screen([0, y])[1];
+                ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(width, sy);
+                ctx.strokeStyle = "#2f3e50"; ctx.stroke();
+                ctx.fillStyle = "#8399b3"; ctx.fillText(y.toFixed(step < 1 ? 2 : 0), 5, sy - 4);
+            }
+            line([[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]], "#566b84");
+            line(path, "#ff7979"); line(fov, "#53d7a5", true);
+            verification.forEach(p => dot(point(p.lat, p.lon), "#7abaff", p.label));
+            if (showObjects) objects.forEach(p => dot(point(p.lat, p.lon), "#ffc56a", p.label));
+            if (marker) dot(marker, "#ff7979", "", 6);
+        }
+        function fit() {
+            const points = [[0, 0], [100, 100], ...path, ...fov,
+                ...verification.map(p => point(p.lat, p.lon)), ...(marker ? [marker] : []),
+                ...(panorama ? panorama.corners : [])].filter(finite);
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            points.forEach(p => { minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
+                minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]); });
+            center = [(minX + maxX) / 2, (minY + maxY) / 2];
+            span = Math.max(1, maxX - minX, maxY - minY) * 1.2; draw();
+        }
+        canvas.addEventListener("wheel", e => {
+            e.preventDefault(); span = Math.min(100000, Math.max(0.01, span * Math.exp(e.deltaY * 0.001))); draw();
+        }, {passive: false});
+        canvas.addEventListener("pointerdown", e => {
+            dragging = [e.offsetX, e.offsetY]; moved = false; canvas.setPointerCapture(e.pointerId);
+        });
+        canvas.addEventListener("pointermove", e => {
+            if (dragging) {
+                const dx = e.offsetX - dragging[0], dy = e.offsetY - dragging[1];
+                moved = moved || Math.abs(dx) + Math.abs(dy) > 2;
+                center[0] -= dx / scale; center[1] += dy / scale;
+                dragging = [e.offsetX, e.offsetY]; draw();
+            }
+            const p = world(e.offsetX, e.offsetY);
+            position.textContent = `X: ${p[0].toFixed(2)}   Y: ${p[1].toFixed(2)} · умовні одиниці`;
+        });
+        canvas.addEventListener("pointerup", e => {
+            dragging = null;
+            if (!moved && bridge) { const p = world(e.offsetX, e.offsetY); bridge.mapClicked(p[1], p[0]); }
+        });
+        canvas.addEventListener("pointercancel", () => { dragging = null; });
+        document.getElementById("fit").onclick = fit;
+        document.getElementById("panorama-visible").onchange = e => { showPanorama = e.target.checked; draw(); };
+        window.addEventListener("resize", draw); draw();
+        new QWebChannel(qt.webChannelTransport, channel => {
+            bridge = channel.objects.mapBridge;
+            bridge.setPanoramaSignal.connect(setPanorama);
+            bridge.updateMarkerSignal.connect((y, x) => { marker = point(y, x); draw(); });
+            bridge.addTrajectorySignal.connect((y, x) => { path.push(point(y, x)); draw(); });
+            bridge.clearTrajectorySignal.connect(() => { path = []; marker = null; fov = []; objects = []; draw(); });
+            bridge.updateFOVSignal.connect((...coords) => {
+                fov = []; for (let i = 0; i < coords.length; i += 2) fov.push(point(coords[i], coords[i+1])); draw();
+            });
+            bridge.showVerificationMarkersSignal.connect(json => { verification = JSON.parse(json); fit(); });
+            bridge.clearVerificationMarkersSignal.connect(() => { verification = []; draw(); });
+            bridge.updateObjectMarkersSignal.connect(json => { objects = JSON.parse(json); draw(); });
+            bridge.toggleObjectMarkersSignal.connect(visible => { showObjects = visible; draw(); });
+            bridge.ready("LOCAL");
+        });
+    </script>
+</body>
+</html>

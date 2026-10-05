@@ -48,6 +48,11 @@ class Localizer:
         self.matcher = matcher
         self.calibration = calibration
         self.config = config or {}
+        # Independent relative maps have independent gauges. Search only the
+        # selected database; never compare or switch them by geographic distance.
+        self.relative_mode = getattr(getattr(calibration, "converter", None), "mode", "") == "LOCAL"
+        if self.relative_mode:
+            db_manager = calib_manager = None
         self._failure_logger = FailureLogger()
 
         # Multi-source database and calibration management
@@ -85,7 +90,7 @@ class Localizer:
 
         # Sliding Window Smoother for trajectory optimization over keyframe fixes & optical flow.
         self._smoother = None
-        if get_cfg(self.config, "tracking.smoother_enabled", False):
+        if not self.relative_mode and get_cfg(self.config, "tracking.smoother_enabled", False):
             from src.tracking.smoother import SlidingWindowSmoother
 
             self._smoother = SlidingWindowSmoother(
@@ -432,6 +437,16 @@ class Localizer:
         if result.get("fallback_mode") == "retrieval_only":
             self._consecutive_failures += 1
             self._scale_manager.invalidate()
+        return self._coordinate_result(result)
+
+    def _coordinate_result(self, result):
+        if self.relative_mode:
+            result["coordinate_kind"] = "local_planar"
+            result["coordinate_units"] = "arbitrary"
+            if "lat" in result and "lon" in result:
+                # lat/lon remain internal vertical/horizontal transport for the
+                # existing Qt signals. Network and exports emit x/y only.
+                result["x"], result["y"] = result["lon"], result["lat"]
         return result
 
     def _localize_layers(self, query_frame, static_mask, dt, yaw_hint, collector, timestamp):
@@ -973,7 +988,7 @@ class Localizer:
         # RANSAC inliers should not be discarded due to platform speed assumptions.
         # Position is still appended to history so detector window
         # corresponded to reality, not to a filtered version of it.
-        _strong = self._trust_strong and best_inliers >= self._trust_min_inliers
+        _strong = self.relative_mode or (self._trust_strong and best_inliers >= self._trust_min_inliers)
         if _strong:
             logger.debug(
                 f"Kinematic gate bypassed: {best_inliers} inliers "
@@ -1025,7 +1040,7 @@ class Localizer:
             best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
         )
 
-        filtered_pt = self.trajectory_filter.update(
+        filtered_pt = metric_pt if self.relative_mode else self.trajectory_filter.update(
             metric_pt,
             dt=dt,
             noise_scale=1.0 / max(confidence, 0.25),
@@ -1275,7 +1290,8 @@ class Localizer:
             else None
         )
         _is_out = (
-            self._of_outlier_gate
+            not self.relative_mode
+            and self._of_outlier_gate
             and not _strong_flow
             and self.outlier_detector.is_outlier(
                 metric_pt, dt, ref_position=_of_ref, maha_d2=_maha_d2
@@ -1310,7 +1326,7 @@ class Localizer:
         else:
             of_conf = 0.7
 
-        filtered_pt = self.trajectory_filter.update(
+        filtered_pt = metric_pt if self.relative_mode else self.trajectory_filter.update(
             metric_pt, dt=dt, noise_scale=1.5 / max(of_conf, 0.25)
         )
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
@@ -1322,7 +1338,7 @@ class Localizer:
 
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
 
-        return {
+        return self._coordinate_result({
             "success": True,
             "lat": lat,
             "lon": lon,
@@ -1331,7 +1347,7 @@ class Localizer:
             "inliers": of_inliers,
             "fov_polygon": None,
             "is_of": True,
-        }
+        })
 
     # ─────────────────────────────────────────────────────────────────────────
 

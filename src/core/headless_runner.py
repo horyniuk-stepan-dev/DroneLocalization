@@ -127,6 +127,8 @@ class HeadlessRunner:
             if calib_path.exists():
                 self.calibration.load(str(calib_path))
 
+        if self.database.converter is not None:
+            self.calibration.converter = self.database.converter
         if not self.database.is_propagated:
             logger.warning("Database is not propagated! Precision will be degraded.")
 
@@ -177,6 +179,7 @@ class HeadlessRunner:
             sys.exit(1)
 
         localizer = self._build_localizer()
+        self.coordinates_broker.set_coordinate_mode(self.calibration.converter.mode)
 
         self.tracking_worker = RealtimeTrackingWorker(
             self.video_source,

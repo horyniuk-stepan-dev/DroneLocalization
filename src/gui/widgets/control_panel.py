@@ -48,6 +48,7 @@ class ControlPanel(QWidget):
     start_live_tracking_clicked = pyqtSignal()
     stop_tracking_clicked = pyqtSignal()
     calibrate_clicked = pyqtSignal()
+    relative_map_clicked = pyqtSignal()
     load_calibration_clicked = pyqtSignal()
     localize_image_clicked = pyqtSignal()
     generate_panorama_clicked = pyqtSignal()
@@ -110,10 +111,16 @@ class ControlPanel(QWidget):
             db_layout.addWidget(btn)
 
         # Calibration group
-        self.calib_group = QGroupBox("Калібрування GPS")
+        self.calib_group = QGroupBox("Калібрування / локальна карта")
         calib_layout = QVBoxLayout(self.calib_group)
 
         self.btn_calibrate = QPushButton("Виконати калібрування (Video → Map)")
+        self.btn_relative_map = QPushButton("Локальна карта без GPS (FPV)")
+        self.btn_relative_map.setToolTip(
+            "Побудувати карту 0–100 із руху між кадрами, без опорних точок. "
+            "Умовні одиниці, не метри. Використовується лише вибраний шар."
+        )
+        self.btn_relative_map.clicked.connect(self.relative_map_clicked)
         self.btn_load_calibrate = QPushButton("Завантажити калібрування (JSON)")
         self.btn_verify_propagation = QPushButton("🔍 Перевірити пропагацію на карті")
         self.btn_verify_propagation.setToolTip(
@@ -128,6 +135,7 @@ class ControlPanel(QWidget):
         self.btn_clear_map.clicked.connect(self.clear_map_clicked)
 
         calib_layout.addWidget(self.btn_calibrate)
+        calib_layout.addWidget(self.btn_relative_map)
         calib_layout.addWidget(self.btn_load_calibrate)
         calib_layout.addWidget(self.btn_verify_propagation)
         calib_layout.addWidget(self.btn_clear_map)
@@ -243,7 +251,7 @@ class ControlPanel(QWidget):
         # ── Layer table (always shown while a project is open) ──
         self.sources_table = QTableWidget()
         self.sources_table.setColumnCount(5)
-        self.sources_table.setHorizontalHeaderLabels(["Шар", "Зона", "Якорі", "GPS", "Статус"])
+        self.sources_table.setHorizontalHeaderLabels(["Шар", "Зона", "Якорі", "Коорд.", "Статус"])
         header = self.sources_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for col in (1, 2, 3, 4):
@@ -326,6 +334,7 @@ class ControlPanel(QWidget):
             self.btn_load_db,
             self.btn_rebuild_db,
             self.btn_calibrate,
+            self.btn_relative_map,
             self.btn_load_calibrate,
             self.btn_verify_propagation,
             self.btn_clear_map,
@@ -369,7 +378,7 @@ class ControlPanel(QWidget):
         if num_anchors is not None:
             lines.append(f"⚓ Якорів: {num_anchors}")
         if num_propagated is not None and num_frames is not None:
-            lines.append(f"📍 GPS: {num_propagated}/{num_frames} кадрів")
+            lines.append(f"📍 З координатами: {num_propagated}/{num_frames} кадрів")
 
         self.lbl_project_info.setText("<br>".join(lines))
         self.lbl_project_info.setStyleSheet("font-size: 11px; color: #000;")
@@ -446,13 +455,13 @@ class ControlPanel(QWidget):
     def set_active_layer_context(self, source_id: str | None, num_layers: int = 1):
         """Підписує кнопки, що діють на активний шар, його назвою."""
         if not source_id or num_layers <= 1:
-            self.calib_group.setTitle("Калібрування GPS")
+            self.calib_group.setTitle("Калібрування / локальна карта")
             self.btn_calibrate.setText("Виконати калібрування (Video → Map)")
             self.btn_load_calibrate.setText("Завантажити калібрування (JSON)")
             self.btn_rebuild_db.setText("🔄 Перегенерувати базу")
             return
         name = _short(source_id)
-        self.calib_group.setTitle(f"Калібрування GPS — шар «{name}»")
+        self.calib_group.setTitle(f"Калібрування / локальна карта — «{name}»")
         self.btn_calibrate.setText(f"Калібрувати шар «{name}» (Video → Map)")
         self.btn_load_calibrate.setText(f"Завантажити калібрування шару «{name}»")
         self.btn_rebuild_db.setText(f"🔄 Перегенерувати базу шару «{name}»")

@@ -12,7 +12,7 @@ from src.gui.widgets.map_widget import MapWidget
 from src.gui.widgets.video_widget import VideoWidget
 from src.models.model_manager import ModelManager
 from src.network.coordinates_broker import CoordinatesBroker
-from src.utils.logging_utils import fmt_coord, get_logger
+from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -162,6 +162,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.start_live_tracking_clicked.connect(self.on_start_live_tracking)
         cp.stop_tracking_clicked.connect(self.on_stop_tracking)
         cp.calibrate_clicked.connect(self.on_calibrate)
+        cp.relative_map_clicked.connect(self.on_build_relative_map)
         cp.load_calibration_clicked.connect(self.on_load_calibration)
         cp.generate_panorama_clicked.connect(self.on_generate_panorama)
         cp.show_panorama_clicked.connect(self.on_show_panorama)
@@ -177,9 +178,11 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
 
     def _on_map_clicked(self, lat: float, lon: float):
         """Handle map click by showing coordinates in the status bar."""
-        msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
+        local = self.calibration.converter.mode == "LOCAL"
+        msg = (f"Локальна карта: X={lon:.3f}, Y={lat:.3f} · умовні одиниці"
+               if local else f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}")
         self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
-        logger.info(f"Map click: {fmt_coord(lat, lon)}")
+        logger.info(msg)
 
     def on_open_config(self):
         """Open the configuration editor dialog."""
@@ -232,6 +235,17 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
 
     def closeEvent(self, event):
         """Зберігає стан видимості debug-вікон, не чіпаючи інші налаштування."""
+        # Map mosaics run in the background. Do not destroy a running QThread
+        # when closing the window, or leave a partially written overlay.
+        from src.workers.local_panorama_worker import LocalPanoramaWorker
+
+        panorama = getattr(self, "pano_worker", None)
+        if isinstance(panorama, LocalPanoramaWorker) and panorama.isRunning():
+            panorama.stop()
+            if not panorama.wait(5000):
+                self.status_bar.showMessage("Завершується побудова панорами. Закрийте вікно ще раз за кілька секунд.")
+                event.ignore()
+                return
         try:
             from config import load_user_config, save_user_config
 

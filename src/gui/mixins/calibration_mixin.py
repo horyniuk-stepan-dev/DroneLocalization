@@ -93,6 +93,9 @@ class CalibrationMixin:
 
     @pyqtSlot()
     def on_calibrate(self):
+        if self.calibration.converter.mode == "LOCAL":
+            QMessageBox.information(self, "Локальна карта", "Цей шар використовує умовні X/Y. Для GPS-калібрування створіть окремий шар із відео.")
+            return
         source_id = self._get_current_source_id()
         if not self.database or self.database.db_file is None:
             QMessageBox.warning(
@@ -411,14 +414,28 @@ class CalibrationMixin:
     # ── Propagation ──────────────────────────────────────────────────────────
 
     @pyqtSlot()
-    def on_run_propagation(self):
+    def on_build_relative_map(self):
+        self.on_run_propagation(relative=True)
+
+    @pyqtSlot()
+    def on_run_propagation(self, relative=False):
         if self._refuse_if_encrypted_project("Пропагація калібрування"):
             return
-        if not self.calibration.is_calibrated:
+        current_local = self.calibration.converter.mode == "LOCAL"
+        relative = relative or current_local
+        if relative and not current_local and (
+            self.calibration.anchors or (self.database and self.database.is_propagated)
+        ):
+            QMessageBox.warning(self, "Локальна карта", "Цей шар уже має геоприв’язку. Створіть окремий шар для FPV-відео.")
+            return
+        if not relative and not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Додайте хоча б один якір калібрування!")
             return
         if not self.database:
             QMessageBox.warning(self, "Увага", "База даних не завантажена!")
+            return
+        existing = getattr(self, "propagation_worker", None)
+        if existing is not None and existing.isRunning():
             return
         # Mutual exclusion with tracking: propagation overwrites HDF5.
         tw = getattr(self, "tracking_worker", None)
@@ -437,14 +454,17 @@ class CalibrationMixin:
             return
 
         source_id = self._get_current_source_id()
-        anchor_ids = [a.frame_id for a in self.calibration.anchors]
+        work_calibration = (
+            MultiAnchorCalibration(CoordinateConverter("LOCAL")) if relative else self.calibration
+        )
+        anchor_ids = [a.frame_id for a in work_calibration.anchors]
         n_frames = self.database.get_num_frames()
         logger.info(
             f"Propagation of layer '{source_id}': {len(anchor_ids)} anchors {anchor_ids}, "
             f"{n_frames} frames"
         )
         # The report and the map check must use the layer that was propagated.
-        self._propagation_target = (source_id, self.database, self.calibration)
+        self._propagation_target = (source_id, self.database, work_calibration)
 
         self._propagation_dialog = QProgressDialog(
             f"Шар «{source_id}»: пропагація GPS від {len(anchor_ids)} якорів "
@@ -455,13 +475,16 @@ class CalibrationMixin:
             self,
         )
         self._propagation_dialog.setWindowTitle(f"Розповсюдження GPS — шар «{source_id}»")
+        if relative:
+            self._propagation_dialog.setWindowTitle("Локальна карта FPV — без GPS")
+            self._propagation_dialog.setLabelText("Побудова карти з міжкадрових зв’язків…")
         self._propagation_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self._propagation_dialog.setMinimumDuration(0)
         self._propagation_dialog.setValue(0)
 
         self.propagation_worker = CalibrationPropagationWorker(
             database=self.database,
-            calibration=self.calibration,
+            calibration=work_calibration,
             matcher=matcher,
             config=self.config,
         )
@@ -504,6 +527,27 @@ class CalibrationMixin:
         source_id, database = (
             (target[0], target[1]) if target else (self._get_current_source_id(), self.database)
         )
+        if target and target[2].converter.mode == "LOCAL":
+            local_cal = target[2]
+            if database is self.database:
+                self.calibration = local_cal
+            manager = getattr(self, "calib_manager", None)
+            if manager is not None:
+                manager.set(source_id, local_cal)
+            if database is self.database:
+                path = self._get_calibration_save_path()
+                if path:
+                    try:
+                        save_layer_calibration(local_cal, path, source_id)
+                    except Exception as exc:
+                        logger.warning(f"Local map is saved in HDF5; JSON save failed: {exc}")
+                self.map_widget.set_coordinate_mode("LOCAL", reset=True)
+            if hasattr(self, "_after_layer_data_changed"):
+                self._after_layer_data_changed()
+            self.status_bar.showMessage("Локальна карта 0–100 готова. Координати в умовних одиницях.")
+            if database is self.database:
+                self.on_verify_propagation()
+            return
 
         # Status first: the table must show the new state even while the report is open.
         if hasattr(self, "_after_layer_data_changed"):
@@ -582,6 +626,7 @@ class CalibrationMixin:
             return
 
         try:
+            self.map_widget.set_coordinate_mode(self.calibration.converter.mode)
             self.map_widget.clear_verification_markers()
             num_frames = self.database.get_num_frames()
             # Limit number of Leaflet markers to ~600 with uniform step
@@ -812,6 +857,10 @@ class CalibrationMixin:
             # wipe the anchors of the active layer.
             loaded = MultiAnchorCalibration()
             loaded.load(path)
+            db_mode = getattr(getattr(self.database, "converter", None), "mode", None)
+            if db_mode and (db_mode == "LOCAL") != (loaded.converter.mode == "LOCAL"):
+                QMessageBox.warning(self, "Несумісні координати", "Локальну карту X/Y і GPS-калібрування не можна змішувати в одному шарі. Створіть окремий шар.")
+                return
 
             issues = self._calibration_load_issues(loaded, path, source_id)
             if issues:

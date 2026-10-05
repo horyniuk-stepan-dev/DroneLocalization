@@ -98,10 +98,10 @@
         "sift_max_keypoints": 2048,
         "lancedb_batch_size": 64,
         "lancedb_index_min_frames": 256,
-        "yolo_batch_size": 4,
         "hdf5_compression": "lzf",
         "hdf5_chunk_frames": 64,
-        "max_keypoints_stored": 2048
+        "max_keypoints_stored": 2048,
+        "yolo_batch_size": 4
     },
     "localization": {
         "layer_search": {

@@ -22,6 +22,7 @@ class CoordinatesBroker(QObject):
         self.config = config
 
         self._last_position: dict | None = None
+        self._coordinate_mode = "GEOGRAPHIC"
         self._last_objects: list[dict] = []
         self._history: deque = deque(maxlen=1000)
 
@@ -214,10 +215,23 @@ class CoordinatesBroker(QObject):
             "inliers": inliers,
             "timestamp": time.time(),
         }
+        if self._coordinate_mode == "LOCAL":
+            msg.pop("lat")
+            msg.pop("lon")
+            msg.update(x=lon, y=lat, coordinate_kind="local_planar", coordinate_units="arbitrary")
         self._last_position = msg
         self._last_fix_mono = time.monotonic()  # Timestamp of last position fix
         self._history.append(msg)
         self._broadcast(msg)
+
+    def set_coordinate_mode(self, mode: str):
+        if mode != self._coordinate_mode:
+            self._last_position = None
+            self._last_objects = []
+            self._history.clear()
+            self._last_fix_mono = None
+            self._last_anchor_mono = None
+        self._coordinate_mode = mode
 
     @pyqtSlot()
     def on_anchor_fix(self):
@@ -240,6 +254,11 @@ class CoordinatesBroker(QObject):
             ],
             "timestamp": time.time(),
         }
+        if self._coordinate_mode == "LOCAL":
+            msg.update(coordinate_kind="local_planar", coordinate_units="arbitrary")
+            for obj in msg["objects"]:
+                obj["x"], obj["y"] = obj.pop("lon"), obj.pop("lat")
+                obj.update(coordinate_kind="local_planar", coordinate_units="arbitrary")
         self._last_objects = msg["objects"]
         self._broadcast(msg)
 

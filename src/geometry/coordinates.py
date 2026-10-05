@@ -20,7 +20,7 @@ def mercator_scale_factor(lat: float) -> float:
 
 
 class CoordinateConverter:
-    """Deterministic coordinate conversion (WebMercator or UTM) based on instance configuration."""
+    """Geographic projection, or LOCAL arbitrary XY using legacy (y, x) transport."""
 
     def __init__(
         self, mode: str = "WEB_MERCATOR", reference_gps: tuple[float, float] | None = None
@@ -31,7 +31,9 @@ class CoordinateConverter:
         self._transformer_to_gps: Transformer | None = None
         self._initialized = False
 
-        if self._mode == "WEB_MERCATOR":
+        if self._mode == "LOCAL":
+            self._initialized = True
+        elif self._mode == "WEB_MERCATOR":
             self._initialize_projection(0.0, 0.0)
         elif self._reference_gps:
             self._initialize_projection(*self._reference_gps)
@@ -48,7 +50,7 @@ class CoordinateConverter:
 
     @property
     def mode(self) -> str:
-        """Projection mode: 'UTM' or 'WEB_MERCATOR' (public access instead of _mode)."""
+        """Coordinate mode: UTM, WEB_MERCATOR or LOCAL (no geographic projection)."""
         return self._mode
 
     def ground_scale_factor(self, lat: float | None = None) -> float:
@@ -88,6 +90,10 @@ class CoordinateConverter:
         self._initialized = True
 
     def gps_to_metric(self, lat: float, lon: float) -> tuple[float, float]:
+        # Legacy UI transport is (vertical, horizontal). LOCAL has no GPS;
+        # public outputs must label these as y/x, in arbitrary map units.
+        if self._mode == "LOCAL":
+            return float(lon), float(lat)
         if not self._initialized:
             if self._mode == "WEB_MERCATOR":
                 self._initialize_projection(lat, lon)
@@ -108,6 +114,8 @@ class CoordinateConverter:
         return float(x), float(y)
 
     def metric_to_gps(self, x: float, y: float) -> tuple[float, float]:
+        if self._mode == "LOCAL":
+            return float(y), float(x)
         if not self._initialized:
             if self._mode == "WEB_MERCATOR":
                 self._initialize_projection(0.0, 0.0)
@@ -127,6 +135,8 @@ class CoordinateConverter:
         """Vectorised metric_to_gps: arrays of x, y -> (lat, lon) arrays."""
         import numpy as np
 
+        if self._mode == "LOCAL":
+            return np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)
         if not self._initialized:
             if self._mode == "WEB_MERCATOR":
                 self._initialize_projection(0.0, 0.0)
