@@ -10,7 +10,8 @@ camera altitude or a real-world DEM.
    feature database using the normal database action. Do not add GPS anchors.
 2. Select that layer and click **Локальна карта без GPS (FPV)** in the calibration
    panel. This matches neighboring reference frames, adds verified loop closures
-   and optimizes the existing pose graph. The first frame with features fixes the
+   and optimizes the existing pose graph, then refines all six affine parameters
+   against shared image points. The first frame with features fixes the
    arbitrary coordinate origin, scale and orientation during optimization.
 3. On completion the map switches to an offline X/Y grid. Numbered markers show
    reference frame centers. The connected frame footprints are uniformly scaled
@@ -28,9 +29,26 @@ project restart. No geographic coordinates are written to `frame_gps`. The layer
 calibration JSON records LOCAL mode with **zero surveyed anchors**; the internal
 gauge is not a user-provided geographic anchor.
 
+The point refinement retains verified temporal/loop-closure links and their
+confidence weights. It also searches a bounded set of spatial neighbors for
+overlaps between flight passes that global-descriptor retrieval missed. These
+proposals must pass image matching, inlier count/spread and geometric checks;
+proximity alone never creates a link. Previously pruned graph edges are excluded.
+This additional matching runs only during LOCAL map preparation, with no GPS
+or simulator ground truth. It uses spatially distributed inliers and robust residuals
+to reduce seams caused by the pose graph's five-parameter approximation. The
+map and video panorama share the refined affines. Disconnected point constraints,
+folded geometry or excessive deformation abort before saving. HDF5
+`local_alignment_json` records before/after point errors in initial reference
+pixels and the number of additional verified overlaps; LOCAL `frame_rmse`
+records shared-point alignment error rather than just
+the pairwise homography fit. This does not measure absolute geographic accuracy.
+
 Rebuilding the feature database requires rebuilding its local map. Running the
 local-map action again recomputes the normalization, so old exported tracks must
 not be combined with results from a newly built map without alignment.
+To update a map built before point refinement, rerun **Локальна карта без GPS
+(FPV)** using its existing feature database, then regenerate the panorama.
 
 ## Video panorama on the local map
 

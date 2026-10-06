@@ -95,6 +95,11 @@ def test_relative_graph_save_reload_and_no_fabricated_gap(tmp_path, monkeypatch)
         )
         assert db.db_file["calibration"].attrs["num_anchors"] == 0
         assert json.loads(db.db_file["calibration"].attrs["anchors_json"]) == []
+        attrs = db.db_file["calibration"].attrs
+        assert attrs["optimizer"] == "pose_graph_lm+affine_point_irls"
+        assert attrs["frame_rmse_kind"] == "shared_point_alignment"
+        report = json.loads(attrs["local_alignment_json"])
+        assert report["frames"] == 3 and report["after_p95_px"] < 1e-3
         before = db.frame_affine.copy()
     finally:
         db.close()

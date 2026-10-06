@@ -91,6 +91,11 @@ class PropagationPipeline:
         self.config = config or {}
         self._is_running = True
         self.relative_mode = getattr(getattr(calibration, "converter", None), "mode", "") == "LOCAL"
+        self._relative_feature_ids = {}
+        self._relative_point_pairs = {}
+        self._relative_alignment_report = None
+        self._relative_alignment_rmse = {}
+        self._last_inlier_pair = None
 
         self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
@@ -313,6 +318,11 @@ class PropagationPipeline:
         # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
         self._report_progress(0, "Prefetching features into RAM...")
         all_features = self._prefetch_features(num_frames)
+        if self.relative_mode:
+            self._relative_feature_ids = {id(features): fid for fid, features in all_features.items()}
+            self._relative_point_pairs.clear()
+            self._relative_alignment_report = None
+            self._relative_alignment_rmse = {}
         self._check_running()
         if not all_features:
             # Two cases: (a) corrupted/unreadable file — _prefetch_features already
@@ -509,6 +519,10 @@ class PropagationPipeline:
 
         # ── Phase 4: Optimize ────────────────────────────────────────────────
         self._report_progress(70, "Global graph optimisation (Levenberg-Marquardt)...")
+        # Do not resurrect an edge discarded by the pose-graph pruning stage.
+        relative_graph_pairs = {
+            tuple(sorted((edge.from_id, edge.to_id))) for edge in optimizer.edges
+        } if self.relative_mode else set()
         results = optimizer.optimize(
             max_iterations=self.max_iters,
             tolerance=self.tolerance,
@@ -615,12 +629,40 @@ class PropagationPipeline:
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
         if self.relative_mode:
+            from src.geometry.relative_alignment import PointLink, refine_relative_affines
             from src.geometry.relative_map import normalize_relative_map
 
             results = {fid: matrix for fid, matrix in results.items() if fid in graph_supported}
             if len(results) < 2:
                 self._report_error("Local map needs at least two visually connected frames. Use denser video sampling.")
                 return
+            self._report_progress(82, "Aligning shared image points in the local map...")
+            links = []
+            for edge in optimizer.edges:
+                if edge.weight <= 0:
+                    continue
+                key = (edge.from_id, edge.to_id)
+                if key not in self._relative_point_pairs:
+                    key = key[::-1]
+                pair = self._relative_point_pairs.get(key)
+                if pair is not None:
+                    links.append(PointLink(*key, *pair, weight=edge.weight))
+            initial_affines = results
+            results, report, frame_rmse = refine_relative_affines(
+                results, links, self.frame_w, self.frame_h, anchors[0].frame_id, self._check_running
+            )
+            extra_links = self._local_overlap_links(results, all_features, relative_graph_pairs)
+            if extra_links:
+                self._report_progress(84, "Refining local map with verified cross-pass overlaps...")
+                results, report, frame_rmse = refine_relative_affines(
+                    initial_affines, links + extra_links, self.frame_w, self.frame_h,
+                    anchors[0].frame_id, self._check_running,
+                )
+            report["additional_overlap_links"] = len(extra_links)
+            self._relative_alignment_report = report
+            self._relative_alignment_rmse = frame_rmse
+            logger.info(f"Local point alignment: {self._relative_alignment_report}")
+            self._relative_point_pairs.clear()
             results, _ = normalize_relative_map(results, self.frame_w, self.frame_h)
         self._report_progress(85, "Saving results to HDF5...")
         valid_count = self._save_to_hdf5(
@@ -659,6 +701,48 @@ class PropagationPipeline:
             f"({temporal_count} temporal + {spatial_count} spatial edges).",
         )
         self._report_completed()
+
+    def _local_overlap_links(self, affines, features, known_pairs):
+        """Verify nearby flight passes that descriptor retrieval did not connect."""
+        from src.geometry.relative_alignment import PointLink, nearby_frame_pairs
+
+        if self.spatial_base_w <= 0:
+            return []
+        candidates = nearby_frame_pairs(
+            affines, self.frame_w, self.frame_h, known_pairs, self.lc_min_gap,
+            limit=min(8, self.lc_top_k),
+        )
+        links = []
+        for index, (first, second) in enumerate(candidates):
+            self._check_running()
+            if index % 50 == 0:
+                self._report_progress(83, f"Checking local overlaps: {index}/{len(candidates)}")
+            # Match second -> first, just like the ordinary spatial graph edges.
+            match = self._match_and_build_edge(features[second], features[first])
+            if match is None:
+                continue
+            _H, inliers, rmse, total, spread = match
+            if (inliers < max(30, self.lc_min_inliers) or inliers / total < .3
+                    or spread is None or spread < .025 or rmse > max(3., 2 * self.ransac_thresh)):
+                continue
+            source, target = self._last_inlier_pair
+            source_h = np.column_stack([source, np.ones(len(source))])
+            fitted = np.linalg.lstsq(source_h, target, rcond=None)[0].T
+            # Compare in map space, allowing zoom/rotation between source images
+            # while rejecting flips and implausible changes to the current map.
+            relative = affines[first][:, :2] @ fitted[:, :2] @ np.linalg.inv(affines[second][:, :2])
+            scales = np.linalg.svd(relative, compute_uv=False)
+            if np.linalg.det(relative) <= 0 or scales.min() < .5 or scales.max() > 2:
+                continue
+            delta = (source_h @ affines[second].T
+                     - (target @ affines[first][:, :2].T + affines[first][:, 2]))
+            pixel_scale = np.sqrt(abs(np.linalg.det(affines[second][:, :2])))
+            if np.median(np.linalg.norm(delta, axis=1)) / pixel_scale > .75 * np.hypot(self.frame_w, self.frame_h):
+                continue
+            weight = self._compute_weight(inliers, rmse, self.spatial_base_w)
+            links.append(PointLink(second, first, source, target, weight))
+        logger.info(f"Local overlaps: {len(links)} verified from {len(candidates)} spatial proposals")
+        return links
 
     # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
 
@@ -890,6 +974,10 @@ class PropagationPipeline:
             H_true = np.asarray(H_r, dtype=np.float64) @ rotation_homography(ang, cx, cy)
             similarity = homography_to_similarity(H_true, self.frame_w, self.frame_h)
             if similarity is not None:
+                if self.relative_mode and self._last_inlier_pair is not None:
+                    rotated, reference = self._last_inlier_pair
+                    original = rotate_keypoints(rotated, -ang, cx, cy)
+                    self._relative_point_pairs[(to_id, from_id)] = (original, reference)
                 logger.debug(
                     f"Rotation-retry {from_id}→{to_id} OK @ {ang_deg:.1f}° (chain={chain_angle})"
                 )
@@ -1282,6 +1370,10 @@ class PropagationPipeline:
                 rmse_list = [s[1] for s in stats if s[1] > 0]
                 frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
                 frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
+        if self.relative_mode:
+            for fid, rmse in self._relative_alignment_rmse.items():
+                if frame_valid[fid]:
+                    frame_rmse[fid] = rmse
 
         # Disagreement metric: read by ResultBuilder.compute_confidence (stability_score,
         # then R in Kalman), so the metric shape matters for live localisation.
@@ -1394,6 +1486,10 @@ class PropagationPipeline:
                     self.calibration.converter.export_metadata()
                 )
                 grp.attrs["optimizer"] = "pose_graph_lm"
+                if self.relative_mode and self._relative_alignment_report is not None:
+                    grp.attrs["optimizer"] = "pose_graph_lm+affine_point_irls"
+                    grp.attrs["local_alignment_json"] = json.dumps(self._relative_alignment_report)
+                    grp.attrs["frame_rmse_kind"] = "shared_point_alignment"
                 grp.attrs["provenance_version"] = 1
                 grp.attrs["frame_origin_codes"] = "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated,5=anchor_linear_model"
                 grp.attrs["anchor_linear_model_intervals_json"] = json.dumps(
@@ -1704,6 +1800,7 @@ class PropagationPipeline:
         here and discarded — only the count remained, which cannot detect all
         points clustered in one image corner.
         """
+        self._last_inlier_pair = None
         try:
             mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
             if (
@@ -1742,6 +1839,14 @@ class PropagationPipeline:
             rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
 
             spread = inlier_spread(pts_a_in, self.frame_w, self.frame_h)
+            if self.relative_mode:
+                from src.geometry.relative_alignment import sample_point_pair
+
+                self._last_inlier_pair = sample_point_pair(pts_a_in, pts_b_in)
+                first = self._relative_feature_ids.get(id(features_a))
+                second = self._relative_feature_ids.get(id(features_b))
+                if first is not None and second is not None:
+                    self._relative_point_pairs[(first, second)] = self._last_inlier_pair
 
             return H, inliers, rmse, int(len(mkpts_a)), spread
         except Exception:
