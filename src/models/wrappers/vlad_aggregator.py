@@ -66,12 +66,21 @@ class VladAggregator:
             raise ValueError("fit() needs at least 2 images of tokens")
 
         rng = np.random.default_rng(self.seed)
-        stacked = np.concatenate(
-            [np.asarray(t, dtype=np.float32) for t in tokens_per_image], axis=0
-        )
-        if len(stacked) > max_kmeans_tokens:
-            idx = rng.choice(len(stacked), size=max_kmeans_tokens, replace=False)
-            stacked = stacked[idx]
+        total = sum(len(t) for t in tokens_per_image)
+        if total > max_kmeans_tokens:
+            # Sample per image instead of stacking everything first: at 448 px input
+            # 3000 frames hold ~2.4M tokens (~10 GB float32), more than k-means needs.
+            per_image = max(1, max_kmeans_tokens // len(tokens_per_image))
+            parts = []
+            for t in tokens_per_image:
+                t = np.asarray(t)
+                pick = rng.choice(len(t), size=min(per_image, len(t)), replace=False)
+                parts.append(np.asarray(t[pick], dtype=np.float32))
+            stacked = np.concatenate(parts, axis=0)
+        else:
+            stacked = np.concatenate(
+                [np.asarray(t, dtype=np.float32) for t in tokens_per_image], axis=0
+            )
 
         self.centers = self._kmeans(stacked)
         logger.info(

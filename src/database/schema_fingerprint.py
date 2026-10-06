@@ -52,6 +52,11 @@ SCHEMA_FIELDS: tuple[str, ...] = (
 # every database built without VLAD keeps the fingerprint it was built with.
 OPTIONAL_FIELDS: tuple[str, ...] = ("vlad_vocab", "vlad_layer", "vlad_low_norm_fraction")
 
+# Recorded in schema_components but NOT hashed (so existing fingerprints stay valid):
+# the DINO input resolution. Descriptors from different resolutions are not
+# comparable; databases built before 2026-10-06 lack it and are not checked.
+CHECKED_EXTRA_FIELDS: tuple[str, ...] = ("dino_input_size",)
+
 
 @functools.lru_cache(maxsize=8)
 def _file_digest(path: str, mtime_ns: int, size: int) -> str:
@@ -113,7 +118,9 @@ def build_components(
 
     vlad_enabled = bool(g("models.vlad.enabled", False))
     vlad_layer = g("models.vlad.layer", None)
+    default_size = 224 if backend == "dinov3" else 336
     return {
+        "dino_input_size": int(g(f"global_descriptor.{backend}.input_size", default_size)),
         "schema_version": schema_version,
         "global_backend": backend,
         "descriptor_dim": int(descriptor_dim),
@@ -157,6 +164,23 @@ def vlad_mismatch(stored: Any, runtime: dict[str, Any]) -> str | None:
         f"{key}: database {stored.get(key)!r} != runtime {runtime.get(key)!r}"
         for key in OPTIONAL_FIELDS
         if stored.get(key) != runtime.get(key)
+    ]
+    return "; ".join(diffs) or None
+
+
+def extra_mismatch(stored: Any, runtime: dict[str, Any]) -> str | None:
+    """Differences in the unhashed checked fields (e.g. DINO input size), or None.
+
+    A field missing on either side (older database) is not a mismatch.
+    """
+    if not isinstance(stored, dict):
+        return None
+    diffs = [
+        f"{key}: database {stored.get(key)!r} != runtime {runtime.get(key)!r}"
+        for key in CHECKED_EXTRA_FIELDS
+        if stored.get(key) is not None
+        and runtime.get(key) is not None
+        and stored.get(key) != runtime.get(key)
     ]
     return "; ".join(diffs) or None
 

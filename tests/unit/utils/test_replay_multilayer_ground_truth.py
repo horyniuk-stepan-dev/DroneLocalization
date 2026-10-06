@@ -122,6 +122,8 @@ def test_replay_keeps_query_gt_out_of_localizer_and_records_handoff(tmp_path):
     assert rows[2]["retrieved_candidates_by_source"] == {
         "b": {"count": 1, "unique_frames": [12], "top_score": 0.9}
     }
+    assert rows[2]["retrieval_calls"] == [{"b": [[12, 0.9]]}]
+    assert rows[3]["retrieval_calls"] == []
     assert rows[2]["raw_error_m"] == pytest.approx(10.0)
     assert rows[2]["final_error_m"] == pytest.approx(20.0)
     assert rows[3]["observed_candidates"] == []
@@ -317,3 +319,26 @@ def test_replay_hands_the_localizer_rgb_like_the_app():
     rgb = to_rgb(bgr)
     assert rgb[0, 0, 2] == 255 and rgb[0, 0, 0] == 0
     assert to_rgb("image-0") == "image-0"  # non-image test doubles pass through
+
+
+def test_capture_records_legacy_best_match_calls():
+    from scripts.replay_multilayer_ground_truth import capture_observations
+
+    class Manager:
+        def get_matches_by_source(self, *_a, **_k):
+            return {}
+
+        def get_best_match(self, *_a, **_k):
+            return "main", [(5, 0.81), (7, 0.7), (9, 0.6), (1, 0.5), (2, 0.4), (3, 0.3)]
+
+    class Localizer:
+        def __init__(self):
+            self._layer_search = FakeSearch()
+            self.db_manager = Manager()
+
+    loc = Localizer()
+    take = capture_observations(loc)
+    assert loc.db_manager.get_best_match(None)[0] == "main"
+    _verified, _retrieved, calls = take()
+    assert calls == [{"main": [[5, 0.81], [7, 0.7], [9, 0.6], [1, 0.5], [2, 0.4]]}]
+    assert take()[2] == []

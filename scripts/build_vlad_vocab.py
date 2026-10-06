@@ -127,6 +127,12 @@ def main() -> int:
     ap.add_argument("--clusters", type=int, default=None, help="Перекрити models.vlad.n_clusters")
     ap.add_argument("--pca-dim", type=int, default=None, help="Перекрити models.vlad.pca_dim")
     ap.add_argument("--layer", type=int, default=None, help="Проміжний шар ViT (default: конфіг)")
+    ap.add_argument(
+        "--input-size",
+        type=int,
+        default=None,
+        help="DINO input size in px (default: config); a multiple of the ViT patch, 16",
+    )
     args = ap.parse_args()
     if not args.video and not args.images:
         ap.error("give at least one --video or --images source")
@@ -162,7 +168,10 @@ def main() -> int:
     # torchvision Resize(antialias) на cv2 INTER_AREA/INTER_CUBIC — інший фільтр,
     # тому він і сидить у SCHEMA_FIELDS.
     cpu_resize = bool(get_cfg(APP_CONFIG, "models.performance.dino_cpu_resize", False))
-    s = int(desc_cfg.input_size)
+    s = int(args.input_size or desc_cfg.input_size)
+    if s % 16:
+        print(f"ERROR: --input-size {s} is not a multiple of the ViT/16 patch size")
+        return 1
     normalize = T.Normalize(mean=desc_cfg.normalize_mean, std=desc_cfg.normalize_std)
     resize_gpu = T.Resize((s, s), antialias=True)
 
@@ -207,7 +216,11 @@ def main() -> int:
                         if layer is not None
                         else model.forward_features(t)
                     )
-                tokens_per_image.append(feats["x_norm_patchtokens"][0].float().cpu().numpy())
+                # float16 halves host memory (448 px: 784 tokens x 1024 per frame);
+                # VladAggregator works in float32 per image.
+                tokens_per_image.append(
+                    feats["x_norm_patchtokens"][0].float().cpu().numpy().astype(np.float16)
+                )
                 got += 1
                 if got % 100 == 0:
                     print(f"  [{si + 1}/{len(sources)}] {got}/{quota}")

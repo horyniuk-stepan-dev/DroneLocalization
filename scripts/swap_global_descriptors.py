@@ -44,6 +44,7 @@ GLOBAL_DESCRIPTOR_FIELDS = (
     "vlad_vocab",
     "vlad_layer",
     "vlad_low_norm_fraction",
+    "dino_input_size",
 )
 KEYPOINT_VIDEO = "database_keypoints.mp4"
 STANDARD_DIRS = ("panoramas", "reports", "test_photos", "test_videos")

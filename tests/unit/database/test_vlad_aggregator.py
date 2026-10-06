@@ -111,3 +111,21 @@ def test_vocabulary_without_provenance_still_loads(tmp_path, fitted_agg):
     assert loaded.provenance == {}
     tokens = _make_tokens(rng, world)
     np.testing.assert_allclose(loaded.aggregate(tokens), agg.aggregate(tokens), atol=1e-6)
+
+
+def test_fit_samples_tokens_per_image_and_accepts_float16(monkeypatch):
+    rng = np.random.default_rng(0)
+    images = [rng.normal(size=(100, 8)).astype(np.float16) for _ in range(10)]
+    agg = VladAggregator(n_clusters=4, pca_dim=4)
+    seen = {}
+    original = agg._kmeans
+
+    def spy(tokens):
+        seen["shape"] = tokens.shape
+        seen["dtype"] = tokens.dtype
+        return original(tokens)
+
+    monkeypatch.setattr(agg, "_kmeans", spy)
+    agg.fit(images, max_kmeans_tokens=50)
+    assert seen["shape"] == (50, 8) and seen["dtype"] == np.float32
+    assert agg.aggregate(images[0].astype(np.float32)).shape == (agg.out_dim,)

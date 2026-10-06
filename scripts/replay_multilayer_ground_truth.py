@@ -188,6 +188,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 # The replay itself enables layer search and requires schema-validated maps.
 REPLAY_FIXED_LAYER_SEARCH_KEYS = frozenset({"enabled", "require_schema"})
+# Candidates kept per retrieval call and source in rows["retrieval_calls"].
+RETRIEVAL_CALL_TOP = 5
 
 
 def layer_search_overrides(raw: Iterable[str] | None) -> dict:
@@ -399,6 +401,7 @@ def score_result(
         "exception_type": result.get("exception_type"),
         "observed_candidates": result.get("replay_observed_candidates", []),
         "retrieved_candidates_by_source": result.get("replay_retrieved_candidates_by_source", {}),
+        "retrieval_calls": result.get("replay_retrieval_calls", []),
         "observed_sources": sorted(
             {candidate["source_id"] for candidate in result.get("replay_observed_candidates", [])}
         ),
@@ -433,10 +436,13 @@ def capture_observations(localizer) -> Callable[[], tuple[list[dict], dict]]:
     """Tap source-scoped retrieval and verified observations without changing decisions."""
     search = getattr(localizer, "_layer_search", None)
     if search is None:
-        return lambda: ([], {})
+        return lambda: ([], {}, [])
     original = search.search
     latest: list[dict] = []
     retrieved: dict[str, dict] = {}
+    # One entry per retrieval call (one query view): top candidates per source with
+    # their scores, for threshold calibration (scripts/retrieval_threshold_report.py).
+    calls: list[dict] = []
 
     manager = getattr(localizer, "db_manager", None)
     if manager is not None:
@@ -444,6 +450,15 @@ def capture_observations(localizer) -> Callable[[], tuple[list[dict], dict]]:
 
         def tapped_matches(*args, **kwargs):
             groups = original_matches(*args, **kwargs)
+            calls.append(
+                {
+                    sid: [
+                        [int(frame), round(float(score), 4)]
+                        for frame, score in candidates[:RETRIEVAL_CALL_TOP]
+                    ]
+                    for sid, candidates in groups.items()
+                }
+            )
             for sid, candidates in groups.items():
                 record = retrieved.setdefault(sid, {"count": 0, "frames": set(), "top_score": None})
                 record["count"] += len(candidates)
@@ -455,6 +470,27 @@ def capture_observations(localizer) -> Callable[[], tuple[list[dict], dict]]:
             return groups
 
         manager.get_matches_by_source = tapped_matches
+
+        # The legacy (non-layer) path retrieves through get_best_match: one source
+        # per call. Recorded the same way so thresholds can be calibrated for it.
+        original_best = getattr(manager, "get_best_match", None)
+        if original_best is not None:
+
+            def tapped_best(*args, **kwargs):
+                out = original_best(*args, **kwargs)
+                sid, candidates = out
+                if sid is not None and candidates:
+                    calls.append(
+                        {
+                            sid: [
+                                [int(frame), round(float(score), 4)]
+                                for frame, score in candidates[:RETRIEVAL_CALL_TOP]
+                            ]
+                        }
+                    )
+                return out
+
+            manager.get_best_match = tapped_best
 
     def tapped(*args, **kwargs):
         nonlocal latest
@@ -475,7 +511,7 @@ def capture_observations(localizer) -> Callable[[], tuple[list[dict], dict]]:
         return observations
 
     def take_latest():
-        nonlocal latest, retrieved
+        nonlocal latest, retrieved, calls
         captured = latest
         candidates = {
             sid: {
@@ -485,9 +521,11 @@ def capture_observations(localizer) -> Callable[[], tuple[list[dict], dict]]:
             }
             for sid, record in retrieved.items()
         }
+        taken = calls
         latest = []
         retrieved = {}
-        return captured, candidates
+        calls = []
+        return captured, candidates, taken
 
     search.search = tapped
     return take_latest
@@ -544,7 +582,9 @@ def replay_slots(
                 # The legacy path has no confirmation state: what it returns is
                 # what the app shows.
                 result["status"] = "confirmed"
-            verified, retrieved = observed()
+            taken = observed()
+            verified, retrieved = taken[0], taken[1]
+            result["replay_retrieval_calls"] = taken[2] if len(taken) > 2 else []
             result["replay_observed_candidates"] = verified
             result["replay_retrieved_candidates_by_source"] = retrieved
             handoff = getattr(getattr(localizer, "_layer_search", None), "handoff", None)

@@ -76,8 +76,8 @@ class MultiDatabaseManager:
                 if vlad_problem:
                     logger.error(
                         f"Source '{src.source_id}': global descriptors were built with "
-                        f"other VLAD settings ({vlad_problem}). Skipping this layer until "
-                        "it is rebuilt with the current models.vlad settings."
+                        f"other settings ({vlad_problem}). Skipping this layer until it is "
+                        "rebuilt with the current models.vlad / global_descriptor settings."
                     )
                     loader.close()
                     continue
@@ -135,7 +135,11 @@ class MultiDatabaseManager:
         """Compare a database's VLAD settings (incl. vocabulary hash) with the config."""
         import json
 
-        from src.database.schema_fingerprint import build_components, vlad_mismatch
+        from src.database.schema_fingerprint import (
+            build_components,
+            extra_mismatch,
+            vlad_mismatch,
+        )
 
         raw = loader.metadata.get("schema_components")
         try:
@@ -143,7 +147,8 @@ class MultiDatabaseManager:
         except ValueError:
             return None  # reported by _check_interchangeability
         runtime = build_components(self._config, descriptor_dim=0, local_descriptor_dim=0)
-        return vlad_mismatch(stored, runtime)
+        problems = [p for p in (vlad_mismatch(stored, runtime), extra_mismatch(stored, runtime)) if p]
+        return "; ".join(problems) or None
 
     def _check_interchangeability(self) -> None:
         """Warn if loaded databases were built with incompatible schema settings."""
@@ -257,7 +262,7 @@ class MultiDatabaseManager:
         """
         import json
 
-        from src.database.schema_fingerprint import build_components, vlad_mismatch
+        from src.database.schema_fingerprint import build_components, extra_mismatch, vlad_mismatch
 
         dimension = int(np.asarray(global_desc).size)
         runtime = build_components(
@@ -292,6 +297,12 @@ class MultiDatabaseManager:
                     continue
                 if components and vlad_mismatch(components, runtime):
                     logger.warning(f"Skipping localization source '{sid}': other VLAD vocabulary")
+                    continue
+                if components and extra_mismatch(components, runtime):
+                    logger.warning(
+                        f"Skipping localization source '{sid}': "
+                        f"{extra_mismatch(components, runtime)}"
+                    )
                     continue
                 candidates = retriever.find_similar_frames(global_desc, top_k=top_k)
                 if candidates:
