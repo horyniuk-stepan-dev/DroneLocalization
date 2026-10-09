@@ -68,6 +68,8 @@ def test_group_pools_routes(tmp_path):
 def test_main(tmp_path, capsys):
     _report(tmp_path / "x.json", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
     (tmp_path / "notareport.json").write_text("{}", encoding="utf-8")
+    # retrieval_threshold_report.py output in the same folder ("rows" is a count)
+    (tmp_path / "thresholds.json").write_text('{"calls": 3, "rows": 2}', encoding="utf-8")
     out = tmp_path / "out" / "c.json"
     out.parent.mkdir()
     assert C.main([str(tmp_path), "--bootstrap", "50", "--out", str(out)]) == 0

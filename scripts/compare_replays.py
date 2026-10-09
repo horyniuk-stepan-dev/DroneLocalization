@@ -26,6 +26,14 @@ from pathlib import Path
 import numpy as np
 
 
+def is_replay_report(path: Path) -> bool:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return False
+    return isinstance(report, dict) and isinstance(report.get("rows"), list)
+
+
 def load_rows(path: Path) -> list[dict]:
     report = json.loads(path.read_text(encoding="utf-8"))
     rows = [r for r in report.get("rows", []) if r.get("gt_valid")]
@@ -166,7 +174,9 @@ def main(argv: list[str] | None = None) -> int:
     paths: list[Path] = []
     for item in args.inputs:
         paths += sorted(item.glob("*.json")) if item.is_dir() else [item]
-    paths = [p for p in paths if "rows" in json.loads(p.read_text(encoding="utf-8"))]
+    # Replay reports only: thresholds.json (retrieval_threshold_report.py) also has a
+    # "rows" key, an int; sharing the folder made every re-run of the summary crash.
+    paths = [p for p in paths if is_replay_report(p)]
     if not paths:
         print("no replay reports found")
         return 1
