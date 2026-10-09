@@ -61,7 +61,7 @@
         },
         "dinov3": {
             "descriptor_dim": 1024,
-            "input_size": 224,
+            "input_size": 336,
             "normalize_mean": [
                 0.43,
                 0.411,
@@ -107,7 +107,7 @@
         "layer_search": {
             "enabled": false,
             "max_sources_per_frame": 8,
-            "candidates_per_source": 4,
+            "candidates_per_source": 8,
             "descriptor_batch_size": 4,
             "max_verifications": 32,
             "budget_ms": 2000.0,
@@ -142,8 +142,8 @@
         "retrieval_only_min_score": 0.9,
         "auto_rotation": true,
         "rotation_rescan_min_score": 0.7,
-        "rotation_mode": "quarter",
-        "rotation_scan_step_deg": 45.0,
+        "rotation_mode": "continuous",
+        "rotation_scan_step_deg": 90.0,
         "rotation_refine_min_deg": 12.0,
         "rotation_border_erode_px": 8,
         "enable_lightglue_fallback": true,
@@ -345,7 +345,7 @@
         },
         "vlad": {
             "enabled": true,
-            "vocab_path": "models/vlad_vocab_v1_c32_p256.npz",
+            "vocab_path": "models/vlad_vocab_v1_c32_p256_s336.npz",
             "n_clusters": 32,
             "pca_dim": 256,
             "layer": null,
