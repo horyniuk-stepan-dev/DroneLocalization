@@ -2,9 +2,17 @@
 
 Every retrieval call of a replay (``rows[].retrieval_calls``, written by
 ``scripts/replay_multilayer_ground_truth.py``) is scored against the query's
-ground truth: the call's top-1 candidate is *correct* when that reference
-frame's footprint (its propagated affine) contains the query's true ground
-centre. From the score distributions of correct and wrong top-1 candidates the
+ground truth: the call's top-1 candidate is *correct* when the two views
+overlap — the query's true ground centre lies in that reference frame's
+footprint (its propagated affine), or the reference frame's centre lies in the
+query's footprint (the slot's affine in the replay's ground_truth.json). The
+second clause matters across altitudes: a 1000 m query matched to a 500 m layer
+frame sees four times that frame's area, so its centre is usually outside the
+frame although the match is right (2026-10-07: the first clause alone scored
+12 % of the top-1 calls correct on the rotation A/B replays, where the
+legacy variants confirmed 70–88 % of the frames).
+Without a readable ground_truth.json only the first clause is used.
+From the score distributions of correct and wrong top-1 candidates the
 script reports, for a grid of thresholds, how many calls pass, how many of those
 are correct (precision) and how many correct calls pass (recall), and suggests:
 
@@ -38,6 +46,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.geometry.dem import lonlat_to_mercator  # noqa: E402
+
 CURRENT = {
     "retrieval_only_min_score": 0.90,
     "rotation_rescan_min_score": 0.70,
@@ -60,12 +70,61 @@ class Footprints:
         if a is None:
             return None
         x, y = self.converter.gps_to_metric(lat, lon)
-        lin = a[:, :2]
-        if abs(np.linalg.det(lin)) < 1e-12:
+        return _inside(a, self.width, self.height, x, y, margin)
+
+    def center_gps(self, frame: int) -> tuple[float, float] | None:
+        a = self.affines.get(int(frame))
+        if a is None:
             return None
-        u, v = np.linalg.solve(lin, np.array([x, y]) - a[:, 2])
-        mx, my = margin * self.width, margin * self.height
-        return bool(mx <= u <= self.width - mx and my <= v <= self.height - my)
+        x, y = a @ np.array([self.width / 2.0, self.height / 2.0, 1.0])
+        lat, lon = self.converter.metric_to_gps(float(x), float(y))
+        return float(lat), float(lon)
+
+
+@dataclass
+class QueryFootprints:
+    """Query camera footprint per replay slot: ground_truth.json affine, pixel -> EPSG:3857."""
+
+    affines: dict[int, np.ndarray]
+    width: float
+    height: float
+
+    def contains(self, slot: int, lat: float, lon: float) -> bool | None:
+        a = self.affines.get(int(slot))
+        if a is None:
+            return None
+        x, y = lonlat_to_mercator(lon, lat)
+        return _inside(a, self.width, self.height, float(x), float(y), 0.0)
+
+
+def _inside(affine, width: float, height: float, x: float, y: float, margin: float) -> bool | None:
+    """Whether metric (x, y) maps inside the pixel frame of ``affine`` (pixel -> metric)."""
+    lin = affine[:, :2]
+    if abs(np.linalg.det(lin)) < 1e-12:
+        return None
+    u, v = np.linalg.solve(lin, np.array([x, y]) - affine[:, 2])
+    mx, my = margin * width, margin * height
+    return bool(mx <= u <= width - mx and my <= v <= height - my)
+
+
+def load_query_footprints(gt_path) -> QueryFootprints | None:
+    """Slot affines of a simulator ground_truth.json; None when unreadable or not plain Mercator."""
+    try:
+        gt = json.loads(Path(gt_path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return None
+    proj = gt.get("projection") or {}
+    if str(proj.get("mode", "")).upper() != "WEB_MERCATOR" or proj.get("reference_gps"):
+        return None
+    size = gt.get("frame_size") or []
+    affines = {
+        int(slot["slot"]): np.asarray(slot["affine"], dtype=np.float64)
+        for slot in gt.get("slots", [])
+        if slot.get("affine") is not None and "slot" in slot
+    }
+    if len(size) != 2 or not affines:
+        return None
+    return QueryFootprints(affines, float(size[0]), float(size[1]))
 
 
 def load_footprints(db_path: str | Path) -> Footprints:
@@ -88,13 +147,41 @@ def load_footprints(db_path: str | Path) -> Footprints:
     return Footprints(affines, width, height, CoordinateConverter.from_metadata(proj))
 
 
-def score_calls(report: dict, footprints: dict[str, Footprints], margin: float = 0.0) -> list[dict]:
+def overlaps(
+    fp: Footprints | None,
+    frame: int,
+    lat: float,
+    lon: float,
+    margin: float = 0.0,
+    queries: QueryFootprints | None = None,
+    slot: int | None = None,
+) -> bool | None:
+    """Query centre in the reference footprint, or reference centre in the query footprint."""
+    if fp is None:
+        return None
+    ok = fp.contains(frame, lat, lon, margin)
+    if ok is True or queries is None or slot is None:
+        return ok
+    centre = fp.center_gps(frame)
+    if centre is None:
+        return ok
+    inside = queries.contains(slot, *centre)
+    return ok if inside is None else bool(ok) or inside
+
+
+def score_calls(
+    report: dict,
+    footprints: dict[str, Footprints],
+    margin: float = 0.0,
+    queries: QueryFootprints | None = None,
+) -> list[dict]:
     """One record per retrieval call: row index, first-of-row flag, top-1 score/correct."""
     out = []
     for r_idx, row in enumerate(report.get("rows", [])):
         if not row.get("gt_valid") or row.get("gt_lat") is None:
             continue
         lat, lon = float(row["gt_lat"]), float(row["gt_lon"])
+        slot = row.get("slot")
         for c_idx, call in enumerate(row.get("retrieval_calls") or []):
             best = None
             any_correct = False
@@ -102,7 +189,7 @@ def score_calls(report: dict, footprints: dict[str, Footprints], margin: float =
             for sid, cands in call.items():
                 fp = footprints.get(sid)
                 for rank, (frame, score) in enumerate(cands):
-                    ok = fp.contains(frame, lat, lon, margin) if fp is not None else None
+                    ok = overlaps(fp, frame, lat, lon, margin, queries, slot)
                     if rank == 0 and (best is None or score > best[2]):
                         best = (sid, int(frame), float(score), ok)
                     any_correct = any_correct or bool(ok)
@@ -205,25 +292,50 @@ def recall_at(t: float):
     return stat
 
 
+def selected_calls(records: list[dict]) -> list[dict]:
+    """Per frame, the call whose top-1 scored highest: the candidate the localizer keeps."""
+    best: dict[int, dict] = {}
+    for rec in records:
+        cur = best.get(rec["row"])
+        if cur is None or rec["score"] > cur["score"]:
+            best[rec["row"]] = rec
+    return list(best.values())
+
+
 def analyse(records: list[dict], precision: float, keep: float, min_pass: int, n_boot: int) -> dict:
+    """Threshold statistics.
+
+    A full rescan retrieves one view per angle (and scale), so most calls of a
+    rescanned frame are wrong-angle views whose top-1 is wrong by construction:
+    the share over all calls says little. What the thresholds act on is the
+    first call of a frame (the prior view: keep it or rescan) and the
+    best-scoring call of a frame (the candidate a retrieval-only fix would use),
+    so ``retrieval_only_min_score`` is evaluated on the latter. Frames that the
+    temporal candidate prior localizes without retrieval are not in the sample.
+    """
     known = [r for r in records if r["correct"] is not None]
     first = [r for r in known if r["first"]]
+    selected = selected_calls(known)
     s_all, c_all = _arrays(known) if known else (np.zeros(0), np.zeros(0, bool))
     s_first, c_first = _arrays(first) if first else (np.zeros(0), np.zeros(0, bool))
+    s_sel, c_sel = _arrays(selected) if selected else (np.zeros(0), np.zeros(0, bool))
     result = {
         "calls": len(records),
         "calls_with_known_footprint": len(known),
         "rows": len({r["row"] for r in known}),
         "top1_correct_rate": float(c_all.mean()) if known else None,
+        "top1_correct_first_call": float(c_first.mean()) if first else None,
+        "top1_correct_selected": float(c_sel.mean()) if selected else None,
         "score_quantiles_correct": _quantiles(s_all[c_all]),
         "score_quantiles_wrong": _quantiles(s_all[~c_all]),
         "curve_all_calls": curve(s_all, c_all),
         "curve_first_call": curve(s_first, c_first),
+        "curve_selected_call": curve(s_sel, c_sel),
         "current": {},
         "suggested": {},
     }
     for key, t in CURRENT.items():
-        sample = first if key != "retrieval_only_min_score" else known
+        sample = first if key != "retrieval_only_min_score" else selected
         s, c = _arrays(sample) if sample else (np.zeros(0), np.zeros(0, bool))
         passed = s >= t
         result["current"][key] = {
@@ -234,14 +346,17 @@ def analyse(records: list[dict], precision: float, keep: float, min_pass: int, n
             "precision_ci95": bootstrap(sample, precision_at(t), n_boot),
             "recall_ci95": bootstrap(sample, recall_at(t), n_boot),
         }
-    t_ro = suggest_retrieval_only(s_all, c_all, precision, min_pass) if known else None
+    t_ro = suggest_retrieval_only(s_sel, c_sel, precision, min_pass) if selected else None
     t_keep = suggest_keep(s_first, c_first, keep) if first else None
     if t_ro is not None:
         result["suggested"]["retrieval_only_min_score"] = {
             "t": t_ro,
-            "rule": f"lowest t with precision >= {precision} and >= {min_pass} calls passing",
-            "precision_ci95": bootstrap(known, precision_at(t_ro), n_boot),
-            "recall": float((s_all[c_all] >= t_ro).mean()) if c_all.any() else None,
+            "rule": (
+                f"lowest t with precision >= {precision} and >= {min_pass} frames passing "
+                "(best-scoring call per frame)"
+            ),
+            "precision_ci95": bootstrap(selected, precision_at(t_ro), n_boot),
+            "recall": float((s_sel[c_sel] >= t_ro).mean()) if c_sel.any() else None,
         }
     if t_keep is not None:
         passed = s_first >= t_keep
@@ -273,27 +388,41 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     records: list[dict] = []
+    criteria: list[bool] = []
     offset = 0
     for path in args.reports:
         report = json.loads(path.read_text(encoding="utf-8"))
+        if not (isinstance(report.get("rows"), list) and isinstance(report.get("inputs"), dict)):
+            print(f"{path.name}: not a replay report, skipped")
+            continue
         footprints = {
             src["source_id"]: load_footprints(src["database"])
             for src in report.get("inputs", {}).get("sources", [])
         }
-        recs = score_calls(report, footprints, args.margin)
+        queries = load_query_footprints(report.get("inputs", {}).get("ground_truth"))
+        recs = score_calls(report, footprints, args.margin, queries)
         for rec in recs:
             rec["row"] += offset
         offset += len(report.get("rows", []))
         records.extend(recs)
-        print(f"{path.name}: {len(recs)} retrieval calls")
+        criteria.append(queries is not None)
+        overlap = "query footprints from ground_truth.json" if queries else "NO ground_truth.json"
+        print(f"{path.name}: {len(recs)} retrieval calls ({overlap})")
     if not records:
         print("no retrieval_calls in the reports (replay older than 2026-10-04?)")
         return 1
     result = analyse(records, args.precision, args.keep, args.min_pass, args.bootstrap)
     result["inputs"] = [str(p) for p in args.reports]
+    result["correct_if"] = (
+        "query centre in reference footprint OR reference centre in query footprint"
+        if all(criteria)
+        else "query centre in reference footprint (some reports lack ground_truth.json)"
+    )
     print(
-        f"calls {result['calls_with_known_footprint']} in {result['rows']} frames, "
-        f"top-1 correct {result['top1_correct_rate']:.1%}"
+        f"calls {result['calls_with_known_footprint']} in {result['rows']} frames with retrieval; "
+        f"top-1 correct: first call per frame {result['top1_correct_first_call']:.1%}, "
+        f"best-scoring call per frame {result['top1_correct_selected']:.1%}, "
+        f"all calls (incl. wrong-angle rescan views) {result['top1_correct_rate']:.1%}"
     )
     print(f"score correct {result['score_quantiles_correct']}")
     print(f"score wrong   {result['score_quantiles_wrong']}")

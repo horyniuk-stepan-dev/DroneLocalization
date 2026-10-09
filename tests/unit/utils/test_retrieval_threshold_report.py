@@ -91,14 +91,20 @@ def test_scoring_and_suggestions(tmp_path):
     assert all(r["any_correct_topk"] for r in recs)
     res = R.analyse(recs, precision=1.0, keep=0.95, min_pass=30, n_boot=200)
     assert res["top1_correct_rate"] == pytest.approx(105 / 120)
-    # wrong top-1 scores are <= 0.80, correct >= 0.85: the cut lands right above the
-    # highest wrong score
-    max_wrong = max(r["score"] for r in recs if not r["correct"])
-    t_ro = res["suggested"]["retrieval_only_min_score"]["t"]
-    assert max_wrong < t_ro <= round(max_wrong + 0.01, 2) + 1e-9
+    assert res["top1_correct_first_call"] == pytest.approx(45 / 60)
+    # the second call of every row retrieves the right frame with a higher score
+    # than the wrong first call, so the best-scoring call per frame is always right
+    assert res["top1_correct_selected"] == 1.0
+    assert res["suggested"]["retrieval_only_min_score"]["t"] == 0.3
     assert res["suggested"]["rescan_min_score"]["t"] >= 0.85
     cur = res["current"]["retrieval_only_min_score"]
     assert cur["precision"] == 1.0 and cur["precision_ci95"] is not None
+    # over ALL calls the cut lands right above the highest wrong score (<= 0.80)
+    s_all = np.array([r["score"] for r in recs])
+    c_all = np.array([r["correct"] for r in recs])
+    max_wrong = s_all[~c_all].max()
+    t_all = R.suggest_retrieval_only(s_all, c_all, 1.0, 30)
+    assert max_wrong < t_all <= round(max_wrong + 0.01, 2) + 1e-9
 
 
 def test_main_writes_json(tmp_path, capsys):
@@ -110,6 +116,59 @@ def test_main_writes_json(tmp_path, capsys):
     assert R.main([str(rep), "--out", str(out), "--bootstrap", "50"]) == 0
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["calls"] == 120 and data["curve_all_calls"][0]["t"] == 0.3
+    # its own output passed back in (a glob over the folder) is skipped, not a crash
+    assert R.main([str(rep), str(out), "--bootstrap", "50"]) == 0
     empty = tmp_path / "e.json"
     empty.write_text(json.dumps({"inputs": {"sources": []}, "rows": []}), encoding="utf-8")
     assert R.main([str(empty)]) == 1
+
+
+def test_reference_inside_a_larger_query_footprint_counts_as_correct(tmp_path):
+    """Cross-altitude match: the 1 m/px reference frame lies inside the 2 m/px query view."""
+    db = tmp_path / "db.h5"
+    x0, y0 = _db(db)  # frame 0 centred at (x0, y0), 1280 x 720 m
+    qx = x0 + 800.0  # query centre 800 m east: outside frame 0 (half-width 640 m)
+    gsd_q = 2.0  # query footprint 2560 x 1440 m: contains frame 0's centre
+    gt = tmp_path / "gt.json"
+    gt.write_text(
+        json.dumps(
+            {
+                "projection": {"mode": "WEB_MERCATOR", "reference_gps": None},
+                "frame_size": [W, H],
+                "slots": [
+                    {
+                        "slot": 0,
+                        "affine": [
+                            [gsd_q, 0.0, qx - gsd_q * W / 2],
+                            [0.0, -gsd_q, y0 + gsd_q * H / 2],
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    lat, lon = _gps(qx, y0)
+    row = {
+        "slot": 0,
+        "gt_valid": True,
+        "gt_lat": lat,
+        "gt_lon": lon,
+        "retrieval_calls": [{"main": [[0, 0.9], [5, 0.8]]}],
+    }
+    report = {
+        "inputs": {
+            "sources": [{"source_id": "main", "database": str(db)}],
+            "ground_truth": str(gt),
+        },
+        "rows": [row],
+    }
+    fp = {"main": R.load_footprints(db)}
+    queries = R.load_query_footprints(gt)
+    assert queries is not None
+    assert R.score_calls(report, fp)[0]["correct"] is False  # centre-in-reference only
+    rec = R.score_calls(report, fp, queries=queries)[0]
+    assert rec["correct"] is True and rec["frame"] == 0
+    # frame 5 is 10 km away: wrong under both clauses
+    assert R.overlaps(fp["main"], 5, lat, lon, queries=queries, slot=0) is False
+    assert R.load_query_footprints(tmp_path / "missing.json") is None
