@@ -63,6 +63,53 @@ def test_residual_ignores_scale_and_translation():
     assert residual_angle_deg(T @ S @ R) == pytest.approx(residual_angle_deg(R), abs=1e-9)
 
 
+@pytest.mark.parametrize("gain", [-1.0, -0.37, 1e-3, 250.0])
+def test_residual_ignores_sign_and_scale_of_h(gain):
+    """poselib returns unit-norm H with H22 < 0 in most fits: same map, same angle."""
+    R = rotation_matrix(25, W, H)
+    P = np.array([[1, 0, 0], [0, 1, 0], [2e-5, -1e-5, 1.0]])  # mild perspective
+    Hm = P @ R
+    for center in (None, (W / 2, H / 2)):
+        assert residual_angle_deg(gain * Hm, center) == pytest.approx(
+            residual_angle_deg(Hm, center), abs=1e-9
+        )
+        assert next_prior_deg(0.0, gain * Hm, center) == pytest.approx(
+            next_prior_deg(0.0, Hm, center), abs=1e-9
+        )
+
+
+@pytest.mark.parametrize("true", [0, 37, 180, 315])
+def test_next_prior_with_negated_h_from_any_scan_angle(true):
+    """The 2026-10-06 regression: a correct 0° match read as 180° when H22 < 0."""
+    for applied in scan_angles(45):
+        Hm = -rotation_matrix(true, W, H) @ np.linalg.inv(rotation_matrix(applied, W, H))
+        for center in (None, (W / 2, H / 2)):
+            assert angle_distance_deg(next_prior_deg(applied, Hm, center), true) < 1e-6
+
+
+def test_residual_at_centre_of_perspective_h():
+    """The angle is that of the local Jacobian at ``center`` (checked numerically)."""
+    c = (W / 2, H / 2)
+    R = rotation_matrix(30, W, H)
+    P = np.array([[1, 0, 0], [0, 1, 0], [3e-4, 0, 1.0]])
+    Hm = P @ R
+
+    def project(x, y):
+        p = Hm @ [x, y, 1.0]
+        return p[:2] / p[2]
+
+    eps = 1e-3
+    j = np.column_stack(
+        [
+            (project(c[0] + eps, c[1]) - project(c[0] - eps, c[1])) / (2 * eps),
+            (project(c[0], c[1] + eps) - project(c[0], c[1] - eps)) / (2 * eps),
+        ]
+    )
+    numeric = np.degrees(np.arctan2(j[1, 0] - j[0, 1], j[0, 0] + j[1, 1]))
+    assert residual_angle_deg(Hm, c) == pytest.approx(numeric, abs=1e-4)
+    assert residual_angle_deg(np.zeros((3, 3))) == 0.0
+
+
 def test_rotate_view_zero_is_identity():
     img = np.zeros((H, W, 3), np.uint8)
     view, mask, valid = rotate_view(img, 0.0)

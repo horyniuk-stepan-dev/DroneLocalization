@@ -105,25 +105,39 @@ def rotate_view(
     return view, view_mask, valid
 
 
-def residual_angle_deg(H: np.ndarray) -> float:
-    """In-plane rotation of the linear part of ``H`` (view → reference), degrees.
+def residual_angle_deg(H: np.ndarray, center: tuple[float, float] | None = None) -> float:
+    """In-plane rotation of ``H`` (view → reference) at ``center``, degrees.
 
-    Uses the closest rotation of the 2×2 block (atan2(a10 - a01, a00 + a11)),
-    so moderate anisotropic scale and mild perspective barely bias it. The
-    sign is that of the rotation's [1, 0] entry in y-down pixel coordinates.
+    Takes the closest rotation (atan2(j10 - j01, j00 + j11)) of the local
+    Jacobian of the projective map at ``center`` (view pixels; the origin when
+    None), so moderate anisotropic scale and mild perspective barely bias it.
+    The Jacobian is invariant to the scale AND SIGN of ``H``: poselib returns
+    unit-norm homographies with H[2, 2] < 0 in most fits, and the raw 2×2 block
+    of such an H reads 180° off (the continuous-mode prior then pointed the
+    next keyframe the wrong way round). The sign is that of the rotation's
+    [1, 0] entry in y-down pixel coordinates. A degenerate H (centre on the
+    horizon line) gives 0.
     """
-    a = np.asarray(H, dtype=np.float64)[:2, :2]
-    # closest rotation: atan2(a10 - a01, a00 + a11)
-    return float(np.degrees(np.arctan2(a[1, 0] - a[0, 1], a[0, 0] + a[1, 1])))
+    h = np.asarray(H, dtype=np.float64)
+    x, y = (0.0, 0.0) if center is None else (float(center[0]), float(center[1]))
+    den = h[2, 0] * x + h[2, 1] * y + h[2, 2]
+    if not np.isfinite(den) or abs(den) <= 1e-12 * max(float(np.abs(h).max()), 1e-300):
+        return 0.0
+    projected = (h[:2, :2] @ np.array([x, y]) + h[:2, 2]) / den
+    j = (h[:2, :2] - np.outer(projected, h[2, :2])) / den
+    return float(np.degrees(np.arctan2(j[1, 0] - j[0, 1], j[0, 0] + j[1, 1])))
 
 
-def next_prior_deg(applied_deg: float, H_view_to_ref: np.ndarray) -> float:
+def next_prior_deg(
+    applied_deg: float, H_view_to_ref: np.ndarray, center: tuple[float, float] | None = None
+) -> float:
     """Angle to apply next so the view would have matched with zero residual.
 
     View = R(applied)·Q with cv2's matrix = Rot(-applied) in pixel coordinates;
     Ref ≈ Rot(phi)·View ⇒ Ref ≈ Rot(phi - applied)·Q ⇒ apply (applied - phi).
+    ``center``: where to measure phi (view pixels), see ``residual_angle_deg``.
     """
-    return norm_deg(float(applied_deg) - residual_angle_deg(H_view_to_ref))
+    return norm_deg(float(applied_deg) - residual_angle_deg(H_view_to_ref, center))
 
 
 def angle_distance_deg(a: float, b: float) -> float:
