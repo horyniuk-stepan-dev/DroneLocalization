@@ -104,6 +104,12 @@ def iter_image_files(folder: str | Path, quota: int):
 
 
 def main() -> int:
+    # Messages are partly Ukrainian. Redirected to a file on Windows (dino_resolution_ab.ps1
+    # uses *> log) stdout falls back to cp1252 and the first print raised
+    # UnicodeEncodeError before any frame was read (2026-10-07).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--video",
