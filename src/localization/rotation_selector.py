@@ -106,9 +106,10 @@ class RotationSelector:
             # We try the prior angle with each scale candidate (usually 1).
             prior_scales = scale_candidates if len(scale_candidates) == 1 else [scale_candidates[0]]
             for sc in prior_scales:
-                rotated_frame, crop_info, valid = self._prepare(
-                    query_frame, prior_angle, sc, scale_manager
-                )
+                with Telemetry.profile("view_prepare"):
+                    rotated_frame, crop_info, valid = self._prepare(
+                        query_frame, prior_angle, sc, scale_manager
+                    )
                 global_desc = extract_globals(
                     self.feature_extractor, [rotated_frame], None if valid is None else [valid]
                 )[0]
@@ -141,10 +142,11 @@ class RotationSelector:
                 # copied for each (angle, scale) pair instead of once per angle
                 # (on 4K footage that is tens of MB of memcpy per extra copy).
                 rot_cache: dict[Any, Any] = {}
-                prepared = [
-                    self._prepare(query_frame, a, sc, scale_manager, rot_cache)
-                    for a, sc in stage_combos
-                ]
+                with Telemetry.profile("view_prepare"):
+                    prepared = [
+                        self._prepare(query_frame, a, sc, scale_manager, rot_cache)
+                        for a, sc in stage_combos
+                    ]
                 frames = [p[0] for p in prepared]
                 valids = [p[2] for p in prepared] if self.continuous else None
 

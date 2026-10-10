@@ -241,30 +241,33 @@ class FeatureExtractor:
         Only VLAD can use it (tokens outside are not aggregated); CLS and CESP
         see the whole input.
         """
+        # The whole call is the "dinov2" stage. Until 2026-10-10 only the input
+        # preparation was inside it, so single-view calls (the prior-angle check)
+        # reported ~20 ms while the forward pass and VLAD went unrecorded.
         with Telemetry.profile("dinov2"):
             logger.debug("Extracting global descriptor with DINOv2...")
             dino_input = self._dino_input(image)
 
-        if self.vlad_aggregator is not None:
-            masks = None if valid_mask is None else [valid_mask]
-            return self._vlad_descriptors(dino_input, masks)[0]
+            if self.vlad_aggregator is not None:
+                masks = None if valid_mask is None else [valid_mask]
+                return self._vlad_descriptors(dino_input, masks)[0]
 
-        if self.cesp_module is not None:
-            with torch.amp.autocast(
-                self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
-            ):
-                features = self.global_model.forward_features(dino_input)
-                patch_tokens = features["x_norm_patchtokens"].float()
+            if self.cesp_module is not None:
+                with torch.amp.autocast(
+                    self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                ):
+                    features = self.global_model.forward_features(dino_input)
+                    patch_tokens = features["x_norm_patchtokens"].float()
 
-            h_patches = w_patches = self._patch_grid_side(patch_tokens.shape[1])
-            global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
-        else:
-            with torch.amp.autocast(
-                self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
-            ):
-                global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
+                h_patches = w_patches = self._patch_grid_side(patch_tokens.shape[1])
+                global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
+            else:
+                with torch.amp.autocast(
+                    self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                ):
+                    global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
 
-        return global_desc
+            return global_desc
 
     @torch.no_grad()
     def extract_global_descriptors_multi(
@@ -337,20 +340,23 @@ class FeatureExtractor:
     def extract_local_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
         logger.debug(f"Extracting local features from image: {image.shape}")
 
-        enhanced_image = self.preprocessor.preprocess(image)
-        rgb_tensor = self._upload_chw(enhanced_image)
+        with Telemetry.profile("local_preprocess"):  # CLAHE, upload, optional downscale
+            enhanced_image = self.preprocessor.preprocess(image)
+            rgb_tensor = self._upload_chw(enhanced_image)
 
-        # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
-        max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
-        orig_h, orig_w = rgb_tensor.shape[2], rgb_tensor.shape[3]
-        scale_factor = 1.0
-        if max(orig_h, orig_w) > max_edge:
-            scale_factor = max_edge / float(max(orig_h, orig_w))
-            new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
-            rgb_tensor = torch.nn.functional.interpolate(
-                rgb_tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
-            )
-            logger.debug(f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
+            # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
+            max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
+            orig_h, orig_w = rgb_tensor.shape[2], rgb_tensor.shape[3]
+            scale_factor = 1.0
+            if max(orig_h, orig_w) > max_edge:
+                scale_factor = max_edge / float(max(orig_h, orig_w))
+                new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
+                rgb_tensor = torch.nn.functional.interpolate(
+                    rgb_tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
+                )
+                logger.debug(
+                    f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}"
+                )
 
         is_xfeat = "XFeat" in self.local_model.__class__.__name__
 

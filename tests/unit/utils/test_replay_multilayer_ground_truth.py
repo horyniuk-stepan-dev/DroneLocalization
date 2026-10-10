@@ -9,6 +9,7 @@ import pytest
 from scripts.replay_multilayer_ground_truth import (
     parse_args,
     replay_slots,
+    stage_delta,
     summarize,
     write_report,
 )
@@ -342,3 +343,40 @@ def test_capture_records_legacy_best_match_calls():
     _verified, _retrieved, calls = take()
     assert calls == [{"main": [[5, 0.81], [7, 0.7], [9, 0.6], [1, 0.5], [2, 0.4]]}]
     assert take()[2] == []
+
+
+def test_stage_delta_counts_only_the_stages_used_in_between():
+    before = {"dinov2": (3, 0.5), "match": (10, 1.0)}
+    after = {"dinov2": (4, 0.7), "match": (10, 1.0), "prefilter": (1, 0.02)}
+    assert stage_delta(before, after) == {
+        "dinov2": {"n": 1, "ms": 200.0},
+        "prefilter": {"n": 1, "ms": 20.0},
+    }
+
+
+def test_replay_rows_carry_the_stage_times_of_their_own_call(tmp_path):
+    from src.utils.telemetry import Telemetry
+
+    class TimedLocalizer:
+        def __init__(self):
+            self.n = 0
+
+        def localize_frame(self, frame, *, dt, timestamp):
+            self.n += 1
+            for _ in range(self.n):  # call k profiles the test stage k times
+                with Telemetry.profile("replay_test_stage"):
+                    pass
+            return {"success": False, "status": "lost", "error": "x"}
+
+    slots = [
+        {"slot": i, "video_frame": i * 30, "timestamp": float(i), "ground_center_gps": [1, 2]}
+        for i in range(4)
+    ]
+    rows = replay_slots(slots, FakeCapture(), TimedLocalizer(), {"a"})
+    assert [r["stages"]["replay_test_stage"]["n"] for r in rows[:3]] == [1, 2, 3]
+    assert rows[3]["stages"] == {}  # frame 90 does not decode
+    report = {"rows": rows, **summarize(rows, [], None)}
+    write_report(report, tmp_path / "r.json", tmp_path / "r.csv")
+    with (tmp_path / "r.csv").open(newline="", encoding="utf-8") as stream:
+        first = next(csv.DictReader(stream))
+    assert json.loads(first["stages"])["replay_test_stage"]["n"] == 1

@@ -160,7 +160,8 @@ class GeometricVerifier:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = ref_cache.get(candidate_id)
             if ref_features is None:
-                ref_features = database.get_local_features(candidate_id)
+                with Telemetry.profile("ref_read"):
+                    ref_features = database.get_local_features(candidate_id)
 
             with Telemetry.profile("match"):
                 mkpts_q, mkpts_r = self.matcher.match(query_features, ref_features)

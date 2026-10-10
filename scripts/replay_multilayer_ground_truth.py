@@ -402,6 +402,8 @@ def score_result(
         "observed_candidates": result.get("replay_observed_candidates", []),
         "retrieved_candidates_by_source": result.get("replay_retrieved_candidates_by_source", {}),
         "retrieval_calls": result.get("replay_retrieval_calls", []),
+        # Per-stage time of this call (stage_delta); {} for undecoded frames.
+        "stages": result.get("replay_stages", {}),
         "observed_sources": sorted(
             {candidate["source_id"] for candidate in result.get("replay_observed_candidates", [])}
         ),
@@ -531,6 +533,28 @@ def capture_observations(localizer) -> Callable[[], tuple[list[dict], dict]]:
     return take_latest
 
 
+def telemetry_totals() -> dict[str, tuple[int, float]]:
+    """Cumulative (calls, seconds) of every src.utils.telemetry stage so far."""
+    from src.utils.telemetry import Telemetry
+
+    return {name: (st["calls"], st["total_time"]) for name, st in list(Telemetry.stats.items())}
+
+
+def stage_delta(before: dict, after: dict) -> dict:
+    """``{stage: {"n": calls, "ms": time}}`` spent between two telemetry_totals().
+
+    Stages are leaf blocks (dinov2, local_extractor, prefilter, match, ...), so
+    their sum is the profiled part of a call; processing_ms minus that sum is
+    the unprofiled rest. Exception: patchify_retrieval contains dinov2 calls.
+    """
+    out = {}
+    for name, (calls, total) in after.items():
+        calls0, total0 = before.get(name, (0, 0.0))
+        if calls > calls0:
+            out[name] = {"n": calls - calls0, "ms": round((total - total0) * 1000.0, 1)}
+    return out
+
+
 def replay_slots(
     slots: list[dict],
     capture,
@@ -560,6 +584,7 @@ def replay_slots(
         if not ok or frame is None:
             result = {"success": False, "status": "decode_failed", "error": "decode_failed"}
         else:
+            stages_before = telemetry_totals()
             started = clock()
             try:
                 # Image and time only: no query GT, altitude, or camera pose.
@@ -577,7 +602,9 @@ def replay_slots(
                     "exception_type": type(exc).__name__,
                 }
             elapsed_ms = (clock() - started) * 1000.0
+            stages = stage_delta(stages_before, telemetry_totals())
             result = dict(result)
+            result["replay_stages"] = stages
             if legacy and result.get("success") and result.get("status") is None:
                 # The legacy path has no confirmation state: what it returns is
                 # what the app shows.
@@ -860,6 +887,7 @@ def write_report(report: dict, json_path: Path, csv_path: Path) -> None:
                 row["retrieved_candidates_by_source"]
             )
             flat["search_sources_probed"] = json.dumps(row["search_sources_probed"])
+            flat["stages"] = json.dumps(row.get("stages", {}))
             writer.writerow(flat)
 
 

@@ -1488,15 +1488,16 @@ class Localizer:
             return cached
         from src.localization.rotation_selector import RotationSelector
 
-        if prepared is not None and prepared[0] is not None:
-            frame, crop_info = prepared[0], prepared[1]
-        else:
-            frame, crop_info, _ = RotationSelector._prepare_view(
-                query_frame, angle, scale, self._scale_manager, None, self._rot_erode
-            )
-        mask = view_mask(query_frame.shape[:2], angle, static_mask, self._rot_erode)
-        if mask is not None and abs(float(scale) - 1.0) > 0.15:
-            mask, _ = self._scale_manager.normalize(mask, float(scale))
+        with Telemetry.profile("view_prepare"):
+            if prepared is not None and prepared[0] is not None:
+                frame, crop_info = prepared[0], prepared[1]
+            else:
+                frame, crop_info, _ = RotationSelector._prepare_view(
+                    query_frame, angle, scale, self._scale_manager, None, self._rot_erode
+                )
+            mask = view_mask(query_frame.shape[:2], angle, static_mask, self._rot_erode)
+            if mask is not None and abs(float(scale) - 1.0) > 0.15:
+                mask, _ = self._scale_manager.normalize(mask, float(scale))
         feats = self.feature_extractor.extract_local_features(frame, static_mask=mask)
         feats.setdefault("image_size", np.array([frame.shape[0], frame.shape[1]], dtype=np.int32))
         cache[key] = (frame, mask, crop_info, feats)
