@@ -380,3 +380,32 @@ def test_replay_rows_carry_the_stage_times_of_their_own_call(tmp_path):
     with (tmp_path / "r.csv").open(newline="", encoding="utf-8") as stream:
         first = next(csv.DictReader(stream))
     assert json.loads(first["stages"])["replay_test_stage"]["n"] == 1
+
+
+def test_replay_rows_carry_the_verifier_trace_of_their_own_call():
+    class Verifier:
+        trace = None
+
+    class TracedLocalizer:
+        def __init__(self):
+            self._geometric_verifier = Verifier()
+            self.n = 0
+
+        def localize_frame(self, frame, *, dt, timestamp):
+            self.n += 1
+            assert self._geometric_verifier.trace == []  # fresh list per call
+            self._geometric_verifier.trace.append({"tag": "retrieval", "n": self.n})
+            return {"success": False, "status": "lost", "error": "x"}
+
+    slots = [
+        {"slot": i, "video_frame": i * 30, "timestamp": float(i), "ground_center_gps": [1, 2]}
+        for i in range(3)
+    ]
+    localizer = TracedLocalizer()
+    rows = replay_slots(slots, FakeCapture(), localizer, {"a"})
+    assert [r["verifications"] for r in rows] == [
+        [{"tag": "retrieval", "n": 1}],
+        [{"tag": "retrieval", "n": 2}],
+        [{"tag": "retrieval", "n": 3}],
+    ]
+    assert localizer._geometric_verifier.trace is None  # tracing ends with the call

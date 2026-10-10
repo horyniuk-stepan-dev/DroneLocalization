@@ -745,7 +745,7 @@ class Localizer:
                         logger.debug(f"Debug DINO tokens skipped: {e}")
 
             ver = self._geometric_verifier.verify(
-                best_query_features, best_global_candidates, self.database
+                best_query_features, best_global_candidates, self.database, tag="retrieval"
             )
 
         # ── Continuous rotation: remove the residual the scan step left ──────
@@ -1386,7 +1386,10 @@ class Localizer:
             query_frame, static_mask, target, scale, cache
         )
         ver2 = self._geometric_verifier.verify(
-            top_keypoints(feats, max_keypoints), [(int(ver.candidate_id), 0.0)], self.database
+            top_keypoints(feats, max_keypoints),
+            [(int(ver.candidate_id), 0.0)],
+            self.database,
+            tag="refine",
         )
         if ver2 is None or ver2.inliers <= ver.inliers:
             logger.debug(
@@ -1578,7 +1581,9 @@ class Localizer:
             return None
 
         probe = [(cid, float(m)) for m, cid, _ in scored[: max(1, self._tp_keep)]]
-        ver = self._geometric_verifier.verify(tp_feats, probe, self.database, ref_cache=ref_cache)
+        ver = self._geometric_verifier.verify(
+            tp_feats, probe, self.database, ref_cache=ref_cache, tag="temporal_prior"
+        )
         if ver is None or ver.inliers < self._tp_accept:
             got = ver.inliers if ver is not None else 0
             logger.debug(

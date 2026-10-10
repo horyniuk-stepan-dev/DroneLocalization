@@ -404,6 +404,10 @@ def score_result(
         "retrieval_calls": result.get("replay_retrieval_calls", []),
         # Per-stage time of this call (stage_delta); {} for undecoded frames.
         "stages": result.get("replay_stages", {}),
+        # GeometricVerifier.trace of this call: one record per verify() with the
+        # input candidates, prefilter MNN pairs (Lowe 0.75 / 0.85 / 0.95), every
+        # LightGlue + RANSAC outcome and the winner.
+        "verifications": result.get("replay_verifications", []),
         "observed_sources": sorted(
             {candidate["source_id"] for candidate in result.get("replay_observed_candidates", [])}
         ),
@@ -585,6 +589,10 @@ def replay_slots(
             result = {"success": False, "status": "decode_failed", "error": "decode_failed"}
         else:
             stages_before = telemetry_totals()
+            # Per-candidate verification records (GeometricVerifier.trace).
+            verifier = getattr(localizer, "_geometric_verifier", None)
+            if verifier is not None:
+                verifier.trace = []
             started = clock()
             try:
                 # Image and time only: no query GT, altitude, or camera pose.
@@ -605,6 +613,9 @@ def replay_slots(
             stages = stage_delta(stages_before, telemetry_totals())
             result = dict(result)
             result["replay_stages"] = stages
+            if verifier is not None:
+                result["replay_verifications"] = verifier.trace or []
+                verifier.trace = None
             if legacy and result.get("success") and result.get("status") is None:
                 # The legacy path has no confirmation state: what it returns is
                 # what the app shows.
@@ -888,6 +899,7 @@ def write_report(report: dict, json_path: Path, csv_path: Path) -> None:
             )
             flat["search_sources_probed"] = json.dumps(row["search_sources_probed"])
             flat["stages"] = json.dumps(row.get("stages", {}))
+            flat["verifications"] = json.dumps(row.get("verifications", []))
             writer.writerow(flat)
 
 

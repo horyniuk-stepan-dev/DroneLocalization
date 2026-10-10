@@ -67,6 +67,13 @@ class GeometricVerifier:
         self.min_reference_eigenvalue = float(min_reference_eigenvalue)
         self.ransac_max_iters = int(ransac_max_iters)
         self.ransac_confidence = float(ransac_confidence)
+        # Diagnostics only (replay sets a list per frame): one record per verify()
+        # call with every candidate's prefilter pairs and LightGlue / RANSAC
+        # outcome. None = off; nothing below changes what verify() returns.
+        self.trace: list | None = None
+        # MNN pairs of the last mnn_counts() call while tracing:
+        # {candidate_id: [pairs at Lowe ratio 0.75 (used), 0.85, 0.95]}.
+        self._last_mnn: dict | None = None
 
     def _has_spatial_support(
         self,
@@ -139,7 +146,21 @@ class GeometricVerifier:
         candidates: list,
         database: Any,
         ref_cache: dict | None = None,
+        tag: str | None = None,
     ) -> VerificationResult | None:
+        """``tag`` names the caller in ``trace`` records (temporal_prior, retrieval, refine)."""
+        rec = None
+        if self.trace is not None:
+            rec = {
+                "tag": tag,
+                "input": [[int(c), round(float(sc), 4)] for c, sc in candidates],
+                "prefilter": None,
+                "tried": [],
+                "winner": None,
+                "early_stop": False,
+            }
+            self.trace.append(rec)
+            self._last_mnn = None
         best_inliers = 0
         best_candidate_id = -1
         best_H_query_to_ref = None
@@ -155,6 +176,13 @@ class GeometricVerifier:
         ref_cache = {} if ref_cache is None else ref_cache
         if self.prefilter_enabled and len(candidates) > self.prefilter_keep:
             candidates = self._prefilter(query_features, candidates, database, ref_cache)
+            if rec is not None:
+                mnn = self._last_mnn or {}
+                rec["prefilter"] = {
+                    "pairs": {str(c): v for c, v in mnn.items()},
+                    "all_zero": bool(mnn) and all(v[0] == 0 for v in mnn.values()),
+                    "kept": [int(c) for c, _ in candidates],
+                }
 
         for candidate_id, score in candidates:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
@@ -165,6 +193,14 @@ class GeometricVerifier:
 
             with Telemetry.profile("match"):
                 mkpts_q, mkpts_r = self.matcher.match(query_features, ref_features)
+            tried = None
+            if rec is not None:
+                tried = {
+                    "cid": int(candidate_id),
+                    "matches": int(len(mkpts_q)),
+                    "result": "few_matches",
+                }
+                rec["tried"].append(tried)
 
             if len(mkpts_q) >= self.min_matches:
                 with Telemetry.profile("ransac_homography"):
@@ -179,6 +215,8 @@ class GeometricVerifier:
                         mad_k_factor=self.mad_k_factor,
                     )
 
+                if tried is not None:
+                    tried["result"] = "no_homography"
                 if H_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     inliers = int(np.sum(inlier_mask))
@@ -191,22 +229,32 @@ class GeometricVerifier:
                     )
 
                     inlier_ratio = inliers / max(1, len(mkpts_q))
+                    if tried is not None:
+                        tried["inliers"] = inliers
+                        tried["rmse"] = round(rmse, 3) if np.isfinite(rmse) else None
+                        tried["result"] = "rmse"
                     if not np.isfinite(rmse) or rmse > self.max_rmse_px:
                         logger.debug(
                             f"Rejecting candidate {candidate_id}: RMSE {rmse:.2f}px > "
                             f"{self.max_rmse_px:.2f}px"
                         )
                         continue
+                    if tried is not None:
+                        tried["result"] = "inlier_ratio"
                     if inlier_ratio < self.min_inlier_ratio:
                         logger.debug(
                             f"Rejecting candidate {candidate_id}: inlier ratio "
                             f"{inlier_ratio:.3f} < {self.min_inlier_ratio:.3f}"
                         )
                         continue
+                    if tried is not None:
+                        tried["result"] = "spatial_support"
                     if not self._has_spatial_support(
                         query_features, pts_q_in, pts_r_in, H_eval
                     ):
                         continue
+                    if tried is not None:
+                        tried["result"] = "ok" if inliers >= self.min_matches else "few_inliers"
 
                     if inliers > best_inliers and inliers >= self.min_matches:
                         best_inliers = inliers
@@ -224,7 +272,12 @@ class GeometricVerifier:
                 logger.debug(
                     f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
                 )
+                if rec is not None:
+                    rec["early_stop"] = True
                 break
+
+        if rec is not None and best_candidate_id != -1 and best_inliers >= self.min_matches:
+            rec["winner"] = [int(best_candidate_id), int(best_inliers)]
 
         if (
             best_inliers < self.min_matches
@@ -285,9 +338,16 @@ class GeometricVerifier:
         ratio = 0.75
         gpu_failed = False
 
+        tracing = self.trace is not None
+        traced: dict = {}
+        # Pairs at looser Lowe ratios, recorded only while tracing (diagnostics).
+        extra_ratios = (0.85, 0.95)
+        last_extra = [0, 0]
+
         def _mnn_count(r: np.ndarray) -> int:
-            nonlocal use_torch, gpu_failed
+            nonlocal use_torch, gpu_failed, last_extra
             r32 = np.ascontiguousarray(r, dtype=np.float32)
+            last_extra = [0, 0]
             if r32.shape[0] < 2:
                 return 0
             if use_torch:
@@ -301,6 +361,11 @@ class GeometricVerifier:
                     nn12 = sim.argmax(dim=1)
                     nn21 = sim.argmax(dim=0)
                     idx = torch.arange(sim.shape[0], device=sim.device)
+                    if tracing:
+                        mutual_t = nn21[nn12] == idx
+                        last_extra = [
+                            int((mutual_t & (d1 < t * d2)).sum().item()) for t in extra_ratios
+                        ]
                     return int(((nn21[nn12] == idx) & ratio_ok).sum().item())
                 except Exception as e:  # noqa: BLE001 — OOM тощо → numpy
                     # Silent fallback to numpy is a performance drop that
@@ -321,6 +386,8 @@ class GeometricVerifier:
             nn12 = sim.argmax(axis=1)
             nn21 = sim.argmax(axis=0)
             mutual = nn21[nn12] == np.arange(sim.shape[0])
+            if tracing:
+                last_extra = [int(np.sum(mutual & (d1 < t * d2))) for t in extra_ratios]
             return int(np.sum(mutual & ratio_ok))
 
         scored: list[tuple[int, int, float]] = []
@@ -342,7 +409,12 @@ class GeometricVerifier:
                 if r is None or r.ndim != 2 or len(r) == 0 or r.shape[1] != q.shape[1]:
                     scored.append((0, candidate_id, score))
                     continue
-                scored.append((_mnn_count(r), candidate_id, score))
+                pairs = _mnn_count(r)
+                scored.append((pairs, candidate_id, score))
+                if tracing:
+                    traced[int(candidate_id)] = [pairs, *last_extra]
+        if tracing:
+            self._last_mnn = traced
         return scored
 
     def _prefilter(

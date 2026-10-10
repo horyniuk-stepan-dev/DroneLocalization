@@ -288,3 +288,58 @@ class TestResultShape:
         assert res.inliers <= res.total_matches == 40
         assert res.rmse == pytest.approx(res.rmse)  # не NaN
         assert np.isfinite(res.rmse)
+
+
+class TestTrace:
+    """GeometricVerifier.trace: diagnostics only, never changes the result."""
+
+    def test_trace_records_every_candidate_and_the_winner(self):
+        bad_q, bad_r = _garbage_matches(40)
+        good_q, good_r = _identity_matches(40)
+        db = FakeDB({1: _feats(40, fid=1), 2: _feats(40, fid=2), 3: _feats(5, fid=3)})
+        plan = {1: (bad_q, bad_r), 2: (good_q, good_r), 3: _identity_matches(5)}
+        ver = _verifier(matcher=FakeMatcher(plan))
+        cands = [(1, 0.9), (2, 0.5), (3, 0.4)]
+        plain = ver.verify(_feats(40), cands, db)
+
+        ver.trace = []
+        traced = ver.verify(_feats(40), cands, db, tag="retrieval")
+        assert traced.candidate_id == plain.candidate_id == 2
+        assert traced.inliers == plain.inliers
+        (rec,) = ver.trace
+        assert rec["tag"] == "retrieval" and rec["prefilter"] is None
+        assert rec["input"] == [[1, 0.9], [2, 0.5], [3, 0.4]]
+        by_cid = {t["cid"]: t for t in rec["tried"]}
+        assert by_cid[2]["result"] == "ok" and by_cid[2]["inliers"] == plain.inliers
+        assert by_cid[3]["result"] == "few_matches" and by_cid[3]["matches"] == 5
+        assert by_cid[1]["result"] != "ok" or by_cid[1].get("inliers", 0) < plain.inliers
+        assert rec["winner"] == [2, plain.inliers] and rec["early_stop"] is False
+
+    def test_trace_records_prefilter_pairs_and_the_all_zero_fallback(self):
+        query = _feats(30, fid=0, seed=4)
+        same = dict(query, _id=2)  # identical descriptors: many mutual pairs
+        flat = _feats(30, fid=1)
+        flat["descriptors"] = np.tile(flat["descriptors"][:1], (30, 1))  # ratio test fails
+        other = _feats(30, fid=3)
+        other["descriptors"] = np.tile(other["descriptors"][:1], (30, 1))
+        db = FakeDB({1: flat, 2: same, 3: other})
+        q, r = _identity_matches(30)
+        ver = _verifier(
+            matcher=FakeMatcher({1: (q, r), 2: (q, r), 3: (q, r)}),
+            prefilter_enabled=True,
+            prefilter_keep=1,
+        )
+        ver.trace = []
+        ver.verify(query, [(1, 0.9), (2, 0.8), (3, 0.7)], db)
+        pre = ver.trace[0]["prefilter"]
+        assert set(pre["pairs"]) == {"1", "2", "3"}
+        assert all(len(v) == 3 for v in pre["pairs"].values())
+        assert pre["pairs"]["2"][0] > 0 and pre["pairs"]["1"][0] == 0
+        assert pre["all_zero"] is False and pre["kept"] == [2]
+
+        # only the degenerate candidates: no pair anywhere -> the full list is kept
+        ver.trace = []
+        ver.verify(query, [(1, 0.9), (3, 0.7)], db)
+        pre = ver.trace[0]["prefilter"]
+        assert pre["all_zero"] is True and pre["kept"] == [1, 3]
+        assert [t["cid"] for t in ver.trace[0]["tried"]] == [1, 3]
