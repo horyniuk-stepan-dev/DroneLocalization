@@ -200,7 +200,8 @@
         "temporal_prior_keep": 1,
         "temporal_prior_min_mnn": 20,
         "temporal_prior_accept_inliers": 25,
-        "temporal_prior_audit_every": 10
+        "temporal_prior_audit_every": 10,
+        "temporal_prior_max_keypoints": 0
     },
     "tracking": {
         "kalman_process_noise": 2.0,
