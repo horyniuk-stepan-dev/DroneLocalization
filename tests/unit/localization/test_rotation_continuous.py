@@ -105,11 +105,11 @@ class _DB:
         return self.features
 
 
-def _localizer(mode: str, ref):
+def _localizer(mode: str, ref, extractor=None, matcher=None, **localization):
     pytest.importorskip("torch")  # Localizer imports torch / faiss at module level
     from src.localization.localizer import Localizer
 
-    ext = _Extractor()
+    ext = extractor or _Extractor()
     cfg = {
         "localization": {
             "rotation_mode": mode,
@@ -117,13 +117,14 @@ def _localizer(mode: str, ref):
             "rotation_rescan_min_score": 0.0,
             "temporal_candidate_prior": False,
             "max_geometric_rmse_px": 4.0,
+            **localization,
         },
         "homography": {"backend": "opencv", "use_mad_ransac": True},
     }
     return Localizer(
         database=_DB(ref, ext),
         feature_extractor=ext,
-        matcher=_Matcher(),
+        matcher=matcher or _Matcher(),
         calibration=FakeCalibration(),
         config=cfg,
         ref_frame_width=W,
@@ -232,3 +233,60 @@ def test_layer_search_path_continuous():
         res = loc.localize_frame(query, timestamp=2.0)
     assert res["success"], res.get("error")
     np.testing.assert_allclose(res["raw_metric"], _ref_point(Wq, W / 2, H / 2), atol=2.0)
+
+
+class _ScoreOrderedExtractor(_Extractor):
+    """ORB keypoints strongest first, like FeatureExtractor._by_score."""
+
+    def extract_local_features(self, image, static_mask=None):
+        g = cv2.cvtColor(np.ascontiguousarray(image), cv2.COLOR_RGB2GRAY)
+        m = None if static_mask is None else (static_mask > 128).astype(np.uint8) * 255
+        kps, desc = self.orb.detectAndCompute(g, m)
+        order = np.argsort([-k.response for k in kps], kind="stable")
+        pts = np.array([kps[i].pt for i in order], np.float32).reshape(-1, 2)
+        desc = np.zeros((0, 32), np.uint8) if desc is None else desc[order]
+        return {"keypoints": pts, "descriptors": desc, "image_size": np.array(g.shape[:2])}
+
+
+class _SpyMatcher(_Matcher):
+    def __init__(self):
+        super().__init__()
+        self.query_sizes: list[int] = []
+
+    def match(self, q, r):
+        self.query_sizes.append(len(q["keypoints"]))
+        return super().match(q, r)
+
+
+@pytest.mark.parametrize("budget", [0, 300])
+def test_temporal_prior_keypoint_budget(budget):
+    """localization.temporal_prior_max_keypoints: the temporal-prior check uses the
+    strongest `budget` query keypoints, the full path keeps all of them."""
+    ref = _scene()
+    query, Wq = _query(ref, 30)
+    spy = _SpyMatcher()
+    loc = _localizer(
+        "continuous",
+        ref,
+        extractor=_ScoreOrderedExtractor(),
+        matcher=spy,
+        temporal_candidate_prior=True,
+        temporal_prior_min_mnn=0,  # ORB descriptors make the float MNN probe meaningless
+        temporal_prior_audit_every=0,
+        temporal_prior_max_keypoints=budget,
+    )
+    first = loc.localize_frame(query)
+    assert first["success"], first.get("error")
+    full = max(spy.query_sizes)
+    assert full > 300 and loc._tp_hits == 0
+
+    spy.query_sizes.clear()
+    second = loc.localize_frame(query)
+    assert second["success"], second.get("error")
+    assert loc._tp_hits == 1  # served by the temporal prior
+    assert spy.query_sizes, "temporal prior did not reach the matcher"
+    if budget:
+        assert max(spy.query_sizes) == budget
+    else:  # the view's own full set (each rotated view has its own count)
+        assert max(spy.query_sizes) > 300
+    np.testing.assert_allclose(second["raw_metric"], _ref_point(Wq, W / 2, H / 2), atol=2.0)

@@ -6,6 +6,7 @@ from src.geometry.transformations import GeometryTransforms
 from src.localization.candidate_retriever import CandidateRetriever
 from src.localization.failure_log import FAILURE_TYPES, FailureLogger
 from src.localization.geometric_verifier import GeometricVerifier
+from src.localization.keypoint_budget import top_keypoints
 from src.localization.layer_search import LayerSearch
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.localization.query_rotation import (
@@ -139,6 +140,8 @@ class Localizer:
         self._tp_audit_every = int(
             get_cfg(self.config, "localization.temporal_prior_audit_every", 10)
         )
+        # Strongest-N query keypoints for the temporal-prior check (0 = all).
+        self._tp_max_kp = int(get_cfg(self.config, "localization.temporal_prior_max_keypoints", 0))
         self._tp_counter = 0
         self._tp_tries = 0
         self._tp_hits = 0
@@ -574,6 +577,9 @@ class Localizer:
         # yaw_hint_deg disables this path: external heading is new information
         # about orientation, it must be processed by full rotation path.
         _tp = _verified
+        # True only for a temporal-prior hit (not layer search's _verified): the
+        # rotation refine then compares inliers under the same keypoint budget.
+        tp_hit = False
         if _tp is None and self._temporal_prior and yaw_hint_deg is None:
             self._tp_counter += 1
             audit = self._tp_audit_every
@@ -582,6 +588,7 @@ class Localizer:
                 _tp = self._try_temporal_prior(query_frame, static_mask, _feat_cache)
                 if _tp is not None:
                     self._tp_hits += 1
+                    tp_hit = True
                 if self._tp_tries % 50 == 0:
                     logger.info(
                         f"[temporal-prior] tries={self._tp_tries} "
@@ -753,7 +760,13 @@ class Localizer:
             and self._rot_refine_min > 0
         ):
             refined = self._refine_rotation(
-                query_frame, static_mask, best_global_angle, best_scale, ver, _feat_cache
+                query_frame,
+                static_mask,
+                best_global_angle,
+                best_scale,
+                ver,
+                _feat_cache,
+                max_keypoints=self._tp_max_kp if tp_hit else 0,
             )
             if refined is not None:
                 (
@@ -1357,12 +1370,13 @@ class Localizer:
         """Angle as reported/collected: int (k*90) in quarter mode, float otherwise."""
         return round(float(angle), 2) if self._rot_continuous else int(angle)
 
-    def _refine_rotation(self, query_frame, static_mask, angle, scale, ver, cache):
+    def _refine_rotation(self, query_frame, static_mask, angle, scale, ver, cache, max_keypoints=0):
         """Re-verify ``ver``'s frame at the residual-corrected angle.
 
         Returns ``(ver, angle, frame, mask, crop_info, features)`` when the
         corrected view verifies the same reference frame with more inliers,
-        else None.
+        else None. ``max_keypoints`` (0 = all) must be the budget ``ver`` was
+        verified with, so the inlier counts are comparable.
         """
         target = next_prior_deg(angle, ver.H_query_to_ref)
         residual = angle_distance_deg(target, angle)
@@ -1371,7 +1385,9 @@ class Localizer:
         frame, mask, crop, feats = self._prepare_and_extract(
             query_frame, static_mask, target, scale, cache
         )
-        ver2 = self._geometric_verifier.verify(feats, [(int(ver.candidate_id), 0.0)], self.database)
+        ver2 = self._geometric_verifier.verify(
+            top_keypoints(feats, max_keypoints), [(int(ver.candidate_id), 0.0)], self.database
+        )
         if ver2 is None or ver2.inliers <= ver.inliers:
             logger.debug(
                 f"Rotation refine {angle:.1f}° -> {target:.1f}° kept the original "
@@ -1543,10 +1559,13 @@ class Localizer:
         rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
             query_frame, static_mask, angle, scale, cache
         )
+        # Probe and verification on the strongest keypoints only; `feats` (the
+        # full set, also in `cache` for the retrieval path) is what is returned.
+        tp_feats = top_keypoints(feats, self._tp_max_kp)
 
         cands = [(int(i), 0.0) for i in ids]
         ref_cache: dict = {}
-        scored = self._geometric_verifier.mnn_counts(feats, cands, self.database, ref_cache)
+        scored = self._geometric_verifier.mnn_counts(tp_feats, cands, self.database, ref_cache)
         if not scored:
             return None
         scored.sort(key=lambda t: -t[0])
@@ -1558,7 +1577,7 @@ class Localizer:
             return None
 
         probe = [(cid, float(m)) for m, cid, _ in scored[: max(1, self._tp_keep)]]
-        ver = self._geometric_verifier.verify(feats, probe, self.database, ref_cache=ref_cache)
+        ver = self._geometric_verifier.verify(tp_feats, probe, self.database, ref_cache=ref_cache)
         if ver is None or ver.inliers < self._tp_accept:
             got = ver.inliers if ver is not None else 0
             logger.debug(

@@ -184,6 +184,13 @@ class LocalizationConfig(BaseModel):
     # Кожен N-й keyframe примусово йде повним шляхом — аудит проти дрейфу.
     # 0 = аудит вимкнено (не рекомендується).
     temporal_prior_audit_every: int = 10
+    # Query keypoint budget for the temporal-prior check only (MNN probe, its
+    # LightGlue verification and the rotation refine of a temporal-prior hit):
+    # the strongest N of the extracted keypoints. Retrieval / rescan frames keep
+    # the full models.aliked.max_keypoints set. 0 = all keypoints (behaviour
+    # before 2026-10-10). Measured 2026-10-10 with a global 2048 cap: GTX 1650
+    # temporal-prior frames 348 -> 241 ms median, same fixes on own imagery.
+    temporal_prior_max_keypoints: int = 0
 
 
 class TrackingConfig(BaseModel):
