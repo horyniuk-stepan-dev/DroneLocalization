@@ -156,6 +156,12 @@ class LocalizationConfig(BaseModel):
     candidate_prefilter: bool = False
     # Скільки найкращих (за MNN-парами) кандидатів іде в повний LightGlue.
     prefilter_keep: int = 2
+    # When no candidate has a single MNN pair (Lowe ratio 0.75), the prefilter
+    # keeps the whole list and LightGlue runs on all top-K. N > 0 = LightGlue
+    # only the first N by global score instead. 0 = whole list (old behaviour).
+    # Measured 2026-10-10 on 6 routes: that case ran 63 % of all LightGlue
+    # calls; 3 of its 163 calls found a frame, at global positions 0, 3, 0.
+    prefilter_fallback_keep: int = 0
 
     # ── PIPELINE_OPTIMIZATION_PLAN §A3: довга сторона кадру для локального
     # екстрактора. Раніше жила ЛИШЕ як дефолт у get_cfg(..., 1600) і не була

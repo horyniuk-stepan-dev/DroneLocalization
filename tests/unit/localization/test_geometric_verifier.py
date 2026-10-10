@@ -343,3 +343,61 @@ class TestTrace:
         pre = ver.trace[0]["prefilter"]
         assert pre["all_zero"] is True and pre["kept"] == [1, 3]
         assert [t["cid"] for t in ver.trace[0]["tried"]] == [1, 3]
+
+
+class TestPrefilterFallbackKeep:
+    """localization.prefilter_fallback_keep: what LightGlue gets when no candidate
+    has a single MNN pair."""
+
+    CANDS = [(1, 0.9), (2, 0.8), (3, 0.7), (4, 0.6), (5, 0.5)]
+
+    @staticmethod
+    def _stub(ver, pairs: dict):
+        ver.mnn_counts = lambda q, cands, db, cache=None: [
+            (pairs.get(c, 0), c, s) for c, s in cands
+        ]
+
+    def test_off_keeps_the_whole_list(self):
+        ver = _verifier(matcher=FakeMatcher({}), prefilter_enabled=True, prefilter_keep=2)
+        self._stub(ver, {})
+        assert ver._prefilter({}, self.CANDS, None, {}) == self.CANDS
+
+    def test_keeps_the_first_n_by_global_score(self):
+        ver = _verifier(
+            matcher=FakeMatcher({}),
+            prefilter_enabled=True,
+            prefilter_keep=2,
+            prefilter_fallback_keep=4,
+        )
+        self._stub(ver, {})
+        assert ver._prefilter({}, self.CANDS, None, {}) == self.CANDS[:4]
+
+    def test_candidates_with_pairs_are_ranked_as_before(self):
+        for keep in (0, 4):
+            ver = _verifier(
+                matcher=FakeMatcher({}),
+                prefilter_enabled=True,
+                prefilter_keep=2,
+                prefilter_fallback_keep=keep,
+            )
+            self._stub(ver, {3: 2})
+            assert ver._prefilter({}, self.CANDS, None, {}) == [(3, 0.7), (1, 0.9)]
+
+    def test_verify_runs_lightglue_on_the_kept_candidates_only(self):
+        query = _feats(30, fid=0, seed=4)
+        flat = {}
+        for cid in range(1, 7):
+            f = _feats(30, fid=cid, seed=30 + cid)
+            f["descriptors"] = np.tile(f["descriptors"][:1], (30, 1))  # no MNN pair
+            flat[cid] = f
+        q, r = _identity_matches(30)
+        matcher = FakeMatcher({cid: (q, r) for cid in flat})
+        ver = _verifier(
+            matcher=matcher,
+            prefilter_enabled=True,
+            prefilter_keep=2,
+            prefilter_fallback_keep=3,
+            early_stop_inliers=10_000,
+        )
+        ver.verify(query, [(c, 1.0 - c / 10) for c in flat], FakeDB(flat))
+        assert matcher.calls == [1, 2, 3]

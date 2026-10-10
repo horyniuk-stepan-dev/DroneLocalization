@@ -51,6 +51,7 @@ class GeometricVerifier:
         min_reference_eigenvalue: float = 1e-4,
         ransac_max_iters: int = 2000,
         ransac_confidence: float = 0.99,
+        prefilter_fallback_keep: int = 0,
     ) -> None:
         self.matcher = matcher
         self.min_matches = min_matches
@@ -67,6 +68,9 @@ class GeometricVerifier:
         self.min_reference_eigenvalue = float(min_reference_eigenvalue)
         self.ransac_max_iters = int(ransac_max_iters)
         self.ransac_confidence = float(ransac_confidence)
+        # When no candidate has a single MNN pair, LightGlue only the first N by
+        # global score instead of the whole list. 0 = whole list (old behaviour).
+        self.prefilter_fallback_keep = int(prefilter_fallback_keep)
         # Diagnostics only (replay sets a list per frame): one record per verify()
         # call with every candidate's prefilter pairs and LightGlue / RANSAC
         # outcome. None = off; nothing below changes what verify() returns.
@@ -430,6 +434,16 @@ class GeometricVerifier:
         if scored is None:
             return candidates
         if all(s[0] == 0 for s in scored):
+            if self.prefilter_fallback_keep > 0:
+                # Measured 2026-10-10 on 6 routes: this case ran 63 % of all
+                # LightGlue calls; 3 of its 163 calls found a frame, at global
+                # positions 0, 3 and 0. MNN pairs at looser Lowe ratios did not
+                # single them out, the retrieval order did.
+                logger.debug(
+                    f"Prefilter: no MNN pairs on any candidate — keeping the first "
+                    f"{self.prefilter_fallback_keep} by global score"
+                )
+                return candidates[: self.prefilter_fallback_keep]
             logger.debug("Prefilter: no MNN pairs on any candidate — keeping full list")
             return candidates
         scored.sort(key=lambda t: (-t[0], -t[2]))

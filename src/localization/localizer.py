@@ -287,6 +287,9 @@ class Localizer:
             ),
             ransac_max_iters=self.ransac_max_iters,
             ransac_confidence=self.ransac_confidence,
+            prefilter_fallback_keep=get_cfg(
+                self.config, "localization.prefilter_fallback_keep", 0
+            ),
         )
         self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
         self._rotation_selector = RotationSelector(
