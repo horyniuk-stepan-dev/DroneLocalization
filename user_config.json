@@ -193,6 +193,7 @@
         "recovery_cascade": true,
         "candidate_prefilter": true,
         "prefilter_keep": 2,
+        "prefilter_fallback_keep": 4,
         "max_local_edge": 1600,
         "temporal_candidate_prior": true,
         "temporal_prior_window": 2,
