@@ -22,6 +22,7 @@ from src.localization.result_builder import ResultBuilder
 from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
 from src.localization.rotation_selector import RotationSelector
 from src.localization.scale_manager import ScaleManager, crop_to_affine
+from src.localization.spatial_prior import SpatialPrior
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
@@ -145,6 +146,14 @@ class Localizer:
         self._tp_counter = 0
         self._tp_tries = 0
         self._tp_hits = 0
+        # Spatial prior: second temporal-prior stage near the dead-reckoned
+        # position (flag localization.spatial_prior, off by default).
+        self._spatial_prior = SpatialPrior.from_config(self.config, enabled=not self.relative_mode)
+        self._sp_now: float | None = None
+        self._sp_frame_done = False
+        self._tp_verified: list[int] = []  # ids the index stage verified this call
+        self._sp_tries = 0
+        self._sp_hits = 0
 
         # Monitoring of inlier spatial spread across frame
         self._spread_stats_enabled = get_cfg(
@@ -361,6 +370,9 @@ class Localizer:
         self._tp_counter = 0
         self._tp_tries = 0
         self._tp_hits = 0
+        self._spatial_prior.reset()
+        self._sp_now = None
+        self._sp_frame_done = False
         if self._smoother is not None:
             self._smoother.reset()
 
@@ -427,6 +439,9 @@ class Localizer:
                 query_frame, static_mask, dt, yaw_hint_deg, collector, timestamp
             )
         previous = (self.database, self.calibration, self._active_source_id)
+        sp = self._spatial_prior
+        self._sp_now = sp.tick(timestamp, dt) if sp.enabled else None
+        self._sp_frame_done = False
         had_prior = self._scale_manager.prior is not None
         result = self._localize_frame_impl(query_frame, static_mask, dt, yaw_hint_deg, collector)
         if not result.get("success"):
@@ -443,6 +458,14 @@ class Localizer:
         if result.get("fallback_mode") == "retrieval_only":
             self._consecutive_failures += 1
             self._scale_manager.invalidate()
+        elif sp.enabled and result.get("success") and "lat" in result and "lon" in result:
+            sp.record_fix(
+                self._sp_now,
+                float(result["lat"]),
+                float(result["lon"]),
+                angle=self._last_best_angle,
+                scale=self._scale_manager.prior,
+            )
         return self._coordinate_result(result)
 
     def _coordinate_result(self, result):
@@ -1528,19 +1551,106 @@ class Localizer:
             for c in (cid,) if d == 0 else (cid - d, cid + d):
                 if c < 0 or c in ids:
                     continue
-                try:
-                    support_check = getattr(self.database, "is_frame_georef_supported", None)
-                    if support_check is not None and not support_check(c):
-                        continue
-                    if self.database.get_frame_affine(c) is None:
-                        continue
-                except Exception as e:  # noqa: BLE001 — БД може не мати кадру
-                    logger.debug(f"Temporal prior: frame {c} rejected ({e})")
-                    continue
-                ids.append(c)
+                if self._tp_frame_usable(c):
+                    ids.append(c)
         return ids
 
+    def _tp_frame_usable(self, c: int) -> bool:
+        """A frame can end a temporal / spatial prior check: georeferenced + calibrated."""
+        try:
+            support_check = getattr(self.database, "is_frame_georef_supported", None)
+            if support_check is not None and not support_check(c):
+                return False
+            return self.database.get_frame_affine(c) is not None
+        except Exception as e:  # noqa: BLE001 — БД може не мати кадру
+            logger.debug(f"Temporal prior: frame {c} rejected ({e})")
+            return False
+
     def _try_temporal_prior(
+        self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
+    ) -> tuple | None:
+        """Index-neighbour temporal prior, then (flag) the spatial prior."""
+        self._tp_verified = []
+        hit = self._try_index_prior(query_frame, static_mask, cache)
+        if hit is None and self._spatial_prior.enabled:
+            hit = self._try_spatial_prior(query_frame, static_mask, cache)
+        return hit
+
+    def _try_spatial_prior(
+        self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
+    ) -> tuple | None:
+        """Second temporal-prior stage: map frames near the dead-reckoned position.
+
+        Runs at most once per ``localize_frame`` call (the in-frame retry would
+        repeat it) and only within ``spatial_prior_max_age_s`` of the last fix.
+        Angle and scale fall back to the last confirmed ones (the retry clears
+        both priors). Candidates: the ``spatial_prior_nearest_k`` usable frames
+        of the active layer nearest to the prediction, then the index
+        neighbours; the best ``spatial_prior_verify`` by MNN go to LightGlue
+        without the ``temporal_prior_min_mnn`` gate (on other-satellite imagery
+        the probe scores the right frame below it while LightGlue accepts it).
+        Same return tuple as ``_try_index_prior``; verification tag
+        ``spatial_prior``.
+        """
+        if self._sp_frame_done or self._sp_now is None:
+            return None
+        self._sp_frame_done = True
+        sp = self._spatial_prior
+        pred = sp.predict(self._sp_now)
+        if pred is None:
+            return None
+        angle = self._last_best_angle if self._last_best_angle is not None else sp.angle
+        if angle is None:
+            return None
+        scale = self._scale_manager.prior
+        if scale is None:
+            scale = sp.scale
+        scale = 1.0 if scale is None else float(scale)
+
+        index_ids = self._tp_neighbour_ids()
+        ids = sp.nearest_ids(
+            self.database, pred[0], pred[1], exclude=index_ids, usable=self._tp_frame_usable
+        )
+        # Frames the index stage already ran LightGlue on in this frame are not
+        # verified twice.
+        ids = [c for c in ids + index_ids if c not in self._tp_verified]
+        if not ids:
+            return None
+        self._sp_tries += 1
+
+        rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
+            query_frame, static_mask, angle, scale, cache
+        )
+        tp_feats = top_keypoints(feats, self._tp_max_kp)
+        cands = [(int(i), 0.0) for i in ids]
+        ref_cache: dict = {}
+        scored = self._geometric_verifier.mnn_counts(tp_feats, cands, self.database, ref_cache)
+        if not scored:
+            return None
+        # Stable sort: equal probe counts keep the nearest-first order.
+        scored.sort(key=lambda t: -t[0])
+        probe = [(cid, float(m)) for m, cid, _ in scored[: sp.verify]]
+        ver = self._geometric_verifier.verify(
+            tp_feats, probe, self.database, ref_cache=ref_cache, tag="spatial_prior"
+        )
+        if ver is None or ver.inliers < self._tp_accept:
+            got = ver.inliers if ver is not None else 0
+            logger.debug(
+                f"Spatial prior: rejected ({got} inliers < {self._tp_accept}; "
+                f"{len(ids)} candidates, age {sp.age(self._sp_now):.1f} s)"
+            )
+            return None
+        self._sp_hits += 1
+        if self._sp_tries % 25 == 0 or self._sp_hits == 1:
+            logger.info(f"[spatial-prior] tries={self._sp_tries} hits={self._sp_hits}")
+        logger.debug(
+            f"Spatial prior HIT: frame={ver.candidate_id}, inliers={ver.inliers}, "
+            f"angle={angle:.1f} deg, age {sp.age(self._sp_now):.1f} s"
+        )
+        out_angle = float(angle) if self._rot_continuous else int(angle)
+        return (ver, out_angle, float(scale), rotated, rot_mask, crop_info, feats, probe)
+
+    def _try_index_prior(
         self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
     ) -> tuple | None:
         """Item A1: localization without global descriptor.
@@ -1584,6 +1694,7 @@ class Localizer:
             return None
 
         probe = [(cid, float(m)) for m, cid, _ in scored[: max(1, self._tp_keep)]]
+        self._tp_verified = [cid for cid, _ in probe]
         ver = self._geometric_verifier.verify(
             tp_feats, probe, self.database, ref_cache=ref_cache, tag="temporal_prior"
         )

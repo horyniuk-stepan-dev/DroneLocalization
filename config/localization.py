@@ -197,6 +197,23 @@ class LocalizationConfig(BaseModel):
     # before 2026-10-10). Measured 2026-10-10 with a global 2048 cap: GTX 1650
     # temporal-prior frames 348 -> 241 ms median, same fixes on own imagery.
     temporal_prior_max_keypoints: int = 0
+    # Spatial prior (src/localization/spatial_prior.py): when the index-neighbour
+    # temporal prior finds nothing, probe the map frames nearest to the
+    # constant-velocity prediction from the last two fixes, with the last
+    # confirmed angle and scale (the in-frame retry clears those priors, which
+    # otherwise turns the temporal prior off for a whole loss), and LightGlue the
+    # best `spatial_prior_verify` of them without the temporal_prior_min_mnn
+    # gate. Acceptance stays temporal_prior_accept_inliers. Once per frame, only
+    # within spatial_prior_max_age_s of the last fix, active layer only.
+    # Diagnosed 2026-10-10 on wb2019 (other-satellite imagery): the right frame
+    # was accepted by LightGlue 22 of 22 times it got there, but got there in
+    # 22 of 176 slots; at each loss start it was the nearest frame of its layer
+    # to the prediction. False = old behaviour.
+    spatial_prior: bool = False
+    spatial_prior_max_age_s: float = 30.0
+    spatial_prior_nearest_k: int = 4
+    spatial_prior_radius_m: float = 1500.0
+    spatial_prior_verify: int = 2
 
 
 class TrackingConfig(BaseModel):

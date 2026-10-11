@@ -290,3 +290,143 @@ def test_temporal_prior_keypoint_budget(budget):
     else:  # the view's own full set (each rotated view has its own count)
         assert max(spy.query_sizes) > 300
     np.testing.assert_allclose(second["raw_metric"], _ref_point(Wq, W / 2, H / 2), atol=2.0)
+
+
+# ── spatial prior (localization.spatial_prior) ─────────────────────────────────
+#
+# Map: frame 0 = scene A, frame 9 = scene B, frames 1..8 = other scenes. Index
+# neighbours of frame 0 are 1 and 2; frame 9 is 9 indices away but at the same
+# place on the ground (frame_gps), the others 5.5 km off. The drone sees A, then
+# B: the index stage cannot find B, the spatial stage can.
+
+
+class _MultiDB:
+    def __init__(self, scenes, gps, extractor):
+        self.scenes = scenes
+        self.features = [extractor.extract_local_features(s) for s in scenes]
+        # Only A and B are retrievable (zero descriptor = score 0): the thumbnail
+        # is too coarse to keep random scenes apart at every scan view and scale.
+        g = np.stack([_thumb(s) for s in scenes])
+        g[1:-1] = 0.0
+        self.global_descriptors = g
+        self.frame_gps = np.asarray(gps, dtype=np.float64)
+        self.lance_table = None
+        self.frame_rmse = None
+        self.frame_disagreement = None
+
+    def get_num_frames(self):
+        return len(self.scenes)
+
+    def get_frame_size(self, i):
+        return self.scenes[i].shape[:2]
+
+    def get_frame_affine(self, i):  # reference pixels == metres, same ground for all
+        return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    def get_local_features(self, i):
+        return self.features[i]
+
+
+class _CountingExtractor(_Extractor):
+    def __init__(self):
+        super().__init__()
+        self.global_calls = 0
+
+    def extract_global_descriptor(self, image, valid_mask=None):
+        self.global_calls += 1
+        return super().extract_global_descriptor(image, valid_mask)
+
+    def extract_global_descriptors_multi(self, images, valid_masks=None):
+        self.global_calls += 1
+        return super().extract_global_descriptors_multi(images, valid_masks)
+
+
+def _spatial_setup(**localization):
+    pytest.importorskip("torch")
+    from src.localization.localizer import Localizer
+
+    a, b = _scene(3), _scene(11)
+    others = [_scene(20 + i) for i in range(8)]
+    qa, Wq = _query(a, 30)
+    qb, _ = _query(b, 30)
+    x, y = _ref_point(Wq, W / 2, H / 2)
+    here = (50.0 + y * 1e-5, 30.0 + x * 1e-5)  # FakeCalibration's converter
+    far = (here[0] + 0.05, here[1])
+    ext = _CountingExtractor()
+    db = _MultiDB([a, *others, b], [here] + [far] * 8 + [here], ext)
+    cfg = {
+        "localization": {
+            "rotation_mode": "continuous",
+            "retrieval_top_k": 1,
+            "rotation_rescan_min_score": 0.0,
+            "max_geometric_rmse_px": 4.0,
+            "temporal_candidate_prior": True,
+            "temporal_prior_audit_every": 0,
+            "spatial_prior_verify": 4,  # ORB: the float MNN probe does not rank
+            **localization,
+        },
+        "homography": {"backend": "opencv", "use_mad_ransac": True},
+    }
+    loc = Localizer(
+        database=db,
+        feature_extractor=ext,
+        matcher=_Matcher(),
+        calibration=FakeCalibration(),
+        config=cfg,
+        ref_frame_width=W,
+        ref_frame_height=H,
+    )
+    loc._geometric_verifier.trace = []
+    return loc, ext, qa, qb
+
+
+def _winner_tags(loc):
+    return [r["tag"] for r in loc._geometric_verifier.trace if r["winner"]]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_spatial_prior_finds_a_frame_far_in_index(enabled):
+    loc, ext, qa, qb = _spatial_setup(spatial_prior=enabled)
+    assert loc.localize_frame(qa, timestamp=0.0)["success"]
+    assert loc.localize_frame(qa, timestamp=1.0)["success"]
+    ext.global_calls = 0
+    loc._geometric_verifier.trace = []
+    hits = loc._sp_hits  # the ORB probe may already have sent frame A here
+    res = loc.localize_frame(qb, timestamp=2.0)
+    assert res["success"], res.get("error")
+    assert res["matched_frame"] == 9
+    if enabled:
+        assert _winner_tags(loc) == ["spatial_prior"] and loc._sp_hits == hits + 1
+        assert ext.global_calls == 0  # no retrieval
+    else:  # old behaviour: the global descriptor finds it
+        assert "spatial_prior" not in _winner_tags(loc) and ext.global_calls > 0
+
+
+def test_spatial_prior_survives_the_retry_reset_and_runs_once_per_frame():
+    """A lost frame clears the angle prior; the next frame still gets the
+    spatial check (last confirmed angle) and no frame runs it twice."""
+    loc, ext, qa, qb = _spatial_setup(spatial_prior=True)
+    assert loc.localize_frame(qa, timestamp=0.0)["success"]
+    assert loc.localize_frame(qa, timestamp=1.0)["success"]
+    noise = np.random.default_rng(0).integers(0, 255, (H, W, 3), dtype=np.uint8)
+    tries = loc._sp_tries
+    lost = loc.localize_frame(noise, timestamp=2.0)
+    assert not lost["success"]
+    assert loc._last_best_angle is None  # the in-frame retry reset it
+    assert loc._sp_tries == tries + 1  # the retry did not repeat the spatial check
+    ext.global_calls = 0
+    loc._geometric_verifier.trace = []
+    res = loc.localize_frame(qb, timestamp=3.0)
+    assert res["success"] and res["matched_frame"] == 9
+    assert _winner_tags(loc) == ["spatial_prior"] and ext.global_calls == 0
+
+
+def test_spatial_prior_only_near_the_last_fix():
+    loc, ext, qa, qb = _spatial_setup(spatial_prior=True, spatial_prior_max_age_s=5.0)
+    assert loc.localize_frame(qa, timestamp=0.0)["success"]
+    assert loc.localize_frame(qa, timestamp=1.0)["success"]
+    tries = loc._sp_tries
+    loc._geometric_verifier.trace = []
+    res = loc.localize_frame(qb, timestamp=10.0)  # 9 s after the last fix
+    assert res["success"] and loc._sp_tries == tries
+    assert "spatial_prior" not in _winner_tags(loc)
