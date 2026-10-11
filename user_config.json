@@ -201,7 +201,8 @@
         "temporal_prior_min_mnn": 20,
         "temporal_prior_accept_inliers": 25,
         "temporal_prior_audit_every": 10,
-        "temporal_prior_max_keypoints": 0
+        "temporal_prior_max_keypoints": 0,
+        "spatial_prior": true
     },
     "tracking": {
         "kalman_process_noise": 2.0,
