@@ -1,0 +1,155 @@
+[
+  {
+    "frames": 100,
+    "links": 390,
+    "seconds": 27.79879630000505,
+    "peak_working_set_mb": 193.51953125,
+    "qa": {
+      "method": "affine_symmetric_irls_v1",
+      "units": "original_image_pixels",
+      "frames": 100,
+      "links": 390,
+      "points": 199680,
+      "training_points": 37440,
+      "training_point_limit_per_link": 96,
+      "jacobian": "analytic",
+      "heldout_points": 40170,
+      "before_median_px": 1.8481795037100306,
+      "after_median_px": 0.1778401105932314,
+      "before_p95_px": 3.59079005101754,
+      "after_p95_px": 0.36901848707578705,
+      "heldout_before_p95_px": 3.5895100085478773,
+      "heldout_after_p95_px": 0.36904556669947813,
+      "heldout_scope": "global_adjustment_only",
+      "evaluations": 195,
+      "converged": false,
+      "heldout_robust_cost": 9.517529914084022,
+      "training_robust_cost": 8.760512186282398,
+      "frames_with_single_link": 0,
+      "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+      "solver": "overlapping_block_coordinate",
+      "window_frames": 32,
+      "window_overlap": 8,
+      "sweeps": 8,
+      "max_sweeps": 8,
+      "windows_solved": 40,
+      "windows_rejected": 0,
+      "final_sweep_max_motion_px": 0.07899631304078514,
+      "convergence_scope": "bounded_window_sweeps; global stationarity not certified",
+      "selected_model": "affine",
+      "model_selection": {
+        "projective": {
+          "heldout_robust_cost": 9.536311445540205,
+          "heldout_p95_px": 0.3698957666910736
+        },
+        "affine": {
+          "heldout_robust_cost": 9.517529914084022,
+          "heldout_p95_px": 0.36904556669947813
+        }
+      },
+      "rejected_models": {}
+    }
+  },
+  {
+    "frames": 200,
+    "links": 790,
+    "seconds": 62.36918219999643,
+    "peak_working_set_mb": 232.546875,
+    "qa": {
+      "method": "affine_symmetric_irls_v1",
+      "units": "original_image_pixels",
+      "frames": 200,
+      "links": 790,
+      "points": 404480,
+      "training_points": 75840,
+      "training_point_limit_per_link": 96,
+      "jacobian": "analytic",
+      "heldout_points": 81370,
+      "before_median_px": 1.7298420960165557,
+      "after_median_px": 0.17797075907324533,
+      "before_p95_px": 3.5720069914901704,
+      "after_p95_px": 0.3702139188302197,
+      "heldout_before_p95_px": 3.573491462948277,
+      "heldout_after_p95_px": 0.3690859404891563,
+      "heldout_scope": "global_adjustment_only",
+      "evaluations": 412,
+      "converged": false,
+      "heldout_robust_cost": 19.321985201860507,
+      "training_robust_cost": 17.935523835633973,
+      "frames_with_single_link": 0,
+      "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+      "solver": "overlapping_block_coordinate",
+      "window_frames": 32,
+      "window_overlap": 8,
+      "sweeps": 8,
+      "max_sweeps": 8,
+      "windows_solved": 72,
+      "windows_rejected": 0,
+      "final_sweep_max_motion_px": 0.1277855094514289,
+      "convergence_scope": "bounded_window_sweeps; global stationarity not certified",
+      "selected_model": "affine",
+      "model_selection": {
+        "projective": {
+          "heldout_robust_cost": 19.41885771720708,
+          "heldout_p95_px": 0.36981363540906
+        },
+        "affine": {
+          "heldout_robust_cost": 19.321985201860507,
+          "heldout_p95_px": 0.3690859404891563
+        }
+      },
+      "rejected_models": {}
+    }
+  },
+  {
+    "frames": 500,
+    "links": 1990,
+    "seconds": 153.31016150000505,
+    "peak_working_set_mb": 467.921875,
+    "qa": {
+      "method": "affine_symmetric_irls_v1",
+      "units": "original_image_pixels",
+      "frames": 500,
+      "links": 1990,
+      "points": 1018880,
+      "training_points": 191040,
+      "training_point_limit_per_link": 96,
+      "jacobian": "analytic",
+      "heldout_points": 204970,
+      "before_median_px": 1.6574707740507124,
+      "after_median_px": 0.1774570139370893,
+      "before_p95_px": 3.52487229544831,
+      "after_p95_px": 0.36859748723141245,
+      "heldout_before_p95_px": 3.523554382634909,
+      "heldout_after_p95_px": 0.3697830673706026,
+      "heldout_scope": "global_adjustment_only",
+      "evaluations": 1038,
+      "converged": false,
+      "heldout_robust_cost": 48.638898882608764,
+      "training_robust_cost": 44.66361619640337,
+      "frames_with_single_link": 0,
+      "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+      "solver": "overlapping_block_coordinate",
+      "window_frames": 32,
+      "window_overlap": 8,
+      "sweeps": 8,
+      "max_sweeps": 8,
+      "windows_solved": 168,
+      "windows_rejected": 0,
+      "final_sweep_max_motion_px": 0.1268139834896487,
+      "convergence_scope": "bounded_window_sweeps; global stationarity not certified",
+      "selected_model": "affine",
+      "model_selection": {
+        "projective": {
+          "heldout_robust_cost": 48.80619573310257,
+          "heldout_p95_px": 0.3703722686633908
+        },
+        "affine": {
+          "heldout_robust_cost": 48.638898882608764,
+          "heldout_p95_px": 0.3697830673706026
+        }
+      },
+      "rejected_models": {}
+    }
+  }
+]

@@ -120,6 +120,13 @@ def build_components(
     vlad_layer = g("models.vlad.layer", None)
     default_size = 224 if backend == "dinov3" else 336
     return {
+        # Diagnostic only: local matching supports cross-resolution images and
+        # this offline extraction choice must not disable live retrieval.
+        "local_extraction_max_edge": (
+            0
+            if g("database.accuracy_features", False)
+            else int(g("localization.max_local_edge", 1600))
+        ),
         "dino_input_size": int(g(f"global_descriptor.{backend}.input_size", default_size)),
         "schema_version": schema_version,
         "global_backend": backend,

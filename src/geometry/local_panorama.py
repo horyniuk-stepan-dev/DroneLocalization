@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from src.geometry.frame_transform import as_homography, get_frame_transform, project_points
+
 
 @dataclass
 class LocalPanoramaLayout:
@@ -33,7 +35,7 @@ class LocalPanoramaLayout:
         if database.frame_valid is None or database.frame_affine is None:
             raise ValueError("Build the local map before creating its panorama")
         affines = {
-            int(i): np.array(database.frame_affine[i], dtype=np.float64, copy=True)
+            int(i): np.array(get_frame_transform(database, int(i)), dtype=np.float64, copy=True)
             for i in np.flatnonzero(database.frame_valid)
         }
         if not affines:
@@ -47,8 +49,8 @@ class LocalPanoramaLayout:
         digest.update(
             str(database.metadata.get("source_sha256") or getattr(database, "db_path", "")).encode()
         )
-        corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]])
-        footprints = np.concatenate([corners @ a.T for a in affines.values()])
+        corners = np.array([[0, 0], [w, 0], [w, h], [0, h]])
+        footprints = np.concatenate([project_points(a, corners) for a in affines.values()])
         if not np.isfinite(footprints).all():
             raise ValueError("Non-finite local map geometry")
         lo, hi = footprints.min(axis=0), footprints.max(axis=0)
@@ -112,10 +114,10 @@ def render_local_panorama(video_path, layout, *, running=lambda: True, progress=
                     f"Cannot read reference video frame {video_frame}; check the source video"
                 )
             frame = cv2.resize(frame, (layout.frame_width, layout.frame_height))
-            matrix = (layout.map_to_canvas @ np.vstack([affine, [0, 0, 1]]))[:2]
+            matrix = layout.map_to_canvas @ as_homography(affine)
             weighted = frame.astype(np.float32) * feather[..., None]
-            colors += cv2.warpAffine(weighted, matrix, (cw, ch), flags=cv2.INTER_LINEAR)
-            weights += cv2.warpAffine(feather, matrix, (cw, ch), flags=cv2.INTER_LINEAR)
+            colors += cv2.warpPerspective(weighted, matrix, (cw, ch), flags=cv2.INTER_LINEAR)
+            weights += cv2.warpPerspective(feather, matrix, (cw, ch), flags=cv2.INTER_LINEAR)
             progress(
                 int(count / len(layout.affines) * 95),
                 f"Панорама локальної карти: {count}/{len(layout.affines)} кадрів",

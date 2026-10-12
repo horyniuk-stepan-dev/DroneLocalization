@@ -6,6 +6,8 @@ Key fixes:
   preventing false positive matches on homogeneous textures.
 """
 
+import copy
+
 import faiss
 import numpy as np
 import torch
@@ -253,6 +255,19 @@ class FeatureMatcher:
 
         # Fallback (no LightGlue or unsupported descriptor)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
+
+    def match_accuracy(self, query_features: dict, ref_features: dict) -> tuple:
+        """Full-depth offline matching without changing the shared live model."""
+        if self.lightglue is None or not hasattr(self.lightglue, "conf"):
+            return self.match(query_features, ref_features)
+        dims = [f["descriptors"].shape[1] for f in (query_features, ref_features)]
+        if dims[0] != dims[1] or dims[0] not in (128, 256):
+            return self.match(query_features, ref_features)
+        model = copy.copy(self.lightglue)
+        model.conf = copy.deepcopy(self.lightglue.conf)
+        model.conf.depth_confidence = -1
+        model.conf.width_confidence = -1
+        return self._lightglue_match(query_features, ref_features, model=model)
 
     def _fast_numpy_match(
         self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.75

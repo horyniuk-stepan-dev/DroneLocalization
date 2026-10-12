@@ -287,6 +287,7 @@ class DatabaseLoader:
             raise
 
     def _load_propagation_data(self) -> None:
+        self.frame_homography = None
         self.frame_origin = None
         self.frame_georef_status = None
         self.frame_support_distance_slots = None
@@ -338,21 +339,34 @@ class DatabaseLoader:
             if "frame_affine" in grp:
                 self.frame_affine = grp["frame_affine"][:]
                 self.frame_valid = grp["frame_valid"][:].astype(bool)
+                if "frame_homography" in grp:
+                    from src.geometry.frame_transform import valid_footprint
+
+                    matrices = grp["frame_homography"][:]
+                    if matrices.shape != (len(self.frame_valid), 3, 3) or not all(
+                        valid_footprint(
+                            H, self.metadata["frame_width"], self.metadata["frame_height"]
+                        )
+                        for H in matrices[self.frame_valid]
+                    ):
+                        raise ValueError("Invalid projective calibration dataset")
+                    self.frame_homography = matrices
                 self.frame_origin = grp["frame_origin"][:] if "frame_origin" in grp else None
                 self.frame_georef_status = (
                     grp["frame_georef_status"][:] if "frame_georef_status" in grp else None
                 )
                 self.frame_support_distance_slots = (
                     grp["frame_support_distance_slots"][:]
-                    if "frame_support_distance_slots" in grp else None
+                    if "frame_support_distance_slots" in grp
+                    else None
                 )
                 self.frame_graph_component = (
-                    grp["frame_graph_component"][:]
-                    if "frame_graph_component" in grp else None
+                    grp["frame_graph_component"][:] if "frame_graph_component" in grp else None
                 )
                 self.frame_support_anchor_count = (
                     grp["frame_support_anchor_count"][:]
-                    if "frame_support_anchor_count" in grp else None
+                    if "frame_support_anchor_count" in grp
+                    else None
                 )
                 self.frame_rmse_units = grp.attrs.get("frame_rmse_units")
                 self.disagreement_kind = grp.attrs.get("disagreement_kind")
@@ -378,6 +392,7 @@ class DatabaseLoader:
                 exc_info=True,
             )
             self.frame_affine = None
+            self.frame_homography = None
             self.frame_valid = None
 
     @property

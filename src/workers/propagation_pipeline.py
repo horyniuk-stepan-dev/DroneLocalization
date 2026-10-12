@@ -12,6 +12,7 @@ with SO(2)-safe angular residuals (arctan2(sin, cos)).
 import json
 from collections import defaultdict
 
+import cv2
 import faiss
 import h5py
 import numpy as np
@@ -91,6 +92,14 @@ class PropagationPipeline:
         self.config = config or {}
         self._is_running = True
         self.relative_mode = getattr(getattr(calibration, "converter", None), "mode", "") == "LOCAL"
+        self.high_accuracy = bool(get_cfg(self.config, "propagation.high_accuracy", False))
+        self.temporal_neighbors = int(get_cfg(self.config, "propagation.temporal_neighbors", 4))
+        self.point_pair_limit = int(get_cfg(self.config, "propagation.point_pair_limit", 512))
+        self._pair_homographies = {}
+        self._pair_diagnostics = {}
+        self._source_frames = None
+        self._frame_homographies = None
+        self._subpixel_status = "disabled"
         self._relative_feature_ids = {}
         self._relative_point_pairs = {}
         self._relative_alignment_report = None
@@ -283,6 +292,14 @@ class PropagationPipeline:
                 self._cancelled_cb()
 
     def _run_propagation(self):
+        try:
+            self._run_propagation_core()
+        finally:
+            if self._source_frames is not None:
+                self._source_frames.close()
+                self._source_frames = None
+
+    def _run_propagation_core(self):
         if self.relative_mode:
             # A single gauge fixes arbitrary translation/rotation/scale. Geographic
             # priors, old solutions and geographic exports have no meaning here.
@@ -291,7 +308,9 @@ class PropagationPipeline:
             self.pin_exact_anchors = False
             self.use_bfs = True
         num_frames = self.database.get_num_frames()
-        all_anchors = [] if self.relative_mode else sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        all_anchors = (
+            [] if self.relative_mode else sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        )
         anchors = [a for a in all_anchors if a.frame_id < num_frames]
 
         # Validate that all anchors refer to slots within the database.
@@ -318,11 +337,26 @@ class PropagationPipeline:
         # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
         self._report_progress(0, "Prefetching features into RAM...")
         all_features = self._prefetch_features(num_frames)
-        if self.relative_mode:
-            self._relative_feature_ids = {id(features): fid for fid, features in all_features.items()}
+        if self.relative_mode or self.high_accuracy:
+            self._relative_feature_ids = {
+                id(features): fid for fid, features in all_features.items()
+            }
             self._relative_point_pairs.clear()
             self._relative_alignment_report = None
             self._relative_alignment_rmse = {}
+        if self.high_accuracy:
+            self._pair_homographies.clear()
+            self._pair_diagnostics.clear()
+            self._frame_homographies = None
+            if get_cfg(self.config, "propagation.subpixel_refinement", True):
+                from src.geometry.pair_refinement import SourceFrames
+
+                try:
+                    self._source_frames = SourceFrames(self.database.metadata, self._check_running)
+                    self._subpixel_status = "verified_source"
+                except (ValueError, OSError) as exc:
+                    self._subpixel_status = str(exc)
+                    logger.warning(f"Subpixel refinement unavailable: {exc}")
         self._check_running()
         if not all_features:
             # Two cases: (a) corrupted/unreadable file — _prefetch_features already
@@ -345,10 +379,18 @@ class PropagationPipeline:
             from src.calibration.multi_anchor_calibration import AnchorCalibration
 
             seed = min(all_features)
-            anchors = [AnchorCalibration(seed, np.array([
-                [1.0, 0.0, -self.frame_w / 2],
-                [0.0, -1.0, self.frame_h / 2],
-            ]), {"transform_type": "relative_gauge", "projection_mode": "LOCAL"})]
+            anchors = [
+                AnchorCalibration(
+                    seed,
+                    np.array(
+                        [
+                            [1.0, 0.0, -self.frame_w / 2],
+                            [0.0, -1.0, self.frame_h / 2],
+                        ]
+                    ),
+                    {"transform_type": "relative_gauge", "projection_mode": "LOCAL"},
+                )
+            ]
         for i in range(num_frames):
             if i in all_features:
                 optimizer.add_node(i)
@@ -406,8 +448,17 @@ class PropagationPipeline:
             f"({temporal_count} temporal + {spatial_count} spatial)"
         )
 
+        if self.high_accuracy and self.relative_mode:
+            self._run_accurate_local_map(optimizer, all_features, anchors)
+            return
+
         # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
-        self._report_progress(60, "Fixing local coordinate origin..." if self.relative_mode else "Fixing GPS anchors (Local Origin)...")
+        self._report_progress(
+            60,
+            "Fixing local coordinate origin..."
+            if self.relative_mode
+            else "Fixing GPS anchors (Local Origin)...",
+        )
 
         # An affine belongs to one exact image.  Applying it to a neighbouring
         # keyframe silently moves the map, so missing anchor slots are a database
@@ -520,9 +571,11 @@ class PropagationPipeline:
         # ── Phase 4: Optimize ────────────────────────────────────────────────
         self._report_progress(70, "Global graph optimisation (Levenberg-Marquardt)...")
         # Do not resurrect an edge discarded by the pose-graph pruning stage.
-        relative_graph_pairs = {
-            tuple(sorted((edge.from_id, edge.to_id))) for edge in optimizer.edges
-        } if self.relative_mode else set()
+        relative_graph_pairs = (
+            {tuple(sorted((edge.from_id, edge.to_id))) for edge in optimizer.edges}
+            if self.relative_mode
+            else set()
+        )
         results = optimizer.optimize(
             max_iterations=self.max_iters,
             tolerance=self.tolerance,
@@ -580,7 +633,9 @@ class PropagationPipeline:
         force_invalid: set[int] = set()
         if self.anchor_gap_check and flagged_gaps:
             force_invalid = {
-                fid for start, end in flagged_gaps for fid in range(start + 1, end)
+                fid
+                for start, end in flagged_gaps
+                for fid in range(start + 1, end)
                 if fid not in graph_supported
             }
             if force_invalid:
@@ -611,9 +666,7 @@ class PropagationPipeline:
             linear_affines = interpolate_linear_anchor_intervals(
                 anchor_affines, linear_intervals, self.frame_w, self.frame_h
             )
-            interior_count = sum(
-                1 for fid in linear_affines if fid not in anchor_affines
-            )
+            interior_count = sum(1 for fid in linear_affines if fid not in anchor_affines)
             logger.info(
                 f"Anchor-linear model: {len(linear_intervals)} stable intervals, "
                 f"{interior_count} interior slots"
@@ -628,13 +681,43 @@ class PropagationPipeline:
             )
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
-        if self.relative_mode:
+        if self.high_accuracy:
+            # Keep the geographic anchor behavior from the existing graph stage.
+            # Refine only relative image geometry around those fixed results.
+            results.update(
+                {fid: affine for fid, affine in linear_affines.items() if fid in results}
+            )
+            self._frame_homographies = self._refine_accurate_map(
+                results,
+                optimizer,
+                all_features,
+                fixed_ids={a.frame_id for a in anchors} | set(linear_affines),
+            )
+            from src.geometry.frame_transform import affine_at_center
+
+            if self._frame_homographies is not None:
+                results.update(
+                    {
+                        fid: affine_at_center(H, self.frame_w, self.frame_h)
+                        for fid, H in self._frame_homographies.items()
+                    }
+                )
+            # Accuracy validation can reject spatial constraints after the
+            # legacy solve. Do not retain support through a rejected edge.
+            graph_supported, compact_component_ids, component_anchors = anchored_graph_support(
+                results.keys(), optimizer.edges, anchor_nodes
+            )
+            frame_components[:] = -1
+            frame_components[: len(compact_component_ids)] = compact_component_ids
+        elif self.relative_mode:
             from src.geometry.relative_alignment import PointLink, refine_relative_affines
             from src.geometry.relative_map import normalize_relative_map
 
             results = {fid: matrix for fid, matrix in results.items() if fid in graph_supported}
             if len(results) < 2:
-                self._report_error("Local map needs at least two visually connected frames. Use denser video sampling.")
+                self._report_error(
+                    "Local map needs at least two visually connected frames. Use denser video sampling."
+                )
                 return
             self._report_progress(82, "Aligning shared image points in the local map...")
             links = []
@@ -655,8 +738,12 @@ class PropagationPipeline:
             if extra_links:
                 self._report_progress(84, "Refining local map with verified cross-pass overlaps...")
                 results, report, frame_rmse = refine_relative_affines(
-                    initial_affines, links + extra_links, self.frame_w, self.frame_h,
-                    anchors[0].frame_id, self._check_running,
+                    initial_affines,
+                    links + extra_links,
+                    self.frame_w,
+                    self.frame_h,
+                    anchors[0].frame_id,
+                    self._check_running,
                 )
             report["additional_overlap_links"] = len(extra_links)
             self._relative_alignment_report = report
@@ -681,11 +768,22 @@ class PropagationPipeline:
         # Export GeoJSON for visualisation
         if self.export_geojson and self.calibration.converter:
             try:
+                final_transforms = None
+                if self._frame_homographies is not None:
+                    from src.geometry.frame_transform import get_frame_transform
+
+                    final_transforms = {
+                        fid: get_frame_transform(self.database, fid)
+                        for fid in results
+                        if self.database.frame_valid[fid]
+                    }
                 geojson = optimizer.export_graph_geojson(
                     self.calibration.converter,
                     self.frame_w,
                     self.frame_h,
                     origin_xy=self._origin_xy,
+                    frame_transforms=final_transforms,
+                    point_pairs=self._relative_point_pairs,
                 )
                 geojson_path = str(self.database.db_path).replace(".h5", "_graph.geojson")
                 assert_project_writable(geojson_path)
@@ -709,7 +807,11 @@ class PropagationPipeline:
         if self.spatial_base_w <= 0:
             return []
         candidates = nearby_frame_pairs(
-            affines, self.frame_w, self.frame_h, known_pairs, self.lc_min_gap,
+            affines,
+            self.frame_w,
+            self.frame_h,
+            known_pairs,
+            0 if self.high_accuracy else self.lc_min_gap,
             limit=min(8, self.lc_top_k),
         )
         links = []
@@ -722,27 +824,200 @@ class PropagationPipeline:
             if match is None:
                 continue
             _H, inliers, rmse, total, spread = match
-            if (inliers < max(30, self.lc_min_inliers) or inliers / total < .3
-                    or spread is None or spread < .025 or rmse > max(3., 2 * self.ransac_thresh)):
+            if (
+                inliers < max(30, self.lc_min_inliers)
+                or inliers / total < 0.3
+                or spread is None
+                or spread < 0.025
+                or rmse > max(3.0, 2 * self.ransac_thresh)
+            ):
                 continue
             source, target = self._last_inlier_pair
+            if self.high_accuracy:
+                if not self._consistent_with_map(affines, second, first, source, target):
+                    continue
+                links.append(
+                    PointLink(
+                        second,
+                        first,
+                        source,
+                        target,
+                        self._compute_weight(inliers, rmse, self.spatial_base_w),
+                    )
+                )
+                continue
             source_h = np.column_stack([source, np.ones(len(source))])
             fitted = np.linalg.lstsq(source_h, target, rcond=None)[0].T
             # Compare in map space, allowing zoom/rotation between source images
             # while rejecting flips and implausible changes to the current map.
             relative = affines[first][:, :2] @ fitted[:, :2] @ np.linalg.inv(affines[second][:, :2])
             scales = np.linalg.svd(relative, compute_uv=False)
-            if np.linalg.det(relative) <= 0 or scales.min() < .5 or scales.max() > 2:
+            if np.linalg.det(relative) <= 0 or scales.min() < 0.5 or scales.max() > 2:
                 continue
-            delta = (source_h @ affines[second].T
-                     - (target @ affines[first][:, :2].T + affines[first][:, 2]))
+            delta = source_h @ affines[second].T - (
+                target @ affines[first][:, :2].T + affines[first][:, 2]
+            )
             pixel_scale = np.sqrt(abs(np.linalg.det(affines[second][:, :2])))
-            if np.median(np.linalg.norm(delta, axis=1)) / pixel_scale > .75 * np.hypot(self.frame_w, self.frame_h):
+            if np.median(np.linalg.norm(delta, axis=1)) / pixel_scale > 0.75 * np.hypot(
+                self.frame_w, self.frame_h
+            ):
                 continue
             weight = self._compute_weight(inliers, rmse, self.spatial_base_w)
             links.append(PointLink(second, first, source, target, weight))
-        logger.info(f"Local overlaps: {len(links)} verified from {len(candidates)} spatial proposals")
+        logger.info(
+            f"Local overlaps: {len(links)} verified from {len(candidates)} spatial proposals"
+        )
         return links
+
+    def _consistent_with_map(self, transforms, first, second, source, target):
+        """Reject coherent aliases against independent temporal/map geometry.
+
+        This is a coarse image-space guard, with slack for accumulated drift.
+        A consistent feature consensus alone cannot detect repeated field rows.
+        """
+        from src.geometry.frame_transform import as_homography
+        from src.geometry.pair_refinement import symmetric_errors
+
+        if first not in transforms or second not in transforms:
+            return False
+        try:
+            predicted = np.linalg.inv(as_homography(transforms[second])) @ as_homography(
+                transforms[first]
+            )
+            errors = symmetric_errors(predicted, source, target)
+            return bool(
+                np.isfinite(errors).all()
+                and np.median(errors) <= 0.1 * np.hypot(self.frame_w, self.frame_h)
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            return False
+
+    def _accuracy_links(self, optimizer):
+        from src.geometry.relative_alignment import PointLink
+
+        links, known = [], set()
+        for edge in optimizer.edges:
+            canonical = tuple(sorted((edge.from_id, edge.to_id)))
+            if edge.weight <= 0 or canonical in known:
+                continue
+            key = (edge.to_id, edge.from_id)
+            if key not in self._relative_point_pairs:
+                key = key[::-1]
+            pair = self._relative_point_pairs.get(key)
+            if pair is not None:
+                links.append(PointLink(*key, *pair, weight=edge.weight))
+                known.add(canonical)
+        return links
+
+    def _refine_accurate_map(self, initial, optimizer, features, fixed_ids):
+        from src.geometry.relative_projective import connected_links, refine_projective_map
+
+        links = self._accuracy_links(optimizer)
+        spatial = {
+            tuple(sorted((e.from_id, e.to_id))) for e in optimizer.edges if e.edge_type == "spatial"
+        }
+        rejected = {
+            tuple(sorted((link.first, link.second)))
+            for link in links
+            if tuple(sorted((link.first, link.second))) in spatial
+            and not self._consistent_with_map(
+                initial, link.first, link.second, link.first_points, link.second_points
+            )
+        }
+        # Keep support/provenance and saved diagnostics consistent with the solve.
+        for edge in optimizer.edges:
+            if tuple(sorted((edge.from_id, edge.to_id))) in rejected:
+                edge.weight = 0.0
+        links = [link for link in links if tuple(sorted((link.first, link.second))) not in rejected]
+        original_ids = set(initial)
+        initial, links = connected_links(initial, links, fixed_ids)
+        known = {tuple(sorted((edge.from_id, edge.to_id))) for edge in optimizer.edges}
+        extra = self._local_overlap_links(initial, features, known)
+        links += extra
+        self._validated_alignment_links = links
+        self._report_progress(75, "Refining full frame geometry with shared image points...")
+        try:
+            result, report, frame_rmse = refine_projective_map(
+                initial,
+                links,
+                self.frame_w,
+                self.frame_h,
+                set(fixed_ids) & initial.keys(),
+                max_nfev=int(get_cfg(self.config, "propagation.projective_max_evaluations", 150)),
+                check_running=self._check_running,
+            )
+        except ValueError as exc:
+            self._relative_alignment_report = {
+                "status": "fallback",
+                "reason": str(exc),
+                "refined_frames": 0,
+                "converged": False,
+            }
+            self._relative_alignment_rmse = {}
+            logger.warning(f"Relative refinement unavailable; preserving initialized map: {exc}")
+            return None
+        report["unrefined_frame_ids"] = sorted(original_ids - result.keys())
+        report["rejected_spatial_links"] = len(rejected)
+        report["additional_overlap_links"] = len(extra)
+        report["subpixel_status"] = self._subpixel_status
+        report["pairs_checked"] = len(self._pair_diagnostics)
+        report["pairs_rejected"] = sum(
+            bool(q["rejection"]) for q in self._pair_diagnostics.values()
+        )
+        self._relative_alignment_report = report
+        self._relative_alignment_rmse = frame_rmse
+        if not report["converged"]:
+            logger.warning(
+                "Relative alignment reached its iteration budget; validation passed but convergence is not certified"
+            )
+        logger.info(
+            f"Relative alignment ({report['selected_model']}): {report['before_p95_px']:.3f} -> "
+            f"{report['after_p95_px']:.3f} px P95; held-out {report['heldout_after_p95_px']}"
+        )
+        return result
+
+    def _run_accurate_local_map(self, optimizer, features, anchors):
+        from src.geometry.frame_transform import affine_at_center
+        from src.geometry.relative_map import normalize_relative_map
+        from src.geometry.relative_projective import initialize_from_pairs
+
+        gauge_id = anchors[0].frame_id
+        initial = initialize_from_pairs(
+            self._pair_homographies,
+            [(e.from_id, e.to_id, e.weight) for e in optimizer.edges if e.edge_type == "temporal"],
+            {gauge_id: anchors[0].affine_matrix},
+            self.frame_w,
+            self.frame_h,
+        )
+        if len(initial) < 2:
+            self._report_error(
+                "Local map needs at least two visually connected frames. Use denser video sampling."
+            )
+            return
+        transforms = self._refine_accurate_map(initial, optimizer, features, {gauge_id})
+        if transforms is None:
+            transforms = initial
+        self._frame_homographies, _ = normalize_relative_map(transforms, self.frame_w, self.frame_h)
+        affines = {
+            fid: affine_at_center(H, self.frame_w, self.frame_h)
+            for fid, H in self._frame_homographies.items()
+        }
+        supported, components, component_anchors = anchored_graph_support(
+            affines.keys(), optimizer.edges, {gauge_id}
+        )
+        all_components = np.full(self.database.get_num_frames(), -1, dtype=np.int32)
+        all_components[: len(components)] = components
+        self._report_progress(90, "Saving full projective frame geometry...")
+        count = self._save_to_hdf5(
+            affines,
+            anchors,
+            optimizer,
+            graph_supported=supported,
+            frame_components=all_components,
+            component_anchors=component_anchors,
+        )
+        self._report_progress(100, f"Done! {count} frames aligned in the local map.")
+        self._report_completed()
 
     # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
 
@@ -844,7 +1119,9 @@ class PropagationPipeline:
                     logger.debug(
                         f"Temporal edge across keyframe gap: {recent[-1][0]} → {i} ({gap} slots)"
                     )
-                candidates = recent[::-1] if self.skip_bridges else recent[-1:]
+                candidates = (
+                    recent[::-1] if (self.skip_bridges or self.high_accuracy) else recent[-1:]
+                )
                 for depth, (last_id, last_feat) in enumerate(candidates):
                     similarity, inliers, rmse_val, result, spread = self._try_temporal_pair(
                         feat_i, last_feat, last_id, i
@@ -890,10 +1167,17 @@ class PropagationPipeline:
                     count += 1
                     if depth > 0:
                         n_bridged += 1
-                    break
+                    if not self.high_accuracy:
+                        break
 
             recent.append((i, feat_i))
-            depth_limit = max(1, self.max_skip_frames) if self.skip_bridges else 1
+            depth_limit = (
+                self.temporal_neighbors
+                if self.high_accuracy
+                else max(1, self.max_skip_frames)
+                if self.skip_bridges
+                else 1
+            )
             if len(recent) > depth_limit:
                 recent.pop(0)
 
@@ -908,7 +1192,10 @@ class PropagationPipeline:
         if n_gated:
             logger.info(f"Temporal gate rejected {n_gated} edges (degenerate transforms)")
         if n_bridged:
-            logger.info(f"Skip-bridges connected {n_bridged} temporal-chain breaks")
+            if self.high_accuracy:
+                logger.info(f"Added {n_bridged} redundant temporal overlap constraints")
+            else:
+                logger.info(f"Skip-bridges connected {n_bridged} temporal-chain breaks")
         if n_spread_down:
             logger.info(
                 f"Spatial collapse: {n_spread_down}/{count} temporal edges received "
@@ -974,10 +1261,39 @@ class PropagationPipeline:
             H_true = np.asarray(H_r, dtype=np.float64) @ rotation_homography(ang, cx, cy)
             similarity = homography_to_similarity(H_true, self.frame_w, self.frame_h)
             if similarity is not None:
-                if self.relative_mode and self._last_inlier_pair is not None:
+                if (
+                    self.relative_mode or self.high_accuracy
+                ) and self._last_inlier_pair is not None:
                     rotated, reference = self._last_inlier_pair
                     original = rotate_keypoints(rotated, -ang, cx, cy)
+                    if self.high_accuracy:
+                        from src.geometry.pair_refinement import pair_quality
+
+                        accepted, quality = pair_quality(
+                            H_true,
+                            original,
+                            reference,
+                            _n,
+                            self.frame_w,
+                            self.frame_h,
+                            inlier_count=inliers,
+                            min_ratio=get_cfg(
+                                self.config, "propagation.pair_min_inlier_ratio", 0.3
+                            ),
+                            min_spread=get_cfg(self.config, "propagation.pair_min_spread", 0.025),
+                            max_error=get_cfg(self.config, "propagation.pair_max_error_px", 3.0),
+                        )
+                        # The retained pair is spatially sampled; its size is
+                        # not the original RANSAC inlier count.
+                        quality["inliers"] = inliers
+                        quality["inlier_ratio"] = inliers / max(_n, 1)
+                        quality["rotation_retry_deg"] = float(ang_deg)
+                        self._pair_diagnostics[(to_id, from_id)] = quality
+                        if not accepted:
+                            continue
+                        rmse_val, spread = quality["symmetric_rms_px"], quality["spread"]
                     self._relative_point_pairs[(to_id, from_id)] = (original, reference)
+                    self._pair_homographies[(to_id, from_id)] = H_true.copy()
                 logger.debug(
                     f"Rotation-retry {from_id}→{to_id} OK @ {ang_deg:.1f}° (chain={chain_angle})"
                 )
@@ -1055,7 +1371,11 @@ class PropagationPipeline:
         topk_sets = {fid: {int(j) for j, _ in cands} for fid, cands in retrieval.items()}
 
         # Pass 2: collect spatial candidates + gates
-        already_matched: set[tuple[int, int]] = set()
+        already_matched: set[tuple[int, int]] = (
+            {tuple(sorted((e.from_id, e.to_id))) for e in optimizer.edges}
+            if self.high_accuracy
+            else set()
+        )
         specs: list[dict] = []
         n_gated_phys = 0
         n_gated_mutual = 0
@@ -1072,7 +1392,7 @@ class PropagationPipeline:
                 j = int(j)
                 if j == i or j == -1:
                     continue
-                if abs(i - j) <= self.lc_min_gap:
+                if abs(i - j) <= (0 if self.high_accuracy else self.lc_min_gap):
                     continue
                 if float(sim_score) < self.lc_min_sim:
                     continue
@@ -1314,7 +1634,9 @@ class PropagationPipeline:
         for frame_id in graph_supported or set():
             if 0 <= frame_id < num_frames and optimized_mask[frame_id]:
                 supported_mask[frame_id] = True
-        filled_count = 0 if self.relative_mode else self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        filled_count = (
+            0 if self.relative_mode else self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        )
         frame_origin, frame_support_distance, frame_georef_status = classify_calibration(
             frame_valid,
             optimized_mask,
@@ -1370,7 +1692,7 @@ class PropagationPipeline:
                 rmse_list = [s[1] for s in stats if s[1] > 0]
                 frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
                 frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
-        if self.relative_mode:
+        if self.relative_mode or self.high_accuracy:
             for fid, rmse in self._relative_alignment_rmse.items():
                 if frame_valid[fid]:
                     frame_rmse[fid] = rmse
@@ -1396,7 +1718,38 @@ class PropagationPipeline:
             adj[e.from_id].append(e)
             adj[e.to_id].append(e)
 
-        if self.true_disagreement:
+        if self.high_accuracy and self._frame_homographies:
+            from src.geometry.frame_transform import project_frame_points, project_points
+
+            center = [[self.frame_w / 2, self.frame_h / 2]]
+            for fid in self._frame_homographies:
+                predictions = []
+                for edge in adj[fid]:
+                    if edge.weight <= 0:
+                        continue
+                    other = edge.to_id if edge.from_id == fid else edge.from_id
+                    other_transform = self._frame_homographies.get(other)
+                    pair = self._pair_homographies.get((fid, other))
+                    if pair is None and (other, fid) in self._pair_homographies:
+                        pair = np.linalg.inv(self._pair_homographies[(other, fid)])
+                    if pair is not None and other_transform is not None:
+                        try:
+                            reference = project_points(pair, center)
+                            predictions.append(
+                                project_frame_points(
+                                    other_transform, reference, self.frame_w, self.frame_h
+                                )[0]
+                            )
+                        except ValueError:
+                            # An extrapolated diagnostic must not abort saving a
+                            # valid map, or create a mirrored center prediction.
+                            continue
+                if len(predictions) >= 2:
+                    points = np.asarray(predictions)
+                    frame_disagreement[fid] = float(
+                        np.mean(np.linalg.norm(points - points.mean(axis=0), axis=1))
+                    )
+        elif self.true_disagreement:
             states = optimizer._current_states_full()
             sign = optimizer.sign
             for fid in range(num_frames):
@@ -1473,8 +1826,16 @@ class PropagationPipeline:
                 grp = f.create_group(pending_calibration)
 
                 grp.attrs["version"] = "3.0"  # New version: graph optimisation
-                grp.attrs["coordinate_kind"] = "local_planar" if self.relative_mode else "geographic"
-                grp.attrs["coordinate_units"] = "arbitrary" if self.relative_mode else "projected_metres"
+                if self._frame_homographies is not None:
+                    grp.attrs["version"] = "3.1"
+                    grp.attrs["transform_model"] = "projective"
+                    grp.attrs["frame_affine_kind"] = "center_tangent_compatibility"
+                grp.attrs["coordinate_kind"] = (
+                    "local_planar" if self.relative_mode else "geographic"
+                )
+                grp.attrs["coordinate_units"] = (
+                    "arbitrary" if self.relative_mode else "projected_metres"
+                )
                 if self.relative_mode:
                     grp.attrs["relative_extent"] = 100.0
                     grp.attrs["gauge_frame_id"] = anchors[0].frame_id
@@ -1486,33 +1847,51 @@ class PropagationPipeline:
                     self.calibration.converter.export_metadata()
                 )
                 grp.attrs["optimizer"] = "pose_graph_lm"
-                if self.relative_mode and self._relative_alignment_report is not None:
+                if (
+                    self.relative_mode or self.high_accuracy
+                ) and self._relative_alignment_report is not None:
                     grp.attrs["optimizer"] = "pose_graph_lm+affine_point_irls"
+                    if (
+                        self.high_accuracy
+                        and self._relative_alignment_report.get("status") != "fallback"
+                    ):
+                        grp.attrs["optimizer"] = "relative_symmetric_irls"
+                    elif self.high_accuracy:
+                        grp.attrs["optimizer"] = (
+                            "pose_graph_lm"
+                            if not self.relative_mode
+                            else "temporal_projective_initializer"
+                        )
                     grp.attrs["local_alignment_json"] = json.dumps(self._relative_alignment_report)
-                    grp.attrs["frame_rmse_kind"] = "shared_point_alignment"
+                    if self._relative_alignment_rmse:
+                        grp.attrs["frame_rmse_kind"] = "shared_point_alignment"
                 grp.attrs["provenance_version"] = 1
-                grp.attrs["frame_origin_codes"] = "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated,5=anchor_linear_model"
-                grp.attrs["anchor_linear_model_intervals_json"] = json.dumps(
-                    linear_intervals or []
+                grp.attrs["frame_origin_codes"] = (
+                    "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated,5=anchor_linear_model"
                 )
+                grp.attrs["anchor_linear_model_intervals_json"] = json.dumps(linear_intervals or [])
                 grp.attrs["anchor_linear_model_parameters_json"] = json.dumps(
                     {
                         "enabled": bool(self.anchor_linear_fallback),
                         "min_gap_slots": int(self.anchor_linear_min_gap_slots),
                         "min_run_intervals": int(self.anchor_linear_min_run_intervals),
-                        "max_velocity_deviation": float(
-                            self.anchor_linear_max_velocity_deviation
-                        ),
+                        "max_velocity_deviation": float(self.anchor_linear_max_velocity_deviation),
                     }
                 )
                 grp.attrs["pin_exact_anchors"] = bool(self.pin_exact_anchors)
                 grp.attrs["georef_status_version"] = 1
-                grp.attrs["frame_georef_status_codes"] = "0=unknown,1=supported,2=provisional,3=invalid"
+                grp.attrs["frame_georef_status_codes"] = (
+                    "0=unknown,1=supported,2=provisional,3=invalid"
+                )
                 grp.attrs["component_anchors_json"] = json.dumps(
                     {str(key): value for key, value in (component_anchors or {}).items()}
                 )
                 grp.attrs["frame_rmse_units"] = "reference_pixels"
-                grp.attrs["disagreement_kind"] = "edge_prediction" if self.true_disagreement else "neighbor_tx_spread"
+                grp.attrs["disagreement_kind"] = (
+                    "edge_prediction" if self.true_disagreement else "neighbor_tx_spread"
+                )
+                if self.high_accuracy:
+                    grp.attrs["disagreement_kind"] = "projective_edge_prediction"
                 grp.attrs["num_temporal_edges"] = sum(
                     1 for e in optimizer.edges if e.edge_type == "temporal"
                 )
@@ -1521,6 +1900,27 @@ class PropagationPipeline:
                 )
 
                 grp.create_dataset("frame_affine", data=frame_affine, compression="gzip")
+                if self._frame_homographies is not None:
+                    from src.geometry.frame_transform import as_homography
+
+                    full = np.zeros((num_frames, 3, 3), dtype=np.float64)
+                    for fid in np.flatnonzero(frame_valid):
+                        full[fid] = (
+                            self._frame_homographies.get(int(fid), as_homography(frame_affine[fid]))
+                            if optimized_mask[fid]
+                            else as_homography(frame_affine[fid])
+                        )
+                    for fid, affine in (linear_affines or {}).items():
+                        if 0 <= fid < num_frames:
+                            full[fid] = as_homography(affine)
+                    grp.create_dataset("frame_homography", data=full, compression="gzip")
+                    grp.create_dataset(
+                        "pair_quality_json",
+                        data=json.dumps(
+                            {f"{a}:{b}": value for (a, b), value in self._pair_diagnostics.items()}
+                        ),
+                        dtype=h5py.string_dtype("utf-8"),
+                    )
                 grp.create_dataset(
                     "frame_valid", data=frame_valid.astype(np.uint8), compression="gzip"
                 )
@@ -1538,14 +1938,20 @@ class PropagationPipeline:
                 grp.create_dataset(
                     "frame_support_anchor_count", data=anchor_counts, compression="gzip"
                 )
-                grp.create_dataset("frame_support_distance_slots", data=frame_support_distance, compression="gzip")
+                grp.create_dataset(
+                    "frame_support_distance_slots", data=frame_support_distance, compression="gzip"
+                )
                 grp.create_dataset(
                     "frame_disagreement", data=frame_disagreement, compression="gzip"
                 )
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
                 # Compute and save frame_gps (lat/lon per frame) for SpatialIndex
-                if self.calibration.converter and self.calibration.converter.is_initialized and not self.relative_mode:
+                if (
+                    self.calibration.converter
+                    and self.calibration.converter.is_initialized
+                    and not self.relative_mode
+                ):
                     frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
                     gps_count = 0
                     gps_failed = 0
@@ -1623,9 +2029,7 @@ class PropagationPipeline:
                     for backup in (backup_calibration, backup_gps):
                         if backup in f:
                             del f[backup]
-                    f.attrs["georef_generation"] = int(
-                        f.attrs.get("georef_generation", 0)
-                    ) + 1
+                    f.attrs["georef_generation"] = int(f.attrs.get("georef_generation", 0)) + 1
                     f.flush()
 
             valid_count = int(np.sum(frame_valid))
@@ -1801,8 +2205,18 @@ class PropagationPipeline:
         points clustered in one image corner.
         """
         self._last_inlier_pair = None
+        first = self._relative_feature_ids.get(id(features_a))
+        second = self._relative_feature_ids.get(id(features_b))
+        if self.high_accuracy and first is not None and second is not None:
+            self._pair_diagnostics[(first, second)] = {"rejection": "insufficient_matches"}
         try:
-            mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
+            match = (
+                self.matcher.match_accuracy
+                if self.high_accuracy
+                and callable(getattr(type(self.matcher), "match_accuracy", None))
+                else self.matcher.match
+            )
+            mkpts_a, mkpts_b = match(features_a, features_b)
             if (
                 len(mkpts_a) < self.min_matches
                 and self.mnn_fallback
@@ -1814,15 +2228,26 @@ class PropagationPipeline:
             if len(mkpts_a) < self.min_matches:
                 return None
 
+            if self.high_accuracy and first is not None and second is not None:
+                self._pair_diagnostics[(first, second)] = {
+                    "rejection": "insufficient_geometric_inliers",
+                    "matches": len(mkpts_a),
+                }
+
             H, mask = GeometryTransforms.estimate_homography(
                 mkpts_a,
                 mkpts_b,
                 ransac_threshold=self.ransac_thresh,
-                max_iters=self.ransac_max_iters,
-                confidence=self.ransac_confidence,
+                max_iters=max(10000, self.ransac_max_iters)
+                if self.high_accuracy
+                else self.ransac_max_iters,
+                confidence=max(0.999, self.ransac_confidence)
+                if self.high_accuracy
+                else self.ransac_confidence,
                 backend=self.homography_backend,
                 use_mad_ransac=self.use_mad_ransac,
                 mad_k_factor=self.mad_k_factor,
+                frame_size=(self.frame_w, self.frame_h) if self.high_accuracy else None,
             )
             if H is None or mask is None:
                 return None
@@ -1838,18 +2263,80 @@ class PropagationPipeline:
             pts_b_in = mkpts_b[inlier_mask]
             rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
 
-            spread = inlier_spread(pts_a_in, self.frame_w, self.frame_h)
-            if self.relative_mode:
+            spread = inlier_spread(
+                pts_a_in, self.frame_w, self.frame_h, principal=self.high_accuracy
+            )
+            if self.high_accuracy:
+                from src.geometry.pair_refinement import pair_quality, refine_pair, refine_subpixel
+
+                refined_count = 0
+                if self._source_frames is not None and first is not None and second is not None:
+                    try:
+                        refined, refined_count = refine_subpixel(
+                            self._source_frames.get(first),
+                            self._source_frames.get(second),
+                            pts_a_in,
+                            pts_b_in,
+                            get_cfg(self.config, "propagation.subpixel_max_correction_px", 2.0),
+                        )
+                        candidate = refine_pair(H, pts_a_in, refined, self.frame_w, self.frame_h)
+                        ok, _ = pair_quality(
+                            candidate,
+                            pts_a_in,
+                            refined,
+                            len(mkpts_a),
+                            self.frame_w,
+                            self.frame_h,
+                            min_ratio=get_cfg(
+                                self.config, "propagation.pair_min_inlier_ratio", 0.3
+                            ),
+                            min_spread=get_cfg(self.config, "propagation.pair_min_spread", 0.025),
+                            max_error=get_cfg(self.config, "propagation.pair_max_error_px", 3.0),
+                        )
+                        if ok:
+                            H, pts_b_in = candidate, refined
+                        else:
+                            refined_count = 0
+                    except PropagationCancelledError:
+                        raise
+                    except (ValueError, OSError, cv2.error) as exc:
+                        refined_count = 0
+                        logger.warning(
+                            f"Subpixel refinement unavailable for {first}->{second}: {exc}"
+                        )
+                H = refine_pair(H, pts_a_in, pts_b_in, self.frame_w, self.frame_h)
+                accepted, quality = pair_quality(
+                    H,
+                    pts_a_in,
+                    pts_b_in,
+                    len(mkpts_a),
+                    self.frame_w,
+                    self.frame_h,
+                    min_ratio=get_cfg(self.config, "propagation.pair_min_inlier_ratio", 0.3),
+                    min_spread=get_cfg(self.config, "propagation.pair_min_spread", 0.025),
+                    max_error=get_cfg(self.config, "propagation.pair_max_error_px", 3.0),
+                )
+                quality["subpixel_points"] = refined_count
+                if first is not None and second is not None:
+                    self._pair_diagnostics[(first, second)] = quality
+                if not accepted:
+                    return None
+                rmse, spread = quality["symmetric_rms_px"], quality["spread"]
+            if self.relative_mode or self.high_accuracy:
                 from src.geometry.relative_alignment import sample_point_pair
 
-                self._last_inlier_pair = sample_point_pair(pts_a_in, pts_b_in)
-                first = self._relative_feature_ids.get(id(features_a))
-                second = self._relative_feature_ids.get(id(features_b))
+                self._last_inlier_pair = sample_point_pair(
+                    pts_a_in, pts_b_in, self.point_pair_limit if self.high_accuracy else 96
+                )
                 if first is not None and second is not None:
                     self._relative_point_pairs[(first, second)] = self._last_inlier_pair
+                    self._pair_homographies[(first, second)] = H.copy()
 
             return H, inliers, rmse, int(len(mkpts_a)), spread
-        except Exception:
+        except PropagationCancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(f"Pair estimation failed: {type(exc).__name__}: {exc}")
             return None
 
     @staticmethod

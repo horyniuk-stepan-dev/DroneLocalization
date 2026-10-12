@@ -94,7 +94,11 @@ class CalibrationMixin:
     @pyqtSlot()
     def on_calibrate(self):
         if self.calibration.converter.mode == "LOCAL":
-            QMessageBox.information(self, "Локальна карта", "Цей шар використовує умовні X/Y. Для GPS-калібрування створіть окремий шар із відео.")
+            QMessageBox.information(
+                self,
+                "Локальна карта",
+                "Цей шар використовує умовні X/Y. Для GPS-калібрування створіть окремий шар із відео.",
+            )
             return
         source_id = self._get_current_source_id()
         if not self.database or self.database.db_file is None:
@@ -423,10 +427,16 @@ class CalibrationMixin:
             return
         current_local = self.calibration.converter.mode == "LOCAL"
         relative = relative or current_local
-        if relative and not current_local and (
-            self.calibration.anchors or (self.database and self.database.is_propagated)
+        if (
+            relative
+            and not current_local
+            and (self.calibration.anchors or (self.database and self.database.is_propagated))
         ):
-            QMessageBox.warning(self, "Локальна карта", "Цей шар уже має геоприв’язку. Створіть окремий шар для FPV-відео.")
+            QMessageBox.warning(
+                self,
+                "Локальна карта",
+                "Цей шар уже має геоприв’язку. Створіть окремий шар для FPV-відео.",
+            )
             return
         if not relative and not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Додайте хоча б один якір калібрування!")
@@ -544,7 +554,9 @@ class CalibrationMixin:
                 self.map_widget.set_coordinate_mode("LOCAL", reset=True)
             if hasattr(self, "_after_layer_data_changed"):
                 self._after_layer_data_changed()
-            self.status_bar.showMessage("Локальна карта 0–100 готова. Координати в умовних одиницях.")
+            self.status_bar.showMessage(
+                "Локальна карта 0–100 готова. Координати в умовних одиницях."
+            )
             if database is self.database:
                 self.on_verify_propagation()
             return
@@ -640,7 +652,9 @@ class CalibrationMixin:
             points_to_show = []
             _diag_done = False
             for i in range(0, num_frames, step):
-                affine = self.database.get_frame_affine(i)
+                from src.geometry.frame_transform import get_frame_transform, project_points
+
+                affine = get_frame_transform(self.database, i)
                 if affine is not None:
                     w = self.database.metadata.get("frame_width", 1920)
                     h = self.database.metadata.get("frame_height", 1080)
@@ -655,8 +669,7 @@ class CalibrationMixin:
                             ("center", w / 2, h / 2),
                             ("corner2", w, h),
                         ]:
-                            mx_d = affine[0, 0] * px + affine[0, 1] * py + affine[0, 2]
-                            my_d = affine[1, 0] * px + affine[1, 1] * py + affine[1, 2]
+                            mx_d, my_d = project_points(affine, [[px, py]])[0]
                             lat_d, lon_d = self.calibration.converter.metric_to_gps(
                                 float(mx_d), float(my_d)
                             )
@@ -665,17 +678,11 @@ class CalibrationMixin:
                             )
 
                     # Frame center
-                    mx, my = (
-                        affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
-                        affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
-                    )
+                    mx, my = project_points(affine, [[w / 2, h / 2]])[0]
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
                     # Frame bottom
-                    mx_b, my_b = (
-                        affine[0, 0] * (w / 2) + affine[0, 1] * h + affine[0, 2],
-                        affine[1, 0] * (w / 2) + affine[1, 1] * h + affine[1, 2],
-                    )
+                    mx_b, my_b = project_points(affine, [[w / 2, h]])[0]
                     lat_b, lon_b = self.calibration.converter.metric_to_gps(
                         float(mx_b), float(my_b)
                     )
@@ -859,7 +866,11 @@ class CalibrationMixin:
             loaded.load(path)
             db_mode = getattr(getattr(self.database, "converter", None), "mode", None)
             if db_mode and (db_mode == "LOCAL") != (loaded.converter.mode == "LOCAL"):
-                QMessageBox.warning(self, "Несумісні координати", "Локальну карту X/Y і GPS-калібрування не можна змішувати в одному шарі. Створіть окремий шар.")
+                QMessageBox.warning(
+                    self,
+                    "Несумісні координати",
+                    "Локальну карту X/Y і GPS-калібрування не можна змішувати в одному шарі. Створіть окремий шар.",
+                )
                 return
 
             issues = self._calibration_load_issues(loaded, path, source_id)

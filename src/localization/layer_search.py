@@ -396,9 +396,7 @@ class LayerSearch:
                         int(getattr(crop, "crop_w", 0)),
                         int(getattr(crop, "crop_h", 0)),
                     )
-                    image_signature = (
-                        angle, prepared.shape[0], prepared.shape[1], crop_signature
-                    )
+                    image_signature = (angle, prepared.shape[0], prepared.shape[1], crop_signature)
                     for sid, candidates in groups.items():
                         for candidate in candidates:
                             signature = (sid, int(candidate[0]), image_signature)
@@ -510,7 +508,9 @@ class LayerSearch:
         spread = localizer._inlier_spread(ver.mkpts_q_in, features)
         if spread is None or spread < self.cfg("min_spread", 0.015):
             return None
-        affine = database.get_frame_affine(ver.candidate_id)
+        from src.geometry.frame_transform import get_frame_transform, project_frame_points
+
+        affine = get_frame_transform(database, ver.candidate_id)
         if affine is None:
             return None
         statuses = getattr(database, "frame_georef_status", None)
@@ -565,7 +565,10 @@ class LayerSearch:
         if not np.isfinite(H).all() or not (np.all(den > 1e-9) or np.all(den < -1e-9)):
             return None
         center = GeometryTransforms.apply_homography(np.array([[w / 2, h / 2]]), H)
-        metric = GeometryTransforms.apply_affine(center, affine)
+        try:
+            metric = project_frame_points(affine, center, ref_w, ref_h)
+        except ValueError:
+            return None
         if metric is None or not np.isfinite(metric).all():
             return None
         gps = calibration.converter.metric_to_gps(*map(float, metric[0]))

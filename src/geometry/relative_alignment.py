@@ -13,6 +13,8 @@ from scipy import sparse
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
+from src.geometry.frame_transform import project_points
+
 
 @dataclass
 class PointLink:
@@ -32,8 +34,9 @@ def nearby_frame_pairs(affines, width, height, known_pairs, min_frame_gap, limit
     if len(affines) < 2 or limit <= 0:
         return []
     ids = sorted(affines)
-    center = np.array([width / 2, height / 2, 1.0])
-    centers = np.array([affines[fid] @ center for fid in ids])
+    center = np.array([[width / 2, height / 2]])
+    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]])
+    centers = np.array([project_points(affines[fid], center)[0] for fid in ids])
     radii = np.array(
         [
             0.5
@@ -41,7 +44,9 @@ def nearby_frame_pairs(affines, width, height, known_pairs, min_frame_gap, limit
                 np.linalg.norm(affines[fid][:, 0]) * width
                 + np.linalg.norm(affines[fid][:, 1]) * height
             )
-            for fid in ids
+            if np.asarray(affines[fid]).shape == (2, 3)
+            else np.linalg.norm(project_points(affines[fid], corners) - centers[i], axis=1).max()
+            for i, fid in enumerate(ids)
         ]
     )
     tree = cKDTree(centers)
@@ -68,7 +73,7 @@ def nearby_frame_pairs(affines, width, height, known_pairs, min_frame_gap, limit
 def sample_point_pair(first, second, limit=96):
     """Keep a deterministic, spatially spread subset of verified matches."""
     first, second = np.asarray(first, dtype=np.float64), np.asarray(second, dtype=np.float64)
-    if len(first) <= limit:
+    if limit <= 0 or len(first) <= limit:
         return first.copy(), second.copy()
     selected = [int(np.argmin(first[:, 0]))]
     distances = np.full(len(first), np.inf)

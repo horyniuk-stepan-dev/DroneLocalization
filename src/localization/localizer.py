@@ -1,6 +1,7 @@
 import numpy as np
 
 from config import get_cfg
+from src.geometry.frame_transform import project_frame_points
 from src.geometry.point_spread import inlier_spread
 from src.geometry.transformations import GeometryTransforms
 from src.localization.candidate_retriever import CandidateRetriever
@@ -285,9 +286,7 @@ class Localizer:
             prefilter_enabled=get_cfg(self.config, "localization.candidate_prefilter", False),
             prefilter_keep=get_cfg(self.config, "localization.prefilter_keep", 2),
             max_rmse_px=get_cfg(self.config, "localization.max_geometric_rmse_px", 4.0),
-            min_inlier_ratio=get_cfg(
-                self.config, "localization.geometric_min_inlier_ratio", 0.2
-            ),
+            min_inlier_ratio=get_cfg(self.config, "localization.geometric_min_inlier_ratio", 0.2),
             max_center_extrapolation=get_cfg(
                 self.config, "localization.geometric_max_center_extrapolation", 0.1
             ),
@@ -296,9 +295,7 @@ class Localizer:
             ),
             ransac_max_iters=self.ransac_max_iters,
             ransac_confidence=self.ransac_confidence,
-            prefilter_fallback_keep=get_cfg(
-                self.config, "localization.prefilter_fallback_keep", 0
-            ),
+            prefilter_fallback_keep=get_cfg(self.config, "localization.prefilter_fallback_keep", 0),
         )
         self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
         self._rotation_selector = RotationSelector(
@@ -430,8 +427,13 @@ class Localizer:
             logger.debug(f"Debug depth skipped: {e}")
 
     def localize_frame(
-        self, query_frame, static_mask=None, dt=1.0, yaw_hint_deg=None,
-        collector=None, timestamp=None,
+        self,
+        query_frame,
+        static_mask=None,
+        dt=1.0,
+        yaw_hint_deg=None,
+        collector=None,
+        timestamp=None,
     ) -> dict:
         enabled = get_cfg(self.config, "localization.layer_search.enabled", False)
         if enabled and self.db_manager is not None:
@@ -452,7 +454,9 @@ class Localizer:
         ):
             self._scale_manager.invalidate()
             self._last_best_angle = None
-            result = self._localize_frame_impl(query_frame, static_mask, dt, yaw_hint_deg, collector)
+            result = self._localize_frame_impl(
+                query_frame, static_mask, dt, yaw_hint_deg, collector
+            )
             if not result.get("success"):
                 self.database, self.calibration, self._active_source_id = previous
         if result.get("fallback_mode") == "retrieval_only":
@@ -482,8 +486,16 @@ class Localizer:
         from copy import deepcopy
 
         if self.calib_manager is None:
-            return {"success": False, "status": "lost", "error": "Layer calibration manager missing"}
-        now = (self._layer_clock or 0.0) + max(0.0, float(dt)) if timestamp is None else float(timestamp)
+            return {
+                "success": False,
+                "status": "lost",
+                "error": "Layer calibration manager missing",
+            }
+        now = (
+            (self._layer_clock or 0.0) + max(0.0, float(dt))
+            if timestamp is None
+            else float(timestamp)
+        )
         if not np.isfinite(now) or (self._layer_clock is not None and now <= self._layer_clock):
             return {"success": False, "status": "stale", "error": "Non-increasing frame timestamp"}
         self._layer_clock = now
@@ -494,14 +506,19 @@ class Localizer:
         diagnostics = dict(self._layer_search.last_diagnostics)
         if chosen is None:
             self._consecutive_failures += 1
-            if (self._layer_search.handoff.state == "LOST"
-                    or self._layer_search.handoff.reason == "ambiguous_geometry"):
+            if (
+                self._layer_search.handoff.state == "LOST"
+                or self._layer_search.handoff.reason == "ambiguous_geometry"
+            ):
                 self._last_state = None
             return {
                 "success": False,
-                "status": "ambiguous" if self._layer_search.handoff.reason == "ambiguous_geometry" else "lost",
+                "status": "ambiguous"
+                if self._layer_search.handoff.reason == "ambiguous_geometry"
+                else "lost",
                 "error": self._layer_search.handoff.reason,
-                "layer_state": self._layer_search.handoff.state, "search": diagnostics,
+                "layer_state": self._layer_search.handoff.state,
+                "search": diagnostics,
             }
         previous = (self.database, self.calibration, self._active_source_id, self._scale_manager)
         switching = chosen.source_id != self._active_source_id
@@ -539,7 +556,9 @@ class Localizer:
             return result
         finally:
             if not accepted:
-                self.database, self.calibration, self._active_source_id, self._scale_manager = previous
+                self.database, self.calibration, self._active_source_id, self._scale_manager = (
+                    previous
+                )
                 self.trajectory_filter, self.outlier_detector, self._smoother = filters
                 self._last_state, self._last_best_angle, self._last_of_raw = previous_state
 
@@ -910,7 +929,9 @@ class Localizer:
                     "GPS output suppressed"
                 ),
             }
-        affine_ref = self.database.get_frame_affine(best_candidate_id)
+        from src.geometry.frame_transform import get_frame_transform
+
+        affine_ref = get_frame_transform(self.database, best_candidate_id)
         if affine_ref is None:
             target_id = (
                 best_candidate_id if (best_candidate_id != -1) else best_global_candidates[0][0]
@@ -984,7 +1005,9 @@ class Localizer:
             downstream_angle = 0
 
         # ── Step 5: State for Optical Flow (commit — AFTER outlier gate) ─────
+        ref_h, ref_w = self.database.get_frame_size(best_candidate_id)
         pending_state = {
+            "reference_size": (ref_w, ref_h),
             "H": M_query_to_ref,
             "affine": affine_ref,
             "candidate_id": best_candidate_id,
@@ -1017,7 +1040,10 @@ class Localizer:
                 "error": "Coordinate transformation error (homography failed)",
             }
 
-        pts_metric = GeometryTransforms.apply_affine(pts_in_ref, affine_ref)
+        try:
+            pts_metric = project_frame_points(affine_ref, pts_in_ref, ref_w, ref_h)
+        except ValueError:
+            return {"success": False, "error": "Center outside safe reference projection"}
         mx = float(pts_metric[0, 0])
         my = float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
@@ -1027,7 +1053,9 @@ class Localizer:
         # RANSAC inliers should not be discarded due to platform speed assumptions.
         # Position is still appended to history so detector window
         # corresponded to reality, not to a filtered version of it.
-        _strong = self.relative_mode or (self._trust_strong and best_inliers >= self._trust_min_inliers)
+        _strong = self.relative_mode or (
+            self._trust_strong and best_inliers >= self._trust_min_inliers
+        )
         if _strong:
             logger.debug(
                 f"Kinematic gate bypassed: {best_inliers} inliers "
@@ -1079,11 +1107,15 @@ class Localizer:
             best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
         )
 
-        filtered_pt = metric_pt if self.relative_mode else self.trajectory_filter.update(
-            metric_pt,
-            dt=dt,
-            noise_scale=1.0 / max(confidence, 0.25),
-            trusted_max_offset_m=(self._trusted_fix_max_filter_offset if _strong else None),
+        filtered_pt = (
+            metric_pt
+            if self.relative_mode
+            else self.trajectory_filter.update(
+                metric_pt,
+                dt=dt,
+                noise_scale=1.0 / max(confidence, 0.25),
+                trusted_max_offset_m=(self._trusted_fix_max_filter_offset if _strong else None),
+            )
         )
         # RESEARCH 3.1: back-end smoother — fix window + OF-odometry;
         # KF correction by shift BEFORE writing to detector history and GPS/FOV,
@@ -1119,9 +1151,7 @@ class Localizer:
                 else:
                     self.trajectory_filter.shift(float(corr[0]), float(corr[1]))
                     filtered_pt = proposed_pt
-                    logger.debug(
-                        f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m"
-                    )
+                    logger.debug(f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m")
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         # New keyframe restarts LK, so chain of local OF comparisons
         # breaks: first OF after keyframe should measure shift FROM keyframe
@@ -1149,6 +1179,7 @@ class Localizer:
             my,
             filtered_pt,
             best_candidate_id,
+            reference_size=(ref_w, ref_h),
         )
 
         logger.debug(
@@ -1290,7 +1321,14 @@ class Localizer:
         if pts_in_ref is None or len(pts_in_ref) == 0:
             return {"success": False, "error": "OF homography failed"}
 
-        pts_metric = GeometryTransforms.apply_affine(pts_in_ref, self._last_state["affine"])
+        try:
+            pts_metric = project_frame_points(
+                self._last_state["affine"],
+                pts_in_ref,
+                *self._last_state.get("reference_size", (0, 0)),
+            )
+        except ValueError:
+            return {"success": False, "error": "OF center outside safe reference projection"}
         if pts_metric is None or len(pts_metric) == 0:
             return {"success": False, "error": "OF affine failed"}
 
@@ -1365,8 +1403,12 @@ class Localizer:
         else:
             of_conf = 0.7
 
-        filtered_pt = metric_pt if self.relative_mode else self.trajectory_filter.update(
-            metric_pt, dt=dt, noise_scale=1.5 / max(of_conf, 0.25)
+        filtered_pt = (
+            metric_pt
+            if self.relative_mode
+            else self.trajectory_filter.update(
+                metric_pt, dt=dt, noise_scale=1.5 / max(of_conf, 0.25)
+            )
         )
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
 
@@ -1377,16 +1419,18 @@ class Localizer:
 
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
 
-        return self._coordinate_result({
-            "success": True,
-            "lat": lat,
-            "lon": lon,
-            "confidence": round(of_conf, 3),
-            "matched_frame": int(self._last_state.get("candidate_id", -1)),
-            "inliers": of_inliers,
-            "fov_polygon": None,
-            "is_of": True,
-        })
+        return self._coordinate_result(
+            {
+                "success": True,
+                "lat": lat,
+                "lon": lon,
+                "confidence": round(of_conf, 3),
+                "matched_frame": int(self._last_state.get("candidate_id", -1)),
+                "inliers": of_inliers,
+                "fov_polygon": None,
+                "is_of": True,
+            }
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
 

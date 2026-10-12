@@ -54,4 +54,6 @@ class DatabaseConfig(BaseModel):
     hdf5_compression: str = "lzf"  # "lzf" | "gzip" | "none"
     hdf5_chunk_frames: int = 64
     max_keypoints_stored: int = 2048
+    # Offline database extraction at source resolution. Does not alter live input sizes.
+    accuracy_features: bool = False
     yolo_batch_size: int = 1

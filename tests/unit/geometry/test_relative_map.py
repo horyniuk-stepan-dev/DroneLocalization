@@ -123,6 +123,178 @@ def test_unconnected_video_does_not_commit_a_map(tmp_path, monkeypatch):
         db.close()
 
 
+def test_projective_pipeline_roundtrip_preserves_image_geometry(tmp_path, monkeypatch):
+    from src.geometry.frame_transform import get_frame_transform, project_points
+
+    path = tmp_path / "projective.h5"
+    db = make_database(path, n=4)
+    truth = {
+        0: np.eye(3),
+        1: np.array([[1.0, 0.08, 20], [0.02, 1.01, -8], [0.0002, -0.0001, 1]]),
+        2: np.array([[1.03, -0.03, 40], [-0.01, 0.98, 5], [-0.0001, 0.0002, 1]]),
+    }
+    world = np.array([[x, y] for x in np.linspace(55, 150, 10) for y in np.linspace(30, 80, 8)])
+    features = {
+        fid: {"keypoints": project_points(np.linalg.inv(H), world)} for fid, H in truth.items()
+    }
+    matcher = Mock()
+    matcher.match.side_effect = lambda a, b: (a["keypoints"], b["keypoints"])
+    pipeline = PropagationPipeline(
+        db,
+        MultiAnchorCalibration(CoordinateConverter("LOCAL")),
+        matcher,
+        config={"propagation": {"high_accuracy": True, "subpixel_refinement": False}},
+        error_callback=Mock(),
+        completed_callback=Mock(),
+    )
+    monkeypatch.setattr(pipeline, "_prefetch_features", lambda n: features)
+    monkeypatch.setattr(pipeline, "_detect_loop_closures", lambda *a: 0)
+    pipeline._propagate()
+    pipeline._error_cb.assert_not_called()
+    pipeline._completed_cb.assert_called_once()
+    np.testing.assert_array_equal(db.frame_valid, [True, True, True, False])
+    assert db.db_file["calibration"].attrs["transform_model"] == "projective"
+    before = db.frame_homography.copy()
+    db.close()
+    reopened = DatabaseLoader(str(path))
+    try:
+        np.testing.assert_array_equal(reopened.frame_homography, before)
+        heldout = np.array([[20, 15], [100, 50], [180, 90]])
+        gauge = get_frame_transform(reopened, 0)
+        for fid in truth:
+            H = np.linalg.inv(gauge) @ get_frame_transform(reopened, fid)
+            np.testing.assert_allclose(
+                project_points(H, heldout), project_points(truth[fid], heldout), atol=0.01
+            )
+        assert get_frame_transform(reopened, 3) is None
+    finally:
+        reopened.close()
+
+
+def test_corrupt_projective_calibration_is_not_silently_read_as_affine(tmp_path):
+    path = tmp_path / "corrupt.h5"
+    make_database(path, n=1).close()
+    with h5py.File(path, "a") as f:
+        group = f.create_group("calibration")
+        group["frame_affine"] = np.eye(3)[None, :2]
+        group["frame_valid"] = [True]
+        group["frame_homography"] = np.zeros((1, 3, 3))
+    db = DatabaseLoader(str(path))
+    try:
+        assert not db.is_propagated and db.frame_homography is None
+    finally:
+        db.close()
+
+
+def test_projective_geographic_stage_preserves_anchor_and_exports_final_centers(
+    tmp_path, monkeypatch
+):
+    from src.geometry.frame_transform import get_frame_transform, project_points
+
+    path = tmp_path / "geographic.h5"
+    db = make_database(path, n=3)
+    calibration = MultiAnchorCalibration(CoordinateConverter("WEB_MERCATOR"))
+    anchor = np.array([[0.7, 0.0, 3e6], [0.0, -0.7, 6e6]])
+    calibration.add_anchor(0, anchor.copy())
+    truth = {0: np.eye(3), 1: np.array([[1.0, 0.08, 20], [0.02, 1.01, -8], [0.0002, -0.0001, 1]])}
+    grid = np.array([[x, y] for x in np.linspace(55, 150, 10) for y in np.linspace(30, 80, 8)])
+    features = {
+        fid: {"keypoints": project_points(np.linalg.inv(H), grid)} for fid, H in truth.items()
+    }
+    matcher = Mock()
+    matcher.match.side_effect = lambda a, b: (a["keypoints"], b["keypoints"])
+    pipeline = PropagationPipeline(
+        db,
+        calibration,
+        matcher,
+        config={"propagation": {"high_accuracy": True, "subpixel_refinement": False}},
+        error_callback=Mock(),
+        completed_callback=Mock(),
+    )
+    monkeypatch.setattr(pipeline, "_prefetch_features", lambda n: features)
+    monkeypatch.setattr(pipeline, "_detect_loop_closures", lambda *a: 0)
+    try:
+        pipeline._propagate()
+        pipeline._error_cb.assert_not_called()
+        pipeline._completed_cb.assert_called_once()
+        np.testing.assert_array_equal(calibration.anchors[0].affine_matrix, anchor)
+        np.testing.assert_allclose(db.get_frame_affine(0), anchor)
+        np.testing.assert_allclose(get_frame_transform(db, 2)[2], [0, 0, 1])
+        exported = json.loads((tmp_path / "geographic_graph.geojson").read_text(encoding="utf-8"))
+        point = next(f for f in exported["features"] if f["properties"].get("frame_id") == 1)
+        center = project_points(get_frame_transform(db, 1), [[100, 50]])[0]
+        lat, lon = calibration.converter.metric_to_gps(*center)
+        np.testing.assert_allclose(point["geometry"]["coordinates"], [lon, lat], atol=1e-10)
+        edge = next(f for f in exported["features"] if f["geometry"]["type"] == "LineString")
+        assert edge["properties"]["residual"] is not None
+        assert edge["properties"]["residual_units"] == "original_image_pixels"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("failure", ["pruned_orphan", "invalid_models", "diagnostic_horizon"])
+def test_geo_refinement_failure_does_not_abort_atomic_save(tmp_path, monkeypatch, failure):
+    from src.geometry.pose_graph.optimizer import PoseGraphOptimizer
+
+    db = make_database(tmp_path / f"{failure}.h5", n=3)
+    calibration = MultiAnchorCalibration(CoordinateConverter("WEB_MERCATOR"))
+    calibration.add_anchor(0, np.array([[0.7, 0.0, 3e6], [0.0, -0.7, 6e6]]))
+    grid = np.array([[x, y] for x in np.linspace(30, 170, 10) for y in np.linspace(20, 80, 8)])
+    features = {i: {"keypoints": grid - [10 * i, 0]} for i in range(3)}
+    matcher = Mock()
+    matcher.match.side_effect = lambda a, b: (a["keypoints"], b["keypoints"])
+    pipeline = PropagationPipeline(
+        db,
+        calibration,
+        matcher,
+        config={"propagation": {"high_accuracy": True, "subpixel_refinement": False}},
+        error_callback=Mock(),
+        completed_callback=Mock(),
+    )
+    monkeypatch.setattr(pipeline, "_prefetch_features", lambda n: features)
+    monkeypatch.setattr(pipeline, "_detect_loop_closures", lambda *a: 0)
+    monkeypatch.setattr(pipeline, "_local_overlap_links", lambda *a: [])
+    if failure == "pruned_orphan":
+        original = PoseGraphOptimizer.optimize
+
+        def prune(self, *args, **kwargs):
+            results = original(self, *args, **kwargs)
+            self._edges[:] = [e for e in self.edges if 2 not in (e.from_id, e.to_id)]
+            return results
+
+        monkeypatch.setattr(PoseGraphOptimizer, "optimize", prune)
+    elif failure == "invalid_models":
+
+        def reject(*args, **kwargs):
+            raise ValueError("both relative models rejected")
+
+        monkeypatch.setattr("src.geometry.relative_projective.refine_projective_map", reject)
+    else:
+
+        def unsafe(*args, **kwargs):
+            raise ValueError("center prediction outside reference chart")
+
+        monkeypatch.setattr("src.geometry.frame_transform.project_frame_points", unsafe)
+    try:
+        pipeline._propagate()
+        pipeline._error_cb.assert_not_called()
+        pipeline._completed_cb.assert_called_once()
+        assert db.is_propagated and db.frame_valid.all()
+        if failure == "pruned_orphan":
+            assert pipeline._relative_alignment_report["unrefined_frame_ids"] == [2]
+            assert not db.is_frame_georef_supported(2)
+            np.testing.assert_array_equal(db.frame_homography[2, 2], [0, 0, 1])
+        elif failure == "invalid_models":
+            assert db.frame_homography is None
+            assert pipeline._relative_alignment_report["status"] == "fallback"
+            assert db.db_file["calibration"].attrs["optimizer"] == "pose_graph_lm"
+        else:
+            assert db.frame_homography is not None
+            assert np.isfinite(db.db_file["calibration/frame_disagreement"][:]).all()
+    finally:
+        db.close()
+
+
 def test_localization_returns_xy_and_uses_selected_local_map_only(monkeypatch):
     from pathlib import Path
 

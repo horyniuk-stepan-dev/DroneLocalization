@@ -167,8 +167,17 @@ class DatabaseBuilder:
             except Exception:
                 logger.warning("CESP loading failed during DB build, continuing without it")
 
+        import copy
+
+        feature_config = (
+            self.config.model_dump()
+            if hasattr(self.config, "model_dump")
+            else copy.deepcopy(self.config)
+        )
+        if get_cfg(self.config, "database.accuracy_features", False):
+            feature_config.setdefault("localization", {})["max_local_edge"] = 0
         feature_extractor = FeatureExtractor(
-            local_model, nv_model, model_manager.device, config=self.config, cesp_module=cesp
+            local_model, nv_model, model_manager.device, config=feature_config, cesp_module=cesp
         )
         logger.success("All models loaded successfully")
 
@@ -249,8 +258,7 @@ class DatabaseBuilder:
         forced_frame_ids.update(int(fid) for fid in (required_frame_ids or set()))
         if forced_frame_ids:
             logger.info(
-                "Calibration contract requires keyframes at slots: "
-                f"{sorted(forced_frame_ids)}"
+                f"Calibration contract requires keyframes at slots: {sorted(forced_frame_ids)}"
             )
 
         processor = FrameProcessor(

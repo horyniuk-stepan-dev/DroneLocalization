@@ -30,17 +30,18 @@ import numpy as np
 UNIFORM_SPREAD = float(1.0 / np.sqrt(12.0))
 
 
-def inlier_spread(points: np.ndarray, frame_w: float, frame_h: float) -> float | None:
-    """min(sigma_x, sigma_y) / min(W, H) — dimensionless spatial point spread.
+def inlier_spread(
+    points: np.ndarray, frame_w: float, frame_h: float, *, principal=False
+) -> float | None:
+    """Axis spread by default; principal spread for offline accuracy validation.
 
     Normalizing by ``min(W, H)`` makes the metric invariant to both resolution and
     aspect ratio: for uniform coverage sigma_x = 0.2887*W, sigma_y = 0.2887*H,
     so min(sigma_x, sigma_y) = 0.2887*min(W, H) -> spread ≈ 0.289 for any aspect.
 
-    Specifically takes ``min`` of the two axes rather than cloud area: typical failure
-    mode is points along a single line/furrow where one sigma is large while the second ≈ 0.
-    The product sigma_x*sigma_y catches this too, but ``min`` gives a linear scale in the
-    same units as frame side, making threshold calibration simpler.
+    With ``principal=True``, uses covariance eigenvalues so diagonal and horizontal
+    lines are equally degenerate. The default preserves the live confidence
+    metric (minimum of the two image-axis standard deviations).
 
     Args:
         points: (N, 2) pixel coordinates in query frame.
@@ -68,8 +69,15 @@ def inlier_spread(points: np.ndarray, frame_w: float, frame_h: float) -> float |
         if xy.shape[0] < 2:
             return None
 
-    sigma = xy.std(axis=0)
-    return float(min(sigma[0], sigma[1]) / denom)
+    if not principal:
+        return float(np.min(np.std(xy, axis=0)) / denom)
+    centered = xy - xy.mean(axis=0)
+    eigenvalues = np.linalg.eigvalsh(centered.T @ centered / len(centered))
+    # Roundoff must not turn an exactly collinear cloud into weak 2D support.
+    smallest = max(0.0, float(eigenvalues[0]))
+    if smallest <= np.finfo(float).eps * max(float(eigenvalues[-1]), 1.0) * 8:
+        return 0.0
+    return float(np.sqrt(smallest) / denom)
 
 
 def spread_confidence_factor(

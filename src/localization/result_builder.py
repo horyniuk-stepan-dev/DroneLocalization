@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from config import get_cfg
+from src.geometry.frame_transform import get_frame_transform, project_frame_points
 from src.geometry.point_spread import spread_confidence_factor
 from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
@@ -109,7 +110,7 @@ class ResultBuilder:
                 "is provisional or invalid"
             )
             return None
-        affine_ref = database.get_frame_affine(frame_id)
+        affine_ref = get_frame_transform(database, frame_id)
         if affine_ref is None:
             logger.debug(
                 f"Retrieval-only fallback failed: no affine matrix for frame {frame_id}. "
@@ -151,6 +152,7 @@ class ResultBuilder:
         my: float,
         filtered_pt: Any,
         candidate_id: int,
+        reference_size: tuple | None = None,
     ) -> list:
         """Project the frame FOV to a GPS polygon, guarding against exploded homographies."""
         corners = np.array(
@@ -204,7 +206,18 @@ class ResultBuilder:
 
         gps_corners = []
         if ref_corners is not None:
-            metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
+            try:
+                if np.asarray(affine_ref).shape == (3, 3):
+                    if reference_size is None:
+                        return []
+                    metric_corners = project_frame_points(affine_ref, ref_corners, *reference_size)
+                else:
+                    metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
+            except ValueError:
+                logger.warning(
+                    f"FOV outside safe reference projection for frame {candidate_id}; polygon dropped"
+                )
+                return []
             if metric_corners is not None:
                 fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
                 fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])

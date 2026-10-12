@@ -1,0 +1,449 @@
+{
+  "scope": "Temporal subgraphs; same held-out-from-global-fitting observations; original databases unchanged",
+  "runs": {
+    "1000m": {
+      "database": "D:\\My Projects\\TEST\\testtopboch_max_dino336\\sources\\main\\database.h5",
+      "frame_ids": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20,
+        22,
+        24,
+        26,
+        28,
+        30,
+        32,
+        34,
+        36,
+        38,
+        40,
+        42,
+        46,
+        48
+      ],
+      "frame_size": [
+        1280,
+        720
+      ],
+      "point_limit": 512,
+      "results": {
+        "legacy_local": {
+          "frames": 24,
+          "edges": 23,
+          "seconds": 15.503292000001238,
+          "alignment": {
+            "method": "affine_point_irls_v1",
+            "units": "initial_reference_pixels",
+            "frames": 24,
+            "links": 23,
+            "points": 2208,
+            "iterations": 7,
+            "before_median_px": 3.231859079148559,
+            "after_median_px": 0.9214229577858237,
+            "before_p95_px": 9.195072402871386,
+            "after_p95_px": 2.2389375295457787
+          },
+          "subpixel_points": 0,
+          "ground_center_error_seed_pixels": {
+            "median": 199.86679502395657,
+            "p95": 798.5369959587605,
+            "max": 872.1377277636892,
+            "count": 23,
+            "scope": "first-frame affine scale and center only; planar model over real simulator terrain"
+          },
+          "common_transfer_error_px": {
+            "median": 0.8809172322057721,
+            "p95": 2.9877089089897755,
+            "count": 2310,
+            "scope": "same accuracy pair observations; withheld from global adjustment only"
+          }
+        },
+        "accuracy": {
+          "frames": 24,
+          "edges": 27,
+          "seconds": 65.28645249999681,
+          "alignment": {
+            "method": "projective_symmetric_irls_v1",
+            "units": "original_image_pixels",
+            "frames": 24,
+            "links": 27,
+            "points": 11486,
+            "training_points": 9176,
+            "heldout_points": 2310,
+            "before_median_px": 0.6149883265248343,
+            "after_median_px": 0.6596171137903698,
+            "before_p95_px": 2.8056647711540306,
+            "after_p95_px": 2.0807174798759713,
+            "heldout_before_p95_px": 2.7423245766720243,
+            "heldout_after_p95_px": 2.069502040449856,
+            "heldout_scope": "global_adjustment_only",
+            "evaluations": 450,
+            "converged": false,
+            "heldout_robust_cost": 3.2198106701989904,
+            "frames_with_single_link": 1,
+            "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+            "selected_model": "projective",
+            "model_selection": {
+              "projective": {
+                "heldout_robust_cost": 3.2198106701989904,
+                "heldout_p95_px": 2.069502040449856
+              },
+              "affine": {
+                "heldout_robust_cost": 3.5803634011667382,
+                "heldout_p95_px": 2.1844285232350553
+              }
+            },
+            "rejected_models": {}
+          },
+          "subpixel_points": 12196,
+          "ground_center_error_seed_pixels": {
+            "median": 294.9294735583171,
+            "p95": 1283.4001212325618,
+            "max": 1399.0405218026935,
+            "count": 23,
+            "scope": "first-frame affine scale and center only; planar model over real simulator terrain"
+          },
+          "common_transfer_error_px": {
+            "median": 0.6739303154490328,
+            "p95": 2.069502040449672,
+            "count": 2310,
+            "scope": "same accuracy pair observations; withheld from global adjustment only"
+          }
+        }
+      },
+      "common_frame_ids": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20,
+        22,
+        24,
+        26,
+        28,
+        30,
+        32,
+        34,
+        36,
+        38,
+        40,
+        42,
+        46,
+        48
+      ]
+    },
+    "2000m": {
+      "database": "D:\\My Projects\\TEST\\testtopboch_max_dino336\\sources\\2\\database.h5",
+      "frame_ids": [
+        0,
+        3,
+        6,
+        9,
+        12,
+        15,
+        18,
+        21,
+        24,
+        28,
+        32,
+        35,
+        38,
+        41,
+        44,
+        47,
+        50,
+        53,
+        57,
+        61,
+        64,
+        67,
+        70,
+        73
+      ],
+      "frame_size": [
+        1280,
+        720
+      ],
+      "point_limit": 512,
+      "results": {
+        "legacy_local": {
+          "frames": 24,
+          "edges": 23,
+          "seconds": 15.828771999993478,
+          "alignment": {
+            "method": "affine_point_irls_v1",
+            "units": "initial_reference_pixels",
+            "frames": 24,
+            "links": 23,
+            "points": 2208,
+            "iterations": 5,
+            "before_median_px": 2.550279700146885,
+            "after_median_px": 0.7382957506464854,
+            "before_p95_px": 7.266730930223778,
+            "after_p95_px": 1.8604191625899644
+          },
+          "subpixel_points": 0,
+          "ground_center_error_seed_pixels": {
+            "median": 61.33960724090947,
+            "p95": 143.1321676062388,
+            "max": 143.30509104685677,
+            "count": 23,
+            "scope": "first-frame affine scale and center only; planar model over real simulator terrain"
+          },
+          "common_transfer_error_px": {
+            "median": 0.7467703327370204,
+            "p95": 7.312045017104395,
+            "count": 2631,
+            "scope": "same accuracy pair observations; withheld from global adjustment only"
+          }
+        },
+        "accuracy": {
+          "frames": 24,
+          "edges": 33,
+          "seconds": 57.51356079999823,
+          "alignment": {
+            "method": "projective_symmetric_irls_v1",
+            "units": "original_image_pixels",
+            "frames": 24,
+            "links": 33,
+            "points": 13085,
+            "training_points": 10454,
+            "heldout_points": 2631,
+            "before_median_px": 0.6686432104758543,
+            "after_median_px": 0.7856415531340091,
+            "before_p95_px": 7.84387780827008,
+            "after_p95_px": 2.2791578818382443,
+            "heldout_before_p95_px": 7.582516836549148,
+            "heldout_after_p95_px": 2.219813641712422,
+            "heldout_scope": "global_adjustment_only",
+            "evaluations": 450,
+            "converged": false,
+            "heldout_robust_cost": 6.089566734477074,
+            "frames_with_single_link": 2,
+            "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+            "selected_model": "projective",
+            "model_selection": {
+              "projective": {
+                "heldout_robust_cost": 6.089566734477074,
+                "heldout_p95_px": 2.219813641712422
+              },
+              "affine": {
+                "heldout_robust_cost": 6.937321943259239,
+                "heldout_p95_px": 2.481185130233987
+              }
+            },
+            "rejected_models": {}
+          },
+          "subpixel_points": 13094,
+          "ground_center_error_seed_pixels": {
+            "median": 50.791865132788466,
+            "p95": 179.3138539193012,
+            "max": 190.8517584482709,
+            "count": 23,
+            "scope": "first-frame affine scale and center only; planar model over real simulator terrain"
+          },
+          "common_transfer_error_px": {
+            "median": 0.7870927585024508,
+            "p95": 2.2198136417122747,
+            "count": 2631,
+            "scope": "same accuracy pair observations; withheld from global adjustment only"
+          }
+        }
+      },
+      "common_frame_ids": [
+        0,
+        3,
+        6,
+        9,
+        12,
+        15,
+        18,
+        21,
+        24,
+        28,
+        32,
+        35,
+        38,
+        41,
+        44,
+        47,
+        50,
+        53,
+        57,
+        61,
+        64,
+        67,
+        70,
+        73
+      ]
+    },
+    "500m": {
+      "database": "D:\\My Projects\\TEST\\testtopboch_max_dino336\\sources\\3\\database.h5",
+      "frame_ids": [
+        1036,
+        1040,
+        1044,
+        1048,
+        1052,
+        1056,
+        1060,
+        1064,
+        1068,
+        1072,
+        1076,
+        1080,
+        1084,
+        1088,
+        1092,
+        1096
+      ],
+      "frame_size": [
+        1280,
+        720
+      ],
+      "point_limit": 512,
+      "results": {
+        "legacy_local": {
+          "frames": 3,
+          "edges": 14,
+          "seconds": 15.503184100001818,
+          "alignment": {
+            "method": "affine_point_irls_v1",
+            "units": "initial_reference_pixels",
+            "frames": 3,
+            "links": 2,
+            "points": 192,
+            "iterations": 3,
+            "before_median_px": 1.9917565330979299,
+            "after_median_px": 0.7649062400608805,
+            "before_p95_px": 4.6704478678802035,
+            "after_p95_px": 1.69219475127811
+          },
+          "subpixel_points": 0,
+          "ground_center_error_seed_pixels": {
+            "median": 7.451476794062192,
+            "p95": 11.412920767184325,
+            "max": 11.85308120864234,
+            "count": 2,
+            "scope": "first-frame affine scale and center only; planar model over real simulator terrain"
+          },
+          "common_transfer_error_px": {
+            "median": 0.5149712694831249,
+            "p95": 1.4878997786146744,
+            "count": 206,
+            "scope": "same accuracy pair observations; withheld from global adjustment only"
+          }
+        },
+        "accuracy": {
+          "frames": 3,
+          "edges": 20,
+          "seconds": 4.017155100002128,
+          "alignment": {
+            "method": "affine_symmetric_irls_v1",
+            "units": "original_image_pixels",
+            "frames": 3,
+            "links": 2,
+            "points": 1024,
+            "training_points": 818,
+            "heldout_points": 206,
+            "before_median_px": 0.564975437533022,
+            "after_median_px": 0.46799344112376207,
+            "before_p95_px": 1.7125280463927455,
+            "after_p95_px": 1.6567552942407033,
+            "heldout_before_p95_px": 1.820837417523529,
+            "heldout_after_p95_px": 1.7293313212678054,
+            "heldout_scope": "global_adjustment_only",
+            "evaluations": 10,
+            "converged": true,
+            "heldout_robust_cost": 0.12888846656796146,
+            "frames_with_single_link": 2,
+            "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+            "selected_model": "affine",
+            "model_selection": {
+              "projective": {
+                "heldout_robust_cost": 0.1253430412211446,
+                "heldout_p95_px": 1.702717101646516
+              },
+              "affine": {
+                "heldout_robust_cost": 0.12888846656796146,
+                "heldout_p95_px": 1.7293313212678054
+              }
+            },
+            "rejected_models": {}
+          },
+          "subpixel_points": 9825,
+          "ground_center_error_seed_pixels": {
+            "median": 6.624759056072209,
+            "p95": 10.15832249129914,
+            "max": 10.5509406507688,
+            "count": 2,
+            "scope": "first-frame affine scale and center only; planar model over real simulator terrain"
+          },
+          "common_transfer_error_px": {
+            "median": 0.4255317585229383,
+            "p95": 1.7293313212675838,
+            "count": 206,
+            "scope": "same accuracy pair observations; withheld from global adjustment only"
+          }
+        }
+      },
+      "common_frame_ids": [
+        1036,
+        1040,
+        1044
+      ]
+    }
+  },
+  "disconnected_500m_start_1032": {
+    "database": "D:\\My Projects\\TEST\\testtopboch_max_dino336\\sources\\3\\database.h5",
+    "frame_ids": [
+      1032,
+      1036,
+      1040,
+      1044,
+      1048,
+      1052,
+      1056,
+      1060,
+      1064,
+      1068,
+      1072,
+      1076,
+      1080,
+      1084,
+      1088,
+      1092
+    ],
+    "frame_size": [
+      1280,
+      720
+    ],
+    "point_limit": 512,
+    "results": {
+      "legacy_local": {
+        "error": "Local point alignment needs dimensions, a gauge and connected frames",
+        "edges": 13,
+        "seconds": 14.910513800001354
+      },
+      "accuracy": {
+        "error": "Projective adjustment needs verified links",
+        "edges": 19,
+        "seconds": 6.58766750000359
+      }
+    }
+  }
+}

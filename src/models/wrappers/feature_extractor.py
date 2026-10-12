@@ -348,7 +348,7 @@ class FeatureExtractor:
             max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
             orig_h, orig_w = rgb_tensor.shape[2], rgb_tensor.shape[3]
             scale_factor = 1.0
-            if max(orig_h, orig_w) > max_edge:
+            if max_edge > 0 and max(orig_h, orig_w) > max_edge:
                 scale_factor = max_edge / float(max(orig_h, orig_w))
                 new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
                 rgb_tensor = torch.nn.functional.interpolate(
@@ -453,7 +453,7 @@ class FeatureExtractor:
         max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
         orig_h, orig_w = local_batch.shape[2], local_batch.shape[3]
         scale_factor = 1.0
-        if max(orig_h, orig_w) > max_edge:
+        if max_edge > 0 and max(orig_h, orig_w) > max_edge:
             scale_factor = max_edge / float(max(orig_h, orig_w))
             new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
             local_batch = torch.nn.functional.interpolate(

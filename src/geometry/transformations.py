@@ -219,6 +219,7 @@ class GeometryTransforms:
         backend: str = "opencv",
         use_mad_ransac: bool = False,
         mad_k_factor: float = 2.5,
+        frame_size: tuple[int, int] | None = None,
     ):
         """
         Estimate Homography with configurable backend.
@@ -233,12 +234,26 @@ class GeometryTransforms:
             )
             return None, None
 
+        def valid(matrix):
+            if frame_size is None:
+                return GeometryTransforms.is_matrix_valid(matrix, is_homography=True)
+            from src.geometry.frame_transform import affine_at_center, valid_footprint
+
+            if matrix is None or not valid_footprint(matrix, *frame_size, orientation=1):
+                return False
+            inverse = np.linalg.inv(matrix)
+            if not valid_footprint(inverse, *frame_size, orientation=1):
+                return False
+            # Judge local scale, not the top-left block of a projective matrix.
+            scale = np.linalg.svd(affine_at_center(matrix, *frame_size)[:, :2], compute_uv=False)
+            return 0.1 < scale.min() and scale.max() < 10.0
+
         # PoseLib backend (LO-RANSAC)
         if backend == "poselib" and _POSELIB_AVAILABLE:
             H, mask = GeometryTransforms._estimate_homography_poselib(
                 src_pts, dst_pts, ransac_threshold, max_iters, confidence
             )
-            if GeometryTransforms.is_matrix_valid(H, is_homography=True):
+            if valid(H):
                 if use_mad_ransac:
                     mask = GeometryTransforms._refine_mask_mad(
                         src_pts, dst_pts, H, mask, mad_k_factor, ransac_threshold
@@ -261,11 +276,11 @@ class GeometryTransforms:
         )
 
         # Validate Homography
-        if not GeometryTransforms.is_matrix_valid(H, is_homography=True):
+        if not valid(H):
             if fallback_to_affine:
                 logger.warning(
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
-                    f"Falling back to Full Affine (5 DoF)."
+                    f"Falling back to Full Affine (6 DoF)."
                 )
                 M, mask = GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
                 if M is not None:
@@ -428,7 +443,11 @@ class GeometryTransforms:
         if M is None or len(points) == 0:
             return points
         if M.shape == (3, 3):
-            M = M[:2, :]
+            # Full projective maps must retain the homogeneous denominator.
+            # Keep this compatibility entry point for callers with old affines.
+            from src.geometry.frame_transform import project_points
+
+            return project_points(M, points)
         points_cv = points.reshape(-1, 1, 2).astype(np.float64)
         transformed_pts_cv = cv2.transform(points_cv, M.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import deque
 
-import cv2
 import numpy as np
 
 from src.geometry.pose_graph.model_5dof import (
@@ -246,14 +245,25 @@ class DiagnosticsMixin:
         return "\n".join(lines)
 
     def export_graph_geojson(
-        self, converter, frame_w: int, frame_h: int, origin_xy: tuple = (0.0, 0.0)
+        self,
+        converter,
+        frame_w: int,
+        frame_h: int,
+        origin_xy: tuple = (0.0, 0.0),
+        frame_transforms: dict | None = None,
+        point_pairs: dict | None = None,
     ) -> dict:
         """origin_xy — Local Origin of propagation: internal graph states are local,
         без цього зсуву GeoJSON опинявся біля (0°, 0°) (баг, сесія 2026-07-12)."""
+        from src.geometry.frame_transform import project_points
+
         features = []
-        results = self._export_results()
+        results = self._export_results() if frame_transforms is None else frame_transforms
         cx, cy = frame_w / 2.0, frame_h / 2.0
         ox, oy = float(origin_xy[0]), float(origin_xy[1])
+        if frame_transforms is not None:
+            # Explicit transforms already contain their absolute map origin.
+            ox = oy = 0.0
 
         # Per-edge residual in properties → edges can be colour-coded on the map
         # by residual magnitude (bad loop closures become visually obvious).
@@ -262,7 +272,7 @@ class DiagnosticsMixin:
 
         for fid, affine in results.items():
             pt = np.array([[cx, cy]], dtype=np.float64)
-            metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
+            metric = project_points(affine, pt)[0]
             try:
                 lat, lon = converter.metric_to_gps(float(metric[0]) + ox, float(metric[1]) + oy)
             except Exception:
@@ -282,13 +292,33 @@ class DiagnosticsMixin:
             if affine_from is None or affine_to is None:
                 continue
             try:
-                pt = np.array([[cx, cy]], dtype=np.float64).reshape(-1, 1, 2)
-                m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
-                m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
+                pt = np.array([[cx, cy]], dtype=np.float64)
+                m_from = project_points(affine_from, pt)[0]
+                m_to = project_points(affine_to, pt)[0]
                 lat1, lon1 = converter.metric_to_gps(float(m_from[0]) + ox, float(m_from[1]) + oy)
                 lat2, lon2 = converter.metric_to_gps(float(m_to[0]) + ox, float(m_to[1]) + oy)
             except Exception:
                 continue
+            residual = None if np.isnan(edge_res[e_idx]) else float(edge_res[e_idx])
+            residual_units = "weighted_5dof"
+            if frame_transforms is not None:
+                from src.geometry.frame_transform import as_homography
+                from src.geometry.pair_refinement import symmetric_errors
+
+                residual, residual_units = None, "original_image_pixels"
+                key = (edge.from_id, edge.to_id)
+                pairs = point_pairs or {}
+                if key not in pairs:
+                    key = key[::-1]
+                if key in pairs:
+                    try:
+                        relative = np.linalg.inv(as_homography(results[key[1]])) @ as_homography(
+                            results[key[0]]
+                        )
+                        errors = symmetric_errors(relative, *pairs[key])
+                        residual = float(np.sqrt(np.mean(errors**2)))
+                    except (ValueError, np.linalg.LinAlgError):
+                        pass
             features.append(
                 {
                     "type": "Feature",
@@ -297,7 +327,8 @@ class DiagnosticsMixin:
                         "from_id": edge.from_id,
                         "to_id": edge.to_id,
                         "edge_type": edge.edge_type,
-                        "residual": (None if np.isnan(edge_res[e_idx]) else float(edge_res[e_idx])),
+                        "residual": residual,
+                        "residual_units": residual_units,
                         "weight": float(edge.weight),
                     },
                 }

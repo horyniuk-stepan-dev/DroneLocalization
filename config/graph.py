@@ -43,6 +43,17 @@ class PropagationConfig(BaseModel):
     # MNN по тих самих дескрипторах дає 100–800 пар (перевірено офлайн на lasttest).
     mnn_fallback: bool = False
 
+    # Offline accuracy profile. Legacy behavior stays available for old projects.
+    high_accuracy: bool = False
+    temporal_neighbors: int = Field(4, ge=1, le=20)
+    point_pair_limit: int = Field(512, ge=0)  # 0 retains every verified point
+    pair_min_inlier_ratio: float = Field(0.3, gt=0, le=1)
+    pair_min_spread: float = Field(0.025, ge=0)
+    pair_max_error_px: float = Field(3.0, gt=0)
+    subpixel_refinement: bool = True
+    subpixel_max_correction_px: float = Field(2.0, gt=0)
+    projective_max_evaluations: int = Field(150, ge=1)
+
 
 class GraphOptimizationConfig(BaseModel):
     """Конфігурація графової оптимізації пропагації координат."""

@@ -44,3 +44,12 @@ def test_static_mask_keeps_only_keypoints_on_static_pixels():
 
     np.testing.assert_array_equal(features["keypoints"], [[2.0, 3.0]])
     assert features["descriptors"].shape == (1, 4)
+
+
+def test_zero_edge_cap_preserves_source_resolution_and_keypoint_coordinates():
+    extractor = _extractor_with_features([[1600.0, 8.0]])
+    extractor.config = {"localization": {"max_local_edge": 0}}
+    extractor._upload_chw.return_value = torch.zeros((1, 3, 16, 1801))
+    features = extractor.extract_local_features(np.zeros((16, 1801, 3), dtype=np.uint8))
+    assert extractor.local_model.call_args.args[0]["image"].shape == (1, 3, 16, 1801)
+    np.testing.assert_array_equal(features["keypoints"], [[1600.0, 8.0]])

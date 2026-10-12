@@ -647,10 +647,11 @@ class DatabaseMixin:
         for i in range(0, num_frames, step):
             if frame_valid[i]:
                 # Apply affine matrix (2x3)
-                M = frame_affine[i]
+                from src.geometry.frame_transform import get_frame_transform, project_points
+
+                M = get_frame_transform(self.database, i)
                 # Metric = M * [x, y, 1]^T
-                metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
-                metric_y = M[1, 0] * center_px[0, 0] + M[1, 1] * center_px[0, 1] + M[1, 2]
+                metric_x, metric_y = project_points(M, center_px)[0]
 
                 lat, lon = self.calibration.converter.metric_to_gps(
                     float(metric_x), float(metric_y)
@@ -745,7 +746,9 @@ class DatabaseMixin:
             QMessageBox.warning(self, "Warning", "No results to export!\n\nPerform tracking first.")
             return
 
-        local_results = any(r.get("coordinate_kind") == "local_planar" for r in self._tracking_results)
+        local_results = any(
+            r.get("coordinate_kind") == "local_planar" for r in self._tracking_results
+        )
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export results",

@@ -1,0 +1,107 @@
+{
+  "project": "D:\\My Projects\\TEST\\testtopboch_max_dino336",
+  "source": "main",
+  "scope": "full_GEO_pipeline",
+  "input_sha256": "14ec43e9ca34fbbfd20d3724e8690e6b49a5dc81ed5687d13277124a62f55f43",
+  "results": {
+    "legacy": {
+      "seconds": 40.192783000005875,
+      "completed": true,
+      "errors": [],
+      "slots": 1089,
+      "occupied": 524,
+      "anchors": 248,
+      "saved_valid_frames": 1089,
+      "relative_alignment": null,
+      "nonanchor_center_error_mercator_m": {
+        "count": 276,
+        "median": 2.045824198376721,
+        "p95": 4.010760970391606,
+        "max": 7.5298024971134705
+      },
+      "exported_edges": 800,
+      "edges_with_residual": 800,
+      "common_transfer_px": {
+        "count": 95083,
+        "median": 5.405393553413512,
+        "p95": 15.397329797665739,
+        "max": 48.546982924280904
+      }
+    },
+    "accuracy": {
+      "seconds": 262.50715609999315,
+      "completed": true,
+      "errors": [],
+      "slots": 1089,
+      "occupied": 524,
+      "anchors": 248,
+      "saved_valid_frames": 1089,
+      "relative_alignment": {
+        "method": "projective_symmetric_irls_v1",
+        "units": "original_image_pixels",
+        "frames": 524,
+        "links": 1782,
+        "points": 471598,
+        "training_points": 152589,
+        "training_point_limit_per_link": 96,
+        "jacobian": "analytic",
+        "heldout_points": 95083,
+        "before_median_px": 5.348713201025667,
+        "after_median_px": 2.8090983831324654,
+        "before_p95_px": 15.236078514291112,
+        "after_p95_px": 10.447915553662819,
+        "heldout_before_p95_px": 15.319763586871046,
+        "heldout_after_p95_px": 10.513696505071914,
+        "heldout_scope": "global_adjustment_only",
+        "evaluations": 1286,
+        "converged": false,
+        "heldout_robust_cost": 7490.929395677081,
+        "training_robust_cost": 11361.922676211097,
+        "frames_with_single_link": 0,
+        "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+        "solver": "overlapping_block_coordinate",
+        "window_frames": 32,
+        "window_overlap": 8,
+        "sweeps": 8,
+        "max_sweeps": 8,
+        "windows_solved": 96,
+        "windows_rejected": 0,
+        "final_sweep_max_motion_px": 0.7251760107602678,
+        "convergence_scope": "bounded_window_sweeps; global stationarity not certified",
+        "selected_model": "projective",
+        "model_selection": {
+          "projective": {
+            "heldout_robust_cost": 7490.929395677081,
+            "heldout_p95_px": 10.513696505071914
+          },
+          "affine": {
+            "heldout_robust_cost": 11752.67157638304,
+            "heldout_p95_px": 14.227723461500894
+          }
+        },
+        "rejected_models": {},
+        "unrefined_frame_ids": [],
+        "rejected_spatial_links": 0,
+        "additional_overlap_links": 872,
+        "subpixel_status": "verified_source",
+        "pairs_checked": 4546,
+        "pairs_rejected": 2708
+      },
+      "nonanchor_center_error_mercator_m": {
+        "count": 276,
+        "median": 1.1002834855607309,
+        "p95": 2.7437629159901262,
+        "max": 5.580392497500465
+      },
+      "exported_edges": 910,
+      "edges_with_residual": 910,
+      "common_transfer_px": {
+        "count": 95083,
+        "median": 2.813125471536879,
+        "p95": 10.513696505990195,
+        "max": 45.27336910830905
+      }
+    }
+  },
+  "original_database_unchanged": true
+}
