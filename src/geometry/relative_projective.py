@@ -6,12 +6,119 @@ Geographic anchors, when supplied, remain exactly fixed at their input transform
 """
 
 import heapq
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy import sparse
 from scipy.optimize import least_squares
 
 from src.geometry.frame_transform import as_homography, project_points, valid_footprint
+
+# Perspective deviation from the centre-tangent affine at a frame corner is about
+# |h| * |u|^2 * s in normalised units (u = corner offset / max(W, H), s = frame scale).
+# For a 16:9 frame |u|^2 = 0.5^2 + 0.28^2 ~= 0.33.
+_CORNER_RADIUS_SQ = 0.33
+
+
+@dataclass
+class FramePriors:
+    """Optional non-image terms for the planar adjustment (all off by default).
+
+    points: frame_id -> (pixels (k, 2), map points (k, 2), sigma_px). Frames with point
+        priors may be free: their observations (e.g. anchor reference points) then
+        constrain the map instead of a fixed matrix.
+    log_scale: frame_id -> (target natural-log map scale at the frame centre in map
+        units per pixel, sigma in log units), e.g. from DEM + altitude.
+    perspective_sigma_px: > 0 adds a zero-mean prior on the two perspective terms,
+        expressed as the expected pixel deviation from the tangent affine at a corner.
+    """
+
+    points: dict = field(default_factory=dict)
+    log_scale: dict = field(default_factory=dict)
+    perspective_sigma_px: float = 0.0
+
+    def restricted(self, ids):
+        ids = set(ids)
+        return FramePriors(
+            {k: v for k, v in self.points.items() if k in ids},
+            {k: v for k, v in self.log_scale.items() if k in ids},
+            self.perspective_sigma_px,
+        )
+
+    def __bool__(self):
+        return bool(self.points or self.log_scale or self.perspective_sigma_px > 0)
+
+
+def _point_prior_terms(H, pn, target, scale):
+    """Residuals and dH (flattened first 8 entries) of projecting normalised points."""
+    z = pn @ H.T
+    proj = z[:, :2] / z[:, 2:3]
+    residual = scale * (proj - target)
+    d = np.zeros((len(pn), 2, 8))
+    inv_z = scale / z[:, 2]
+    d[:, 0, 0:3] = pn * inv_z[:, None]
+    d[:, 1, 3:6] = pn * inv_z[:, None]
+    d[:, 0, 6:8] = -(proj[:, 0] * inv_z)[:, None] * pn[:, :2]
+    d[:, 1, 6:8] = -(proj[:, 1] * inv_z)[:, None] * pn[:, :2]
+    return residual.ravel(), d.reshape(-1, 8)
+
+
+def _log_scale_terms(H):
+    """0.5 log|det J| of H at the normalised origin (H[2,2] == 1) and its gradient."""
+    A, t, h = H[:2, :2], H[:2, 2], H[2, :2]
+    J = A - np.outer(t, h)
+    det = np.linalg.det(J)
+    g = 0.5 * np.linalg.inv(J).T
+    grad = np.zeros(8)
+    grad[[0, 1, 3, 4]] = g.ravel()
+    grad[2] = -g[0] @ h
+    grad[5] = -g[1] @ h
+    grad[6:8] = -(g.T @ t)
+    return 0.5 * np.log(abs(det)), grad
+
+
+def _sparse_lm(objective, jac, x0, max_iterations, check_running=lambda: None):
+    """Levenberg-Marquardt on sparse normal equations (bundle-adjustment style).
+
+    The block-sparse J^T J of a frame graph is small (8 params per frame) and is
+    solved directly, so long chains converge in tens of iterations instead of the
+    thousands an iterative trust-region solver needs. Returns (x, evaluations, ok).
+    """
+    from scipy.sparse.linalg import spsolve
+
+    x = np.asarray(x0, dtype=float).copy()
+    r = objective(x)
+    cost = 0.5 * float(r @ r)
+    lam, evaluations = 1e-4, 1
+    for _ in range(max_iterations):
+        check_running()
+        J = jac(x).tocsr()
+        g = J.T @ r
+        A = (J.T @ J).tocsc()
+        diag = A.diagonal()
+        improved = False
+        while lam < 1e10:
+            damped = A + sparse.diags(lam * np.maximum(diag, 1e-12))
+            step = spsolve(damped.tocsc(), -g)
+            if not np.isfinite(step).all():
+                lam *= 10
+                continue
+            r_new = objective(x + step)
+            evaluations += 1
+            cost_new = 0.5 * float(r_new @ r_new)
+            if np.isfinite(cost_new) and cost_new < cost:
+                x, r = x + step, r_new
+                relative = (cost - cost_new) / max(cost, 1e-300)
+                cost = cost_new
+                lam = max(lam / 3, 1e-12)
+                improved = True
+                break
+            lam *= 4
+        if not improved:
+            return x, evaluations, True  # no descent left at any damping: stationary
+        if relative < 1e-10 or np.max(np.abs(step)) < 1e-10:
+            return x, evaluations, True
+    return x, evaluations, False
 
 
 def connected_links(initial, links, fixed_ids):
@@ -135,7 +242,18 @@ def initialize_from_pairs(pair_homographies, weighted_pairs, fixed, width, heigh
 
 
 def refine_projective_map(
-    initial, links, width, height, fixed_ids, *, max_nfev=150, check_running=lambda: None
+    initial,
+    links,
+    width,
+    height,
+    fixed_ids,
+    *,
+    max_nfev=150,
+    check_running=lambda: None,
+    priors=None,
+    window_frames=64,
+    train_points=96,
+    solver="trf",
 ):
     """Select full-affine or projective geometry using held-out transfer error.
 
@@ -156,6 +274,10 @@ def refine_projective_map(
                 model=model,
                 max_nfev=max_nfev,
                 check_running=check_running,
+                priors=priors,
+                window_frames=window_frames,
+                train_points=train_points,
+                solver=solver,
             )
         except ValueError as exc:
             failures[model] = str(exc)
@@ -186,14 +308,30 @@ def refine_projective_map(
     return result, report, per_frame
 
 
-def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, check_running):
+def _refine_map(
+    initial,
+    links,
+    width,
+    height,
+    fixed_ids,
+    *,
+    model,
+    max_nfev,
+    check_running,
+    priors=None,
+    window_frames=64,
+    train_points=96,
+    solver="trf",
+):
     """Return transforms, training/held-out QA and per-frame symmetric pixel RMS.
 
     Every fifth observation is withheld from the global solve (pairwise RANSAC
     may already have used it). The fixed first image removes the projective gauge.
     An analytic sparse Jacobian keeps derivatives local to each pair of cameras.
     """
-    if not initial or not fixed_ids or not set(fixed_ids) <= initial.keys():
+    priors = (priors or FramePriors()).restricted(initial)
+    anchored = set(fixed_ids) | set(priors.points)
+    if not initial or not anchored or not set(fixed_ids) <= initial.keys():
         raise ValueError("Projective adjustment needs existing fixed frames")
     if min(width, height) <= 0:
         raise ValueError("Projective adjustment needs image dimensions")
@@ -224,14 +362,14 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
             raise ValueError("Projective links need non-collinear finite observations")
         neighbors[link.first].add(link.second)
         neighbors[link.second].add(link.first)
-    reached, pending = set(fixed_ids), list(fixed_ids)
+    reached, pending = set(anchored), list(anchored)
     while pending:
         for fid in neighbors[pending.pop()] - reached:
             reached.add(fid)
             pending.append(fid)
     if reached != set(ids):
         raise ValueError("Projective links do not connect every frame to a fixed gauge")
-    if len(free) > 64:
+    if window_frames and len(free) > window_frames:
         return _refine_windowed(
             initial,
             links,
@@ -241,6 +379,9 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
             model=model,
             max_nfev=max_nfev,
             check_running=check_running,
+            priors=priors,
+            train_points=train_points,
+            solver=solver,
         )
 
     # Normalize both image coordinates and the arbitrary map gauge. This also
@@ -250,7 +391,9 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
         [[1 / size, 0, -width / (2 * size)], [0, 1 / size, -height / (2 * size)], [0, 0, 1.0]]
     )
     inv_N = np.linalg.inv(N)
-    gauge = as_homography(initial[min(fixed_ids)])
+    # The gauge only defines the local coordinate system; it is fixed unless it
+    # carries point priors (soft anchors), which then hold the map in place.
+    gauge = as_homography(initial[min(fixed_ids) if fixed_ids else min(priors.points)])
     to_local = N @ np.linalg.inv(gauge)
     to_map = gauge @ inv_N
     matrices = np.array([to_local @ as_homography(initial[fid]) @ inv_N for fid in ids])
@@ -276,11 +419,11 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
         # a spatially spread 96-point subset from the remaining observations.
         validation.extend(~train)
         candidates = np.flatnonzero(train)
-        if len(candidates) > 96:
+        if len(candidates) > train_points:
             from src.geometry.relative_alignment import sample_point_pair
 
             # sample_point_pair returns the paired indices in its second output.
-            _, selected_ids = sample_point_pair(p[candidates], candidates[:, None], 96)
+            _, selected_ids = sample_point_pair(p[candidates], candidates[:, None], train_points)
             train[:] = False
             train[selected_ids.ravel().astype(int)] = True
         first_ids.extend([index[link.first]] * len(p))
@@ -342,6 +485,79 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
     row_ids = np.concatenate(row_ids + [np.arange(n_data, n_data + len(x0))])
     col_ids = np.concatenate(col_ids + [np.arange(len(x0))])
 
+    # Optional non-image priors. Residual units: gauge-frame pixels for points,
+    # sigma-normalised for scale and perspective. Rows follow the shape prior.
+    from src.geometry.frame_transform import affine_at_center
+
+    gauge_affine = affine_at_center(gauge, width, height)
+    log_gauge_scale = 0.5 * np.log(abs(np.linalg.det(gauge_affine[:, :2])))
+    point_items = []
+    for fid, (pixels, targets, sigma) in sorted(priors.points.items()):
+        pixels, targets = np.asarray(pixels, float), np.asarray(targets, float)
+        pn = np.column_stack([project_points(N, pixels), np.ones(len(pixels))])
+        point_items.append((index[fid], pn, project_points(to_local, targets), size / float(sigma)))
+    scale_items = [
+        (index[fid], float(target) - log_gauge_scale, 1.0 / float(sigma))
+        for fid, (target, sigma) in sorted(priors.log_scale.items())
+        if np.isfinite(target)
+    ]
+    persp_items = []
+    if dof == 8 and priors.perspective_sigma_px > 0:
+        for fid in free:
+            k = index[fid]
+            s0 = np.exp(_log_scale_terms(matrices[k])[0])
+            persp_items.append((k, size * _CORNER_RADIUS_SQ * s0 / priors.perspective_sigma_px))
+
+    def prior_residuals(H, only_free=True):
+        out = []
+        for k, pn, target, sc in point_items:
+            if not only_free or camera_columns[k] >= 0:
+                out.append(_point_prior_terms(H[k], pn, target, sc)[0])
+        for k, target, w in scale_items:
+            if not only_free or camera_columns[k] >= 0:
+                out.append([w * (_log_scale_terms(H[k])[0] - target)])
+        for k, c in persp_items:
+            out.append(c * H[k][2, :2])
+        return np.concatenate(out) if out else np.zeros(0)
+
+    def prior_jacobian(H):
+        values = []
+        for k, pn, target, sc in point_items:
+            if camera_columns[k] >= 0:
+                values.append(_point_prior_terms(H[k], pn, target, sc)[1][:, :dof].ravel())
+        for k, target, w in scale_items:
+            if camera_columns[k] >= 0:
+                values.append(w * _log_scale_terms(H[k])[1][:dof])
+        for k, c in persp_items:
+            values.append(np.array([c, c]))
+        return np.concatenate(values) if values else np.zeros(0)
+
+    prior_rows, prior_cols = [], []
+    row = n_data + len(x0)
+    for k, pn, target, sc in point_items:
+        if camera_columns[k] >= 0:
+            m = 2 * len(pn)
+            prior_rows.append(np.repeat(np.arange(row, row + m), dof))
+            prior_cols.append(np.tile(camera_columns[k] + np.arange(dof), m))
+            row += m
+    for k, target, w in scale_items:
+        if camera_columns[k] >= 0:
+            prior_rows.append(np.full(dof, row))
+            prior_cols.append(camera_columns[k] + np.arange(dof))
+            row += 1
+    for k, c in persp_items:
+        prior_rows.append(np.array([row, row + 1]))
+        prior_cols.append(camera_columns[k] + np.array([6, 7]))
+        row += 2
+    n_rows = row
+    if prior_rows:
+        row_ids = np.concatenate([row_ids, *prior_rows])
+        col_ids = np.concatenate([col_ids, *prior_cols])
+
+    def prior_cost(x_):
+        r = prior_residuals(unpack(x_), only_free=False)
+        return 0.5 * float(r @ r)
+
     before = errors(x0)
     x = x0.copy()
     evaluations = 0
@@ -355,7 +571,7 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
         def objective(candidate, per_point=per_point):
             data = errors(candidate, train) * per_point[:, None]
             # Tiny shape prior only stabilizes underconstrained directions.
-            return np.r_[data.ravel(), 1e-3 * (candidate - x0)]
+            return np.r_[data.ravel(), 1e-3 * (candidate - x0), prior_residuals(unpack(candidate))]
 
         def jac(candidate, per_point=per_point):
             _, first, second = errors(candidate, train, jacobian=True)
@@ -364,25 +580,29 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
                 for block, active in zip((first, second), active_indices)
             ]
             values.append(np.full(len(x0), 1e-3))
+            values.append(prior_jacobian(unpack(candidate)))
             return sparse.csr_matrix(
-                (np.concatenate(values), (row_ids, col_ids)), shape=(n_data + len(x0), len(x0))
+                (np.concatenate(values), (row_ids, col_ids)), shape=(n_rows, len(x0))
             )
 
-        fit = least_squares(
-            objective,
-            x,
-            jac=jac,
-            method="trf",
-            x_scale="jac",
-            max_nfev=max_nfev,
-            ftol=1e-8,
-            xtol=1e-8,
-            gtol=1e-8,
-        )
-        evaluations += fit.nfev
-        converged = bool(fit.success)
-        change = np.max(np.abs(fit.x - x))
-        x = fit.x
+        if solver == "lm_sparse":
+            x_new, nfev, converged = _sparse_lm(objective, jac, x, max_nfev, check_running)
+        else:
+            fit = least_squares(
+                objective,
+                x,
+                jac=jac,
+                method="trf",
+                x_scale="jac",
+                max_nfev=max_nfev,
+                ftol=1e-8,
+                xtol=1e-8,
+                gtol=1e-8,
+            )
+            x_new, nfev, converged = fit.x, fit.nfev, bool(fit.success)
+        evaluations += nfev
+        change = np.max(np.abs(x_new - x))
+        x = x_new
         if change < 1e-8:
             break
     after = errors(x)
@@ -394,7 +614,8 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
         e = norms(values)[selected]
         return np.sum(weight[selected] ** 2 * np.where(e <= 2, e**2 / 2, 2 * e - 2))
 
-    if cost(after, train) > cost(before, train) + 1e-5:
+    prior_before, prior_after = prior_cost(x0), prior_cost(x)
+    if cost(after, train) + prior_after > cost(before, train) + prior_before + 1e-5:
         raise ValueError("Projective refinement increased robust image error")
     if np.any(heldout) and cost(after, heldout) > cost(before, heldout) * 1.1 + 0.05:
         raise ValueError("Projective refinement worsened held-out observations")
@@ -429,8 +650,9 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
         "links": len(links),
         "points": len(p),
         "training_points": int(train.sum()),
-        "training_point_limit_per_link": 96,
+        "training_point_limit_per_link": train_points,
         "jacobian": "analytic",
+        "solver_method": solver,
         "heldout_points": int((heldout).sum()),
         "before_median_px": float(np.median(b)),
         "after_median_px": float(np.median(a)),
@@ -444,8 +666,28 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
         "heldout_robust_cost": float(cost(after, heldout)) if np.any(heldout) else None,
         "training_robust_cost": float(cost(after, train)),
         "frames_with_single_link": sum(len(n) == 1 for n in neighbors.values()),
+        "prior_cost": prior_after,
         "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
     }
+    if priors:
+        gauge_m_per_px = float(np.exp(log_gauge_scale))
+
+        def anchor_rms_m(x_):
+            H = unpack(x_)
+            r = [
+                _point_prior_terms(H[k], pn, target, size)[0] * gauge_m_per_px
+                for k, pn, target, _ in point_items
+            ]
+            return float(np.sqrt(np.mean(np.concatenate(r) ** 2) * 2)) if r else None
+
+        report["priors"] = {
+            "point_frames": len(point_items),
+            "scale_frames": len(scale_items),
+            "perspective_sigma_px": float(priors.perspective_sigma_px),
+            "prior_cost_before": prior_before,
+            "anchor_points_rms_m_before": anchor_rms_m(x0),
+            "anchor_points_rms_m_after": anchor_rms_m(x),
+        }
     return (
         result,
         report,
@@ -453,14 +695,34 @@ def _refine_map(initial, links, width, height, fixed_ids, *, model, max_nfev, ch
     )
 
 
-def _refine_windowed(initial, links, width, height, fixed_ids, *, model, max_nfev, check_running):
+def _refine_windowed(
+    initial,
+    links,
+    width,
+    height,
+    fixed_ids,
+    *,
+    model,
+    max_nfev,
+    check_running,
+    priors=None,
+    train_points=96,
+    solver="trf",
+):
     """Bounded block-coordinate adjustment; cross-window/loop neighbors stay fixed.
 
     Each solve includes every incident constraint, including distant loop closures.
     Forward and backward overlapping sweeps propagate corrections. This is a
     bounded approximation, not a claim of global convergence on long chains.
     """
-    options = dict(model=model, max_nfev=max_nfev, check_running=check_running)
+    options = dict(
+        model=model,
+        max_nfev=max_nfev,
+        check_running=check_running,
+        priors=priors,
+        train_points=train_points,
+        solver=solver,
+    )
     _, before, _ = _refine_map(initial, links, width, height, set(initial), **options)
     result = {fid: as_homography(H).copy() for fid, H in initial.items()}
     free = sorted(set(initial) - set(fixed_ids))
@@ -512,7 +774,10 @@ def _refine_windowed(initial, links, width, height, fixed_ids, *, model, max_nfe
         if completed_sweeps >= 2 and final_motion < 0.01:
             break
     _, after, frame_rmse = _refine_map(result, links, width, height, set(result), **options)
-    if after["training_robust_cost"] > before["training_robust_cost"] + 1e-5:
+    if (
+        after["training_robust_cost"] + after["prior_cost"]
+        > before["training_robust_cost"] + before["prior_cost"] + 1e-5
+    ):
         raise ValueError("Windowed refinement increased robust image error")
     if (
         before["heldout_points"]
@@ -521,6 +786,11 @@ def _refine_windowed(initial, links, width, height, fixed_ids, *, model, max_nfe
         raise ValueError("Windowed refinement worsened held-out observations")
     for key in ("before_median_px", "before_p95_px", "heldout_before_p95_px"):
         after[key] = before[key]
+    if "priors" in after:
+        after["priors"]["prior_cost_before"] = before["prior_cost"]
+        after["priors"]["anchor_points_rms_m_before"] = before["priors"][
+            "anchor_points_rms_m_after"
+        ]
     after.update(
         solver="overlapping_block_coordinate",
         window_frames=32,

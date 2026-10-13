@@ -100,6 +100,7 @@ class PropagationPipeline:
         self._source_frames = None
         self._frame_homographies = None
         self._subpixel_status = "disabled"
+        self._terrain_terms = None
         self._relative_feature_ids = {}
         self._relative_point_pairs = {}
         self._relative_alignment_report = None
@@ -598,6 +599,7 @@ class PropagationPipeline:
         if self.terrain_prior:
             self._report_progress(78, "Terrain relief: DEM scale terms...")
             terrain = self._build_terrain_terms(optimizer)
+            self._terrain_terms = terrain
             if terrain is not None:
                 for it in range(self.terrain_iterations):
                     stats = terrain.apply(optimizer)
@@ -909,6 +911,61 @@ class PropagationPipeline:
                 known.add(canonical)
         return links
 
+    def _accuracy_priors(self, initial, optimizer, fixed_ids):
+        """Optional solver priors of the accuracy profile; all off by default.
+
+        Returns (FramePriors, soft anchor ids). Soft anchors are anchor frames whose
+        reference points (points_2d -> points_metric) become observations; they are
+        then refined instead of staying frozen at the graph solution.
+        """
+        from src.geometry.relative_projective import FramePriors
+
+        priors = FramePriors(
+            perspective_sigma_px=float(
+                get_cfg(self.config, "propagation.accuracy_perspective_sigma_px", 0.0)
+            )
+        )
+        soft_ids = set()
+        if get_cfg(self.config, "propagation.accuracy_anchor_points", False):
+            sigma = float(get_cfg(self.config, "propagation.accuracy_anchor_sigma_px", 1.0))
+            for anchor in getattr(self.calibration, "anchors", []):
+                pts = np.asarray(anchor.points_2d or [], dtype=np.float64).reshape(-1, 2)
+                ref = np.asarray(anchor.points_metric or [], dtype=np.float64).reshape(-1, 2)
+                fid = anchor.frame_id
+                if (
+                    fid in initial
+                    and fid in fixed_ids
+                    and len(pts) >= 4
+                    and pts.shape == ref.shape
+                    and np.isfinite(pts).all()
+                    and np.isfinite(ref).all()
+                ):
+                    priors.points[fid] = (pts, ref, sigma)
+                    soft_ids.add(fid)
+        scale_sigma = float(get_cfg(self.config, "propagation.accuracy_terrain_scale_sigma", 0.0))
+        if scale_sigma > 0 and self._terrain_terms is not None:
+            from src.geometry.terrain_scale import ground_scale
+
+            terrain = self._terrain_terms
+            states = optimizer.node_states()
+            fids = [fid for fid in sorted(states) if fid in initial]
+            if fids:
+                fp = terrain.model.sample_footprints(np.array([states[f] for f in fids]))
+                agl = terrain.profile(np.array(fids, dtype=np.float64)) - fp["mean"]
+                k = ground_scale(fp["lat"], terrain.model.converter)
+                ok = np.isfinite(agl) & (agl > terrain.min_agl_m)
+                target = np.log(np.where(ok, agl, 1.0) / (terrain.model.f_px * k))
+                for n, fid in enumerate(fids):
+                    if ok[n] and (fid not in fixed_ids or fid in soft_ids):
+                        priors.log_scale[fid] = (float(target[n]), scale_sigma)
+        if priors:
+            logger.info(
+                f"Accuracy priors: {len(priors.points)} soft anchors, "
+                f"{len(priors.log_scale)} terrain scale priors, "
+                f"perspective sigma {priors.perspective_sigma_px:g} px"
+            )
+        return priors, soft_ids
+
     def _refine_accurate_map(self, initial, optimizer, features, fixed_ids):
         from src.geometry.relative_projective import connected_links, refine_projective_map
 
@@ -930,9 +987,15 @@ class PropagationPipeline:
                 edge.weight = 0.0
         links = [link for link in links if tuple(sorted((link.first, link.second))) not in rejected]
         original_ids = set(initial)
-        initial, links = connected_links(initial, links, fixed_ids)
+        priors, soft_ids = self._accuracy_priors(initial, optimizer, fixed_ids)
+        fixed_ids = set(fixed_ids) - soft_ids
+        initial, links = connected_links(initial, links, fixed_ids | soft_ids)
         known = {tuple(sorted((edge.from_id, edge.to_id))) for edge in optimizer.edges}
-        extra = self._local_overlap_links(initial, features, known)
+        extra = (
+            self._local_overlap_links(initial, features, known)
+            if get_cfg(self.config, "propagation.accuracy_extra_overlaps", True)
+            else []
+        )
         links += extra
         self._validated_alignment_links = links
         self._report_progress(75, "Refining full frame geometry with shared image points...")
@@ -945,6 +1008,10 @@ class PropagationPipeline:
                 set(fixed_ids) & initial.keys(),
                 max_nfev=int(get_cfg(self.config, "propagation.projective_max_evaluations", 150)),
                 check_running=self._check_running,
+                priors=priors.restricted(initial),
+                window_frames=int(get_cfg(self.config, "propagation.projective_window_frames", 64)),
+                train_points=int(get_cfg(self.config, "propagation.projective_train_points", 96)),
+                solver=str(get_cfg(self.config, "propagation.projective_solver", "trf")),
             )
         except ValueError as exc:
             self._relative_alignment_report = {
@@ -960,6 +1027,20 @@ class PropagationPipeline:
         report["rejected_spatial_links"] = len(rejected)
         report["additional_overlap_links"] = len(extra)
         report["subpixel_status"] = self._subpixel_status
+        report["accuracy_options"] = {
+            key: get_cfg(self.config, f"propagation.{key}", default)
+            for key, default in (
+                ("projective_solver", "trf"),
+                ("projective_window_frames", 64),
+                ("projective_train_points", 96),
+                ("accuracy_anchor_points", False),
+                ("accuracy_anchor_sigma_px", 1.0),
+                ("accuracy_terrain_scale_sigma", 0.0),
+                ("accuracy_perspective_sigma_px", 0.0),
+                ("accuracy_extra_overlaps", True),
+            )
+        }
+        report["soft_anchor_frames"] = len(soft_ids)
         report["pairs_checked"] = len(self._pair_diagnostics)
         report["pairs_rejected"] = sum(
             bool(q["rejection"]) for q in self._pair_diagnostics.values()

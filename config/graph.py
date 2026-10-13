@@ -53,6 +53,22 @@ class PropagationConfig(BaseModel):
     subpixel_refinement: bool = True
     subpixel_max_correction_px: float = Field(2.0, gt=0)
     projective_max_evaluations: int = Field(150, ge=1)
+    # Accuracy-profile solver fixes (defaults reproduce the original profile).
+    # Global sparse Levenberg-Marquardt instead of windowed trust-region sweeps:
+    # windows with fixed boundaries cannot carry corrections along long chains.
+    projective_solver: Literal["trf", "lm_sparse"] = "trf"
+    projective_window_frames: int = Field(64, ge=0)  # 0 = always one global solve
+    projective_train_points: int = Field(96, ge=8)  # training observations per link
+    # Anchors as observations: their reference points (points_2d -> points_metric)
+    # constrain the solve instead of freezing the anchor frames at the graph result.
+    accuracy_anchor_points: bool = False
+    accuracy_anchor_sigma_px: float = Field(1.0, gt=0)
+    # DEM + altitude scale prior (same target as the graph terrain prior); 0 = off.
+    accuracy_terrain_scale_sigma: float = Field(0.0, ge=0)
+    # Zero-mean prior on perspective, as expected corner deviation in px; 0 = off.
+    accuracy_perspective_sigma_px: float = Field(0.0, ge=0)
+    # Extra nearby-overlap links found from the map footprint (original: on).
+    accuracy_extra_overlaps: bool = True
 
 
 class GraphOptimizationConfig(BaseModel):
