@@ -466,7 +466,14 @@
         "max_skip_frames": 3,
         "rotation_retry": false,
         "skip_bridges": false,
-        "mnn_fallback": false
+        "mnn_fallback": false,
+        "high_accuracy": true,
+        "projective_solver": "lm_sparse",
+        "projective_window_frames": 0,
+        "projective_train_points": 48,
+        "accuracy_anchor_points": true,
+        "accuracy_anchor_sigma_px": 6.0,
+        "accuracy_terrain_scale_sigma": 0.02
     },
     "flight_data": {
         "source": "none",
