@@ -987,7 +987,11 @@ class DatabaseMixin:
             {src.get("area_id", "") for src in settings.video_sources or []} - {""}
         )
 
-        dialog = AddVideoSourceDialog(existing_area_ids=existing_areas, parent=self)
+        dialog = AddVideoSourceDialog(
+            existing_area_ids=existing_areas,
+            parent=self,
+            existing_sources=list(settings.video_sources or []),
+        )
         if not dialog.exec():
             return
 

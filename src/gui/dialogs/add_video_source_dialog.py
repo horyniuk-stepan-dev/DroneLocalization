@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.project_video_source import ProjectVideoSource
+from src.database.source_priority import effective_patchify_priority, next_priority
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -30,11 +31,18 @@ logger = get_logger(__name__)
 class AddVideoSourceDialog(QDialog):
     """Dialog for adding a new video source to a multi-source project."""
 
-    def __init__(self, existing_area_ids: list[str] | None = None, parent=None):
+    def __init__(
+        self,
+        existing_area_ids: list[str] | None = None,
+        parent=None,
+        existing_sources: list[dict] | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Додати відеоджерело")
         self.setMinimumWidth(500)
         self._existing_areas = existing_area_ids or []
+        # project.json video_sources: the priorities already taken in each area
+        self._existing_sources = [dict(s) for s in existing_sources or []]
         self._init_ui()
 
     def _init_ui(self):
@@ -80,14 +88,27 @@ class AddVideoSourceDialog(QDialog):
         self.area_combo.lineEdit().setPlaceholderText("Виберіть або введіть area_id")
         form.addRow("Area ID:", self.area_combo)
 
-        # Priority
+        # Priority (standard candidates) and patchify priority (patch candidates).
+        # Layers stacked over one area need different numbers, layers of other areas
+        # may share one; the spins start at the next free number of the chosen area.
         self.priority_spin = QSpinBox()
         self.priority_spin.setRange(0, 100)
         self.priority_spin.setValue(0)
         self.priority_spin.setToolTip(
-            "0 = highest priority. When cosine scores match, source with lower priority is chosen."
+            "0 = найвищий. Шари, що накладаються в одній зоні, мають мати різні номери "
+            "(основний 0, далі 1, 2, ...); шари різних зон можуть мати однаковий."
         )
         form.addRow("Пріоритет:", self.priority_spin)
+
+        self.patchify_priority_spin = QSpinBox()
+        self.patchify_priority_spin.setRange(0, 100)
+        self.patchify_priority_spin.setValue(0)
+        self.patchify_priority_spin.setToolTip(
+            "Пріоритет патч-кандидатів цього шару (localization.joint_candidate_ranking). "
+            "0 = найвищий; правило те саме, що для пріоритету шару."
+        )
+        form.addRow("Пріоритет патчифаю:", self.patchify_priority_spin)
+        self.area_combo.currentTextChanged.connect(self._suggest_priorities)
 
         layout.addWidget(basic_group)
 
@@ -181,6 +202,35 @@ class AddVideoSourceDialog(QDialog):
             self.area_combo.setCurrentText(self._existing_areas[0])
         else:
             self.area_combo.setCurrentText("")
+        self._suggest_priorities()
+
+    def _area_sources(self) -> list[dict]:
+        """Existing layers of the chosen area (the ones a new overlay layer stacks on)."""
+        area_id = self.area_combo.currentText().strip()
+        if not area_id or self.mode_combo.currentData() != "layer":
+            return []
+        return [s for s in self._existing_sources if s.get("area_id", "") == area_id]
+
+    def _suggest_priorities(self, *_args):
+        """Next free numbers of the chosen area for an overlay layer; 0 for a new zone."""
+        stacked = self._area_sources()
+        self.priority_spin.setValue(next_priority(int(s.get("priority") or 0) for s in stacked))
+        self.patchify_priority_spin.setValue(
+            next_priority(effective_patchify_priority(s) for s in stacked)
+        )
+
+    def _priority_clashes(self) -> list[str]:
+        """Layers of the chosen area that already use the entered numbers."""
+        clashes = []
+        for s in self._area_sources():
+            sid = s.get("source_id", "?")
+            if int(s.get("priority") or 0) == self.priority_spin.value():
+                clashes.append(f"пріоритет {self.priority_spin.value()} вже має шар '{sid}'")
+            if effective_patchify_priority(s) == self.patchify_priority_spin.value():
+                clashes.append(
+                    f"пріоритет патчифаю {self.patchify_priority_spin.value()} вже має шар '{sid}'"
+                )
+        return clashes
 
     @pyqtSlot()
     def _on_accept(self):
@@ -203,6 +253,21 @@ class AddVideoSourceDialog(QDialog):
             QMessageBox.warning(self, "Помилка", "Введіть або виберіть Area ID!")
             self.area_combo.setFocus()
             return
+
+        clashes = self._priority_clashes()
+        if clashes:
+            answer = QMessageBox.question(
+                self,
+                "Пріоритет шару",
+                "Шари цієї зони накладаються, а правила пріоритету шарів не розрізнять "
+                "однакові номери:\n\n"
+                + "\n".join(f"• {c}" for c in clashes)
+                + "\n\nЗберегти все одно?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
         if self.geo_group.isChecked():
             if self.lat_min_spin.value() >= self.lat_max_spin.value():
@@ -236,6 +301,7 @@ class AddVideoSourceDialog(QDialog):
             description=self.description_edit.text().strip(),
             enabled=True,
             priority=self.priority_spin.value(),
+            patchify_priority=self.patchify_priority_spin.value(),
             geo_bounds=geo_bounds,
             camera_params={
                 "altitude_m": self.altitude_spinbox.value(),

@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from config import get_cfg
 from src.database.database_loader import DatabaseLoader
+from src.database.source_priority import choose_source, coverage_cells, priority_conflicts
 from src.localization.geo_aware_retriever import GeoAwareRetriever
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.utils.logging_utils import get_logger
@@ -130,6 +132,46 @@ class MultiDatabaseManager:
         )
 
         self._check_interchangeability()
+        self._check_priorities()
+
+    def _check_priorities(self) -> list[str]:
+        """Warn about overlapping layers that share a priority (or a patchify priority).
+
+        Overlap: the layers' map frames share a ~2 km grid cell (``frame_gps``); a
+        layer without frame positions overlaps every layer of its ``area_id``.
+        Layers of different terrain may share a number. Warnings only while a rule
+        that reads the priorities is on, info otherwise (then priority only breaks
+        exact score ties).
+        """
+        cells = {
+            sid: coverage_cells(getattr(loader, "frame_gps", None))
+            for sid, loader in self._databases.items()
+        }
+
+        def overlap(a, b) -> bool:
+            ca, cb = cells.get(a.source_id), cells.get(b.source_id)
+            if ca and cb:
+                return bool(ca & cb)
+            return a.area_id == b.area_id
+
+        messages = priority_conflicts(
+            [self._sources[sid] for sid in sorted(self._sources)], overlap
+        )
+        rules_on = (
+            int(get_cfg(self._config, "localization.source_priority_rank_margin", 0) or 0) > 0
+            or int(get_cfg(self._config, "localization.patchify_main_rank_margin", 0) or 0) > 0
+            or bool(get_cfg(self._config, "localization.joint_candidate_ranking", False))
+        )
+        for message in messages:
+            text = (
+                f"Layer priority: {message} - the layer priority rules cannot order them; "
+                "give layers stacked over one area different numbers (main 0, then 1, 2, ...)."
+            )
+            if rules_on:
+                logger.warning(text)
+            else:
+                logger.info(text)
+        return messages
 
     def _vlad_mismatch(self, loader: DatabaseLoader) -> str | None:
         """Compare a database's VLAD settings (incl. vocabulary hash) with the config."""
@@ -317,6 +359,7 @@ class MultiDatabaseManager:
         top_k: int = 8,
     ) -> tuple[str | None, list[tuple[int, float]]]:
         """Performs vector search across active databases, returning best match."""
+        self.last_matches_by_source = {}
         if not self._active_source_ids:
             logger.warning("No active sources for retrieval")
             return None, []
@@ -324,6 +367,8 @@ class MultiDatabaseManager:
         best_source_id: str | None = None
         best_candidates: list[tuple[int, float]] = []
         best_top_score: float = -1.0
+        rank_margin = int(get_cfg(self._config, "localization.source_priority_rank_margin", 0) or 0)
+        per_source: dict[str, list[tuple[int, float]]] = {}
 
         # Sort by priority (0 = highest)
         sorted_ids = sorted(
@@ -344,6 +389,7 @@ class MultiDatabaseManager:
                 if not candidates:
                     continue
 
+                per_source[source_id] = candidates
                 top_score = candidates[0][1]
                 if top_score > best_top_score:
                     best_top_score = top_score
@@ -355,6 +401,25 @@ class MultiDatabaseManager:
                     f"Retrieval failed for source '{source_id}': {e}",
                     exc_info=True,
                 )
+
+        # Per-layer standard candidates of this call (RotationSelector keeps the best
+        # (angle, scale) per layer for localization.patchify_main_rank_margin).
+        self.last_matches_by_source = per_source
+
+        if rank_margin > 0 and per_source:
+            chosen = choose_source(
+                per_source,
+                {sid: self._sources[sid].priority for sid in per_source},
+                rank_margin,
+            )
+            if chosen is not None and chosen != best_source_id:
+                logger.debug(
+                    f"Layer priority: '{chosen}' instead of '{best_source_id}' "
+                    f"(its best candidate within the first {rank_margin + 1} ranks)"
+                )
+                best_source_id = chosen
+                best_candidates = per_source[chosen]
+                best_top_score = best_candidates[0][1]
 
         if best_source_id is not None:
             logger.debug(

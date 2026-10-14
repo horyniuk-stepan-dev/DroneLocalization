@@ -101,6 +101,7 @@
         "hdf5_compression": "lzf",
         "hdf5_chunk_frames": 1,
         "max_keypoints_stored": 2048,
+        "accuracy_features": false,
         "yolo_batch_size": 4
     },
     "localization": {
@@ -157,7 +158,7 @@
             "disagreement_norm_m": 5.0,
             "confidence_max_inliers": 80
         },
-        "use_patchify": false,
+        "use_patchify": true,
         "patchify_grids": [
             [
                 1,
@@ -174,6 +175,8 @@
         ],
         "patchify_batch_size": 1,
         "patchify_merge_weight": 0.4,
+        "source_priority_rank_margin": 2,
+        "patchify_main_rank_margin": 2,
         "scale_pyramid": [
             0.5,
             0.7,
@@ -202,7 +205,11 @@
         "temporal_prior_accept_inliers": 25,
         "temporal_prior_audit_every": 10,
         "temporal_prior_max_keypoints": 0,
-        "spatial_prior": true
+        "spatial_prior": true,
+        "spatial_prior_max_age_s": 30.0,
+        "spatial_prior_nearest_k": 4,
+        "spatial_prior_radius_m": 1500.0,
+        "spatial_prior_verify": 2
     },
     "tracking": {
         "kalman_process_noise": 2.0,
@@ -468,12 +475,22 @@
         "skip_bridges": false,
         "mnn_fallback": false,
         "high_accuracy": true,
+        "temporal_neighbors": 4,
+        "point_pair_limit": 512,
+        "pair_min_inlier_ratio": 0.3,
+        "pair_min_spread": 0.025,
+        "pair_max_error_px": 3.0,
+        "subpixel_refinement": true,
+        "subpixel_max_correction_px": 2.0,
+        "projective_max_evaluations": 150,
         "projective_solver": "lm_sparse",
         "projective_window_frames": 0,
         "projective_train_points": 48,
         "accuracy_anchor_points": true,
         "accuracy_anchor_sigma_px": 6.0,
-        "accuracy_terrain_scale_sigma": 0.02
+        "accuracy_terrain_scale_sigma": 0.02,
+        "accuracy_perspective_sigma_px": 0.0,
+        "accuracy_extra_overlaps": true
     },
     "flight_data": {
         "source": "none",

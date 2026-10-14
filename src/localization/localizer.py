@@ -238,42 +238,42 @@ class Localizer:
         #   1. Enabled via config
         #   2. Database contains patch_descriptors (i.e. built with use_patchify=True)
         # If either condition is not met — patchify is silently disabled (backward compat).
+        # Multi-layer: one patch index per layer, built on the layer's first use. Frame ids
+        # are per database, so patch hits may only be merged into candidates of their own
+        # layer (one index from the first layer used to be merged into every layer's list).
         self.patchify_retrieval = None
-        use_patchify = get_cfg(self.config, "localization.use_patchify", False)
-        if use_patchify:
-            patch_desc = getattr(self.database, "patch_descriptors", None)
-            if patch_desc is not None and len(patch_desc) > 0:
-                try:
-                    from src.localization.patchify import PatchifyRetrieval
-
-                    patchify_grids = get_cfg(
-                        self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
-                    )
-                    patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
-                    desc_dim = int(patch_desc.shape[-1])
-                    self.patchify_retrieval = PatchifyRetrieval(
-                        self.feature_extractor,
-                        descriptor_dim=desc_dim,
-                        grids=patchify_grids,
-                        batch_size=patchify_batch,
-                    )
-                    frame_ids = list(range(self.database.get_num_frames()))
-                    self.patchify_retrieval.build_index(patch_desc, frame_ids)
-                    logger.info(
-                        f"Patchify retrieval initialized: "
-                        f"{self.patchify_retrieval.num_patches} patches/frame, "
-                        f"dim={desc_dim}, grids={patchify_grids}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Patchify retrieval init failed — falling back to standard retrieval: {e}"
-                    )
-                    self.patchify_retrieval = None
+        patchify_factory = None
+        # localization.patchify_main_rank_margin = N > 0 (multi-layer): candidates found
+        # only by patchify are verified after the main layer's standard candidates unless
+        # they rank more than N places above them (src/database/source_priority.py).
+        self._patchify_main_margin = int(
+            get_cfg(self.config, "localization.patchify_main_rank_margin", 0) or 0
+        )
+        # localization.joint_candidate_ranking (multi-layer): one verification list from
+        # the standard and patchify candidates of every layer, ordered by rank, layer
+        # priority and patchify penalty (src/database/source_priority.py::joint_order).
+        self._joint_ranking = bool(
+            get_cfg(self.config, "localization.joint_candidate_ranking", False)
+        )
+        self._joint_top_k = int(get_cfg(self.config, "localization.joint_top_k", 5) or 5)
+        self._joint_patch_penalty = int(
+            get_cfg(self.config, "localization.joint_patchify_rank_penalty", 2) or 0
+        )
+        self._joint_rank_step = int(
+            get_cfg(self.config, "localization.source_priority_rank_margin", 0) or 0
+        )
+        if get_cfg(self.config, "localization.use_patchify", False):
+            if self.db_manager is not None:
+                patchify_factory = self._build_patchify_retrieval
             else:
-                logger.info("Patchify enabled in config but database has no patch_descriptors. ")
+                self.patchify_retrieval = self._build_patchify_retrieval(self.database)
 
         self._candidate_retriever = CandidateRetriever(
-            self.db_manager, self.retriever, self.patchify_retrieval, self.config
+            self.db_manager,
+            self.retriever,
+            self.patchify_retrieval,
+            self.config,
+            patchify_factory=patchify_factory,
         )
         self._geometric_verifier = GeometricVerifier(
             self.matcher,
@@ -329,6 +329,215 @@ class Localizer:
         Public access instead of reading private _last_state externally.
         """
         return getattr(self, "_last_state", None)
+
+    def _main_source_id(self):
+        """Active layer with the highest priority (lowest ``priority``; main = 0)."""
+        manager = self.db_manager
+        if manager is None:
+            return None
+        ids = list(getattr(manager, "active_source_ids", None) or [])
+        if not ids:
+            return None
+
+        def rank(sid):
+            src = manager.get_source_config(sid)
+            return (getattr(src, "priority", 0) if src is not None else 0, sid)
+
+        return min(ids, key=rank)
+
+    def _main_before_patchify(self, rot, standard, expanded, source_id):
+        """``(main RotationResult | None, own, patchify_only)`` when the main layer goes first.
+
+        None keeps the old order (merged candidates of the chosen layer). ``own`` are
+        the chosen layer's standard candidates, ``patchify_only`` the ones patchify
+        added. ``main RotationResult`` is None when the chosen layer is the main one.
+        """
+        if self._patchify_main_margin <= 0 or self.db_manager is None or source_id is None:
+            return None
+        from src.database.source_priority import main_before_patchify
+
+        std_ids = {int(frame) for frame, _ in standard}
+        own = [c for c in expanded if int(c[0]) in std_ids]
+        patch_only = [c for c in expanded if int(c[0]) not in std_ids]
+        if not patch_only:
+            return None
+        main_sid = self._main_source_id()
+        if main_sid is None:
+            return None
+        if main_sid == source_id:
+            main_rot, main_candidates = None, standard
+        else:
+            main_rot = (getattr(rot, "per_source", None) or {}).get(main_sid)
+            if main_rot is None or not main_rot.candidates:
+                return None
+            main_candidates = main_rot.candidates
+        if not main_before_patchify(expanded, std_ids, main_candidates, self._patchify_main_margin):
+            return None
+        return main_rot, own, patch_only
+
+    def _verify_main_layer(self, main_rot, query_frame, static_mask, cache):
+        """Verify the main layer's candidates at its own (angle, scale); switch on success."""
+        sid = main_rot.source_id
+        database = self.db_manager.get_database(sid)
+        if database is None:
+            return None
+        rotated, rot_mask, crop, feats = self._prepare_and_extract(
+            query_frame,
+            static_mask,
+            main_rot.angle,
+            main_rot.best_scale,
+            cache,
+            prepared=(main_rot.frame, main_rot.crop_info),
+        )
+        candidates = list(main_rot.candidates)
+        support_check = getattr(database, "is_frame_georef_supported", None)
+        if support_check is not None:
+            candidates = [c for c in candidates if support_check(int(c[0]))]
+        ver = self._geometric_verifier.verify(feats, candidates, database, tag="main_priority")
+        if ver is None:
+            return None
+        self._active_source_id = sid
+        self.database = database
+        if self.calib_manager is not None:
+            self.calibration = self.calib_manager.get(sid)
+        logger.debug(f"Main layer '{sid}' verified before patchify candidates")
+        return (
+            ver,
+            main_rot.angle,
+            main_rot.best_scale,
+            rotated,
+            rot_mask,
+            crop,
+            feats,
+            candidates,
+            main_rot.score,
+            sid,
+        )
+
+    def _layer_priorities(self) -> tuple[dict, dict]:
+        """``(priority, patchify priority)`` per active layer (project.json numbers)."""
+        from src.database.source_priority import effective_patchify_priority
+
+        manager = self.db_manager
+        standard: dict = {}
+        patch: dict = {}
+        for sid in list(getattr(manager, "active_source_ids", None) or []):
+            src = manager.get_source_config(sid)
+            standard[sid] = int(getattr(src, "priority", 0) or 0) if src is not None else 0
+            patch[sid] = effective_patchify_priority(src) if src is not None else standard[sid]
+        return standard, patch
+
+    def _joint_candidates(self, per_source: dict, top_k: int) -> list:
+        """Every layer's standard and patchify-only candidates (georeferenced frames only)."""
+        from src.database.source_priority import JointCandidate
+
+        entries = []
+        desc_cache: dict = {}
+        for sid, layer in per_source.items():
+            database = self.db_manager.get_database(sid)
+            if database is None:
+                continue
+            usable = getattr(database, "is_frame_georef_supported", None)
+            standard_ids = {int(frame) for frame, _ in layer.candidates}
+            for frame, score in layer.candidates:
+                if usable is None or usable(int(frame)):
+                    entries.append(JointCandidate(sid, int(frame), float(score), False))
+            for frame, score in self._candidate_retriever.patch_candidates(
+                layer.frame, top_k, source_id=sid, desc_cache=desc_cache
+            ):
+                if int(frame) in standard_ids or (usable is not None and not usable(int(frame))):
+                    continue
+                entries.append(JointCandidate(sid, int(frame), float(score), True))
+        return entries
+
+    def _verify_joint(self, rot, query_frame, static_mask, cache, top_k):
+        """Verify the joint candidate list in order; the first verified layer becomes active.
+
+        Same return tuple as ``_verify_main_layer``, or None when nothing verified.
+        Consecutive candidates of one layer go to the verifier together (its
+        prefilter then works as before); each layer at its own (angle, scale).
+        """
+        from src.database.source_priority import joint_order, verification_runs
+
+        per_source = rot.per_source or {}
+        priorities, patch_priorities = self._layer_priorities()
+        ordered = joint_order(
+            self._joint_candidates(per_source, top_k),
+            priorities,
+            patch_priorities,
+            self._joint_rank_step,
+            self._joint_patch_penalty,
+            self._joint_top_k,
+        )
+        for sid, run in verification_runs(ordered):
+            layer = per_source.get(sid)
+            database = self.db_manager.get_database(sid)
+            if layer is None or database is None:
+                continue
+            rotated, rot_mask, crop, feats = self._prepare_and_extract(
+                query_frame,
+                static_mask,
+                layer.angle,
+                layer.best_scale,
+                cache,
+                prepared=(layer.frame, layer.crop_info),
+            )
+            candidates = [(c.frame_id, c.score) for c in run]
+            tag = "joint_patchify" if all(c.patch for c in run) else "joint"
+            ver = self._geometric_verifier.verify(feats, candidates, database, tag=tag)
+            if ver is None:
+                continue
+            self._active_source_id = sid
+            self.database = database
+            if self.calib_manager is not None:
+                self.calibration = self.calib_manager.get(sid)
+            logger.debug(f"Joint candidate list: layer '{sid}' verified frame {ver.candidate_id}")
+            return (
+                ver,
+                layer.angle,
+                layer.best_scale,
+                rotated,
+                rot_mask,
+                crop,
+                feats,
+                candidates,
+                layer.score,
+                sid,
+            )
+        return None
+
+    def _build_patchify_retrieval(self, database):
+        """Patch-descriptor index of one database, or None when it has none."""
+        patch_desc = getattr(database, "patch_descriptors", None)
+        if patch_desc is None or len(patch_desc) == 0:
+            logger.info("Patchify enabled in config but database has no patch_descriptors. ")
+            return None
+        try:
+            from src.localization.patchify import PatchifyRetrieval
+
+            patchify_grids = get_cfg(
+                self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
+            )
+            patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
+            desc_dim = int(patch_desc.shape[-1])
+            retrieval = PatchifyRetrieval(
+                self.feature_extractor,
+                descriptor_dim=desc_dim,
+                grids=patchify_grids,
+                batch_size=patchify_batch,
+            )
+            retrieval.build_index(patch_desc, list(range(database.get_num_frames())))
+            logger.info(
+                f"Patchify retrieval initialized: "
+                f"{retrieval.num_patches} patches/frame, "
+                f"dim={desc_dim}, grids={patchify_grids}"
+            )
+            return retrieval
+        except Exception as e:
+            logger.warning(
+                f"Patchify retrieval init failed — falling back to standard retrieval: {e}"
+            )
+            return None
 
     def _sync_ground_scale(self, lat: float) -> None:
         """Updates projection-to-ground metric multiplier in outlier detector.
@@ -761,9 +970,20 @@ class Localizer:
             # Run ONCE after angle selection — not in a loop.
             # Patchify adds candidates that DINOv2 CLS-token might have missed
             # (e.g., during altitude change).
-            best_global_candidates = self._candidate_retriever.expand(
-                best_rotated_frame, best_global_candidates, top_k
+            standard_candidates = list(best_global_candidates)
+            # Joint candidate list: every layer's patchify candidates are searched there.
+            joint_mode = (
+                self._joint_ranking
+                and self.db_manager is not None
+                and bool(getattr(rot, "per_source", None))
             )
+            if not joint_mode:
+                best_global_candidates = self._candidate_retriever.expand(
+                    best_rotated_frame,
+                    best_global_candidates,
+                    top_k,
+                    source_id=best_source_id_per_angle,
+                )
 
             # Map trust participates in candidate selection, not only in final
             # result assembly.  Otherwise an unsupported self-match can win the
@@ -789,9 +1009,61 @@ class Localizer:
                     except Exception as e:
                         logger.debug(f"Debug DINO tokens skipped: {e}")
 
-            ver = self._geometric_verifier.verify(
-                best_query_features, best_global_candidates, self.database, tag="retrieval"
+            main_first = (
+                None
+                if joint_mode
+                else self._main_before_patchify(
+                    rot, standard_candidates, best_global_candidates, best_source_id_per_angle
+                )
             )
+            if joint_mode:
+                ver = None
+                on_layer = self._verify_joint(rot, query_frame, static_mask, _feat_cache, top_k)
+                if on_layer is not None:
+                    (
+                        ver,
+                        best_global_angle,
+                        best_scale,
+                        best_rotated_frame,
+                        best_rotated_mask,
+                        _crop_info,
+                        best_query_features,
+                        best_global_candidates,
+                        best_global_score,
+                        best_source_id_per_angle,
+                    ) = on_layer
+            elif main_first is None:
+                ver = self._geometric_verifier.verify(
+                    best_query_features, best_global_candidates, self.database, tag="retrieval"
+                )
+            else:
+                # Patchify-only candidates come last: this layer's standard candidates,
+                # then the main layer's (another layer: switch + its own scale), then them.
+                main_rot, own, patch_only = main_first
+                ver = self._geometric_verifier.verify(
+                    best_query_features, own, self.database, tag="retrieval"
+                )
+                if ver is None and main_rot is not None:
+                    on_main = self._verify_main_layer(
+                        main_rot, query_frame, static_mask, _feat_cache
+                    )
+                    if on_main is not None:
+                        (
+                            ver,
+                            best_global_angle,
+                            best_scale,
+                            best_rotated_frame,
+                            best_rotated_mask,
+                            _crop_info,
+                            best_query_features,
+                            best_global_candidates,
+                            best_global_score,
+                            best_source_id_per_angle,
+                        ) = on_main
+                if ver is None:
+                    ver = self._geometric_verifier.verify(
+                        best_query_features, patch_only, self.database, tag="patchify"
+                    )
 
         # ── Continuous rotation: remove the residual the scan step left ──────
         # The scan lands within step/2 of the true heading; the verified

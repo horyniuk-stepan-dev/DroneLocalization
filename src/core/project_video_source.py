@@ -112,6 +112,9 @@ class ProjectVideoSource:
     # Optional versioned layer description; legacy projects remain readable.
     # Unknown GSD/coverage is represented by absent fields, never invented height.
     scale_layer: ScaleLayerMetadata | None = None
+    # Priority of this layer's patchify candidates (localization.joint_candidate_ranking);
+    # None = same as ``priority``. 0 = highest, like ``priority``.
+    patchify_priority: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.scale_layer, dict):

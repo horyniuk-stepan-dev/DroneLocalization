@@ -76,7 +76,7 @@ class NewMissionDialog(QDialog):
 
         self.image_width_spinbox = QSpinBox()
         self.image_width_spinbox.setRange(640, 8000)
-        self.image_width_spinbox.setValue(4000)
+        self.image_width_spinbox.setValue(1200)
         self.image_width_spinbox.setSuffix(" px")
         form.addRow("Ширина зображення:", self.image_width_spinbox)
 

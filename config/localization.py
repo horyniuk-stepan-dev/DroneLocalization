@@ -107,6 +107,29 @@ class LocalizationConfig(BaseModel):
         1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
     )
     patchify_merge_weight: float = 0.4
+    # Legacy multi-layer retrieval: 0 = the layer with the best top score is verified
+    # (old behaviour). N > 0: candidates of all layers are ranked together and a layer
+    # of higher priority (project.json `priority`, main = 0) wins while its best
+    # candidate is within the first N + 1 ranks (src/database/source_priority.py).
+    source_priority_rank_margin: int = Field(default=0, ge=0, le=100)
+    # Multi-layer + patchify: 0 = old order (the chosen layer's merged candidates).
+    # N > 0: candidates found only by patchify are verified after the main layer's
+    # standard candidates unless they rank more than N places above the main layer's best
+    # (patchify 1st, main 2nd -> main first; main 10th -> patchify first with N = 3).
+    patchify_main_rank_margin: int = Field(default=0, ge=0, le=100)
+    # Multi-layer: one verification list for all layers (default False = old path).
+    # True: the standard candidates of every layer and, with use_patchify, every layer's
+    # patchify-only candidates are ranked together; the first joint_top_k are verified in
+    # that order, each on its own layer at its own (angle, scale). Place = rank by score
+    # within its kind (the standard and patchify scores are not on one scale) + N places
+    # per priority step of its layer (N = source_priority_rank_margin; project.json
+    # `priority` for standard candidates, `patchify_priority` (default: priority) for
+    # patchify ones) + joint_patchify_rank_penalty for patchify candidates.
+    # patchify_main_rank_margin is not used while this is on
+    # (src/database/source_priority.py::joint_order).
+    joint_candidate_ranking: bool = False
+    joint_top_k: int = Field(default=5, ge=1, le=50)
+    joint_patchify_rank_penalty: int = Field(default=2, ge=0, le=100)
     # ── Scale-invariance (ScaleManager) ──
     # GSD-ratio pyramid for altitude-invariant localization (r = query_alt / db_alt).
     # Scanned when no temporal prior exists (bootstrap / out-of-coverage).

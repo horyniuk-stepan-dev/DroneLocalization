@@ -37,6 +37,10 @@ class RotationResult:
     crop_info: Any | None = None
     # continuous mode: 0/255 map of the view pixels that come from the frame
     valid: Any | None = None
+    # Multi-layer, localization.patchify_main_rank_margin > 0 or
+    # localization.joint_candidate_ranking: the best (angle, scale) of every layer by
+    # that layer's own top score, as RotationResults.
+    per_source: dict | None = None
 
 
 def extract_globals(extractor: Any, frames: list, valid_masks: list | None) -> list:
@@ -68,6 +72,30 @@ class RotationSelector:
         self.config = config
         self.continuous = is_continuous(config)
         self.erode_px = int(get_cfg(config, "localization.rotation_border_erode_px", 8))
+        self.track_layers = int(
+            get_cfg(config, "localization.patchify_main_rank_margin", 0) or 0
+        ) > 0 or bool(get_cfg(config, "localization.joint_candidate_ranking", False))
+
+    def _track(self, per_source: dict, angle, sc, frame, crop, valid) -> None:
+        """Keep each layer's best (angle, scale) of the retrieval call just made."""
+        by_source = getattr(self._candidate_retriever, "last_by_source", None)
+        if not self.track_layers or not by_source:
+            return
+        for sid, candidates in by_source.items():
+            if not candidates:
+                continue
+            kept = per_source.get(sid)
+            if kept is None or candidates[0][1] > kept.score:
+                per_source[sid] = RotationResult(
+                    angle=angle,
+                    score=candidates[0][1],
+                    candidates=list(candidates),
+                    source_id=sid,
+                    best_scale=sc,
+                    frame=frame,
+                    crop_info=crop,
+                    valid=valid,
+                )
 
     def select(
         self,
@@ -87,6 +115,7 @@ class RotationSelector:
         best_frame: Any | None = None
         best_crop: Any | None = None
         best_valid: Any | None = None
+        per_source: dict = {}
 
         rescan_min = get_cfg(self.config, "localization.rotation_rescan_min_score", 0.70)
         use_cascade = get_cfg(self.config, "localization.recovery_cascade", False)
@@ -115,6 +144,7 @@ class RotationSelector:
                 )[0]
                 with Telemetry.profile("retrieval"):
                     src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+                self._track(per_source, prior_angle, sc, rotated_frame, crop_info, valid)
                 if candidates and candidates[0][1] >= min(rescan_min, scale_rescan_min):
                     if candidates[0][1] > best_global_score:
                         best_global_score = candidates[0][1]
@@ -158,6 +188,7 @@ class RotationSelector:
                 ):
                     with Telemetry.profile("retrieval"):
                         src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+                    self._track(per_source, angle, sc, frm, crop, valid)
 
                     if candidates:
                         top_score = candidates[0][1]
@@ -186,6 +217,7 @@ class RotationSelector:
             frame=best_frame,
             crop_info=best_crop,
             valid=best_valid,
+            per_source=per_source or None,
         )
 
     # ── Recovery cascade planning ──────────────────────────────────────────────

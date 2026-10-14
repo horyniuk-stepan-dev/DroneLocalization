@@ -801,6 +801,8 @@ def build_localizer(
     layer_config.update(layer_search_overrides or {})
     if disable_smoother:
         config.setdefault("tracking", {})["smoother_enabled"] = False
+    # Priority = order of --source (first = 0, like main in project.json): it only
+    # orders equal scores unless localization.source_priority_rank_margin > 0.
     projects = [
         ProjectVideoSource(
             source_id=spec.source_id,
@@ -808,8 +810,9 @@ def build_localizer(
             video_path="",
             database_file=str(spec.database),
             calibration_file=str(spec.calibration),
+            priority=index,
         )
-        for spec in sources
+        for index, spec in enumerate(sources)
     ]
     db_manager = MultiDatabaseManager(projects, Path.cwd(), config=config)
     try:
