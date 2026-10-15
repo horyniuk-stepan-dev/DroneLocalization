@@ -373,6 +373,23 @@ class PropagationPipeline:
                 )
             return
 
+        # An affine belongs to one exact image.  Applying it to a neighbouring
+        # keyframe silently moves the map, so missing anchor slots are a database
+        # contract error and must be rebuilt as required keyframes. Checked right
+        # after the prefetch: it needs only the anchors and the prefetched slots, and
+        # used to fail after the whole temporal + loop-closure matching (70 s on a
+        # 524-keyframe layer). Relative mode has no anchors here (gauge seeded below).
+        missing_anchor_ids = [a.frame_id for a in anchors if a.frame_id not in all_features]
+        if missing_anchor_ids:
+            self._report_error(
+                "Calibration anchors have no features at exact DB slots: "
+                f"{missing_anchor_ids}. Rebuild the database with "
+                f"database.required_frame_ids={missing_anchor_ids} (or pass the same IDs "
+                "as required_frame_ids to DatabaseBuilder). The affine matrices cannot "
+                "be transferred to neighbouring frames."
+            )
+            return
+
         optimizer = PoseGraphOptimizer(
             self.frame_w, self.frame_h, isotropy_weight=self.isotropy_weight
         )
@@ -461,19 +478,6 @@ class PropagationPipeline:
             else "Fixing GPS anchors (Local Origin)...",
         )
 
-        # An affine belongs to one exact image.  Applying it to a neighbouring
-        # keyframe silently moves the map, so missing anchor slots are a database
-        # contract error and must be rebuilt as required keyframes.
-        missing_anchor_ids = [a.frame_id for a in anchors if a.frame_id not in all_features]
-        if missing_anchor_ids:
-            self._report_error(
-                "Calibration anchors have no features at exact DB slots: "
-                f"{missing_anchor_ids}. Rebuild the database with "
-                f"database.required_frame_ids={missing_anchor_ids} (or pass the same IDs "
-                "as required_frame_ids to DatabaseBuilder). The affine matrices cannot "
-                "be transferred to neighbouring frames."
-            )
-            return
         anchor_nodes = {anchor.frame_id: anchor for anchor in anchors}
 
         # Establish local reference point for numerical stability (Local Center).
