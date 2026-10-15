@@ -75,29 +75,40 @@ class CandidateRetriever:
             return []
         try:
             with Telemetry.profile("patchify_retrieval"):
-                key = (
-                    id(rotated_frame),
-                    tuple(getattr(patchify, "grids", ()) or ()),
-                    getattr(patchify, "descriptor_dim", None),
-                )
-                descs = desc_cache.get(key) if desc_cache is not None else None
-                if descs is None:
-                    descs = patchify.compute_patch_descriptors(rotated_frame)
-                    if desc_cache is not None:
-                        desc_cache[key] = descs
+                descs = self._patch_descriptors(patchify, rotated_frame, desc_cache)
                 return list(patchify.search(descs, top_k=top_k))
         except Exception as e:
             logger.warning(f"Patchify retrieval failed for layer '{source_id}': {e}")
             return []
 
-    def expand(self, rotated_frame, base_candidates, top_k: int, source_id=None):
-        """Patchify-expand candidates for the chosen rotation (no-op if disabled)."""
+    @staticmethod
+    def _patch_descriptors(patchify, rotated_frame, desc_cache=None):
+        """Crop descriptors of a prepared view, memoised in ``desc_cache`` by view
+        object and patch layout (the 14 crop forward passes run once per view)."""
+        key = (
+            id(rotated_frame),
+            tuple(getattr(patchify, "grids", ()) or ()),
+            getattr(patchify, "descriptor_dim", None),
+        )
+        descs = desc_cache.get(key) if desc_cache is not None else None
+        if descs is None:
+            descs = patchify.compute_patch_descriptors(rotated_frame)
+            if desc_cache is not None:
+                desc_cache[key] = descs
+        return descs
+
+    def expand(self, rotated_frame, base_candidates, top_k: int, source_id=None, desc_cache=None):
+        """Patchify-expand candidates for the chosen rotation (no-op if disabled).
+
+        ``desc_cache``: see ``patch_candidates``; the caller must keep the view
+        objects alive while the cache is used (keys hold their ``id``).
+        """
         patchify = self.patchify_for(source_id)
         if patchify is None:
             return base_candidates
         try:
             with Telemetry.profile("patchify_retrieval"):
-                patch_descs = patchify.compute_patch_descriptors(rotated_frame)
+                patch_descs = self._patch_descriptors(patchify, rotated_frame, desc_cache)
                 patch_candidates = patchify.search(patch_descs, top_k=top_k)
             if patch_candidates:
                 merged = self.merge(base_candidates, patch_candidates, max_results=top_k * 2)

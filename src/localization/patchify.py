@@ -10,8 +10,9 @@ class PatchifyRetrieval:
     """Multi-scale retrieval via DINOv2/DINOv3 patch descriptors.
 
     Splits the image into grid patches (1x1, 2x2, 3x3) = 14 patches total,
-    extracts the CLS-token for each patch, and retrieves the most similar frames
-    via aggregated patch scores.
+    extracts the global descriptor of each patch (the extractor's active one:
+    CLS, VLAD or CESP), and retrieves the most similar frames via aggregated
+    patch scores.
     """
 
     DEFAULT_GRIDS = [(1, 1), (2, 2), (3, 3)]  # 1 + 4 + 9 = 14 патчів
@@ -22,10 +23,15 @@ class PatchifyRetrieval:
         descriptor_dim: int = 1024,
         grids: list[list[int]] | None = None,
         batch_size: int = 1,
+        unique_coverage: bool = False,
     ):
         self.feature_extractor = feature_extractor
         self.descriptor_dim = descriptor_dim
         self.batch_size = max(1, batch_size)
+        # localization.patchify_unique_coverage: score a frame by the best hit of
+        # each query patch (coverage over distinct query patches, score <= 1)
+        # instead of summing every reference-patch hit (see search()).
+        self.unique_coverage = bool(unique_coverage)
         self.grids = [tuple(g) for g in grids] if grids else self.DEFAULT_GRIDS
         self.num_patches = sum(r * c for r, c in self.grids)
 
@@ -107,34 +113,26 @@ class PatchifyRetrieval:
 
     @torch.no_grad()
     def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
-        """Batched inference for patch group.
+        """Descriptors of a group of crops in one batched extractor call.
 
-        Використовує fe.dinov2_transform — нормалізація та розмір вже налаштовані
-        відповідно до активного backend (DINOv2 або DINOv3).
+        Goes through ``FeatureExtractor.extract_global_descriptors_multi``, which
+        resizes every crop to the DINO input size before stacking and applies the
+        same preprocessing (``dino_cpu_resize``), aggregation (VLAD / CESP / CLS)
+        and ``global_batch_max`` chunking as the sequential path. The previous
+        own implementation stacked crops of different sizes (RuntimeError) and
+        called the backbone directly (CLS instead of VLAD, no CPU resize).
         """
         fe = self.feature_extractor
-        device = fe.device
-
-        tensors = []
-        for patch in patches:
-            t = torch.from_numpy(patch).float().div_(255.0).permute(2, 0, 1)
-            tensors.append(t)
-
-        batch_tensor = torch.stack(tensors).to(device, non_blocking=True)
-        # Use the pre-built transform from FeatureExtractor (correct mean/std for the active backend)
-        batch_input = fe.dinov2_transform(batch_tensor)
-
-        amp_dtype = fe.amp_dtype
-        use_half = fe.use_half
-
-        # Determine device type dynamically for correct autocast dtype
-        device_type = "cuda" if "cuda" in str(device) else "cpu"
-        enabled = use_half and device_type == "cuda"
-
-        with torch.amp.autocast(device_type, dtype=amp_dtype, enabled=enabled):
-            out = fe.global_model(batch_input).float()
-
-        return out.cpu().numpy()
+        multi = getattr(fe, "extract_global_descriptors_multi", None)
+        if multi is None:
+            return np.stack([np.asarray(fe.extract_global_descriptor(p)) for p in patches])
+        out = np.asarray(multi(list(patches)), dtype=np.float32)
+        if out.shape != (len(patches), self.descriptor_dim):
+            raise ValueError(
+                f"Batched patch descriptors have shape {out.shape}, expected "
+                f"({len(patches)}, {self.descriptor_dim})"
+            )
+        return out
 
     # ── Index management ─────────────────────────────────────────────────
 
@@ -207,17 +205,28 @@ class PatchifyRetrieval:
         frame_hits: dict[int, int] = {}
 
         for patch_idx in range(len(q)):
+            # unique_coverage: one hit per (query patch, frame) — its best one
+            # (FAISS returns hits best-first). Legacy: every reference patch hit
+            # counts, so one frame can collect several hits per query patch.
+            seen: set[int] = set()
             for j in range(search_k):
                 ref_idx = indices[patch_idx, j]
                 if ref_idx < 0:
                     continue
                 fid = int(self.patch_frame_ids[ref_idx])
+                if self.unique_coverage:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
                 score = float(scores[patch_idx, j])
 
                 frame_scores[fid] = frame_scores.get(fid, 0.0) + score
                 frame_hits[fid] = frame_hits.get(fid, 0) + 1
 
-        # Compute final score: coverage * avg_score
+        # Compute final score: coverage * avg_score (= sum of the hit scores /
+        # num_patches). Legacy hits may exceed num_patches, so the score can be
+        # > 1 (an identical frame scores min(search_k, patches per frame)); with unique_coverage
+        # coverage <= 1 and the score is on the cosine scale.
         num_patches = len(q)
         final_scores: dict[int, float] = {}
         for fid in frame_scores:

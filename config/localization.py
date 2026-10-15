@@ -107,6 +107,10 @@ class LocalizationConfig(BaseModel):
         1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
     )
     patchify_merge_weight: float = 0.4
+    # False (old behaviour): a patchify frame score sums every reference-patch hit, so
+    # it can exceed 1 and outrank cosine-scored standard candidates in the merge.
+    # True: best hit per (query patch, frame); score = coverage x mean <= 1.
+    patchify_unique_coverage: bool = False
     # Legacy multi-layer retrieval: 0 = the layer with the best top score is verified
     # (old behaviour). N > 0: candidates of all layers are ranked together and a layer
     # of higher priority (project.json `priority`, main = 0) wins while its best

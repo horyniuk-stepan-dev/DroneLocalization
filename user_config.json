@@ -175,6 +175,7 @@
         ],
         "patchify_batch_size": 1,
         "patchify_merge_weight": 0.4,
+        "patchify_unique_coverage": false,
         "source_priority_rank_margin": 2,
         "patchify_main_rank_margin": 2,
         "scale_pyramid": [

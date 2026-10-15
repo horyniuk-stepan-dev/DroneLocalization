@@ -600,6 +600,9 @@ class Localizer:
                 descriptor_dim=desc_dim,
                 grids=patchify_grids,
                 batch_size=patchify_batch,
+                unique_coverage=bool(
+                    get_cfg(self.config, "localization.patchify_unique_coverage", False)
+                ),
             )
             retrieval.build_index(patch_desc, list(range(database.get_num_frames())))
             logger.info(
@@ -729,7 +732,11 @@ class Localizer:
         self._sp_now = sp.tick(timestamp, dt) if sp.enabled else None
         self._sp_frame_done = False
         had_prior = self._scale_manager.prior is not None
-        result = self._localize_frame_impl(query_frame, static_mask, dt, yaw_hint_deg, collector)
+        # Feature / patch-descriptor caches of this frame, shared with the retry below.
+        caches: dict = {}
+        result = self._localize_frame_impl(
+            query_frame, static_mask, dt, yaw_hint_deg, collector, _caches=caches
+        )
         if not result.get("success"):
             self.database, self.calibration, self._active_source_id = previous
         if had_prior and (
@@ -739,7 +746,7 @@ class Localizer:
             self._scale_manager.invalidate()
             self._last_best_angle = None
             result = self._localize_frame_impl(
-                query_frame, static_mask, dt, yaw_hint_deg, collector
+                query_frame, static_mask, dt, yaw_hint_deg, collector, _caches=caches
             )
             if not result.get("success"):
                 self.database, self.calibration, self._active_source_id = previous
@@ -854,6 +861,7 @@ class Localizer:
         yaw_hint_deg: float | None = None,
         collector=None,
         _verified=None,
+        _caches: dict | None = None,
     ) -> dict:
         # Fix #1: If too many consecutive failures occurred — return out_of_coverage
         if _verified is None and self._consecutive_failures >= self._max_failures:
@@ -897,10 +905,15 @@ class Localizer:
 
         top_k = self.retrieval_top_k
 
-        # §A1: cache (angle, scale) -> (frame, mask, crop, features) for ONE call.
+        # §A1: cache (angle, scale) -> (frame, mask, crop, features) for ONE frame.
         # If temporal hypothesis failed, and full path chose the same
         # angle and scale — ALIKED is not recomputed (217-339 ms on GTX 1650).
-        _feat_cache: dict = {}
+        # ``_caches`` (localize_frame) carries it, and the query's patchify
+        # descriptors, into the in-frame retry, which used to recompute both for
+        # the view it had already processed.
+        caches = {} if _caches is None else _caches
+        _feat_cache: dict = caches.setdefault("features", {})
+        _patch_cache: dict = caches.setdefault("patch", {})
 
         # ── §A1: attempt to localize WITHOUT global descriptor ──────────
         # yaw_hint_deg disables this path: external heading is new information
@@ -1061,6 +1074,7 @@ class Localizer:
                     best_global_candidates,
                     top_k,
                     source_id=best_source_id_per_angle,
+                    desc_cache=_patch_cache,
                 )
 
             # Map trust participates in candidate selection, not only in final
