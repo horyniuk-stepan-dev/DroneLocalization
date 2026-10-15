@@ -14,13 +14,22 @@ of every layer (``joint_order``). Each layer has two priorities: ``priority`` fo
 standard candidates and ``patchify_priority`` (default: ``priority``) for its patch
 candidates. Layers that overlap need distinct priorities, otherwise no rule can
 order them; layers of different terrain may share one (``priority_conflicts``).
+
+``localization.layer_fineness_weight`` adds the layer's map accuracy to the project
+priority: effective step = priority step + weight x log2(ground pixel size / the
+finest layer's), the pixel size measured from the layer's calibration
+(``layer_gsd``). ``patchify_layers`` decides where patchify can help: only where no
+real layer is close in scale to the query.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
+
+import numpy as np
 
 
 def choose_source(
@@ -197,12 +206,14 @@ def coverage_cells(gps: Any, cell_deg: float = 0.02) -> set[tuple[int, int]]:
 def priority_conflicts(
     sources: Iterable[Any],
     overlap: Callable[[Any, Any], bool],
+    distinguishable: Callable[[Any, Any], bool] | None = None,
 ) -> list[str]:
     """Pairs of overlapping layers whose priorities cannot be told apart.
 
     Each message names the two layers and the shared number, for ``priority``
     (standard candidates) and ``patchify_priority`` (patchify candidates).
-    Layers that do not overlap may share a number.
+    Layers that do not overlap may share a number, and so may layers that
+    ``distinguishable`` tells apart otherwise (e.g. by map accuracy).
     """
     items = list(sources)
 
@@ -228,6 +239,8 @@ def priority_conflicts(
             )
             if not (same or same_patch) or not overlap(a, b):
                 continue
+            if distinguishable is not None and distinguishable(a, b):
+                continue
             if same:
                 messages.append(
                     f"layers '{sid(a)}' and '{sid(b)}' overlap but share priority {prio(a)}"
@@ -238,3 +251,123 @@ def priority_conflicts(
                     f"{effective_patchify_priority(a)}"
                 )
     return messages
+
+
+# ── Layer accuracy (localization.layer_fineness_weight, patchify_adaptive) ───────────
+
+
+def layer_gsd(database: Any) -> float | None:
+    """Median ground size of one map pixel of a layer, from its frame calibration.
+
+    sqrt(|det|) of the 2x2 part of each valid frame affine (pixel -> map units);
+    None without a calibration. Only ratios between layers are used.
+    """
+    affine = getattr(database, "frame_affine", None)
+    if affine is None:
+        return None
+    a = np.asarray(affine, dtype=float)
+    if a.ndim == 2 and a.shape[1] == 6:
+        a = a.reshape(-1, 2, 3)
+    if a.ndim != 3 or a.shape[1] < 2 or a.shape[2] < 2:
+        return None
+    valid = getattr(database, "frame_valid", None)
+    if valid is not None and len(valid) == len(a):
+        a = a[np.asarray(valid, dtype=bool)]
+    det = np.abs(a[:, 0, 0] * a[:, 1, 1] - a[:, 0, 1] * a[:, 1, 0])
+    det = det[np.isfinite(det) & (det > 0)]
+    return float(np.sqrt(np.median(det))) if det.size else None
+
+
+def effective_steps(
+    priorities: dict[str, int],
+    gsds: dict[str, float | None],
+    weight: float,
+) -> dict[str, float]:
+    """Priority step of each layer + weight x log2(its pixel size / the finest layer's).
+
+    Relief project (main 1000 m = 0, 2000 m = 1, 500 m = 2; 0.72 / 1.51 / 0.33 m/px),
+    weight 2: main 2.3, 2000 m 5.4, 500 m 2.0. Layers without a pixel size get no
+    fineness term.
+    """
+    steps = {sid: float(v) for sid, v in priority_steps(priorities).items()}
+    known = {sid: float(g) for sid, g in gsds.items() if g and g > 0 and sid in steps}
+    if weight > 0 and known:
+        finest = min(known.values())
+        for sid, g in known.items():
+            steps[sid] += weight * math.log2(g / finest)
+    return steps
+
+
+def choose_source_weighted(
+    per_source: dict[str, list[tuple[int, float]]],
+    steps: dict[str, float],
+    rank_step: int,
+) -> str | None:
+    """Layer whose best candidate has the lowest rank + rank_step x effective step.
+
+    Ranks are over the candidates of all layers by score (as ``choose_source``);
+    ties go to the lower effective step. With two layers one whole step apart it
+    is ``choose_source``'s rule.
+    """
+    ranked = sorted(
+        (
+            (float(score), sid)
+            for sid, candidates in per_source.items()
+            for _frame, score in candidates
+        ),
+        key=lambda item: (-item[0], steps.get(item[1], 0.0), item[1]),
+    )
+    if not ranked:
+        return None
+    best_rank: dict[str, int] = {}
+    for rank, (_score, sid) in enumerate(ranked, start=1):
+        best_rank.setdefault(sid, rank)
+    return min(
+        best_rank,
+        key=lambda sid: (
+            best_rank[sid] + rank_step * steps.get(sid, 0.0),
+            steps.get(sid, 0.0),
+            sid,
+        ),
+    )
+
+
+def patchify_layers(
+    query_gsd: float | None,
+    gsds: dict[Any, float | None],
+    factors: Iterable[float],
+    gap_ratio: float,
+) -> set | None:
+    """Layers whose patchify search can help a query of ground pixel size ``query_gsd``.
+
+    None (unknown query scale or layer sizes): every layer, the old behaviour.
+    Empty: a real layer is within ``gap_ratio`` of the query's pixel size. Otherwise
+    the layers with a crop factor (2x2 crop -> pixel size / 2) that comes closer to
+    the query than any real layer: layers 500 m + 2000 m and a drone near 1000 m ->
+    the 2000 m layer.
+    """
+    known = {sid: float(g) for sid, g in gsds.items() if g and g > 0}
+    if query_gsd is None or query_gsd <= 0 or not known:
+        return None
+
+    def distance(size: float) -> float:
+        return abs(math.log(size / query_gsd))
+
+    nearest_real = min(distance(g) for g in known.values())
+    if nearest_real <= math.log(max(gap_ratio, 1.0)):
+        return set()
+    crops = [float(f) for f in factors if float(f) > 1.0]
+    return {sid for sid, g in known.items() if any(distance(g / f) < nearest_real for f in crops)}
+
+
+def grid_factors(grids: Iterable[Any]) -> list[float]:
+    """Linear crop factor of each patchify grid: (2, 2) -> 2, (2, 3) -> sqrt(6)."""
+    factors = []
+    for grid in grids:
+        try:
+            rows, cols = int(grid[0]), int(grid[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if rows > 0 and cols > 0:
+            factors.append(math.sqrt(rows * cols))
+    return factors

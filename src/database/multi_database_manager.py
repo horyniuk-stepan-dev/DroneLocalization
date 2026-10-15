@@ -13,7 +13,14 @@ import numpy as np
 
 from config import get_cfg
 from src.database.database_loader import DatabaseLoader
-from src.database.source_priority import choose_source, coverage_cells, priority_conflicts
+from src.database.source_priority import (
+    choose_source,
+    choose_source_weighted,
+    coverage_cells,
+    effective_steps,
+    layer_gsd,
+    priority_conflicts,
+)
 from src.localization.geo_aware_retriever import GeoAwareRetriever
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.utils.logging_utils import get_logger
@@ -39,6 +46,8 @@ class MultiDatabaseManager:
         self._active_source_ids: set[str] = set()
         self._project_dir = project_dir
         self._config = config or {}
+        # source_id -> (loader, ground pixel size); recomputed after a reload
+        self._gsd_cache: dict[str, tuple[object, float | None]] = {}
 
         self._load_sources(sources)
 
@@ -154,14 +163,22 @@ class MultiDatabaseManager:
                 return bool(ca & cb)
             return a.area_id == b.area_id
 
+        weight = float(get_cfg(self._config, "localization.layer_fineness_weight", 0.0) or 0.0)
+
+        def distinguishable(a, b) -> bool:
+            # with the fineness term on, layers of clearly different pixel size are ordered
+            ga, gb = self.layer_gsd(a.source_id), self.layer_gsd(b.source_id)
+            return weight > 0 and bool(ga) and bool(gb) and abs(np.log2(ga / gb)) >= 0.25
+
         messages = priority_conflicts(
-            [self._sources[sid] for sid in sorted(self._sources)], overlap
+            [self._sources[sid] for sid in sorted(self._sources)], overlap, distinguishable
         )
         rules_on = (
             int(get_cfg(self._config, "localization.source_priority_rank_margin", 0) or 0) > 0
             or int(get_cfg(self._config, "localization.patchify_main_rank_margin", 0) or 0) > 0
             or bool(get_cfg(self._config, "localization.joint_candidate_ranking", False))
         )
+        rules_on = rules_on or weight > 0
         for message in messages:
             text = (
                 f"Layer priority: {message} - the layer priority rules cannot order them; "
@@ -172,6 +189,27 @@ class MultiDatabaseManager:
             else:
                 logger.info(text)
         return messages
+
+    def layer_gsd(self, source_id: str) -> float | None:
+        """Ground size of one map pixel of a layer (``source_priority.layer_gsd``), cached."""
+        loader = self._databases.get(source_id)
+        if loader is None:
+            return None
+        cached = self._gsd_cache.get(source_id)
+        if cached is None or cached[0] is not loader:
+            cached = (loader, layer_gsd(loader))
+            self._gsd_cache[source_id] = cached
+        return cached[1]
+
+    def effective_priority_steps(self) -> dict[str, float]:
+        """Project priority step + fineness term of every active layer."""
+        weight = float(get_cfg(self._config, "localization.layer_fineness_weight", 0.0) or 0.0)
+        ids = sorted(self._active_source_ids)
+        return effective_steps(
+            {sid: self._sources[sid].priority for sid in ids},
+            {sid: self.layer_gsd(sid) for sid in ids},
+            weight,
+        )
 
     def _vlad_mismatch(self, loader: DatabaseLoader) -> str | None:
         """Compare a database's VLAD settings (incl. vocabulary hash) with the config."""
@@ -406,12 +444,18 @@ class MultiDatabaseManager:
         # (angle, scale) per layer for localization.patchify_main_rank_margin).
         self.last_matches_by_source = per_source
 
+        weight = float(get_cfg(self._config, "localization.layer_fineness_weight", 0.0) or 0.0)
         if rank_margin > 0 and per_source:
-            chosen = choose_source(
-                per_source,
-                {sid: self._sources[sid].priority for sid in per_source},
-                rank_margin,
-            )
+            if weight > 0:
+                chosen = choose_source_weighted(
+                    per_source, self.effective_priority_steps(), rank_margin
+                )
+            else:
+                chosen = choose_source(
+                    per_source,
+                    {sid: self._sources[sid].priority for sid in per_source},
+                    rank_margin,
+                )
             if chosen is not None and chosen != best_source_id:
                 logger.debug(
                     f"Layer priority: '{chosen}' instead of '{best_source_id}' "

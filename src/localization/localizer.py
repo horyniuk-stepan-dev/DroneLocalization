@@ -262,6 +262,20 @@ class Localizer:
         self._joint_rank_step = int(
             get_cfg(self.config, "localization.source_priority_rank_margin", 0) or 0
         )
+        # localization.layer_fineness_weight: layer map accuracy (ground pixel size) joins
+        # the project priority; localization.patchify_adaptive: patchify only where no real
+        # layer is close in scale to the query (src/database/source_priority.py).
+        self._fineness_weight = float(
+            get_cfg(self.config, "localization.layer_fineness_weight", 0.0) or 0.0
+        )
+        self._patchify_adaptive = bool(
+            get_cfg(self.config, "localization.patchify_adaptive", False)
+        )
+        self._patchify_gap_ratio = float(
+            get_cfg(self.config, "localization.patchify_gap_ratio", 1.5) or 1.5
+        )
+        self._layer_gsd_cache: dict = {}
+        self._frame_query_gsd = None
         if get_cfg(self.config, "localization.use_patchify", False):
             if self.db_manager is not None:
                 patchify_factory = self._build_patchify_retrieval
@@ -331,13 +345,22 @@ class Localizer:
         return getattr(self, "_last_state", None)
 
     def _main_source_id(self):
-        """Active layer with the highest priority (lowest ``priority``; main = 0)."""
+        """Active layer with the highest priority (lowest ``priority``; main = 0).
+
+        With localization.layer_fineness_weight > 0 the effective priority (project
+        priority + map accuracy) decides.
+        """
         manager = self.db_manager
         if manager is None:
             return None
         ids = list(getattr(manager, "active_source_ids", None) or [])
         if not ids:
             return None
+        if getattr(self, "_fineness_weight", 0.0) > 0 and hasattr(
+            manager, "effective_priority_steps"
+        ):
+            steps = manager.effective_priority_steps()
+            return min(ids, key=lambda sid: (steps.get(sid, 0.0), sid))
 
         def rank(sid):
             src = manager.get_source_config(sid)
@@ -414,6 +437,56 @@ class Localizer:
             sid,
         )
 
+    def _gsd_of(self, source_id):
+        """Ground pixel size of a layer (multi-layer: by id; single database: None)."""
+        from src.database.source_priority import layer_gsd
+
+        if self.db_manager is not None and source_id is not None:
+            if hasattr(self.db_manager, "layer_gsd"):
+                return self.db_manager.layer_gsd(source_id)
+            database = self.db_manager.get_database(source_id)
+        else:
+            database = self.database
+        if database is None:
+            return None
+        cached = self._layer_gsd_cache.get(id(database))
+        if cached is None or cached[0] is not database:
+            cached = (database, layer_gsd(database))
+            self._layer_gsd_cache[id(database)] = cached
+        return cached[1]
+
+    def _estimated_query_gsd(self):
+        """Query ground pixel size: scale prior x active layer's pixel size, or None.
+
+        The scale prior is query / layer (sqrt of the last homography's scale, EMA).
+        """
+        prior = self._scale_manager.prior
+        if prior is None:
+            return None
+        sid = self._active_source_id if self.db_manager is not None else None
+        gsd = self._gsd_of(sid)
+        return float(prior) * float(gsd) if gsd else None
+
+    def _patchify_allowed(self, source_id) -> bool:
+        """localization.patchify_adaptive: may this layer's patchify search run this frame?"""
+        if not getattr(self, "_patchify_adaptive", False):
+            return True
+        from src.database.source_priority import grid_factors, patchify_layers
+
+        if self.db_manager is not None:
+            ids = list(getattr(self.db_manager, "active_source_ids", None) or [])
+        else:
+            ids = [None]
+        layers = patchify_layers(
+            getattr(self, "_frame_query_gsd", None),
+            {sid: self._gsd_of(sid) for sid in ids},
+            grid_factors(
+                get_cfg(self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]])
+            ),
+            self._patchify_gap_ratio,
+        )
+        return layers is None or source_id in layers
+
     def _layer_priorities(self) -> tuple[dict, dict]:
         """``(priority, patchify priority)`` per active layer (project.json numbers)."""
         from src.database.source_priority import effective_patchify_priority
@@ -442,6 +515,8 @@ class Localizer:
             for frame, score in layer.candidates:
                 if usable is None or usable(int(frame)):
                     entries.append(JointCandidate(sid, int(frame), float(score), False))
+            if not self._patchify_allowed(sid):
+                continue
             for frame, score in self._candidate_retriever.patch_candidates(
                 layer.frame, top_k, source_id=sid, desc_cache=desc_cache
             ):
@@ -890,6 +965,9 @@ class Localizer:
             # "continuous" uses it as is. A false hint self-heals: if the
             # retrieval score at the prior angle is below rotation_rescan_min_score,
             # RotationSelector falls back to the full scan.
+            # Query scale vs the layer of the last fix, before retrieval switches layers
+            # (localization.patchify_adaptive).
+            self._frame_query_gsd = self._estimated_query_gsd()
             prior_angle = self._last_best_angle
             use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
             if yaw_hint_deg is not None and self.enable_auto_rotation:
@@ -977,7 +1055,7 @@ class Localizer:
                 and self.db_manager is not None
                 and bool(getattr(rot, "per_source", None))
             )
-            if not joint_mode:
+            if not joint_mode and self._patchify_allowed(best_source_id_per_angle):
                 best_global_candidates = self._candidate_retriever.expand(
                     best_rotated_frame,
                     best_global_candidates,

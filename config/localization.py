@@ -130,6 +130,18 @@ class LocalizationConfig(BaseModel):
     joint_candidate_ranking: bool = False
     joint_top_k: int = Field(default=5, ge=1, le=50)
     joint_patchify_rank_penalty: int = Field(default=2, ge=0, le=100)
+    # Effective layer priority = project priority step + layer_fineness_weight x log2(layer
+    # ground pixel size / the finest layer's); pixel size measured from each layer's
+    # calibration (a finer layer has the more accurate map). 0 = project priority only (old
+    # behaviour). Used by source_priority_rank_margin and for the main layer of
+    # patchify_main_rank_margin (src/database/source_priority.py::effective_steps).
+    layer_fineness_weight: float = Field(default=0.0, ge=0, le=10)
+    # Patchify only where no real layer is close in scale: the query's ground pixel size is
+    # estimated from the scale prior and the active layer; with a layer within
+    # patchify_gap_ratio of it patchify is skipped for the frame, otherwise it runs on the
+    # layers whose crops come closer than any real layer. Unknown scale -> every layer.
+    patchify_adaptive: bool = False
+    patchify_gap_ratio: float = Field(default=1.5, ge=1.0, le=4.0)
     # ── Scale-invariance (ScaleManager) ──
     # GSD-ratio pyramid for altitude-invariant localization (r = query_alt / db_alt).
     # Scanned when no temporal prior exists (bootstrap / out-of-coverage).
