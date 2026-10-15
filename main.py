@@ -2,6 +2,11 @@ import os
 import sys
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# numpy's multithreaded OpenBLAS: on Windows (Ryzen 7 9700X) a 120x120 dense solve took
+# 34 ms with the default thread count and 0.05 ms with one thread (2026-10-15,
+# scratch/probe_smoother_threads.py). Only read when numpy loads, so it must stay above
+# every import that pulls numpy in; an explicit environment value still wins.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 # --- PyInstaller: fix DLL loading & redirect caches for frozen builds ---
 if getattr(sys, "frozen", False):

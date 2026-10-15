@@ -1,5 +1,7 @@
 """GEO accuracy profile with soft anchor points, end to end (graph -> refine -> save -> reload)."""
 
+import sys
+from pathlib import Path
 from unittest.mock import Mock
 
 import numpy as np
@@ -8,7 +10,11 @@ from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.frame_transform import get_frame_transform, project_points
 from src.workers.propagation_pipeline import PropagationPipeline
-from tests.unit.geometry.test_relative_map import make_database
+
+# Sibling module, imported by path: ultralytics installs a top-level tests
+# package into site-packages, which shadows tests.unit... on Windows.
+sys.path.insert(0, str(Path(__file__).parent))
+from test_relative_map import make_database  # noqa: E402
 
 QA = np.array([[100, 50], [40, 20], [160, 20], [160, 80], [40, 80]], float)
 
