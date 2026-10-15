@@ -1,6 +1,7 @@
 import gc
 import os
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -224,7 +225,74 @@ class ModelManager:
             lg_features = "rdd" if local_extractor == "rdd" else "aliked"
             self.load_lightglue(features=lg_features)
             self.load_yolo()
+        self._warmup()
         logger.success("Centralized model prewarm complete")
+
+    def _warmup(self) -> None:
+        """One representative forward pass per prewarmed model, once per process.
+
+        Loading weights leaves CUDA kernel loading, cuBLAS/cuDNN handle creation
+        and allocator growth to the first real call: the first ALIKED call of a
+        session took 3.1 s against a 32 ms average (telemetry 2026-10-15). Inputs
+        mirror the live path: DINO at its input size under the configured fp16
+        autocast, ALIKED on a noise image, LightGlue on random keypoints, YOLO on
+        a blank frame. Never raises; a failed pass is only logged.
+        """
+        if self.device == "cpu" or getattr(self, "_warmed_up", False):
+            return
+        self._warmed_up = True
+        import numpy as np
+
+        from config import get_active_descriptor_cfg
+
+        fp16 = bool(get_cfg(self.config, "models.performance.fp16_enabled", True))
+        size = int(get_active_descriptor_cfg(self.config).input_size)
+        dev = self.device
+
+        def dino():
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=fp16):
+                self.models["dinov2"](torch.zeros(1, 3, size, size, device=dev))
+
+        def aliked():
+            self.models["aliked"]({"image": torch.rand(1, 3, 720, 1280, device=dev)})
+
+        def lightglue(name):
+            n = 512
+            dim = 128 if name in ("lightglue_aliked", "lightglue_sift") else 256
+
+            def side():
+                return {
+                    "keypoints": torch.rand(1, n, 2, device=dev) * 700,
+                    "descriptors": torch.nn.functional.normalize(
+                        torch.randn(1, n, dim, device=dev), dim=-1
+                    ),
+                    "image_size": torch.tensor([[1280, 720]], device=dev),
+                }
+
+            self.models[name]({"image0": side(), "image1": side()})
+
+        def yolo():
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            self.models["yolo"](frame, verbose=False, half=dev == "cuda")  # as YOLOWrapper
+
+        passes = [("dinov2", dino), ("aliked", aliked), ("yolo", yolo)]
+        passes += [
+            (n, lambda n=n: lightglue(n)) for n in list(self.models) if n.startswith("lightglue_")
+        ]
+        done = []
+        for name, run in passes:
+            if name not in self.models:
+                continue
+            t0 = time.perf_counter()
+            try:
+                with torch.inference_mode(), silent_output():
+                    run()
+                torch.cuda.synchronize()
+                done.append(f"{name} {1e3 * (time.perf_counter() - t0):.0f} ms")
+            except Exception as e:  # noqa: BLE001 — warmup is best effort
+                done.append(f"{name} skipped ({type(e).__name__})")
+                logger.debug(f"Warmup pass for {name} skipped: {type(e).__name__}: {e}")
+        logger.info(f"Model warmup: {', '.join(done) or 'no models'}")
 
     def load_local_extractor(self):
         """Loads local feature extractor based on config (aliked | rdd | xfeat)."""
