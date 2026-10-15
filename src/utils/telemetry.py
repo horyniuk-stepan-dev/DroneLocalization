@@ -5,11 +5,18 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+# Where the default report goes; tests point it at a temporary folder (root
+# conftest.py) so a pytest run never overwrites the application's report.
+TELEMETRY_DIR_ENV = "DRONELOC_TELEMETRY_DIR"
+# Per-run copies kept in <logs>/telemetry/ (oldest removed beyond this count).
+MAX_RUN_REPORTS = 200
 
 
 class _TelemetryTracker:
@@ -76,21 +83,52 @@ class _TelemetryTracker:
             }
         return summary
 
+    @staticmethod
+    def _default_report_paths() -> list[Path]:
+        """``<logs>/telemetry_report.json`` (latest run) + a per-run copy.
+
+        The per-run copy (``<logs>/telemetry/telemetry_<time>_<pid>.json``) keeps
+        earlier runs as baselines; before, every process overwrote the one file.
+        ``DRONELOC_TELEMETRY_DIR`` replaces ``<logs>``.
+        """
+        override = os.environ.get(TELEMETRY_DIR_ENV)
+        if override:
+            logs = Path(override)
+        else:
+            from config import user_data_dir
+
+            logs = user_data_dir() / "logs"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        run_copy = logs / "telemetry" / f"telemetry_{stamp}_{os.getpid()}.json"
+        return [logs / "telemetry_report.json", run_copy]
+
+    @staticmethod
+    def _prune_run_reports(folder: Path, keep: int = MAX_RUN_REPORTS) -> None:
+        reports = sorted(folder.glob("telemetry_*.json"))
+        for old in reports[: max(0, len(reports) - keep)]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
     def dump_report(self, path: str | None = None):
         if not self.stats:
             return
 
-        if path is None:
-            from config import user_data_dir
-
-            path = str(user_data_dir() / "logs" / "telemetry_report.json")
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.get_summary(), f, indent=4)
-            logger.info(f"Telemetry report saved to {path} ({len(self.stats)} stages profiled)")
-        except Exception as e:
-            logger.error(f"Failed to save telemetry report: {e}")
+        targets = [Path(path)] if path is not None else self._default_report_paths()
+        summary = self.get_summary()
+        for target in targets:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=4)
+                logger.info(
+                    f"Telemetry report saved to {target} ({len(self.stats)} stages profiled)"
+                )
+            except Exception as e:
+                logger.error(f"Failed to save telemetry report {target}: {e}")
+        if path is None and len(targets) > 1:
+            self._prune_run_reports(targets[1].parent)
 
 
 # Singleton instance

@@ -358,6 +358,9 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
             ),
             "candidate_prefilter": get_cfg(APP_CONFIG, "localization.candidate_prefilter", False),
             "fp16_enabled": get_cfg(APP_CONFIG, "models.performance.fp16_enabled", True),
+            "use_patchify": get_cfg(APP_CONFIG, "localization.use_patchify", False),
+            "patchify_batch_size": get_cfg(APP_CONFIG, "localization.patchify_batch_size", 1),
+            "global_batch_max": get_cfg(APP_CONFIG, "models.performance.global_batch_max", 0),
         }
     )
 
@@ -394,6 +397,23 @@ def run_model_stages(results: dict, config_snapshot: dict) -> None:
         lambda: fe.extract_global_descriptor(frame), warmup=3, iters=15, sync=sync
     )
     results["global_descriptor"]["peak_vram_mb"] = vram_peak_mb()
+
+    # Patchify: the 1x1 + 2x2 + 3x3 crops (14 DINO passes) of one full-retrieval
+    # keyframe, sequential (patchify_batch_size = 1) and in one batched call
+    # (chunked by models.performance.global_batch_max). Measured even when
+    # use_patchify is off, so the cost is known before switching it on.
+    from src.localization.patchify import PatchifyRetrieval
+
+    grids = get_cfg(APP_CONFIG, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]])
+    dim = int(fe.global_descriptor_dim)
+    for name, batch in (("patchify_sequential", 1), ("patchify_batched", 64)):
+        patchify = PatchifyRetrieval(fe, descriptor_dim=dim, grids=grids, batch_size=batch)
+        vram_peak_reset()
+        results[name] = bench(
+            lambda p=patchify: p.compute_patch_descriptors(frame), warmup=2, iters=5, sync=sync
+        )
+        results[name]["peak_vram_mb"] = vram_peak_mb()
+        results[name]["patches"] = patchify.num_patches
 
     # Local features (ALIKED/RDD FP32)
     vram_peak_reset()
@@ -558,6 +578,12 @@ def compute_aggregates(results: dict, config_snapshot: dict) -> dict:
         extra = (med("yolo_seg_1080p") or 0.0) + (med("preprocess_global_1080p") or 0.0)
         if extra > 0:
             agg["steady_keyframe_full_ms"] = round(agg["steady_keyframe_ms"] + extra, 1)
+        # A full-retrieval keyframe with patchify on, at the configured batch size.
+        batched = int(config_snapshot.get("patchify_batch_size") or 1) > 1
+        p = med("patchify_batched" if batched else "patchify_sequential")
+        if p is not None and config_snapshot.get("use_patchify"):
+            base = agg.get("steady_keyframe_full_ms") or agg["steady_keyframe_ms"]
+            agg["patchify_keyframe_ms"] = round(base + p, 1)
 
     of_real = med(f"of_pyrlk_fb_{OF_REAL_POINTS}pts")
     of_legacy = med("of_pyrlk_fb_2000pts")
@@ -663,7 +689,12 @@ def compare_reports(path_a: str, path_b: str) -> None:
         print(f"{name:38s} {ma:>8.1f}ms {mb:>8.1f}ms {ratio:>6.2f}x{mark}")
 
     print("-" * 70)
-    for k in ("steady_keyframe_ms", "worst_keyframe_ms", "tracking_frame_ms"):
+    for k in (
+        "steady_keyframe_ms",
+        "worst_keyframe_ms",
+        "patchify_keyframe_ms",
+        "tracking_frame_ms",
+    ):
         va, vb = a.get("aggregates", {}).get(k), b.get("aggregates", {}).get(k)
         if va and vb:
             print(f"{k:38s} {va:>8.1f}   {vb:>8.1f}   {vb / va:.2f}x")
