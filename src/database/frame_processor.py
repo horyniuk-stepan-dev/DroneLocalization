@@ -33,7 +33,8 @@ class FrameProcessor:
     """Processes decoded+masked frames into database rows.
 
     Args:
-        feature_extractor: provides ``extract_features(rgb, mask)``.
+        feature_extractor: provides ``extract_local_features(rgb, mask)`` and
+            ``extract_global_descriptor(rgb)``.
         db_writer: :class:`src.database.db_writer.DbWriter`.
         compute_inter_frame_h: ``(prev_features, features) -> H | None``.
         is_significant_motion: ``(H, width, height) -> bool`` keyframe gate.
@@ -104,13 +105,15 @@ class FrameProcessor:
         self._frames_since_keyframe = 0
 
     def process(self, p_idx: int, p_frame, p_frame_rgb, p_static_mask) -> None:
-        """Processes one frame: feature extraction, pose calculation, keyframe selection."""
-        features = self.feature_extractor.extract_features(p_frame_rgb, p_static_mask)
-        features["coords_2d"] = features["keypoints"]
+        """Processes one frame: feature extraction, pose calculation, keyframe selection.
 
-        # Patchify descriptors
-        if self.patchify is not None:
-            features["patch_descriptors"] = self.patchify.compute_patch_descriptors(p_frame_rgb)
+        Only local features are extracted up front: they drive the pose chain and
+        the keyframe decision. The global descriptor and the patchify descriptors
+        (1 + 14 DINO passes) are computed for saved frames only; for a skipped
+        frame they were computed and thrown away. Saved rows are unchanged.
+        """
+        features = self.feature_extractor.extract_local_features(p_frame_rgb, p_static_mask)
+        features["coords_2d"] = features["keypoints"]
 
         # Depth scale estimation (reuse scale across interval to save compute)
         features["depth_scale"] = np.float32(
@@ -183,6 +186,9 @@ class FrameProcessor:
         self.db_writer.write_pose(p_idx, self.current_pose)
 
         if save_this_frame:
+            features["global_desc"] = self.feature_extractor.extract_global_descriptor(p_frame_rgb)
+            if self.patchify is not None:
+                features["patch_descriptors"] = self.patchify.compute_patch_descriptors(p_frame_rgb)
             # SIFT features extracted only for keyframes being saved
             if self.store_sift:
                 try:
