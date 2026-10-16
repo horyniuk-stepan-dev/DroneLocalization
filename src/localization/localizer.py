@@ -144,6 +144,12 @@ class Localizer:
         )
         # Strongest-N query keypoints for the temporal-prior check (0 = all).
         self._tp_max_kp = int(get_cfg(self.config, "localization.temporal_prior_max_keypoints", 0))
+        # ...only after a fix with at least this many inliers (0 = always); see
+        # _tp_keypoint_budget.
+        self._tp_kp_min_inliers = int(
+            get_cfg(self.config, "localization.temporal_prior_kp_min_inliers", 0)
+        )
+        self._prev_fix_inliers = 0
         self._tp_counter = 0
         self._tp_tries = 0
         self._tp_hits = 0
@@ -649,6 +655,7 @@ class Localizer:
         self._consecutive_failures = 0
         self._last_best_angle = None
         self._last_state = None
+        self._prev_fix_inliers = 0
         self._scale_manager.reset()
         self._layer_search.reset()
         self._layer_clock = None
@@ -763,7 +770,28 @@ class Localizer:
                 angle=self._last_best_angle,
                 scale=self._scale_manager.prior,
             )
+        # localization.temporal_prior_kp_min_inliers: the next frame's prior check uses
+        # the keypoint cap only after a strong fix.
+        self._prev_fix_inliers = (
+            int(result.get("inliers") or 0)
+            if result.get("success") and not result.get("fallback_mode")
+            else 0
+        )
         return self._coordinate_result(result)
+
+    def _tp_keypoint_budget(self) -> int:
+        """Query keypoints for this frame's temporal / spatial prior check (0 = all).
+
+        localization.temporal_prior_max_keypoints, applied only when the previous
+        frame's fix had at least localization.temporal_prior_kp_min_inliers inliers.
+        """
+        cap = int(getattr(self, "_tp_max_kp", 0) or 0)
+        if cap <= 0:
+            return 0
+        need = int(getattr(self, "_tp_kp_min_inliers", 0) or 0)
+        if need > 0 and int(getattr(self, "_prev_fix_inliers", 0) or 0) < need:
+            return 0
+        return cap
 
     def _coordinate_result(self, result):
         if self.relative_mode:
@@ -1233,7 +1261,7 @@ class Localizer:
                 best_scale,
                 ver,
                 _feat_cache,
-                max_keypoints=self._tp_max_kp if tp_hit else 0,
+                max_keypoints=self._tp_keypoint_budget() if tp_hit else 0,
             )
             if refined is not None:
                 (
@@ -2087,7 +2115,7 @@ class Localizer:
         rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
             query_frame, static_mask, angle, scale, cache
         )
-        tp_feats = top_keypoints(feats, self._tp_max_kp)
+        tp_feats = top_keypoints(feats, self._tp_keypoint_budget())
         cands = [(int(i), 0.0) for i in ids]
         ref_cache: dict = {}
         scored = self._geometric_verifier.mnn_counts(tp_feats, cands, self.database, ref_cache)
@@ -2144,7 +2172,7 @@ class Localizer:
         )
         # Probe and verification on the strongest keypoints only; `feats` (the
         # full set, also in `cache` for the retrieval path) is what is returned.
-        tp_feats = top_keypoints(feats, self._tp_max_kp)
+        tp_feats = top_keypoints(feats, self._tp_keypoint_budget())
 
         cands = [(int(i), 0.0) for i in ids]
         ref_cache: dict = {}

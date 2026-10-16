@@ -242,6 +242,12 @@ class LocalizationConfig(BaseModel):
     # before 2026-10-10). Measured 2026-10-10 with a global 2048 cap: GTX 1650
     # temporal-prior frames 348 -> 241 ms median, same fixes on own imagery.
     temporal_prior_max_keypoints: int = 0
+    # temporal_prior_max_keypoints applies only when the previous frame's fix had at least
+    # this many inliers (0 = always). After a weak or failed fix every keypoint is used:
+    # 2026-10-17 a plain 2048 cap lost the wb2019 recovery (161 -> 91 fixes on both test
+    # machines), whose borderline spatial-prior matches have 12-30 inliers; healthy fixes
+    # have hundreds (median 772 on the route3min flights).
+    temporal_prior_kp_min_inliers: int = Field(default=0, ge=0)
     # Spatial prior (src/localization/spatial_prior.py): when the index-neighbour
     # temporal prior finds nothing, probe the map frames nearest to the
     # constant-velocity prediction from the last two fixes, with the last

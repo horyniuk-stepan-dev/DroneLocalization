@@ -176,7 +176,7 @@
         "patchify_batch_size": 1,
         "patchify_merge_weight": 0.4,
         "patchify_unique_coverage": false,
-        "patchify_lazy": false,
+        "patchify_lazy": true,
         "source_priority_rank_margin": 2,
         "patchify_main_rank_margin": 2,
         "scale_pyramid": [
@@ -207,6 +207,7 @@
         "temporal_prior_accept_inliers": 25,
         "temporal_prior_audit_every": 10,
         "temporal_prior_max_keypoints": 0,
+        "temporal_prior_kp_min_inliers": 0,
         "spatial_prior": true,
         "spatial_prior_max_age_s": 30.0,
         "spatial_prior_nearest_k": 4,
