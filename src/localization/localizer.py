@@ -274,6 +274,8 @@ class Localizer:
         self._patchify_gap_ratio = float(
             get_cfg(self.config, "localization.patchify_gap_ratio", 1.5) or 1.5
         )
+        # localization.patchify_lazy: patch search only after the standard candidates fail.
+        self._patchify_lazy = bool(get_cfg(self.config, "localization.patchify_lazy", False))
         self._layer_gsd_cache: dict = {}
         self._frame_query_gsd = None
         if get_cfg(self.config, "localization.use_patchify", False):
@@ -1068,7 +1070,18 @@ class Localizer:
                 and self.db_manager is not None
                 and bool(getattr(rot, "per_source", None))
             )
-            if not joint_mode and self._patchify_allowed(best_source_id_per_angle):
+            # localization.patchify_lazy: the patch search waits until the standard
+            # candidates of this view have failed (see the lazy branch below).
+            lazy_patchify = (
+                getattr(self, "_patchify_lazy", False)
+                and not joint_mode
+                and self._candidate_retriever.patchify_for(best_source_id_per_angle) is not None
+            )
+            if (
+                not joint_mode
+                and not lazy_patchify
+                and self._patchify_allowed(best_source_id_per_angle)
+            ):
                 best_global_candidates = self._candidate_retriever.expand(
                     best_rotated_frame,
                     best_global_candidates,
@@ -1103,7 +1116,7 @@ class Localizer:
 
             main_first = (
                 None
-                if joint_mode
+                if joint_mode or lazy_patchify
                 else self._main_before_patchify(
                     rot, standard_candidates, best_global_candidates, best_source_id_per_angle
                 )
@@ -1124,6 +1137,51 @@ class Localizer:
                         best_global_score,
                         best_source_id_per_angle,
                     ) = on_layer
+            elif lazy_patchify:
+                ver = self._geometric_verifier.verify(
+                    best_query_features, best_global_candidates, self.database, tag="retrieval"
+                )
+                if ver is None and self._patchify_allowed(best_source_id_per_angle):
+                    expanded = self._candidate_retriever.expand(
+                        best_rotated_frame,
+                        standard_candidates,
+                        top_k,
+                        source_id=best_source_id_per_angle,
+                        desc_cache=_patch_cache,
+                    )
+                    if support_check is not None:
+                        expanded = [c for c in expanded if support_check(int(c[0]))]
+                    std_ids = {int(frame) for frame, _ in standard_candidates}
+                    patch_only = [c for c in expanded if int(c[0]) not in std_ids]
+                    if patch_only:
+                        # Same order as the eager path from here on: the main layer
+                        # (patchify_main_rank_margin), then the patchify-only candidates.
+                        best_global_candidates = expanded
+                        lazy_first = self._main_before_patchify(
+                            rot, standard_candidates, expanded, best_source_id_per_angle
+                        )
+                        main_rot = lazy_first[0] if lazy_first is not None else None
+                        if main_rot is not None:
+                            on_main = self._verify_main_layer(
+                                main_rot, query_frame, static_mask, _feat_cache
+                            )
+                            if on_main is not None:
+                                (
+                                    ver,
+                                    best_global_angle,
+                                    best_scale,
+                                    best_rotated_frame,
+                                    best_rotated_mask,
+                                    _crop_info,
+                                    best_query_features,
+                                    best_global_candidates,
+                                    best_global_score,
+                                    best_source_id_per_angle,
+                                ) = on_main
+                        if ver is None:
+                            ver = self._geometric_verifier.verify(
+                                best_query_features, patch_only, self.database, tag="patchify"
+                            )
             elif main_first is None:
                 ver = self._geometric_verifier.verify(
                     best_query_features, best_global_candidates, self.database, tag="retrieval"

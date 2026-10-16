@@ -78,3 +78,17 @@ def test_expand_computes_crop_descriptors_once_per_view_and_cache():
     assert patchify.computed == 2
     retriever.expand(view, [(1, 0.5)], top_k=5)  # no cache: old behaviour
     assert patchify.computed == 3
+
+
+def test_patch_cache_entry_holds_its_view_and_ignores_a_reused_id():
+    patchify = _CountingPatchify()
+    view, other = object(), object()
+    cache: dict = {}
+    CandidateRetriever._patch_descriptors(patchify, view, cache)
+    ((key, entry),) = cache.items()
+    assert entry[0] is view  # kept alive: its id cannot be handed to another array
+
+    # An entry under ``other``'s id that belongs to a different view is not served.
+    cache[(id(other),) + key[1:]] = (view, "stale")
+    assert CandidateRetriever._patch_descriptors(patchify, other, cache) == "descriptors"
+    assert patchify.computed == 2

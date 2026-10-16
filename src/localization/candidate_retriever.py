@@ -90,18 +90,20 @@ class CandidateRetriever:
             tuple(getattr(patchify, "grids", ()) or ()),
             getattr(patchify, "descriptor_dim", None),
         )
-        descs = desc_cache.get(key) if desc_cache is not None else None
-        if descs is None:
-            descs = patchify.compute_patch_descriptors(rotated_frame)
-            if desc_cache is not None:
-                desc_cache[key] = descs
+        entry = desc_cache.get(key) if desc_cache is not None else None
+        if entry is not None and entry[0] is rotated_frame:
+            return entry[1]
+        descs = patchify.compute_patch_descriptors(rotated_frame)
+        if desc_cache is not None:
+            # The entry holds the view, so its id cannot be reused by another array
+            # while the cache lives (localize_frame shares it with the in-frame retry).
+            desc_cache[key] = (rotated_frame, descs)
         return descs
 
     def expand(self, rotated_frame, base_candidates, top_k: int, source_id=None, desc_cache=None):
         """Patchify-expand candidates for the chosen rotation (no-op if disabled).
 
-        ``desc_cache``: see ``patch_candidates``; the caller must keep the view
-        objects alive while the cache is used (keys hold their ``id``).
+        ``desc_cache``: see ``patch_candidates`` (entries hold the view object).
         """
         patchify = self.patchify_for(source_id)
         if patchify is None:

@@ -146,6 +146,12 @@ class LocalizationConfig(BaseModel):
     # layers whose crops come closer than any real layer. Unknown scale -> every layer.
     patchify_adaptive: bool = False
     patchify_gap_ratio: float = Field(default=1.5, ge=1.0, le=4.0)
+    # Lazy patchify (not with joint_candidate_ranking): the patch search runs only after the
+    # chosen layer's standard candidates fail verification, on the same view (the one the
+    # scale / rotation priors chose); then the main layer (patchify_main_rank_margin) and the
+    # patchify-only candidates as before. Standard candidates keep their retrieval order.
+    # False = patch search before every verification (old behaviour).
+    patchify_lazy: bool = False
     # ── Scale-invariance (ScaleManager) ──
     # GSD-ratio pyramid for altitude-invariant localization (r = query_alt / db_alt).
     # Scanned when no temporal prior exists (bootstrap / out-of-coverage).
