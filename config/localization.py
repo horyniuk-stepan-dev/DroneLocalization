@@ -244,9 +244,10 @@ class LocalizationConfig(BaseModel):
     temporal_prior_max_keypoints: int = 0
     # temporal_prior_max_keypoints applies only when the previous frame's fix had at least
     # this many inliers (0 = always). After a weak or failed fix every keypoint is used:
-    # 2026-10-17 a plain 2048 cap lost the wb2019 recovery (161 -> 91 fixes on both test
-    # machines), whose borderline spatial-prior matches have 12-30 inliers; healthy fixes
-    # have hundreds (median 772 on the route3min flights).
+    # 2026-10-17 a plain 2048 cap lost the wb2019 recovery on the RTX 5070 Ti (161 -> 91
+    # fixes; on the GTX 1650 the same 91 came from models.aliked.max_keypoints=2048, the plain
+    # prior cap was not run to the end there); its borderline spatial-prior matches have
+    # 12-30 inliers, healthy fixes have hundreds (median 772 on the route3min flights).
     temporal_prior_kp_min_inliers: int = Field(default=0, ge=0)
     # Spatial prior (src/localization/spatial_prior.py): when the index-neighbour
     # temporal prior finds nothing, probe the map frames nearest to the
