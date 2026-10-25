@@ -245,12 +245,13 @@ class LayerSearch:
         self._source_cursor = 0
         self._probe_cursor = 0
 
-    def _select_sources(self, manager):
+    def _select_sources(self, manager, hinted=()):
         """Prefer the active/geographically plausible layers, probe the rest fairly.
 
         The last accepted GPS is only a routing hint. A rotating slot always
         reaches other loaded sources, including ones excluded by a stale active
-        area or incomplete source coverage metadata.
+        area or incomplete source coverage metadata. ``hinted``: the layers nearest
+        the altitude (localization.altitude_hint), preferred right after the active one.
         """
         all_ids = getattr(manager, "all_source_ids", None)
         if all_ids is None:
@@ -264,6 +265,7 @@ class LayerSearch:
         active = self.handoff.active
         if active in ids:
             preferred.append(active)
+        preferred.extend(sid for sid in hinted if sid in ids)
 
         source_config = getattr(manager, "get_source_config", None)
         if callable(source_config):
@@ -292,12 +294,18 @@ class LayerSearch:
         self._probe_cursor += probe_count
         return selected
 
-    def search(self, localizer, frame, mask, now, yaw_hint=None):
+    def search(self, localizer, frame, mask, now, yaw_hint=None, altitude_layers=()):
+        """``altitude_layers``: (source id, expected query/layer ratio) of the layers
+        nearest the altitude (localization.altitude_hint), nearest first."""
         start = time.monotonic()
         deadline = start + self.cfg("budget_ms", 2000.0) / 1000.0
         max_verifications = self.cfg("max_verifications", 32)
         top_k = self.cfg("candidates_per_source", 4)
-        source_ids = self._select_sources(localizer.db_manager)
+        hinted_ids = [sid for sid, _ in altitude_layers]
+        if hinted_ids:
+            source_ids = self._select_sources(localizer.db_manager, hinted_ids)
+        else:
+            source_ids = self._select_sources(localizer.db_manager)
         continuous = bool(getattr(localizer, "_rot_continuous", False))
         if not localizer.enable_auto_rotation:
             angles = [0]
@@ -312,6 +320,9 @@ class LayerSearch:
                 angle = (int(round(yaw_hint / 90)) * 90) % 360
             angles = [angle] + [a for a in angles if a != angle]
         primary = [(angle, 1.0) for angle in angles]
+        # The hinted layers' scales at the most likely angle (the beliefs, prepended
+        # below, still come first).
+        primary = [(angles[0], ratio) for _, ratio in altitude_layers] + primary
         for belief in self.beliefs.values():
             primary = [
                 (belief.angle, scale)
@@ -423,6 +434,11 @@ class LayerSearch:
             if ids:
                 offset = self._source_cursor % len(ids)
                 ids = ids[offset:] + ids[:offset]
+                # Hinted layers verify first (then the active one, if early_stop).
+                for sid in reversed(hinted_ids):
+                    if sid in ids:
+                        ids.remove(sid)
+                        ids.insert(0, sid)
                 if early_stop and self.handoff.active in ids:
                     ids.remove(self.handoff.active)
                     ids.insert(0, self.handoff.active)

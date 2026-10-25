@@ -130,6 +130,11 @@
             "early_stop_min_quality": 150.0,
             "early_stop_max_scale_ratio": 1.5
         },
+        "altitude_hint": {
+            "enabled": false,
+            "max_layers": 2,
+            "telemetry_scale_ema": 0.3
+        },
         "min_matches": 12,
         "min_inliers_accept": 10,
         "max_geometric_rmse_px": 4.0,
@@ -176,9 +181,15 @@
         "patchify_batch_size": 1,
         "patchify_merge_weight": 0.4,
         "patchify_unique_coverage": false,
-        "patchify_lazy": true,
         "source_priority_rank_margin": 2,
         "patchify_main_rank_margin": 2,
+        "joint_candidate_ranking": false,
+        "joint_top_k": 5,
+        "joint_patchify_rank_penalty": 2,
+        "layer_fineness_weight": 0.0,
+        "patchify_adaptive": false,
+        "patchify_gap_ratio": 1.5,
+        "patchify_lazy": true,
         "scale_pyramid": [
             0.5,
             0.7,
@@ -498,10 +509,12 @@
     "flight_data": {
         "source": "none",
         "csv_path": "",
+        "mavlink_url": "udpin:0.0.0.0:14550",
         "csv_preset": "generic",
         "time_offset_s": 0.0,
         "max_gap_s": 1.0,
         "use_heading": true,
+        "use_altitude": true,
         "reference_heading_deg": 0.0,
         "camera_yaw_offset_deg": 0.0
     }

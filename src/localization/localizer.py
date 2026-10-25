@@ -4,6 +4,7 @@ from config import get_cfg
 from src.geometry.frame_transform import project_frame_points
 from src.geometry.point_spread import inlier_spread
 from src.geometry.transformations import GeometryTransforms
+from src.localization.altitude_hint import AltitudeHint
 from src.localization.candidate_retriever import CandidateRetriever
 from src.localization.failure_log import FAILURE_TYPES, FailureLogger
 from src.localization.geometric_verifier import GeometricVerifier
@@ -226,6 +227,16 @@ class Localizer:
         self._scale_manager = ScaleManager(self.config)
         self._layer_search = LayerSearch(self.config)
         self._layer_clock = None
+
+        # localization.altitude_hint: the expected scales of the layers nearest the
+        # altitude (telemetry, else the last fix's scale) are tried first.
+        _project_manager = self.config.get("_project_manager", None)
+        self._altitude_hint = AltitudeHint.from_config(
+            self.config, getattr(_project_manager, "settings", None)
+        )
+        self._telemetry_altitude_m = None
+        self._altitude_norm_width = None
+        self._altitude_hint_logged: set = set()
 
         # Depth-based scale hint (soft pyramid reorder; hint only, never a hard scale).
         self._db_depth_scale = getattr(self.database, "median_depth_scale", None)
@@ -474,6 +485,76 @@ class Localizer:
         sid = self._active_source_id if self.db_manager is not None else None
         gsd = self._gsd_of(sid)
         return float(prior) * float(gsd) if gsd else None
+
+    # ── localization.altitude_hint ──────────────────────────────────────────────
+
+    def _layer_gsds(self, source_ids=None) -> dict:
+        """Ground pixel size of the given (default: active) layers; one database: {None: it}."""
+        if self.db_manager is None:
+            return {None: self._gsd_of(None)}
+        if source_ids is None:
+            source_ids = list(getattr(self.db_manager, "active_source_ids", None) or [])
+        return {sid: self._gsd_of(sid) for sid in source_ids}
+
+    def _hint_query_gsd(self, norm_width, visual_gsd):
+        """(query ground pixel size, source); telemetry needs metric (geo) layers."""
+        hint = getattr(self, "_altitude_hint", None)
+        if hint is None:
+            return None, "off"
+        relative = bool(getattr(self, "relative_mode", False))
+        telemetry = None if relative else getattr(self, "_telemetry_altitude_m", None)
+        gsd, source = hint.query_gsd(telemetry, norm_width, visual_gsd)
+        logged = getattr(self, "_altitude_hint_logged", None)
+        if gsd is not None and logged is not None and source not in logged:
+            logged.add(source)
+            logger.info(f"Altitude hint active ({source}): query ground pixel {gsd:.3f}")
+        return gsd, source
+
+    def _apply_altitude_hint(self, norm_width) -> None:
+        """The nearest layers' expected scales go to the ScaleManager before retrieval."""
+        hint = getattr(self, "_altitude_hint", None)
+        if hint is None or not hint.enabled:
+            return
+        self._altitude_norm_width = norm_width
+        gsd, source = self._hint_query_gsd(norm_width, getattr(self, "_frame_query_gsd", None))
+        scales = hint.layer_scales(gsd, self._layer_gsds())
+        self._scale_manager.set_altitude_scales([ratio for _, ratio in scales])
+        if source == "telemetry":
+            # localization.patchify_adaptive gates on the same estimate.
+            self._frame_query_gsd = gsd
+        if scales:
+            listed = ", ".join(f"{sid}: x{ratio:.2f}" for sid, ratio in scales)
+            logger.debug(f"Altitude hint ({source}): {listed}")
+
+    def _altitude_layer_scales(self, norm_width) -> list:
+        """Layer search: (source id, expected ratio) of the layers nearest the altitude."""
+        hint = getattr(self, "_altitude_hint", None)
+        if hint is None or not hint.enabled or self.db_manager is None:
+            return []
+        self._altitude_norm_width = norm_width
+        search = self._layer_search
+        active = search.handoff.active
+        belief = search.beliefs.get(active) if active is not None else None
+        active_gsd = self._gsd_of(active) if active is not None else None
+        visual = None
+        if belief is not None and active_gsd:
+            visual = float(np.exp(belief.log_ratio)) * float(active_gsd)
+        gsd, _ = self._hint_query_gsd(norm_width, visual)
+        ids = getattr(self.db_manager, "all_source_ids", None)
+        if ids is None:
+            ids = getattr(self.db_manager, "active_source_ids", None)
+        return hint.layer_scales(gsd, self._layer_gsds(list(ids or [])))
+
+    def _learn_altitude_factor(self) -> None:
+        """A fix made while telemetry was present refines the hint's camera footprint factor."""
+        hint = getattr(self, "_altitude_hint", None)
+        altitude = getattr(self, "_telemetry_altitude_m", None)
+        if hint is None or not hint.enabled or altitude is None:
+            return
+        if getattr(self, "relative_mode", False):
+            return
+        width = getattr(self, "_altitude_norm_width", None)
+        hint.learn(altitude, width, self._estimated_query_gsd())
 
     def _patchify_allowed(self, source_id) -> bool:
         """localization.patchify_adaptive: may this layer's patchify search run this frame?"""
@@ -730,7 +811,10 @@ class Localizer:
         yaw_hint_deg=None,
         collector=None,
         timestamp=None,
+        altitude_m=None,
     ) -> dict:
+        # Height above ground / take-off from telemetry (localization.altitude_hint).
+        self._telemetry_altitude_m = altitude_m
         enabled = get_cfg(self.config, "localization.layer_search.enabled", False)
         if enabled and self.db_manager is not None:
             return self._localize_layers(
@@ -777,6 +861,8 @@ class Localizer:
             if result.get("success") and not result.get("fallback_mode")
             else 0
         )
+        if result.get("success") and not result.get("fallback_mode"):
+            self._learn_altitude_factor()
         return self._coordinate_result(result)
 
     def _tp_keypoint_budget(self) -> int:
@@ -822,7 +908,15 @@ class Localizer:
         self._layer_clock = now
         frame, _ = self.normalizer.normalize(query_frame)
         mask = self.normalizer.normalize_mask(static_mask) if static_mask is not None else None
-        observations = self._layer_search.search(self, frame, mask, now, yaw_hint)
+        altitude_layers = self._altitude_layer_scales(frame.shape[1])
+        observations = self._layer_search.search(
+            self,
+            frame,
+            mask,
+            now,
+            yaw_hint,
+            **({"altitude_layers": altitude_layers} if altitude_layers else {}),
+        )
         chosen = self._layer_search.handoff.choose(observations, now)
         diagnostics = dict(self._layer_search.last_diagnostics)
         if chosen is None:
@@ -869,6 +963,7 @@ class Localizer:
             accepted = bool(result.get("success"))
             if accepted:
                 self._layer_search.commit(chosen, now)
+                self._learn_altitude_factor()
                 result["status"] = "confirmed"
                 result["source_changed"] = switching
                 result["coordinate_kind"] = "ground_observation"
@@ -1011,6 +1106,7 @@ class Localizer:
             # Query scale vs the layer of the last fix, before retrieval switches layers
             # (localization.patchify_adaptive).
             self._frame_query_gsd = self._estimated_query_gsd()
+            self._apply_altitude_hint(width)
             prior_angle = self._last_best_angle
             use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
             if yaw_hint_deg is not None and self.enable_auto_rotation:

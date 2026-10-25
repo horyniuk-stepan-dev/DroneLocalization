@@ -41,6 +41,22 @@ class LayerSearchConfig(BaseModel):
     early_stop_max_scale_ratio: float = Field(default=1.5, ge=1)
 
 
+class AltitudeHintConfig(BaseModel):
+    """Altitude-guided layer scales (src/localization/altitude_hint.py). Default off.
+
+    The query's ground pixel size comes from telemetry (flight_data: height above
+    ground, else above take-off) or, without telemetry, from the last fix's scale;
+    the expected query/layer scale of the ``max_layers`` layers nearest to it is
+    tried before the rest of the scale pyramid. Neither known -> unchanged search.
+    """
+
+    enabled: bool = False
+    max_layers: int = Field(default=2, ge=1, le=8)
+    # Weight of each telemetry + visual fix in refining the camera footprint factor
+    # (ground width per metre of altitude, initially sensor width / focal length).
+    telemetry_scale_ema: float = Field(default=0.3, gt=0, le=1)
+
+
 class ConfidenceConfig(BaseModel):
     inlier_weight: float = 0.7
     stability_weight: float = 0.3
@@ -51,6 +67,7 @@ class ConfidenceConfig(BaseModel):
 
 class LocalizationConfig(BaseModel):
     layer_search: LayerSearchConfig = Field(default_factory=LayerSearchConfig)
+    altitude_hint: AltitudeHintConfig = Field(default_factory=AltitudeHintConfig)
     min_matches: int = 12
     min_inliers_accept: int = 10
     # Absolute post-fit reprojection gate. Adaptive RANSAC may refine its own

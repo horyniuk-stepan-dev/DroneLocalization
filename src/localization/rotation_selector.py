@@ -236,8 +236,8 @@ class RotationSelector:
         The cascade cannot be slower than the standard behavior; it is designed to be faster.
 
         Reference scale for Stage 1: prior from ScaleManager if available; otherwise
-        the first element of ``scale_candidates`` (already sorted by proximity to depth-hint);
-        else 1.0.
+        the altitude hint's nearest-layer scale (localization.altitude_hint); otherwise 1.0;
+        else the first element of ``scale_candidates`` (sorted by proximity to depth-hint).
         """
         combos = [(a, sc) for a in angles_to_try for sc in scale_candidates]
         if not use_cascade or len(scale_candidates) <= 1:
@@ -245,8 +245,14 @@ class RotationSelector:
 
         primary = None
         prior = getattr(scale_manager, "prior", None) if scale_manager is not None else None
+        # localization.altitude_hint: the scale of the layer nearest the altitude.
+        altitude = (
+            getattr(scale_manager, "altitude_primary", None) if scale_manager is not None else None
+        )
         if prior is not None and prior in scale_candidates:
             primary = prior
+        elif isinstance(altitude, float) and altitude in scale_candidates:
+            primary = altitude
         elif 1.0 in scale_candidates:
             # Scale 1.0 — "as in DB"; most likely when prior is absent.
             primary = 1.0

@@ -38,7 +38,7 @@ COMBO_OPTIONS = {
     "log_level": ["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
     "default_mode": ["UTM", "WEB_MERCATOR"],
     "rotation_mode": ["quarter", "continuous"],
-    "source": {"flight_data": ["none", "csv"]},
+    "source": {"flight_data": ["none", "csv", "mavlink"]},
     "csv_preset": ["generic", "flightsim"],
     "terrain_altitude_model": ["piecewise", "constant"],
     "terrain_dem_source": ["terrarium", "file"],

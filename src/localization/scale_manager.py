@@ -27,6 +27,17 @@ logger = get_logger(__name__)
 
 # Default octave grid around the DB altitude — covers ~50–200 m if DB is ~100 m
 _DEFAULT_PYRAMID = (0.5, 0.7, 1.0, 1.4, 2.0)
+# Two scale candidates closer than this ratio give practically the same view.
+_SAME_SCALE_RATIO = 1.15
+
+
+def _merge_scales(first: list[float], rest: list[float]) -> list[float]:
+    """``first`` then the ``rest`` that are not practically the same scale as one already kept."""
+    merged: list[float] = []
+    for scale in list(first) + list(rest):
+        if all(max(scale, kept) / min(scale, kept) >= _SAME_SCALE_RATIO for kept in merged):
+            merged.append(scale)
+    return merged
 
 
 @dataclass
@@ -113,6 +124,9 @@ class ScaleManager:
         # ── mutable state ──
         self._prior: float | None = None
         self._depth_hint: float | None = None  # set externally per-keyframe
+        # localization.altitude_hint: expected ratios of the layers nearest the
+        # estimated altitude, nearest first (set by the Localizer per keyframe).
+        self._altitude_scales: list[float] | None = None
 
         logger.info(
             f"ScaleManager initialized | pyramid={self._pyramid}, "
@@ -130,6 +144,25 @@ class ScaleManager:
     def rescan_min_score(self) -> float:
         return self._rescan_min
 
+    def set_altitude_scales(self, scales: list[float] | None) -> None:
+        """Expected query/layer ratios from the altitude hint (None or [] = no hint)."""
+        kept = []
+        for scale in scales or []:
+            try:
+                value = float(scale)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value > 0.0:
+                kept.append(float(np.clip(value, self._min_r, self._max_r)))
+        self._altitude_scales = kept or None
+
+    @property
+    def altitude_primary(self) -> float | None:
+        """Nearest-layer ratio when there is no prior: recovery_cascade's stage-1 scale."""
+        if self._prior is not None or not self._altitude_scales:
+            return None
+        return self._altitude_scales[0]
+
     def candidates(self) -> list[float]:
         """Scale levels to scan on the next keyframe.
 
@@ -140,8 +173,13 @@ class ScaleManager:
         When a depth hint is available and no prior, the pyramid is reordered
         so the closest level to the hint comes first (early-stop friendly).
         """
+        hints = self._altitude_scales or []
         if self._prior is not None:
-            return [self._prior]
+            # The prior (last fix's layer) first; the hinted layers back up a rescan.
+            return _merge_scales([self._prior], hints)
+        if hints:
+            # Hinted layers first, then the rest of the pyramid (not a near-duplicate).
+            return _merge_scales(hints, list(self._pyramid))
 
         pyramid = list(self._pyramid)
 
@@ -316,3 +354,4 @@ class ScaleManager:
         """Full reset for a new tracking session."""
         self._prior = None
         self._depth_hint = None
+        self._altitude_scales = None

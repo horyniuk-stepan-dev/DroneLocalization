@@ -81,17 +81,25 @@ class FlightDataConfig(BaseModel):
     """Optional drone telemetry (src/flight_data). Default: none — vision only.
 
     Used as a PRIOR only: heading → rotation prior of each keyframe (a wrong
-    heading costs one retrieval pass, then the vision scan takes over).
+    heading costs one retrieval pass, then the vision scan takes over); height
+    → the layer scales tried first (localization.altitude_hint, default off).
     """
 
-    source: Literal["none", "csv"] = "none"
+    source: Literal["none", "csv", "mavlink"] = "none"
     csv_path: str = ""
-    # "generic": time_s, heading_deg, alt_agl_m, alt_msl_m, pitch_deg, roll_deg,
-    # lat, lon. "flightsim": FlightSimulator telemetry.csv (timestamp, yaw_rad, alt_z).
+    # "mavlink": live stream (pymavlink connection string), e.g. DroneSimUE on
+    # udp 14550. time_offset_s < 0 compensates video latency for this source.
+    mavlink_url: str = "udpin:0.0.0.0:14550"
+    # "generic": time_s, heading_deg, alt_agl_m, alt_rel_m, alt_msl_m, pitch_deg,
+    # roll_deg, lat, lon. "flightsim": FlightSimulator telemetry.csv (timestamp,
+    # yaw_rad, alt_z = height above the simulator's base plane, read as alt_rel_m).
     csv_preset: Literal["generic", "flightsim"] = "generic"
-    time_offset_s: float = 0.0  # log time = video time + offset
+    time_offset_s: float = 0.0  # log time = video time + offset (mavlink: now + offset)
     max_gap_s: float = 1.0  # no row within this → no sample (stale data is not used)
     use_heading: bool = True
+    # Height above ground (else above take-off) for localization.altitude_hint;
+    # it has an effect only while that hint is enabled.
+    use_altitude: bool = True
     # Heading the TOP of the reference frames pointed to (heading-hold layers: 0).
     reference_heading_deg: float = 0.0
     # Camera mounted rotated relative to the nose (clockwise, degrees);

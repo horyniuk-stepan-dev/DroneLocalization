@@ -131,7 +131,7 @@ class RealtimeTrackingWorker(QThread):
             logger.error(f"Flight data disabled: {e}")
             flight_prior = None
         if flight_prior is not None:
-            logger.info("Flight data: heading prior enabled for keyframes")
+            logger.info("Flight data: heading (and altitude) priors enabled for keyframes")
 
         # Fix 6: Pre-warm fallback models when starting tracking
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
@@ -269,6 +269,12 @@ class RealtimeTrackingWorker(QThread):
                     if flight_prior is not None
                     else None
                 )
+                # Height for localization.altitude_hint (passed only when known).
+                altitude_m = (
+                    flight_prior.altitude_m(current_video_time_sec)
+                    if flight_prior is not None
+                    else None
+                )
                 try:
                     loc_result = self.localizer.localize_frame(
                         frame_rgb,
@@ -277,6 +283,7 @@ class RealtimeTrackingWorker(QThread):
                         yaw_hint_deg=yaw_hint,
                         collector=debug_collector,
                         timestamp=current_video_time_sec,
+                        **({"altitude_m": altitude_m} if altitude_m is not None else {}),
                     )
                 except Exception as e:
                     import torch
@@ -504,6 +511,8 @@ class RealtimeTrackingWorker(QThread):
                     self.msleep(int(sleep_time * 1000))
 
         video_src.release()
+        if flight_prior is not None:
+            flight_prior.close()  # live MAVLink source: release the UDP port
         logger.info("Tracking worker thread finished cleanly.")
 
     def _prewarm_fallback_models(self):
