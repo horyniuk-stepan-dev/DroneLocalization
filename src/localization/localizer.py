@@ -935,6 +935,44 @@ class Localizer:
             return 0
         return cap
 
+    def rebase_optical_flow_anchor(self, flow_affine) -> bool:
+        """Move the OF anchor to a later frame (tracking.of_chain_on_keyframe_fail).
+
+        ``flow_affine`` is the similarity (original px) from the current anchor
+        frame to the new anchor frame, as measured by KeyframeFlow. The new
+        frame's homography to the reference is H_new = H · Sc · S⁻¹ · Sc⁻¹ (Sc =
+        resolution normalisation), i.e. a point of the new frame is mapped back
+        into the old anchor frame and then through the old H. Only for states in
+        the unrotated frame (continuous rotation mode stores angle 0); returns
+        False otherwise and the caller keeps the legacy behaviour.
+        """
+        state = self._last_state
+        if state is None or state.get("H") is None or flow_affine is None:
+            return False
+        if int(round(float(state.get("global_angle", 0) or 0))) % 360 != 0:
+            return False
+        S = np.asarray(flow_affine, dtype=np.float64)
+        if S.shape != (2, 3) or not np.all(np.isfinite(S)):
+            return False
+        scale = float(state.get("scale", self._last_scale) or 1.0)
+        S3 = np.vstack([S, [0.0, 0.0, 1.0]])
+        try:
+            S_inv = np.linalg.inv(S3)
+        except np.linalg.LinAlgError:
+            return False
+        Sc = np.diag([scale, scale, 1.0])
+        Sc_inv = np.diag([1.0 / scale, 1.0 / scale, 1.0])
+        H_new = np.asarray(state["H"], dtype=np.float64) @ Sc @ S_inv @ Sc_inv
+        if not np.all(np.isfinite(H_new)):
+            return False
+        new_state = dict(state)
+        new_state["H"] = H_new
+        new_state["of_chain_links"] = int(state.get("of_chain_links", 0)) + 1
+        self._last_state = new_state
+        self._last_of_raw = None
+        self._of_steps_since_kf = 0
+        return True
+
     def _hint_allows_temporal_prior(self, yaw_hint_deg: float | None) -> bool:
         """True when the temporal prior may run under this yaw hint: no hint,
         or (flag on) a hint within the tolerance of the last fix's angle."""
@@ -1651,6 +1689,8 @@ class Localizer:
             # frame system belonging to H (fresh self._last_scale on
             # subsequent frames may already differ).
             "scale": self._last_scale,
+            # Frame time of this real keyframe fix (dead-reckoning age for OF).
+            "fix_t": self._frame_timestamp,
         }
 
         # ── Step 6: Query center → Reference → Metric → GPS ─────────────────
@@ -1855,6 +1895,8 @@ class Localizer:
             "raw_lat": raw_lat,
             "raw_lon": raw_lon,
             "raw_metric": [mx, my],
+            "fix_source": "keyframe",
+            "since_fix_s": 0.0,
             "scale_ratio": float(best_scale),
             "rotation_deg": self._angle_out(best_global_angle),
             "fov_polygon": gps_corners,
@@ -2088,6 +2130,18 @@ class Localizer:
         raw_lat, raw_lon = self.calibration.converter.metric_to_gps(mx, my)
 
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
+        # Provenance for consumers: an OF position chained through failed
+        # keyframes (tracking.of_chain_on_keyframe_fail) is dead reckoning, not
+        # an observation of the map — flagged, with its age and halved confidence.
+        links = int(self._last_state.get("of_chain_links", 0) or 0)
+        fix_t = self._last_state.get("fix_t")
+        since_fix = (
+            round(self._frame_timestamp - float(fix_t), 2)
+            if fix_t is not None and self._frame_timestamp is not None
+            else None
+        )
+        if links > 0:
+            of_conf *= 0.5
 
         return self._coordinate_result(
             {
@@ -2096,6 +2150,9 @@ class Localizer:
                 "lon": lon,
                 "raw_lat": raw_lat,
                 "raw_lon": raw_lon,
+                "fix_source": "dead_reckoning" if links > 0 else "optical_flow",
+                "dead_reckoning_links": links,
+                "since_fix_s": since_fix,
                 "confidence": round(of_conf, 3),
                 "matched_frame": int(self._last_state.get("candidate_id", -1)),
                 "inliers": of_inliers,

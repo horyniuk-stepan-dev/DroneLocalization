@@ -7,7 +7,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from config import get_cfg
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
-from src.tracking.keyframe_flow import KeyframeFlow
+from src.tracking.keyframe_flow import FlowChain, KeyframeFlow
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -18,6 +18,10 @@ class RealtimeTrackingWorker(QThread):
 
     frame_ready = pyqtSignal(np.ndarray)
     location_found = pyqtSignal(float, float, float, int)
+    # Provenance of the next location_found: fix_source ("keyframe" |
+    # "optical_flow" | "dead_reckoning") and seconds since the last real
+    # keyframe fix (-1 = unknown). Emitted right before location_found.
+    fix_info = pyqtSignal(str, float)
     # Precise keyframe localization signal (anchor_fix)
     anchor_fix = pyqtSignal()
     fps_updated = pyqtSignal(float)
@@ -188,6 +192,11 @@ class RealtimeTrackingWorker(QThread):
             max_level=get_cfg(self.config, "tracking.of_lk_max_level", 2),
             max_anchor_age_s=get_cfg(self.config, "tracking.of_max_anchor_age_s", 0.0),
         )
+        chain = FlowChain(
+            enabled=get_cfg(self.config, "tracking.of_chain_on_keyframe_fail", False),
+            max_s=get_cfg(self.config, "tracking.of_chain_max_s", 30.0),
+        )
+        retry_every = max(1, int(get_cfg(self.config, "tracking.keyframe_retry_every", 1)))
         last_tracked_objects = []
 
         last_localization_video_time = -1.0
@@ -223,6 +232,8 @@ class RealtimeTrackingWorker(QThread):
 
             # dt calculation logic
             flow.expire(current_video_time_sec)
+            # No anchor and not a scheduled keyframe: retry only every N frames.
+            _retry_skip = not is_keyframe and not flow.has_anchor and (frame_idx % retry_every) != 0
             _is_of_frame = not (is_keyframe or not flow.has_anchor)
             if is_keyframe or not flow.has_anchor:
                 if last_keyframe_video_time < 0:
@@ -251,7 +262,9 @@ class RealtimeTrackingWorker(QThread):
             loc_result = {"success": False, "error": "Not processed"}
             start_process = time.time()
 
-            if is_keyframe or not flow.has_anchor:
+            if _retry_skip:
+                pass  # keyframe retry throttled (tracking.keyframe_retry_every)
+            elif is_keyframe or not flow.has_anchor:
                 # ====== HEAVY KEYFRAME LOCALIZATION ======
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -313,6 +326,9 @@ class RealtimeTrackingWorker(QThread):
                     and loc_result.get("fallback_mode") != "retrieval_only"
                 ):
                     flow.anchor(curr_gray, current_video_time_sec)
+                    chain.note_keyframe_success(current_video_time_sec)
+                elif not loc_result.get("success"):
+                    chain.try_rebase(self.localizer, flow, current_video_time_sec)
 
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
@@ -382,6 +398,10 @@ class RealtimeTrackingWorker(QThread):
                         except Exception as e:
                             logger.error(f"OF Localization error: {e}")
                             loc_result = {"success": False, "error": str(e)}
+                        if loc_result.get("success"):
+                            chain.note_of_success(
+                                curr_gray, meas.flow_affine, current_video_time_sec
+                            )
 
                         if object_tracker:
                             self.objects_detected.emit(last_tracked_objects)
@@ -389,6 +409,11 @@ class RealtimeTrackingWorker(QThread):
                     flow.clear()
 
             if loc_result.get("success") and loc_result.get("matched_frame", -1) != -1:
+                _since = loc_result.get("since_fix_s")
+                self.fix_info.emit(
+                    str(loc_result.get("fix_source", "keyframe")),
+                    float(_since) if _since is not None else -1.0,
+                )
                 self.location_found.emit(
                     loc_result["lat"],
                     loc_result["lon"],
@@ -403,7 +428,11 @@ class RealtimeTrackingWorker(QThread):
                 if loc_result.get("fov_polygon"):
                     self.fov_found.emit(loc_result["fov_polygon"])
 
-                track_type = "OF" if loc_result.get("is_of") else "KF"
+                track_type = (
+                    "DR"
+                    if loc_result.get("fix_source") == "dead_reckoning"
+                    else ("OF" if loc_result.get("is_of") else "KF")
+                )
                 method_txt = (
                     "Similarity"
                     if loc_result.get("fallback_mode") == "retrieval_only"

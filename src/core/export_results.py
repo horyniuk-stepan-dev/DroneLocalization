@@ -35,6 +35,9 @@ class ResultExporter:
             if all(r.get("coordinate_kind") == "local_planar" for r in results):
                 fieldnames = [k for k in fieldnames if k not in ("lat", "lon")]
             fieldnames += ["x", "y", "coordinate_kind", "coordinate_units"]
+        if any("fix_source" in r for r in results):
+            # keyframe / optical_flow / dead_reckoning (not confirmed by the map)
+            fieldnames.append("fix_source")
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -68,6 +71,7 @@ class ResultExporter:
                     "confidence": r.get("confidence"),
                     "timestamp": r.get("timestamp"),
                     "matched_frame": r.get("matched_frame"),
+                    "fix_source": r.get("fix_source", "keyframe"),
                 },
             )
             features.append(point)
@@ -184,6 +188,9 @@ class ResultExporter:
             if all(r.get("coordinate_kind") == "local_planar" for r in results):
                 fieldnames = [k for k in fieldnames if k not in ("lat", "lon")]
             fieldnames += ["x", "y", "coordinate_kind", "coordinate_units"]
+        if any("fix_source" in r for r in results):
+            # keyframe / optical_flow / dead_reckoning (not confirmed by the map)
+            fieldnames.append("fix_source")
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()

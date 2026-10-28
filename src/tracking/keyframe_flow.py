@@ -179,3 +179,50 @@ class KeyframeFlow:
             flow_quality=flow_quality,
             n_points=int(len(good_new)),
         )
+
+
+class FlowChain:
+    """Keeps optical flow going through failed keyframes (visual odometry).
+
+    Without it a failed keyframe leaves LK tracking from an ever older anchor
+    until the anchor expires; then nothing is output until a keyframe succeeds
+    again (wayback 2019 route, 2026-10-28: ~22 s of flight without a position).
+    With it, a failed keyframe re-anchors LK on the last good OF frame and the
+    localizer composes that frame's homography from the old one, so OF keeps
+    producing positions, drifting slowly, until a keyframe succeeds again or
+    ``max_s`` since the last real keyframe fix is exceeded.
+    """
+
+    def __init__(self, enabled: bool = False, max_s: float = 30.0, max_good_age_s: float = 1.0):
+        self.enabled = bool(enabled)
+        self.max_s = float(max_s)
+        self.max_good_age_s = float(max_good_age_s)
+        self.kf_t: float | None = None
+        self.last_good: tuple[np.ndarray, np.ndarray, float] | None = None
+        self.links = 0
+
+    def note_keyframe_success(self, t: float) -> None:
+        self.kf_t = t
+        self.last_good = None
+        self.links = 0
+
+    def note_of_success(self, gray: np.ndarray, flow_affine, t: float) -> None:
+        if self.enabled and flow_affine is not None:
+            self.last_good = (gray, np.asarray(flow_affine, dtype=np.float64), t)
+
+    def try_rebase(self, localizer, flow: KeyframeFlow, t: float) -> bool:
+        """After a failed keyframe: move the anchor to the last good OF frame."""
+        if not self.enabled or self.last_good is None or self.kf_t is None:
+            return False
+        if t - self.kf_t > self.max_s:
+            return False
+        gray, affine, t_good = self.last_good
+        if t - t_good > self.max_good_age_s:
+            return False
+        if not localizer.rebase_optical_flow_anchor(affine):
+            return False
+        flow.anchor(gray, t_good)
+        self.last_good = None
+        self.links += 1
+        logger.debug(f"OF chain: re-anchored on frame at t={t_good:.2f}s (link {self.links})")
+        return True

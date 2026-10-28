@@ -160,6 +160,7 @@ class TrackingMixin:
             config=self.config,
         )
         self.tracking_worker.frame_ready.connect(self.on_frame_ready)
+        self.tracking_worker.fix_info.connect(self.on_fix_info)
         self.tracking_worker.location_found.connect(self.on_location_found)
         self.tracking_worker.status_update.connect(self.control_panel.update_status)
         self.tracking_worker.fov_found.connect(self.map_widget.update_fov)
@@ -170,6 +171,7 @@ class TrackingMixin:
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.coordinates_broker.set_coordinate_mode(self.calibration.converter.mode)
+            self.tracking_worker.fix_info.connect(self.coordinates_broker.on_fix_info)
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
             self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
             self.tracking_worker.objects_gps_updated.connect(
@@ -343,6 +345,11 @@ class TrackingMixin:
         if hasattr(self.video_widget, "display_frame"):
             self.video_widget.display_frame(opencv_to_qpixmap(frame_bgr))
 
+    @pyqtSlot(str, float)
+    def on_fix_info(self, fix_source: str, since_fix_s: float):
+        self._fix_source = fix_source
+        self._since_fix_s = since_fix_s
+
     @pyqtSlot(float, float, float, int)
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
         self.map_widget.update_marker(lat, lon)
@@ -358,6 +365,7 @@ class TrackingMixin:
                 "confidence": confidence,
                 "inliers": inliers,
                 "timestamp": str(np.datetime64("now")),
+                "fix_source": getattr(self, "_fix_source", "keyframe"),
             }
         )
         if self.calibration.converter.mode == "LOCAL":
@@ -369,7 +377,16 @@ class TrackingMixin:
             self.control_panel.btn_export.setEnabled(True)
         coords = (f"X={lon:.3f}, Y={lat:.3f}" if self.calibration.converter.mode == "LOCAL"
                   else f"{lat:.6f}, {lon:.6f}")
-        self.status_bar.showMessage(f"Локалізація: {coords} | Впевненість: {confidence:.2f} | Точок: {inliers}")
+        source = getattr(self, "_fix_source", "keyframe")
+        if source == "dead_reckoning":
+            age = getattr(self, "_since_fix_s", -1.0)
+            age_txt = f"{age:.0f} с" if age is not None and age >= 0 else "?"
+            prefix = f"⚠ ОДОМЕТРІЯ без підтвердження мапою ({age_txt}) | "
+        else:
+            prefix = ""
+        self.status_bar.showMessage(
+            f"{prefix}Локалізація: {coords} | Впевненість: {confidence:.2f} | Точок: {inliers}"
+        )
 
     @pyqtSlot(object)
     def on_objects_detected(self, objects: list):

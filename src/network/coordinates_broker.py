@@ -205,6 +205,12 @@ class CoordinatesBroker(QObject):
 
     # Slots for RealtimeTrackingWorker connections
 
+    @pyqtSlot(str, float)
+    def on_fix_info(self, fix_source: str, since_fix_s: float):
+        """Provenance of the next position (worker emits it right before)."""
+        self._fix_source = fix_source
+        self._since_fix_s = since_fix_s if since_fix_s >= 0 else None
+
     @pyqtSlot(float, float, float, int)
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
         msg = {
@@ -214,6 +220,10 @@ class CoordinatesBroker(QObject):
             "confidence": confidence,
             "inliers": inliers,
             "timestamp": time.time(),
+            # "keyframe" = map observation, "optical_flow" = tracked from one,
+            # "dead_reckoning" = chained odometry, NOT confirmed by the map.
+            "fix_source": getattr(self, "_fix_source", "keyframe"),
+            "since_fix_s": getattr(self, "_since_fix_s", None),
         }
         if self._coordinate_mode == "LOCAL":
             msg.pop("lat")

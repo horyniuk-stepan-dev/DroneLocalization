@@ -265,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     from config import APP_CONFIG, get_cfg
     from src.flight_data import build_flight_prior
     from src.geometry.transformations import GeometryTransforms
-    from src.tracking.keyframe_flow import KeyframeFlow
+    from src.tracking.keyframe_flow import FlowChain, KeyframeFlow
 
     if args.layer_search_mode == "config":
         legacy = not bool(get_cfg(APP_CONFIG, "localization.layer_search.enabled", False))
@@ -326,6 +326,11 @@ def main(argv: list[str] | None = None) -> int:
         max_level=get_cfg(config, "tracking.of_lk_max_level", 2),
         max_anchor_age_s=get_cfg(config, "tracking.of_max_anchor_age_s", 0.0),
     )
+    chain = FlowChain(
+        enabled=get_cfg(config, "tracking.of_chain_on_keyframe_fail", False),
+        max_s=get_cfg(config, "tracking.of_chain_max_s", 30.0),
+    )
+    retry_every = max(1, int(get_cfg(config, "tracking.keyframe_retry_every", 1)))
 
     capture = cv2.VideoCapture(str(args.video))
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
@@ -348,7 +353,8 @@ def main(argv: list[str] | None = None) -> int:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             is_keyframe = frame_idx % ki == 0
             flow.expire(t)
-            kf_path = is_keyframe or not flow.has_anchor
+            retry_skip = not is_keyframe and not flow.has_anchor and frame_idx % retry_every != 0
+            kf_path = (is_keyframe or not flow.has_anchor) and not retry_skip
             dt = clock.dt(t, kf_path)
             of_computed = (not kf_path) and (of_stride <= 1 or frame_idx % of_stride == 0)
             if of_computed or is_keyframe:
@@ -374,7 +380,10 @@ def main(argv: list[str] | None = None) -> int:
                 clock.last_kf = t
                 if result.get("success") and result.get("fallback_mode") != "retrieval_only":
                     flow.anchor(gray, t)
-            elif of_computed:
+                    chain.note_keyframe_success(t)
+                elif not result.get("success"):
+                    chain.try_rebase(localizer, flow, t)
+            elif of_computed and not retry_skip:
                 meas = flow.track(gray)
                 if meas is not None:
                     flow_quality = meas.flow_quality
@@ -391,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     except Exception as exc:
                         result = {"success": False, "error": str(exc)}
+                    if result.get("success"):
+                        chain.note_of_success(gray, meas.flow_affine, t)
             else:
                 path = "skip"
             elapsed = (time.perf_counter() - started) * 1e3
@@ -419,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
                 "confirmed": success,
                 "error": result.get("error"),
                 "fallback_mode": result.get("fallback_mode"),
+                "fix_source": result.get("fix_source") if success else None,
                 "matched_frame": result.get("matched_frame"),
                 "source_id": result.get("source_id", getattr(localizer, "_active_source_id", None)),
                 "confidence": result.get("confidence"),
