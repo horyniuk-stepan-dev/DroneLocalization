@@ -70,3 +70,22 @@ def test_worker_dt_reproduces_the_sawtooth():
 def test_timestamp_dt_removes_it():
     steps = _run(use_timestamps=True)
     assert steps.max() < 1.0
+
+
+def test_long_gap_restarts_filter_instead_of_poisoning_velocity():
+    def run(max_gap):
+        kf = TrajectoryFilter(process_noise=8.0, max_gap_s=max_gap)
+        for k in range(12):
+            t = k / 6.0
+            kf.update((45.0 * t, 0.0), dt=1 / 6, timestamp=t)
+        t1 = 11 / 6.0 + 15.0  # 15 s without measurements
+        out = kf.update((45.0 * t1, 0.0), dt=15.0, timestamp=t1)
+        return kf, out, 45.0 * t1
+
+    kf, _, _ = run(0.0)
+    assert abs(float(kf.kf.x[2, 0]) - 45.0) > 50.0  # legacy: velocity blown up
+    kf, out, x1 = run(3.0)
+    # restarted at the measurement; velocity re-seeds from the next fix
+    assert out[0] == x1 and float(kf.kf.x[2, 0]) == 0.0
+    kf.update((x1 + 45.0 / 6, 0.0), dt=1 / 6, timestamp=11 / 6.0 + 15.0 + 1 / 6)
+    assert abs(float(kf.kf.x[2, 0]) - 45.0) < 1.0

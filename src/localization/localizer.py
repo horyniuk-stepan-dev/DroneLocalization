@@ -81,6 +81,7 @@ class Localizer:
             reanchor_velocity_from_fixes=get_cfg(
                 self.config, "tracking.kalman_reanchor_velocity_from_fixes", False
             ),
+            max_gap_s=get_cfg(self.config, "tracking.kalman_max_gap_s", 0.0),
         )
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
@@ -152,6 +153,14 @@ class Localizer:
         self._tp_audit_every = int(
             get_cfg(self.config, "localization.temporal_prior_audit_every", 10)
         )
+        # Temporal prior while a yaw hint is present (flag; None = legacy:
+        # any hint disables the prior). Measured 2026-10-28 on route3min
+        # variants: with telemetry the prior never ran, every keyframe paid a
+        # full retrieval, and on other-epoch imagery (wayback 2019) keyframe
+        # success fell 0.87 -> 0.15. A hint that agrees with the last fix's
+        # angle within this many degrees carries no new orientation info.
+        _tol = get_cfg(self.config, "localization.temporal_prior_yaw_hint_tol_deg", None)
+        self._tp_hint_tol = None if _tol is None else float(_tol)
         # Strongest-N query keypoints for the temporal-prior check (0 = all).
         self._tp_max_kp = int(get_cfg(self.config, "localization.temporal_prior_max_keypoints", 0))
         # ...only after a fix with at least this many inliers (0 = always); see
@@ -209,6 +218,20 @@ class Localizer:
         # 0.99, filtered 0.62-0.71; offline KF replay: jumps >10 m 190 -> 6).
         # True = KF dt from frame timestamps since its last update; outlier
         # detector and smoother keep the worker dt.
+        # OF quality floor (flag; 0.0 = legacy). A lost LK track reports
+        # flow_quality 0.026-0.042 (route3min variants 2026-10-28: all 11 OF
+        # samples > 20 m off), good tracking >= 0.075 at its 0.5th percentile;
+        # such samples slipped past the kinematic gate and dragged the KF up
+        # to 178 m off for ~1 s.
+        self._of_min_quality = max(
+            float(get_cfg(self.config, "tracking.of_min_flow_quality", 0.0)), 0.0
+        )
+        # Base KF noise multiplier of an OF measurement (legacy 1.5, "OF is
+        # noisier than a keyframe fix"). With the deeper LK pyramid and the
+        # quality floor OF is as accurate as a fix; offline on six route3min
+        # variants (2026-10-28) the KF output beat raw only when OF was trusted:
+        # q 8 / 1.5 -> p95 5.9 m, max 50 m, 46 jumps; q 128 / 0.1 -> 4.1 m, 28 m, 5.
+        self._of_noise_base = max(float(get_cfg(self.config, "tracking.of_noise_scale", 1.5)), 0.01)
         self._kf_dt_from_ts = bool(
             get_cfg(self.config, "tracking.kalman_dt_from_timestamps", False)
         )
@@ -912,6 +935,25 @@ class Localizer:
             return 0
         return cap
 
+    def _hint_allows_temporal_prior(self, yaw_hint_deg: float | None) -> bool:
+        """True when the temporal prior may run under this yaw hint: no hint,
+        or (flag on) a hint within the tolerance of the last fix's angle."""
+        if yaw_hint_deg is None:
+            return True
+        if self._tp_hint_tol is None:
+            return False
+        if self._last_best_angle is None:
+            # No angle to disagree with (after a reset / failures). The prior
+            # checks its own preconditions (last state, dead-reckoned
+            # position); blocking it here also blocked the spatial prior and
+            # kept failing runs failing (wayback 2019 with heading: 0.47).
+            return True
+        hint = norm_deg(yaw_hint_deg)
+        if not self._rot_continuous:
+            hint = float((int(round(hint / 90.0)) * 90) % 360)
+        diff = abs(hint - norm_deg(float(self._last_best_angle))) % 360.0
+        return min(diff, 360.0 - diff) <= self._tp_hint_tol
+
     def _filter_dt(self, dt: float) -> float:
         """KF prediction interval: time since the filter's last update when
         tracking.kalman_dt_from_timestamps is on and both timestamps are known;
@@ -1092,7 +1134,7 @@ class Localizer:
         # True only for a temporal-prior hit (not layer search's _verified): the
         # rotation refine then compares inliers under the same keypoint budget.
         tp_hit = False
-        if _tp is None and self._temporal_prior and yaw_hint_deg is None:
+        if _tp is None and self._temporal_prior and self._hint_allows_temporal_prior(yaw_hint_deg):
             self._tp_counter += 1
             audit = self._tp_audit_every
             if audit <= 0 or (self._tp_counter % audit) != 0:
@@ -1935,6 +1977,18 @@ class Localizer:
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
+        if (
+            self._of_min_quality > 0.0
+            and flow_quality is not None
+            and float(flow_quality) < self._of_min_quality
+        ):
+            logger.warning(
+                f"OF rejected: flow_quality={float(flow_quality):.3f} < "
+                f"{self._of_min_quality} (LK track lost)"
+            )
+            self._log_failure(FAILURE_TYPES["Outlier detected"])
+            return {"success": False, "error": "OF rejected — flow quality too low"}
+
         # -- Outlier gate on OF path (audit item 1.2), flag-gated ------------
         # Structural gap: keyframe path checks is_outlier (Step 7), while OF —
         # did not, it only appended position to history. At keyframe_interval=30 this is
@@ -1966,7 +2020,9 @@ class Localizer:
         self._frame_timestamp = None if timestamp is None else float(timestamp)
         _kf_dt = self._filter_dt(dt)
         _maha_d2 = (
-            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=_kf_dt, noise_scale=1.5 * _of_corr)
+            self.trajectory_filter.mahalanobis_sq(
+                metric_pt, dt=_kf_dt, noise_scale=self._of_noise_base * _of_corr
+            )
             if self._maha_gate_enabled
             else None
         )
@@ -2017,7 +2073,7 @@ class Localizer:
             else self.trajectory_filter.update(
                 metric_pt,
                 dt=_kf_dt,
-                noise_scale=1.5 * _of_corr / max(of_conf, 0.25),
+                noise_scale=self._of_noise_base * _of_corr / max(of_conf, 0.25),
                 timestamp=self._frame_timestamp,
             )
         )

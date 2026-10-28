@@ -217,6 +217,7 @@
         "temporal_prior_min_mnn": 20,
         "temporal_prior_accept_inliers": 25,
         "temporal_prior_audit_every": 10,
+        "temporal_prior_yaw_hint_tol_deg": 20.0,
         "temporal_prior_max_keypoints": 0,
         "temporal_prior_kp_min_inliers": 0,
         "spatial_prior": true,
@@ -226,7 +227,7 @@
         "spatial_prior_verify": 2
     },
     "tracking": {
-        "kalman_process_noise": 8.0,
+        "kalman_process_noise": 128.0,
         "kalman_measurement_noise": 5.0,
         "trusted_fix_max_filter_offset_m": 5.0,
         "outlier_window": 10,
@@ -252,9 +253,12 @@
         "of_lk_win_px": 21,
         "of_lk_max_level": 4,
         "of_max_anchor_age_s": 1.5,
+        "of_min_flow_quality": 0.05,
+        "of_noise_scale": 0.1,
         "of_noise_growth_per_step": 0.0,
         "kalman_dt_from_timestamps": true,
         "kalman_reanchor_velocity_from_fixes": true,
+        "kalman_max_gap_s": 3.0,
         "of_fb_max_px": 2.0,
         "of_outlier_gate": true,
         "of_local_speed": true,
@@ -523,7 +527,7 @@
         "csv_preset": "generic",
         "time_offset_s": 0.0,
         "max_gap_s": 1.0,
-        "use_heading": true,
+        "use_heading": false,
         "use_altitude": true,
         "reference_heading_deg": 0.0,
         "camera_yaw_offset_deg": 0.0

@@ -16,6 +16,7 @@ class TrajectoryFilter:
         measurement_noise=5.0,
         dt=1.0,
         reanchor_velocity_from_fixes: bool = False,
+        max_gap_s: float = 0.0,
     ):
         # Filter state: [x, y, vx, vy]
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
@@ -48,6 +49,12 @@ class TrajectoryFilter:
         # <= 5 s apart), else the filter's own velocity.
         self._reanchor_from_fixes = bool(reanchor_velocity_from_fixes)
         self._last_trusted: tuple[float, float, float] | None = None
+        # Restart after a long measurement gap (tracking.kalman_max_gap_s;
+        # 0 = legacy). Prediction is clamped to 5 s, so after a longer gap the
+        # whole unexplained displacement entered the velocity (wayback route
+        # 2026-10-28: 15 s without a fix -> 214 m/s instead of 45, output 56 m
+        # off while the raw measurements were 5 m off).
+        self.max_gap_s = max(float(max_gap_s), 0.0)
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(
@@ -182,6 +189,18 @@ class TrajectoryFilter:
         measurement_xy = (float(measurement[0]), float(measurement[1]))
         z = np.array([[measurement_xy[0]], [measurement_xy[1]]])
         self.last_update_reanchored = False
+        if (
+            self.max_gap_s > 0.0
+            and self.is_initialized
+            and timestamp is not None
+            and self.last_update_t is not None
+            and float(timestamp) - self.last_update_t > self.max_gap_s
+        ):
+            logger.info(
+                f"Kalman restart after {float(timestamp) - self.last_update_t:.1f} s "
+                f"without measurements (> {self.max_gap_s} s)"
+            )
+            self.reset()
         if timestamp is not None:
             self.last_update_t = float(timestamp)
 
