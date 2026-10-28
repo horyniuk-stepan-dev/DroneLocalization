@@ -10,7 +10,13 @@ logger = get_logger(__name__)
 class TrajectoryFilter:
     """Kalman filter for GPS trajectory smoothing optimized for high speeds"""
 
-    def __init__(self, process_noise=2.0, measurement_noise=5.0, dt=1.0):
+    def __init__(
+        self,
+        process_noise=2.0,
+        measurement_noise=5.0,
+        dt=1.0,
+        reanchor_velocity_from_fixes: bool = False,
+    ):
         # Filter state: [x, y, vx, vy]
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
 
@@ -29,6 +35,19 @@ class TrajectoryFilter:
         # trusted-fix re-anchor can also refresh velocity after a manoeuvre.
         self._last_raw: tuple[float, float] | None = None
         self.last_update_reanchored = False
+        # Timestamp [s] of the last update() that passed one (tracking.
+        # kalman_dt_from_timestamps): lets the caller predict over the time
+        # since the LAST FILTER UPDATE instead of its own path's dt.
+        self.last_update_t: float | None = None
+        # Re-anchor velocity source (tracking.kalman_reanchor_velocity_from_fixes,
+        # default off = legacy). Legacy derives it from the LAST RAW measurement,
+        # which is usually an optical-flow sample; a lost OF track (e.g. after a
+        # failed keyframe) then turns a good fix into a velocity of hundreds of
+        # m/s (route3min 2026-10-28: 1.4 m fix -> 127 m on the next frame).
+        # On: velocity between the two latest TRUSTED fixes (both timestamped,
+        # <= 5 s apart), else the filter's own velocity.
+        self._reanchor_from_fixes = bool(reanchor_velocity_from_fixes)
+        self._last_trusted: tuple[float, float, float] | None = None
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(
@@ -72,6 +91,17 @@ class TrajectoryFilter:
         self.kf.Q[1, 3] = q_var[0, 1]  # Y / VY covariance
         self.kf.Q[3, 1] = q_var[1, 0]  # VY / Y covariance
         self.kf.Q[3, 3] = q_var[1, 1]  # VY velocity variance
+
+    def predict_position(self, dt: float = 1.0) -> tuple | None:
+        """Constant-velocity position prediction ``dt`` ahead, side-effect free.
+
+        Same dt clamping as ``update``. None before initialisation.
+        """
+        if not self.is_initialized:
+            return None
+        dt = max(0.01, min(dt, 5.0))
+        x = self.kf.x
+        return (float(x[0, 0] + x[2, 0] * dt), float(x[1, 0] + x[3, 0] * dt))
 
     def mahalanobis_sq(
         self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0
@@ -135,6 +165,7 @@ class TrajectoryFilter:
         dt: float = 1.0,
         noise_scale: float = 1.0,
         trusted_max_offset_m: float | None = None,
+        timestamp: float | None = None,
     ) -> tuple:
         """noise_scale — adaptive measurement noise multiplier:
         > 1 for weak/relative measurements (low confidence, optical flow),
@@ -151,6 +182,8 @@ class TrajectoryFilter:
         measurement_xy = (float(measurement[0]), float(measurement[1]))
         z = np.array([[measurement_xy[0]], [measurement_xy[1]]])
         self.last_update_reanchored = False
+        if timestamp is not None:
+            self.last_update_t = float(timestamp)
 
         if not self.is_initialized:
             self.kf.x = np.array([[measurement_xy[0]], [measurement_xy[1]], [0.0], [0.0]])
@@ -192,7 +225,15 @@ class TrajectoryFilter:
             offset = float(np.hypot(filtered_x - measurement_xy[0], filtered_y - measurement_xy[1]))
             if np.isfinite(max_offset) and max_offset > 0.0 and offset > max_offset:
                 safe_dt = max(dt, 0.01)
-                if self._last_raw is None:
+                if self._reanchor_from_fixes:
+                    tr = self._last_trusted
+                    gap = None if (tr is None or timestamp is None) else float(timestamp) - tr[2]
+                    if gap is not None and 0.0 < gap <= 5.0:
+                        vx = (measurement_xy[0] - tr[0]) / gap
+                        vy = (measurement_xy[1] - tr[1]) / gap
+                    else:
+                        vx, vy = float(self.kf.x[2, 0]), float(self.kf.x[3, 0])
+                elif self._last_raw is None:
                     vx = vy = 0.0
                 else:
                     vx = (measurement_xy[0] - self._last_raw[0]) / safe_dt
@@ -213,6 +254,8 @@ class TrajectoryFilter:
                     f"limit={max_offset:.2f} m, velocity=({vx:.2f}, {vy:.2f}) m/s"
                 )
 
+        if trusted_max_offset_m is not None and timestamp is not None:
+            self._last_trusted = (measurement_xy[0], measurement_xy[1], float(timestamp))
         self._last_raw = measurement_xy
 
         return filtered_x, filtered_y
@@ -236,6 +279,8 @@ class TrajectoryFilter:
         self._prev_raw = None
         self._last_raw = None
         self.last_update_reanchored = False
+        self.last_update_t = None
+        self._last_trusted = None
         self.kf.x = np.zeros((4, 1))
         self.kf.P = np.eye(4) * 1000.0
         logger.info("Kalman filter reset to initial state")

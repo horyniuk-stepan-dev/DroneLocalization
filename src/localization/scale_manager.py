@@ -331,8 +331,10 @@ class ScaleManager:
         """Set a depth-based scale hint for pyramid reordering.
 
         Args:
-            query_depth_scale: 1/median_depth for the query frame.
-            db_depth_scale: median 1/median_depth across DB frames.
+            query_depth_scale: DepthEstimator.get_relative_scale() of the query —
+                1/median(model disparity), i.e. grows with distance.
+            db_depth_scale: median of the same quantity across DB frames.
+                The ratio is therefore query_alt / db_alt, matching ``r``.
         """
         if db_depth_scale < 1e-8:
             return

@@ -7,6 +7,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from config import get_cfg
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
+from src.tracking.keyframe_flow import KeyframeFlow
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -177,9 +178,16 @@ class RealtimeTrackingWorker(QThread):
         frame_duration_sec = 1.0 / video_fps
 
         frame_idx = 0
-        prev_gray_for_of = None
-        prev_gray_half_for_of = None
-        prev_pts_for_of = None
+        # LK tracker anchored at the last accepted keyframe (shared with the
+        # offline replay — src/tracking/keyframe_flow.py).
+        flow = KeyframeFlow(
+            fb_check=self.of_fb_check,
+            fb_max_px=self.of_fb_max_px,
+            half_res=self.of_half_res,
+            win_px=get_cfg(self.config, "tracking.of_lk_win_px", 15),
+            max_level=get_cfg(self.config, "tracking.of_lk_max_level", 2),
+            max_anchor_age_s=get_cfg(self.config, "tracking.of_max_anchor_age_s", 0.0),
+        )
         last_tracked_objects = []
 
         last_localization_video_time = -1.0
@@ -214,8 +222,9 @@ class RealtimeTrackingWorker(QThread):
             is_keyframe = frame_idx % self.keyframe_interval == 0
 
             # dt calculation logic
-            _is_of_frame = not (is_keyframe or prev_pts_for_of is None)
-            if is_keyframe or prev_pts_for_of is None:
+            flow.expire(current_video_time_sec)
+            _is_of_frame = not (is_keyframe or not flow.has_anchor)
+            if is_keyframe or not flow.has_anchor:
                 if last_keyframe_video_time < 0:
                     calculated_dt = self.keyframe_interval * frame_duration_sec
                 else:
@@ -242,7 +251,7 @@ class RealtimeTrackingWorker(QThread):
             loc_result = {"success": False, "error": "Not processed"}
             start_process = time.time()
 
-            if is_keyframe or prev_pts_for_of is None:
+            if is_keyframe or not flow.has_anchor:
                 # ====== HEAVY KEYFRAME LOCALIZATION ======
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -303,15 +312,7 @@ class RealtimeTrackingWorker(QThread):
                     loc_result.get("success")
                     and loc_result.get("fallback_mode") != "retrieval_only"
                 ):
-                    prev_gray_for_of = curr_gray
-                    prev_gray_half_for_of = (
-                        cv2.resize(curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-                        if self.of_half_res
-                        else None
-                    )
-                    prev_pts_for_of = cv2.goodFeaturesToTrack(
-                        curr_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
-                    )
+                    flow.anchor(curr_gray, current_video_time_sec)
 
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
@@ -364,85 +365,19 @@ class RealtimeTrackingWorker(QThread):
                 if self.of_stride > 1 and (frame_idx % self.of_stride) != 0:
                     if object_tracker:
                         self.objects_detected.emit(last_tracked_objects)
-                elif prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
-                    of_scale = (
-                        0.5 if (self.of_half_res and prev_gray_half_for_of is not None) else 1.0
-                    )
-                    if of_scale != 1.0:
-                        g_prev = prev_gray_half_for_of
-                        g_curr = cv2.resize(
-                            curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
-                        )
-                        pts_prev = np.ascontiguousarray(
-                            prev_pts_for_of * of_scale, dtype=np.float32
-                        )
-                    else:
-                        g_prev, g_curr, pts_prev = prev_gray_for_of, curr_gray, prev_pts_for_of
-
-                    curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                        g_prev,
-                        g_curr,
-                        pts_prev,
-                        None,
-                        winSize=(15, 15),
-                        maxLevel=2,
-                    )
-                    keep = status.reshape(-1) == 1
-
-                    # Forward-backward check
-                    if self.of_fb_check and keep.any():
-                        back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
-                            g_curr,
-                            g_prev,
-                            curr_pts,
-                            None,
-                            winSize=(15, 15),
-                            maxLevel=2,
-                        )
-                        rt_err = np.linalg.norm(
-                            back_pts.reshape(-1, 2) - pts_prev.reshape(-1, 2), axis=1
-                        )
-                        fb_ok = (back_status.reshape(-1) == 1) & (rt_err <= self.of_fb_max_px)
-                        if int((keep & fb_ok).sum()) >= 10:
-                            keep = keep & fb_ok
-
-                    good_new = curr_pts.reshape(-1, 2)[keep]
-                    good_old = pts_prev.reshape(-1, 2)[keep]
-                    if of_scale != 1.0:
-                        good_new = good_new / of_scale
-                        good_old = good_old / of_scale
-
-                    if len(good_new) > 10:
-                        flow_vectors = good_new - good_old
-                        dx_px, dy_px = np.median(flow_vectors, axis=0)
-
-                        flow_affine = None
-                        flow_quality = None
-                        try:
-                            S_of, of_mask = cv2.estimateAffinePartial2D(
-                                good_old,
-                                good_new,
-                                method=cv2.RANSAC,
-                                ransacReprojThreshold=3.0,
-                            )
-                            if S_of is not None and np.all(np.isfinite(S_of)):
-                                flow_affine = S_of
-                                if of_mask is not None and len(of_mask) > 0:
-                                    inlier_ratio = float(of_mask.sum()) / len(of_mask)
-                                    n_norm = min(1.0, len(good_new) / 120.0)
-                                    flow_quality = inlier_ratio * n_norm
-                        except cv2.error as e:
-                            logger.debug(f"OF affine estimation failed: {e}")
-
+                elif flow.has_anchor:
+                    meas = flow.track(curr_gray)
+                    if meas is not None:
                         try:
                             loc_result = self.localizer.localize_optical_flow(
-                                dx_px,
-                                dy_px,
+                                meas.dx_px,
+                                meas.dy_px,
                                 dt=calculated_dt,
                                 rot_width=frame.shape[1],
                                 rot_height=frame.shape[0],
-                                flow_affine=flow_affine,
-                                flow_quality=flow_quality,
+                                flow_affine=meas.flow_affine,
+                                flow_quality=meas.flow_quality,
+                                timestamp=current_video_time_sec,
                             )
                         except Exception as e:
                             logger.error(f"OF Localization error: {e}")
@@ -450,10 +385,8 @@ class RealtimeTrackingWorker(QThread):
 
                         if object_tracker:
                             self.objects_detected.emit(last_tracked_objects)
-                    else:
-                        prev_pts_for_of = None
                 else:
-                    prev_pts_for_of = None
+                    flow.clear()
 
             if loc_result.get("success") and loc_result.get("matched_frame", -1) != -1:
                 self.location_found.emit(

@@ -27,10 +27,20 @@ class DepthEstimator:
         raise NotImplementedError
 
     def get_relative_scale(self, image_rgb: np.ndarray) -> float:
-        """Returns a scalar relative depth scale (1/median_depth).
+        """Returns 1 / median of the model output over the central region.
 
-        Smaller value = object farther away (greater altitude) = smaller GSD.
-        Larger value = object closer (lower altitude) = larger GSD.
+        Semantics (corrected 2026-10-27): Depth Anything V2 relative models output
+        affine-invariant DISPARITY (inverse depth; the vendored
+        third_party/Depth-Anything-V2/app.py labels the raw output "can be
+        considered as disparity"). 1 / median(disparity) therefore GROWS with
+        distance: larger value = farther = higher altitude = larger GSD (m/px).
+        ScaleManager.set_depth_hint divides query by DB value, which yields
+        r = query_alt / db_alt in the correct direction.
+
+        Caveat: the output's scale and shift are unknown per image, so the ratio
+        between two images carries little altitude information on near-planar
+        nadir scenes. Check with scripts/check_depth_scale_vs_altitude.py before
+        enabling localization.scale_use_depth_hint.
         """
         depth = self.estimate(image_rgb)
         # Take the central region (ignore edges where artifacts occur)

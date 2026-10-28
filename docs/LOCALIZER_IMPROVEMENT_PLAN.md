@@ -3,6 +3,24 @@
 Date: 2026-10-25. Basis: read-only code audit of the same day (report "Пайплайни AVL з UE5 симулятором").
 Companion plan: `DroneSimUE/Docs/SIMULATOR_IMPROVEMENT_PLAN.md` (the simulator side of the benchmark contract).
 
+## Status (2026-10-27)
+
+| Item | State | Where |
+|---|---|---|
+| 0.2 scorecard | **Done (code)**: `scripts/replay_tracking_ground_truth.py` replays the FULL live loop (keyframes + keyframe-anchored OF, worker dt rules, of_stride), reports p50/p95/max, jumps (step error > 10 m), per-path latency, per-stage timings; `--set key=value` A/B without touching user_config. LK extracted from the worker into `src/tracking/keyframe_flow.py` (bit-exact, tested) so replay and worker run the same code. | Windows run pending |
+| 0.3 depth sign | **Resolved, plan premise was wrong**: DA-V2 outputs disparity (vendored `app.py`), so `1/median` grows with distance and `q/db` = query_alt/db_alt — the direction is CORRECT; only the docstring was wrong (fixed). Real limitation: affine-invariant output → `scripts/check_depth_scale_vs_altitude.py` measures whether the ratio carries altitude at all. Keep `scale_use_depth_hint=false` until it does. | Windows run pending |
+| 0.3 docs | CLAUDE.md: v2.4, FlightSimulator = RotorPy + ortho warp, DroneSimUE added. | Done |
+| 1.1 re-acquisition gate | **Done (flag)** `tracking.outlier_reacquire_consistent` (+ `_tol_m`, `_max_wait`); KF `predict_position()`. | 11 tests |
+| 1.2 robust OF edges | **Done (flag)** `tracking.smoother_odom_huber_k`. Measured: one collapsed 60 m edge → max error 24.6 m quadratic vs 9.6 m Huber at 4 IRLS iterations, 4.5 m at 8 (neighbour edges recover full weight). Enable together with `smoother_irls_iterations: 8` (0.56 ms / 60-node solve). | 5 tests |
+| 1.3 OF decorrelation | **Done (flag, option a)** `tracking.of_noise_growth_per_step`. | Needs Windows replay |
+| 1.4, 1.5 | Open (1.5 waits for simulator S1.1). | |
+| **Sawtooth root cause (2026-10-28)** | Jumps were NOT outliers: (1) LK tracked from the keyframe with a 15 px / 2-level pyramid (~60 px capture) while the scene moves up to ~160 px per interval → track lost (37–74 px error late in the interval); (2) the KF predicted over the worker's keyframe dt (~0.9 s) instead of the time since its last update (~0.17 s). Fix: `tracking.of_lk_win_px=21`, `of_lk_max_level=4`, `kalman_dt_from_timestamps=true`, `kalman_process_noise=8`. route3min full-loop replay: p50 6.1→2.0 m, p95 25.6→13.1 m, max 57→38 m, jumps >10 m 178→11, step p95 19→2.7 m. **Enabled in user_config.json 2026-10-28** (backup `.bak-20261028-pre-lk-kfdt`). Phase-1 flags (reacq/odom/ofdecor/maha) measured ~no effect or trade-offs → left off. | Done |
+| Next | 2.1 oracle replay (`tracking_oracle_ab.ps1`): keyframe raw p95 13 m is now the floor; telemetry A/B (`-Only tele,tele_alt`). | Windows run pending |
+| A/B batch | `scratch/testtopboch_analysis/tracking_phase1_ab.ps1` (base / reacq / odom / ofdecor / maha / all on testtopboch_max_dino336 × route3min) + `tracking_table.py`. | Windows run pending |
+| 2.1 robust `least_squares` loss | **Struck**: already tried as RESEARCH_INTEGRATION_PLAN 1.2 and cancelled — a robust scipy loss suppressed loop closures (see config/graph.py). Keep the calibration-error measurement; use real GNC/PCM instead. | |
+
+Finding while doing 0.2: the existing replay scripts call the localizer only on GT slots (keyframes), so the OF path, smoother odometry edges and OF noise were never exercised by any benchmark — 1.2/1.3 could not have been measured before.
+
 ## Targets (from the user's stated requirements)
 
 | Target | Value | Measured by |
@@ -29,7 +47,7 @@ You cannot reach "p95 < 10 m" while every benchmark is optimistic. Today, query 
   Store it as `benchmarks/eval_set_v1.json` (paths and sha256) so every later A/B uses identical inputs.
 - **0.2 One scorecard script.** Wrap the replay, validate and compare scripts into one command. It should output all target rows above plus a per-stage latency breakdown (normalize / rotation / DINO+VLAD / FAISS / prefilter / ALIKED / LightGlue / MAGSAC / OF / KF+smoother). Without a stage breakdown, the performance work in phase 3 is guesswork.
 - **0.3 Close the open suspicions.**
-  - Depth sign: run `DepthEstimator.estimate()` on one frame with known relief and check the sign of `get_relative_scale`. If it is inverted, either fix it or stop computing `depth_scale` in `database_builder.py:207` (it costs build time and is unused while `scale_use_depth_hint=false`).
+  - Depth sign: resolved 2026-10-27, see Status — direction correct, informativeness unproven.
   - Docs: CLAUDE.md says v2.3, but the code and files are at v2.4. The CLAUDE.md simulator line is also stale.
 
 Exit criterion: the scorecard runs end-to-end on the 0.1 set and gives a baseline row with CIs.
@@ -57,8 +75,8 @@ The audit found the filter and smoother are probabilistically inconsistent. That
 - **2.1 Reference-calibration error budget.** Fix error ≈ homography error + the propagated calibration error of the reference keyframe.
   - First measure the second term alone: compare `get_frame_transform` against simulator ground truth on the DB flight itself. If it already eats a large part of the 10 m, matcher work cannot fix it.
   - Measures for the graph (`src/geometry/pose_graph/`):
-    - `scipy.optimize.least_squares(..., loss="huber"|"cauchy", f_scale=…)` (supported with `method="trf"`) instead of weights + MAD-pruning only;
-    - then a real GNC (Yang et al. 2020) or PCM as an option next to `gnc_spatial`;
+    - ~~robust `least_squares` loss~~ — already tried and cancelled (suppressed loop closures);
+    - a real GNC (Yang et al. 2020) or PCM as an option next to `gnc_spatial`;
     - A/B the stage 7.1 `kinematic_prior_weight` > 0.
 - **2.2 Tilt-aware terrain prior.** `terrain_scale.py` assumes nadir and constant baro altitude. When telemetry gives camera pitch/roll, replace the node prior log GSD = log((H−h)/f) with the slant-range form along the optical axis, and evaluate on the DroneSimUE gimbal sweep. This is the user's "must also work under tilt" requirement.
 - **2.3 Rotation.**

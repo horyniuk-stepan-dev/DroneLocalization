@@ -20,6 +20,9 @@ class OutlierDetector:
         zscore_enabled=True,
         mahalanobis_enabled=False,
         chi2_threshold=13.816,
+        reacquire_consistent=False,
+        reacquire_tol_m=15.0,
+        reacquire_max_wait=10,
     ):
         self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
@@ -48,6 +51,20 @@ class OutlierDetector:
         # but the point of switching is to disable Z-score.
         self._mahalanobis_enabled = bool(mahalanobis_enabled)
         self._chi2_threshold = float(chi2_threshold)
+        # Re-acquisition gate (flag, default off = legacy). Legacy behaviour
+        # accepts the N-th consecutive rejected measurement unconditionally —
+        # a direct jump mechanism when the rejections are random false fixes.
+        # With the flag on, the streak is accepted only once two consecutive
+        # rejected candidates sit at a CONSISTENT offset from the KF prediction
+        # (a real relocation: the filter is wrong by a stable vector). Random
+        # false fixes scatter and keep being rejected. ``reacquire_max_wait``
+        # extra rejections cap the wait (0 = never force), so a filter that is
+        # truly lost cannot lock out every measurement forever.
+        self._reacquire = bool(reacquire_consistent)
+        self._reacquire_tol_m = max(float(reacquire_tol_m), 0.0)
+        self._reacquire_max_wait = max(int(reacquire_max_wait), 0)
+        self._streak_offsets: list[np.ndarray] = []
+        self._streak_no_pred = False
 
         logger.info("Initializing OutlierDetector (Speed-based Z-score)")
         logger.info(
@@ -68,12 +85,58 @@ class OutlierDetector:
         """Full state reset (new tracking session)."""
         self.window.clear()
         self._consecutive_outliers = 0
+        self._streak_offsets.clear()
+
+    def _note_rejection(self, new_pos_np: np.ndarray, pred_position) -> None:
+        """Count one rejected measurement and remember its offset from the KF
+        prediction (ground metres) for the re-acquisition consistency test."""
+        self._consecutive_outliers += 1
+        self._streak_no_pred = pred_position is None
+        if pred_position is None:
+            self._streak_offsets.clear()
+            return
+        off = (new_pos_np - np.asarray(pred_position, dtype=np.float64)) * self._ground_scale
+        self._streak_offsets.append(off)
+        del self._streak_offsets[:-2]
+
+    def _streak_accept(self) -> bool:
+        """Should the current rejection streak be accepted now?"""
+        if self._consecutive_outliers < self._max_consecutive:
+            return False
+        if not self._reacquire or self._streak_no_pred:
+            # legacy: N-th rejection is accepted unconditionally (also when no
+            # KF prediction exists to test consistency against)
+            return True
+        if len(self._streak_offsets) == 2:
+            drift = float(np.linalg.norm(self._streak_offsets[1] - self._streak_offsets[0]))
+            if drift <= self._reacquire_tol_m:
+                logger.warning(
+                    f"OUTLIER RE-ACQUIRE: two consecutive rejected fixes agree "
+                    f"(offset change {drift:.1f} m <= {self._reacquire_tol_m:.1f} m)"
+                )
+                return True
+        if (
+            self._reacquire_max_wait > 0
+            and self._consecutive_outliers >= self._max_consecutive + self._reacquire_max_wait
+        ):
+            logger.warning(
+                f"OUTLIER RE-ACQUIRE: forced after {self._consecutive_outliers} "
+                f"inconsistent rejections"
+            )
+            return True
+        return False
+
+    def _accept_streak(self) -> None:
+        self.window.clear()
+        self._consecutive_outliers = 0
+        self._streak_offsets.clear()
 
     def add_position(self, position: tuple, dt: float = 1.0, reset_consecutive: bool = True):
         # Now we store both position and dt (time it took to reach this position)
         self.window.append((np.array(position, dtype=np.float64), max(dt, 0.01)))
         if reset_consecutive:
             self._consecutive_outliers = 0
+            self._streak_offsets.clear()
 
     def is_outlier(
         self,
@@ -81,6 +144,7 @@ class OutlierDetector:
         dt: float = 1.0,
         ref_position: tuple | None = None,
         maha_d2: float | None = None,
+        pred_position: tuple | None = None,
     ) -> bool:
         """Anomaly detection for measurements.
 
@@ -96,6 +160,9 @@ class OutlierDetector:
 
         Passing the previous RAW OF-position as ref_position makes the calculation
         local (frame relative to frame) and removes accumulation.
+
+        ``pred_position`` — KF prediction for this measurement time; used only by
+        the re-acquisition gate (``reacquire_consistent``). None = legacy.
         """
         # The Mahalanobis branch does not need a speed window: the filter
         # covariance already encodes the full history. It is therefore checked
@@ -107,14 +174,13 @@ class OutlierDetector:
 
         if len(self.window) < 3:
             if is_maha_outlier:
-                self._consecutive_outliers += 1
-                if self._consecutive_outliers >= self._max_consecutive:
+                self._note_rejection(np.array(new_position, dtype=np.float64), pred_position)
+                if self._streak_accept():
                     logger.warning(
                         f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
                         f"accepting new position (mahalanobis d2={maha_d2:.1f})"
                     )
-                    self.window.clear()
-                    self._consecutive_outliers = 0
+                    self._accept_streak()
                     return False
                 logger.warning(
                     f"OUTLIER DETECTED (mahalanobis): d2={maha_d2:.2f} > "
@@ -159,18 +225,17 @@ class OutlierDetector:
         )
 
         if is_speed_outlier or is_zscore_outlier or is_maha_outlier:
-            self._consecutive_outliers += 1
+            self._note_rejection(new_pos_np, pred_position)
 
             # Too many consecutive outliers — drone actually moved, reset window
-            if self._consecutive_outliers >= self._max_consecutive:
+            if self._streak_accept():
                 logger.warning(
                     f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
                     f"accepting new position. "
                     f"Position: ({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
                     f"speed={instantaneous_speed:.1f}m/s"
                 )
-                self.window.clear()
-                self._consecutive_outliers = 0
+                self._accept_streak()
                 return False  # Accept the new position
 
             if is_maha_outlier and not is_speed_outlier:
@@ -195,4 +260,5 @@ class OutlierDetector:
             return True
 
         self._consecutive_outliers = 0
+        self._streak_offsets.clear()
         return False

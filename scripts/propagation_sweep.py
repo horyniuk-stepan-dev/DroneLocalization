@@ -90,9 +90,23 @@ def load_variants(path: Path, config: dict) -> list[dict]:
     return variants
 
 
+# propagation.* keys applied INSIDE _match_and_build_edge (its cached result).
+PAIR_MATCH_KEYS = ("pair_min_inlier_ratio", "pair_min_spread", "pair_max_error_px")
+
+
 def match_settings_key(config: dict) -> str:
     relevant = {section: config.get(section) for section in MATCH_SECTIONS}
-    relevant["mnn_fallback"] = (config.get("propagation") or {}).get("mnn_fallback")
+    prop = config.get("propagation") or {}
+    relevant["mnn_fallback"] = prop.get("mnn_fallback")
+    # Pair thresholds change what a cached match returns. They enter the key
+    # only when they differ from the app config, so caches filled before this
+    # key existed stay valid for the base settings.
+    from config import APP_CONFIG
+
+    base = APP_CONFIG.get("propagation") or {}
+    changed = {k: prop.get(k) for k in PAIR_MATCH_KEYS if prop.get(k) != base.get(k)}
+    if changed:
+        relevant["pair_match"] = changed
     text = json.dumps(relevant, sort_keys=True, default=str)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
@@ -288,18 +302,48 @@ def run_variant(variant, args, base_config, cache, matchers, gt_slots, run) -> d
         identity.update({id(value): slot for slot, value in features.items()})
         return features
 
+    # high_accuracy / relative mode: _match_and_build_edge also records side
+    # results (inlier point pair, pair homography, diagnostics) that later
+    # stages read (_local_overlap_links unpacks _last_inlier_pair). The cache
+    # stores and replays them; legacy entries (bare tuples) replay none.
+    side_maps = ("_relative_point_pairs", "_pair_homographies", "_pair_diagnostics")
+
     def match(features_a, features_b):
         key = (identity.get(id(features_a)), identity.get(id(features_b)), settings)
         if None in key[:2]:
-            raise RuntimeError("match called with features outside the prefetched set")
-        if key in cache.pairs:
+            # Derived features (rotation_retry rotates a keyframe's features)
+            # have no slot identity: match them uncached; cache-only cannot.
+            stats["uncached"] = stats.get("uncached", 0) + 1
+            if args.cache_only:
+                pipeline._last_inlier_pair = None
+                return None
+            return original_match(features_a, features_b)
+        ids = pipeline._relative_feature_ids
+        pair = (ids.get(id(features_a)), ids.get(id(features_b)))
+        legacy = key in cache.pairs and not isinstance(cache.pairs[key], dict)
+        if key in cache.pairs and not (legacy and not args.cache_only):
             stats["hits"] += 1
-            return cache.pairs[key]
+            entry = cache.pairs[key]
+            if legacy:  # cache-only: replay the bare result, no side data
+                pipeline._last_inlier_pair = None
+                return entry
+            pipeline._last_inlier_pair = entry.get("inlier_pair")
+            if None not in pair:
+                for name in side_maps:
+                    value = entry.get(name)
+                    if value is not None:
+                        getattr(pipeline, name)[pair] = value
+            return entry["result"]
         if args.cache_only:
             stats["misses"] += 1
+            pipeline._last_inlier_pair = None
             return None
         result = original_match(features_a, features_b)
-        cache.pairs[key] = result
+        entry = {"result": result, "inlier_pair": pipeline._last_inlier_pair}
+        if None not in pair:
+            for name in side_maps:
+                entry[name] = getattr(pipeline, name, {}).get(pair)
+        cache.pairs[key] = entry
         cache.dirty = True
         stats["new"] += 1
         return result

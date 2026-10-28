@@ -78,6 +78,9 @@ class Localizer:
             process_noise=get_cfg(self.config, "tracking.kalman_process_noise", 2.0),
             measurement_noise=get_cfg(self.config, "tracking.kalman_measurement_noise", 5.0),
             dt=1.0,
+            reanchor_velocity_from_fixes=get_cfg(
+                self.config, "tracking.kalman_reanchor_velocity_from_fixes", False
+            ),
         )
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
@@ -87,6 +90,11 @@ class Localizer:
             zscore_enabled=get_cfg(self.config, "tracking.outlier_zscore_enabled", True),
             mahalanobis_enabled=get_cfg(self.config, "tracking.outlier_mahalanobis_enabled", False),
             chi2_threshold=get_cfg(self.config, "tracking.outlier_chi2_threshold", 13.816),
+            reacquire_consistent=get_cfg(
+                self.config, "tracking.outlier_reacquire_consistent", False
+            ),
+            reacquire_tol_m=get_cfg(self.config, "tracking.outlier_reacquire_tol_m", 15.0),
+            reacquire_max_wait=get_cfg(self.config, "tracking.outlier_reacquire_max_wait", 10),
         )
         self._maha_gate_enabled = get_cfg(
             self.config, "tracking.outlier_mahalanobis_enabled", False
@@ -111,6 +119,7 @@ class Localizer:
                 deadband_m=get_cfg(self.config, "tracking.smoother_deadband_m", 2.0),
                 gain=get_cfg(self.config, "tracking.smoother_gain", 0.25),
                 max_step_m=get_cfg(self.config, "tracking.smoother_max_step_m", 3.0),
+                odom_huber_k=get_cfg(self.config, "tracking.smoother_odom_huber_k", 0.0),
             )
 
         # Retriever: single-database mode fallback
@@ -182,6 +191,28 @@ class Localizer:
         # Calculating local frame-to-frame velocity instead of accumulated
         self._of_local_speed = get_cfg(self.config, "tracking.of_local_speed", False)
         self._last_of_raw: np.ndarray | None = None
+        # OF decorrelation (flag; 0.0 = legacy). Every OF position is projected
+        # through the SAME keyframe homography (LK always tracks from the
+        # keyframe), so the keyframe's error is shared by all of them; feeding
+        # them to the KF as independent fixes counts that error N times. The OF
+        # measurement noise is therefore inflated by (1 + growth * n), n = OF
+        # samples since the keyframe, which caps their joint information.
+        self._of_noise_growth = max(
+            float(get_cfg(self.config, "tracking.of_noise_growth_per_step", 0.0)), 0.0
+        )
+        self._of_steps_since_kf = 0
+        # KF prediction interval (flag; False = legacy). The worker's dt is
+        # path-specific: a keyframe gets the time since the previous KEYFRAME
+        # although the KF was last updated by optical flow ~1/6 s earlier, so the
+        # constant-velocity model predicted ~0.9 s instead of ~0.17 s on every
+        # keyframe and lagged in between (measured 2026-10-28: raw OF step ratio
+        # 0.99, filtered 0.62-0.71; offline KF replay: jumps >10 m 190 -> 6).
+        # True = KF dt from frame timestamps since its last update; outlier
+        # detector and smoother keep the worker dt.
+        self._kf_dt_from_ts = bool(
+            get_cfg(self.config, "tracking.kalman_dt_from_timestamps", False)
+        )
+        self._frame_timestamp: float | None = None
 
         # Accepting measurements when strong independent geometric evidence is present
         self._trust_strong = get_cfg(self.config, "tracking.outlier_trust_strong_evidence", False)
@@ -733,6 +764,7 @@ class Localizer:
         self.trajectory_filter.reset()
         self.outlier_detector.reset()
         self._last_of_raw = None
+        self._of_steps_since_kf = 0
         self._consecutive_failures = 0
         self._last_best_angle = None
         self._last_state = None
@@ -815,6 +847,7 @@ class Localizer:
     ) -> dict:
         # Height above ground / take-off from telemetry (localization.altitude_hint).
         self._telemetry_altitude_m = altitude_m
+        self._frame_timestamp = None if timestamp is None else float(timestamp)
         enabled = get_cfg(self.config, "localization.layer_search.enabled", False)
         if enabled and self.db_manager is not None:
             return self._localize_layers(
@@ -878,6 +911,18 @@ class Localizer:
         if need > 0 and int(getattr(self, "_prev_fix_inliers", 0) or 0) < need:
             return 0
         return cap
+
+    def _filter_dt(self, dt: float) -> float:
+        """KF prediction interval: time since the filter's last update when
+        tracking.kalman_dt_from_timestamps is on and both timestamps are known;
+        otherwise the caller's dt (legacy)."""
+        if not self._kf_dt_from_ts or self._frame_timestamp is None:
+            return dt
+        last = self.trajectory_filter.last_update_t
+        if last is None:
+            return dt
+        elapsed = self._frame_timestamp - last
+        return elapsed if elapsed > 0.0 else dt
 
     def _coordinate_result(self, result):
         if self.relative_mode:
@@ -1612,12 +1657,18 @@ class Localizer:
         # yet computed (it is below in Step 8), and reordering for the sake of
         # the gate would mean changing more than the task requires. Consequence: for
         # fixes with low confidence gate is slightly stricter than subsequent update.
+        _kf_dt = self._filter_dt(dt)
         _maha_d2 = (
-            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.0)
+            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=_kf_dt, noise_scale=1.0)
             if self._maha_gate_enabled
             else None
         )
-        if not _strong and self.outlier_detector.is_outlier(metric_pt, dt, maha_d2=_maha_d2):
+        if not _strong and self.outlier_detector.is_outlier(
+            metric_pt,
+            dt,
+            maha_d2=_maha_d2,
+            pred_position=self.trajectory_filter.predict_position(_kf_dt),
+        ):
             logger.warning(
                 f"Outlier filtered | matched_frame={best_candidate_id}, "
                 f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
@@ -1658,9 +1709,10 @@ class Localizer:
             if self.relative_mode
             else self.trajectory_filter.update(
                 metric_pt,
-                dt=dt,
+                dt=_kf_dt,
                 noise_scale=1.0 / max(confidence, 0.25),
                 trusted_max_offset_m=(self._trusted_fix_max_filter_offset if _strong else None),
+                timestamp=self._frame_timestamp,
             )
         )
         # RESEARCH 3.1: back-end smoother — fix window + OF-odometry;
@@ -1704,6 +1756,7 @@ class Localizer:
         # (ref=None -> database = newly added position in window), not from OF-measurement
         # of previous cycle. Otherwise database of shift and dt diverge again.
         self._last_of_raw = None
+        self._of_steps_since_kf = 0
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
@@ -1778,6 +1831,7 @@ class Localizer:
         rot_height: int,
         flow_affine: np.ndarray | None = None,
         flow_quality: float | None = None,
+        timestamp: float | None = None,
     ) -> dict:
         """Localization based on pixel shift from Optical Flow.
 
@@ -1905,10 +1959,14 @@ class Localizer:
         # if rejected). Without it reference is last accepted position, usually
         # keyframe, and speed accumulates along with LK shift.
         _of_ref = self._last_of_raw if self._of_local_speed else None
+        self._of_steps_since_kf += 1
+        _of_corr = 1.0 + self._of_noise_growth * (self._of_steps_since_kf - 1)
         # noise_scale=1.5 matches base multiplier of OF-branch update() at
         # of_conf=1.0 — OF measurement is inherently noisier than keyframe-fix.
+        self._frame_timestamp = None if timestamp is None else float(timestamp)
+        _kf_dt = self._filter_dt(dt)
         _maha_d2 = (
-            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.5)
+            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=_kf_dt, noise_scale=1.5 * _of_corr)
             if self._maha_gate_enabled
             else None
         )
@@ -1917,7 +1975,11 @@ class Localizer:
             and self._of_outlier_gate
             and not _strong_flow
             and self.outlier_detector.is_outlier(
-                metric_pt, dt, ref_position=_of_ref, maha_d2=_maha_d2
+                metric_pt,
+                dt,
+                ref_position=_of_ref,
+                maha_d2=_maha_d2,
+                pred_position=self.trajectory_filter.predict_position(_kf_dt),
             )
         )
         # Updating BEFORE early return: next frame must be compared with this one
@@ -1953,7 +2015,10 @@ class Localizer:
             metric_pt
             if self.relative_mode
             else self.trajectory_filter.update(
-                metric_pt, dt=dt, noise_scale=1.5 / max(of_conf, 0.25)
+                metric_pt,
+                dt=_kf_dt,
+                noise_scale=1.5 * _of_corr / max(of_conf, 0.25),
+                timestamp=self._frame_timestamp,
             )
         )
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
@@ -1962,6 +2027,9 @@ class Localizer:
             float(filtered_pt[0]), float(filtered_pt[1])
         )
         self._sync_ground_scale(lat)
+        # Raw OF position (before KF / smoother), for diagnostics and replay
+        # scoring — same meaning as raw_lat/raw_lon of a keyframe result.
+        raw_lat, raw_lon = self.calibration.converter.metric_to_gps(mx, my)
 
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
 
@@ -1970,6 +2038,8 @@ class Localizer:
                 "success": True,
                 "lat": lat,
                 "lon": lon,
+                "raw_lat": raw_lat,
+                "raw_lon": raw_lon,
                 "confidence": round(of_conf, 3),
                 "matched_frame": int(self._last_state.get("candidate_id", -1)),
                 "inliers": of_inliers,

@@ -34,7 +34,8 @@ Deliberate deviations from the plan text (rationale in the design note):
 The problem solved per window (positions p_i, i = 0..N-1):
 
     sum_i  w_i * ||p_i - z_i||^2          (fixes; w_i Huber-reweighted, IRLS)
-  + sum_e  w_e * ||p_j - p_i - d_e||^2    (odometry edges; quadratic)
+  + sum_e  w_e * ||p_j - p_i - d_e||^2    (odometry edges; quadratic, or
+                                          Huber-IRLS when odom_huber_k > 0)
   + entry prior on the oldest node        (carries marginalized info forward)
 
 x and y decouple into two SPD N x N systems sharing the same matrix.
@@ -144,6 +145,7 @@ class SlidingWindowSmoother:
         deadband_m: float = 2.0,
         gain: float = 0.25,
         max_step_m: float = 3.0,
+        odom_huber_k: float = 0.0,
     ) -> None:
         self.window = max(int(window), 2)
         # Sanitise user-supplied parameters (live incident 2026-07-18:
@@ -163,6 +165,16 @@ class SlidingWindowSmoother:
         self.deadband_m = self._sane("deadband_m", deadband_m, 0.0)
         self.gain = min(self._sane("gain", gain, 0.01), 1.0)
         self.max_step_m = self._sane("max_step_m", max_step_m, 0.01)
+        # Robust odometry (flag; 0 = legacy quadratic edges). A collapsed OF
+        # track (LK lock lost on repetitive farmland, cloud, water) produces an
+        # edge that contradicts the fixes; quadratic edges pass that error into
+        # the window at full weight. Huber on the normalized edge residual
+        # (|p_b - p_a - d| / sigma_e) suppresses it the same way fixes are.
+        k_odom = float(odom_huber_k)
+        if not np.isfinite(k_odom) or k_odom <= 0.0:
+            self.odom_huber_k = 0.0
+        else:
+            self.odom_huber_k = max(k_odom, 0.1)
 
         self._nodes: list[_Node] = []
         self._edges: list[_Edge] = []
@@ -177,10 +189,12 @@ class SlidingWindowSmoother:
         self._t_last_node = 0.0
         self._last_solution: dict[int, np.ndarray] = {}
         self._last_fix_weights: dict[int, float] = {}
+        self._last_edge_weights: list[float] = []
 
         logger.info(
             f"SlidingWindowSmoother: window={self.window}, huber_k={self.huber_k}, "
-            f"fix_sigma={self.fix_sigma_base_m}m, odom_sigma={self.odom_sigma_base_m}m"
+            f"fix_sigma={self.fix_sigma_base_m}m, odom_sigma={self.odom_sigma_base_m}m, "
+            f"odom_huber_k={self.odom_huber_k or 'off'}"
         )
 
     @staticmethod
@@ -203,6 +217,7 @@ class SlidingWindowSmoother:
         self._t_last_node = 0.0
         self._last_solution.clear()
         self._last_fix_weights.clear()
+        self._last_edge_weights = []
 
     def note_of(self, metric_xy, dt: float, quality: float | None = None) -> None:
         """Register a successful optical-flow localization (raw metric point).
@@ -375,6 +390,8 @@ class SlidingWindowSmoother:
 
         diag = np.arange(n)
         hw = np.ones(n, dtype=np.float64)  # Huber weights on fixes
+        hw_e = np.ones(len(e_w), dtype=np.float64)  # Huber weights on odometry
+        e_sig = 1.0 / np.sqrt(np.maximum(e_w, 1e-300))
         p = z.copy()
 
         for _ in range(self.irls_iterations):
@@ -392,12 +409,13 @@ class SlidingWindowSmoother:
                     b[i] += pw * node.prior[0]
 
             if len(self._edges):
-                np.add.at(A, (e_a, e_a), e_w)
-                np.add.at(A, (e_b, e_b), e_w)
-                np.add.at(A, (e_a, e_b), -e_w)
-                np.add.at(A, (e_b, e_a), -e_w)
-                np.subtract.at(b, e_a, e_w[:, None] * e_d)
-                np.add.at(b, e_b, e_w[:, None] * e_d)
+                ew = e_w * hw_e
+                np.add.at(A, (e_a, e_a), ew)
+                np.add.at(A, (e_b, e_b), ew)
+                np.add.at(A, (e_a, e_b), -ew)
+                np.add.at(A, (e_b, e_a), -ew)
+                np.subtract.at(b, e_a, ew[:, None] * e_d)
+                np.add.at(b, e_b, ew[:, None] * e_d)
 
             try:
                 p = np.linalg.solve(A, b)
@@ -407,9 +425,14 @@ class SlidingWindowSmoother:
 
             u = np.linalg.norm(p - z, axis=1) / sig
             hw = np.where(u <= self.huber_k, 1.0, self.huber_k / np.maximum(u, 1e-12))
+            if self.odom_huber_k > 0.0 and len(self._edges):
+                r_e = np.linalg.norm(p[e_b] - p[e_a] - e_d, axis=1) / e_sig
+                k = self.odom_huber_k
+                hw_e = np.where(r_e <= k, 1.0, k / np.maximum(r_e, 1e-12))
 
         self._last_solution = {node.uid: p[i].copy() for i, node in enumerate(self._nodes)}
         self._last_fix_weights = {node.uid: float(hw[i]) for i, node in enumerate(self._nodes)}
+        self._last_edge_weights = [float(w) for w in hw_e]
         return p
 
     # ── introspection (tests / telemetry) ────────────────────────────────────
@@ -426,3 +449,9 @@ class SlidingWindowSmoother:
     def last_fix_weights(self) -> dict[int, float]:
         """uid -> final Huber weight of the fix (1.0 = fully trusted)."""
         return dict(self._last_fix_weights)
+
+    @property
+    def last_edge_weights(self) -> list[float]:
+        """Final Huber weights of odometry edges in edge order (1.0 = trusted;
+        all 1.0 when odom_huber_k is off)."""
+        return list(self._last_edge_weights)

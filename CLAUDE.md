@@ -265,9 +265,10 @@ Environment facts and repo conventions verified in past sessions. The Operating 
 - `user_config.json.bak-*` files are known-good baselines for regression comparison — never overwrite or "clean up".
 
 
-## Paired project: FlightSimulator
+## Paired projects: FlightSimulator and DroneSimUE
 
-- FlightSimulator (sibling folder) records `flight.mp4` + `calibration.json` (+ `ground_truth.json`) that this project consumes. The calibration format is versioned — CalibrationLogger writes v2.3; v2.2 recordings (e.g. the 2026-06-21 pair) have broken-by-construction anchors and must not be used for benchmarks.
+- FlightSimulator (sibling folder) is RotorPy dynamics + an Esri orthophoto warp renderer with DEM parallax (not Flightmare/Cesium). It records `flight.mp4` + `calibration.json` (+ `ground_truth.json` gt-2.0) that this project consumes. The calibration format is versioned — CalibrationLogger writes v2.4 (`calibration_logger.py`); v2.2 recordings (e.g. the 2026-06-21 pair) have broken-by-construction anchors and must not be used for benchmarks.
+- DroneSimUE (sibling folder, UE 5.8 + Cesium for Unreal) currently writes only `flight.mp4` + `frames.csv`/`telemetry.csv`; it does not yet emit `calibration.json`/gt-2.0, so it cannot be scored here until its exporter exists (`DroneSimUE/Docs/SIMULATOR_IMPROVEMENT_PLAN.md` S0).
 - Recorder `--frame-step` must equal this project's `database.frame_step` (30). Any format change must update both projects and bump the version field together.
 
 
