@@ -4,8 +4,11 @@
     <title>Drone Tracker Map</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- Leaflet 1.9.4 vendored locally so the map works offline -->
+    <link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+    <script src="vendor/leaflet/leaflet.js"></script>
+    <link rel="stylesheet" href="map_tools.css" />
+    <script src="map_tools.js"></script>
     <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
     <style>
         body, html { padding: 0; margin: 0; height: 100%; overflow: hidden; background: #1a1a2e; }
@@ -121,6 +124,7 @@
         var panoramaOverlay  = null;
         var verificationMarkers = L.layerGroup().addTo(map);
         var objectMarkersLayer = L.layerGroup().addTo(map);
+        var manualTargetsLayer = L.layerGroup().addTo(map);
 
         // ── Bridge functions ──────────────────────────────────────────────────
         function updateMarker(lat, lon) {
@@ -160,6 +164,9 @@
             }
             if (objectMarkersLayer) {
                 objectMarkersLayer.clearLayers();
+            }
+            if (manualTargetsLayer) {
+                manualTargetsLayer.clearLayers();
             }
         }
 
@@ -261,6 +268,27 @@
             });
         }
 
+        function updateManualTargets(json) {
+            manualTargetsLayer.clearLayers();
+            JSON.parse(json).forEach(t => {
+                if (t.trail && t.trail.length > 1) {
+                    manualTargetsLayer.addLayer(L.polyline(t.trail, {
+                        color: '#00e676', weight: 2, opacity: 0.8, dashArray: '4 4'
+                    }));
+                }
+                if (t.lat === null || t.lat === undefined) return;
+                var m = L.circleMarker([t.lat, t.lon], {
+                    radius: 8,
+                    color: '#ffffff',
+                    weight: 2,
+                    fillColor: t.lost ? '#ff9800' : '#00e676',
+                    fillOpacity: 0.9
+                });
+                m.bindTooltip(t.label, {permanent: true, direction: 'top', className: 'marker-label'});
+                manualTargetsLayer.addLayer(m);
+            });
+        }
+
         function toggleObjectMarkers(show) {
             if (show) {
                 if (!map.hasLayer(objectMarkersLayer)) {
@@ -289,9 +317,17 @@
                     bridge.clearVerificationMarkersSignal.connect(clearVerificationMarkers);
                     bridge.updateObjectMarkersSignal.connect(updateObjectMarkers);
                     bridge.toggleObjectMarkersSignal.connect(toggleObjectMarkers);
+                    bridge.updateManualTargetsSignal.connect(updateManualTargets);
+
+                    // ── User map tools (point / area / ruler ...) ─────────────
+                    var tools = new MapTools(map, bridge);
+                    window.mapTools = tools;
+                    bridge.loadFeaturesSignal.connect(function(json) { tools.loadFeatures(json); });
+                    bridge.rulerMeasuredSignal.connect(function(text) { tools.setRulerText(text); });
 
                     // ── JS -> Python: Notify on map click ─────────────────────
                     map.on('click', function(e) {
+                        if (tools.isBusy()) return;  // a drawing tool owns the click
                         bridge.mapClicked(e.latlng.lat, e.latlng.lng);
                     });
 

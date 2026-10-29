@@ -64,6 +64,23 @@ class ObjectTrackingConfig(BaseModel):
     project_to_gps: bool = True  # False = track in the image only, no GPS
 
 
+class ManualTrackingConfig(BaseModel):
+    """Objects the operator outlines on the video (src/tracking/manual_target_tracker.py).
+
+    Inactive until a box is drawn ("🎯 Обрати об'єкт"), so enabling it changes
+    nothing for runs without manual selection.
+    """
+
+    enabled: bool = True
+    tracker: str = "csrt"  # csrt (accurate) | kcf (fast) | mil; falls back in that order
+    max_side: int = 960  # tracker works on a frame downscaled to this long side (px)
+    reacquire_ncc: float = 0.6  # template-match score needed to re-acquire a lost target
+    template_refresh_frames: int = 30
+    gps_smoothing_alpha: float = 0.5  # EMA weight of the newest position; 1.0 = raw
+    map_update_hz: float = 5.0  # map refresh rate for manual targets
+    trail_max_points: int = 500  # trajectory points kept per target on the map
+
+
 class LiveStreamConfig(BaseModel):
     """Live / file video input (src/video/video_source.py).
 
@@ -154,6 +171,7 @@ class AppConfig(BaseModel):
     live_stream: LiveStreamConfig = LiveStreamConfig()
     network_api: NetworkApiConfig = NetworkApiConfig()
     object_tracking: ObjectTrackingConfig = ObjectTrackingConfig()
+    manual_tracking: ManualTrackingConfig = ManualTrackingConfig()
     global_descriptor: GlobalDescriptorConfig = GlobalDescriptorConfig()
     database: DatabaseConfig = DatabaseConfig()
     localization: LocalizationConfig = LocalizationConfig()

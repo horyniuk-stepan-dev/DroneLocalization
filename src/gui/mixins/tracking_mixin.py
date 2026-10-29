@@ -1,3 +1,5 @@
+import time
+
 import cv2
 import numpy as np
 from PyQt6.QtCore import pyqtSlot
@@ -168,6 +170,7 @@ class TrackingMixin:
         self.tracking_worker.objects_gps_updated.connect(self.on_objects_gps_updated)
         self.tracking_worker.finished.connect(self._on_tracking_finished)
         self.tracking_worker.debug_view_ready.connect(self._on_debug_view_ready)
+        self.tracking_worker.manual_targets_updated.connect(self.on_manual_targets_updated)
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.coordinates_broker.set_coordinate_mode(self.calibration.converter.mode)
@@ -182,6 +185,7 @@ class TrackingMixin:
         self.map_widget.clear_trajectory()
         self._tracking_results = []  # Ініціалізуємо список результатів
         self._object_tracking_results = []  # Список для результатів трекінгу об'єктів
+        self._reset_manual_targets_view()
 
         self.control_panel.set_tracking_enabled(False)
 
@@ -223,6 +227,7 @@ class TrackingMixin:
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.coordinates_broker.set_tracking_active(False)
         self.control_panel.set_tracking_enabled(True)
+        self.video_widget.set_selection_mode(False)
         # Reset REC badge → normal idle state
         self.control_panel.mark_source_tracking("")
         # Restore normal window title
@@ -431,6 +436,133 @@ class TrackingMixin:
             return
         if hasattr(self.map_widget, "update_object_markers"):
             self.map_widget.update_object_markers(points_to_show)
+
+    # ── Manual (operator-selected) targets ───────────────────────────────────
+
+    def _manual_worker(self):
+        w = getattr(self, "tracking_worker", None)
+        return w if w is not None and w.isRunning() else None
+
+    def _reset_manual_targets_view(self):
+        self._manual_trails = {}  # id -> [[lat, lon], ...]
+        self._manual_last_map_t = 0.0
+        self.video_widget.draw_manual_targets([])
+        self.map_widget.update_manual_targets([])
+
+    @pyqtSlot(bool)
+    def on_select_target_toggled(self, checked: bool):
+        worker = self._manual_worker()
+        if checked and (
+            worker is None or not get_cfg(self.config, "manual_tracking.enabled", True)
+        ):
+            self.control_panel.btn_select_target.setChecked(False)
+            return
+        if worker is not None:
+            worker.set_paused(checked)
+        self.video_widget.set_selection_mode(checked)
+        if checked:
+            self.status_bar.showMessage(
+                "Пауза: обведіть об'єкт мишею на відео (Esc або ПКМ — скасувати)"
+            )
+        else:
+            self.status_bar.clearMessage()
+
+    @pyqtSlot(float, float, float, float)
+    def on_manual_roi_selected(self, x1: float, y1: float, x2: float, y2: float):
+        worker = self._manual_worker()
+        if worker is not None:
+            # Queued before un-pausing: the worker applies it to the frame on screen.
+            worker.add_manual_target((x1, y1, x2, y2))
+        self.control_panel.btn_select_target.setChecked(False)  # → resumes playback
+
+    @pyqtSlot()
+    def on_manual_selection_cancelled(self):
+        self.control_panel.btn_select_target.setChecked(False)
+
+    @pyqtSlot(int)
+    def on_manual_target_remove(self, target_id: int):
+        worker = self._manual_worker()
+        if worker is not None:
+            worker.remove_manual_target(target_id)
+        self._manual_trails.pop(target_id, None)
+
+    @pyqtSlot()
+    def on_clear_manual_targets(self):
+        worker = self._manual_worker()
+        if worker is not None:
+            worker.clear_manual_targets()
+        self._reset_manual_targets_view()
+
+    @pyqtSlot(object)
+    def on_manual_targets_updated(self, targets: list):
+        self.video_widget.draw_manual_targets(targets)
+
+        now = time.monotonic()
+        hz = float(get_cfg(self.config, "manual_tracking.map_update_hz", 5.0))
+        if hz > 0 and now - getattr(self, "_manual_last_map_t", 0.0) < 1.0 / hz:
+            return
+        self._manual_last_map_t = now
+
+        local = self.calibration.converter.mode == "LOCAL"
+        max_pts = int(get_cfg(self.config, "manual_tracking.trail_max_points", 500))
+        trails = getattr(self, "_manual_trails", {})
+        alive = {t["id"] for t in targets}
+        for tid in list(trails):
+            if tid not in alive:
+                trails.pop(tid)
+
+        payload = []
+        for t in targets:
+            lat, lon = t.get("lat"), t.get("lon")
+            trail = trails.setdefault(t["id"], [])
+            if lat is not None and not t.get("lost"):
+                if not trail or trail[-1] != [lat, lon]:
+                    trail.append([lat, lon])
+                    del trail[:-max_pts]
+                    self._object_tracking_results.append(
+                        {
+                            "track_id": f"M{t['id']}",
+                            "class_name": "manual",
+                            **(
+                                {"x": lon, "y": lat, "coordinate_kind": "local_planar",
+                                 "coordinate_units": "arbitrary"}
+                                if local
+                                else {"lat": lat, "lon": lon}
+                            ),
+                            "confidence": 1.0,
+                            "timestamp": str(np.datetime64("now")),
+                        }
+                    )
+            if lat is None:
+                coords = "немає геометрії"
+            elif local:
+                coords = f"X={lon:.1f}, Y={lat:.1f}"
+            else:
+                coords = f"{lat:.6f}, {lon:.6f}"
+            payload.append(
+                {
+                    "id": t["id"],
+                    "lat": lat,
+                    "lon": lon,
+                    "lost": bool(t.get("lost")),
+                    "label": f"🎯 #{t['id']}"
+                    + (
+                        " (поза кадром)"
+                        if t.get("reason") == "out_of_frame"
+                        else (" (втрачено)" if t.get("lost") else "")
+                    ),
+                    "trail": trail,
+                }
+            )
+            t["coords_text"] = coords
+        self.map_widget.update_manual_targets(payload)
+        if targets:
+            for t in targets:
+                if t.get("reason") == "out_of_frame":
+                    t["coords_text"] = "поза кадром, остання точка " + t["coords_text"]
+            self.status_bar.showMessage(
+                " | ".join(f"🎯 #{t['id']}: {t['coords_text']}" for t in targets), 2000
+            )
 
     @pyqtSlot(bool)
     def on_toggle_objects(self, checked: bool):

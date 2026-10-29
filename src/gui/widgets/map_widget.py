@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from config.paths import user_data_dir
+from src.gui.map_features import MapFeature, MapFeatureStore, path_length, ruler_label
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -37,10 +40,53 @@ class MapBridge(QObject):
     # Object tracking markers (JSON string of points)
     updateObjectMarkersSignal = pyqtSignal(str)
     toggleObjectMarkersSignal = pyqtSignal(bool)
+    # Operator-selected targets with trails (JSON list)
+    updateManualTargetsSignal = pyqtSignal(str)
 
     # JS -> Python: Map Click
     mapClickedSignal = pyqtSignal(float, float)
     readySignal = pyqtSignal(str)
+
+    # ── User map tools ───────────────────────────────────────────────────
+    # Python -> JS
+    # JSON list of the current mode's features, each with a "measure" label
+    loadFeaturesSignal = pyqtSignal(str)
+    rulerMeasuredSignal = pyqtSignal(str)  # ruler label text
+    # JS -> Python (re-emitted for MapWidget)
+    featureUpsertRequested = pyqtSignal(str)
+    featureDeleteRequested = pyqtSignal(str)
+    rulerMeasureRequested = pyqtSignal(str)
+    exportRequested = pyqtSignal()
+    importRequested = pyqtSignal()
+    clearFeaturesRequested = pyqtSignal()
+
+    @pyqtSlot(str)
+    def copyToClipboard(self, text: str):
+        QApplication.clipboard().setText(text)
+
+    @pyqtSlot(str)
+    def featureUpsert(self, feature_json: str):
+        self.featureUpsertRequested.emit(feature_json)
+
+    @pyqtSlot(str)
+    def featureDelete(self, feature_id: str):
+        self.featureDeleteRequested.emit(feature_id)
+
+    @pyqtSlot(str)
+    def measureRuler(self, coords_json: str):
+        self.rulerMeasureRequested.emit(coords_json)
+
+    @pyqtSlot()
+    def requestExport(self):
+        self.exportRequested.emit()
+
+    @pyqtSlot()
+    def requestImport(self):
+        self.importRequested.emit()
+
+    @pyqtSlot()
+    def clearFeatures(self):
+        self.clearFeaturesRequested.emit()
 
     @pyqtSlot(str)
     def ready(self, mode: str):
@@ -57,6 +103,7 @@ class MapWidget(QWebEngineView):
     """Interactive map widget backed by Leaflet via QWebChannel."""
 
     mapClicked = pyqtSignal(float, float)  # Public signal
+    featuresChanged = pyqtSignal()  # user-drawn features were added/edited/removed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,12 +112,28 @@ class MapWidget(QWebEngineView):
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
 
+        # The page draws its own right-click menu ("Копіювати координати");
+        # hide Qt's browser menu (Back / Reload / View source) so they don't stack.
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
         self.bridge = MapBridge()
         self.bridge.mapClickedSignal.connect(self.mapClicked)  # Re-emit for convenience
         self.bridge.readySignal.connect(self._on_map_ready)
         self._coordinate_mode = "GEOGRAPHIC"
         self._map_ready = False
         self._pending_updates = []
+
+        # User-drawn features: Python is the source of truth, the page is a view.
+        self.features = MapFeatureStore()
+        self._features_path = user_data_dir() / "map_features.geojson"
+        self._load_autosave()
+        b = self.bridge
+        b.featureUpsertRequested.connect(self._on_feature_upsert)
+        b.featureDeleteRequested.connect(self._on_feature_delete)
+        b.rulerMeasureRequested.connect(self._on_ruler_measure)
+        b.exportRequested.connect(self.export_features)
+        b.importRequested.connect(self.import_features)
+        b.clearFeaturesRequested.connect(self._on_clear_features)
 
         self._channel = QWebChannel()
         self._channel.registerObject("mapBridge", self.bridge)
@@ -122,6 +185,7 @@ class MapWidget(QWebEngineView):
         pending, self._pending_updates = self._pending_updates, []
         for signal, args in pending:
             getattr(self.bridge, signal).emit(*args)
+        self._push_features()  # page reload drops drawn layers — restore them
 
     @pyqtSlot(float, float)
     def update_marker(self, lat: float, lon: float):
@@ -206,3 +270,100 @@ class MapWidget(QWebEngineView):
     @pyqtSlot(bool)
     def set_objects_visible(self, visible: bool):
         self._emit_update("toggleObjectMarkersSignal", visible)
+
+    def update_manual_targets(self, targets: list):
+        """targets: [{id, label, lat, lon, lost, trail: [[lat, lon], ...]}]."""
+        self._emit_update("updateManualTargetsSignal", json.dumps(targets))
+
+    # ── User map tools ───────────────────────────────────────────────────────
+
+    def _push_features(self):
+        payload = json.dumps(self.features.view_payload(self._coordinate_mode), ensure_ascii=False)
+        self._emit_update("loadFeaturesSignal", payload)
+
+    def _features_updated(self):
+        self._push_features()
+        self._autosave()
+        self.featuresChanged.emit()
+
+    def _load_autosave(self):
+        if not self._features_path.exists():
+            return
+        try:
+            n = self.features.load(self._features_path)
+            logger.info(f"Map features loaded: {n} from {self._features_path}")
+        except (OSError, ValueError) as e:
+            logger.warning(f"Map features autosave unreadable ({self._features_path}): {e}")
+
+    def _autosave(self):
+        try:
+            self.features.save(self._features_path)
+        except OSError as e:
+            logger.warning(f"Map features autosave failed: {e}")
+
+    def _on_feature_upsert(self, feature_json: str):
+        try:
+            d = json.loads(feature_json)
+            d["mode"] = self._coordinate_mode
+            if d.get("type") == "circle" and d.get("edge") is not None:
+                d["radius"] = _distance(d["coords"][0], d["edge"], self._coordinate_mode)
+            if d.get("id") and self.features.get(d["id"]) is None:
+                d.pop("id")  # stale id from a page that was reloaded meanwhile
+            feature = self.features.upsert(MapFeature.from_dict(d))
+        except (ValueError, KeyError, TypeError, IndexError) as e:
+            logger.warning(f"Map feature rejected: {e}")
+            return
+        logger.info(f"Map feature saved: {feature.type} '{feature.name}'")
+        self._features_updated()
+
+    def _on_feature_delete(self, feature_id: str):
+        if self.features.remove(feature_id):
+            self._features_updated()
+
+    def _on_clear_features(self):
+        if not self.features.features(self._coordinate_mode):
+            return
+        answer = QMessageBox.question(self, "Очистити карту", "Видалити всі об'єкти на цій карті?")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.features.clear(self._coordinate_mode)
+            self._features_updated()
+
+    def _on_ruler_measure(self, coords_json: str):
+        try:
+            coords = [[float(a), float(b)] for a, b in json.loads(coords_json)]
+        except (ValueError, TypeError):
+            return
+        self._emit_update("rulerMeasuredSignal", ruler_label(coords, self._coordinate_mode))
+
+    @pyqtSlot()
+    def export_features(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Експорт об'єктів карти", "map_features.geojson", "GeoJSON (*.geojson *.json)"
+        )
+        if not path:
+            return
+        try:
+            self.features.save(Path(path))
+            logger.info(f"Map features exported: {path}")
+        except OSError as e:
+            QMessageBox.warning(self, "Експорт", f"Не вдалося зберегти файл:\n{e}")
+
+    @pyqtSlot()
+    def import_features(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Імпорт об'єктів карти", "", "GeoJSON (*.geojson *.json)"
+        )
+        if not path:
+            return
+        try:
+            n = self.features.load(Path(path))
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Імпорт", f"Не вдалося прочитати файл:\n{e}")
+            return
+        logger.info(f"Map features imported: {n} from {path}")
+        self._features_updated()
+
+
+def _distance(a, b, mode: str) -> float:
+    """Distance between two transport-convention points (metres or local units)."""
+    return path_length([[float(a[0]), float(a[1])], [float(b[0]), float(b[1])]], mode)

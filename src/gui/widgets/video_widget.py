@@ -1,4 +1,4 @@
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
@@ -11,6 +11,10 @@ class VideoWidget(QGraphicsView):
     """Displays video frames with optional overlay annotations (calibration points)."""
 
     frame_clicked = pyqtSignal(float, float)  # pixel coords in image space (sub-pixel)
+    # Operator outlined an object: x1, y1, x2, y2 in ACTUAL image pixels
+    roi_selected = pyqtSignal(float, float, float, float)
+    selection_cancelled = pyqtSignal()
+    target_remove_requested = pyqtSignal(int)  # right click on a manual target
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -28,6 +32,13 @@ class VideoWidget(QGraphicsView):
         self._object_overlay_items: list = []
         self._show_objects = True
         self._scene.addItem(self._video_item)
+
+        # Manual target selection (rubber band) + overlays
+        self._selection_mode = False
+        self._sel_start: QPointF | None = None
+        self._sel_item = None
+        self._manual_overlay_items: list = []
+        self._manual_targets: list = []  # last dicts from the worker
 
     # ── Display ──────────────────────────────────────────────────────────────
 
@@ -134,9 +145,136 @@ class VideoWidget(QGraphicsView):
         if not visible:
             self.clear_object_overlays()
 
+    # ── Manual targets ───────────────────────────────────────────────────────
+
+    def set_selection_mode(self, enabled: bool):
+        """Rubber-band mode: drag a box around an object to track it."""
+        self._selection_mode = bool(enabled)
+        self._remove_selection_rect()
+        self._sel_start = None
+        if enabled:
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            self.setFocus()
+        else:
+            self.viewport().unsetCursor()
+
+    def _remove_selection_rect(self):
+        if self._sel_item is not None:
+            self._scene.removeItem(self._sel_item)
+            self._sel_item = None
+
+    def _item_to_actual(self, item_pos) -> tuple[float, float]:
+        """Item (logical) coordinates -> ACTUAL image pixels."""
+        pm = self._video_item.pixmap()
+        br = self._video_item.boundingRect()
+        if br.width() > 0 and br.height() > 0:
+            sx, sy = pm.width() / br.width(), pm.height() / br.height()
+        else:
+            sx = sy = 1.0
+        dpr = self._dpr()
+        return item_pos.x() * sx * dpr, item_pos.y() * sy * dpr
+
+    def _clamped_item_pos(self, view_pos):
+        p = self._video_item.mapFromScene(self.mapToScene(view_pos))
+        br = self._video_item.boundingRect()
+        return QPointF(
+            min(max(p.x(), br.left()), br.right()), min(max(p.y(), br.top()), br.bottom())
+        )
+
+    def draw_manual_targets(self, targets: list):
+        """Boxes of operator-selected targets (dicts from the tracking worker)."""
+        self._manual_targets = list(targets or [])
+        for item in self._manual_overlay_items:
+            self._scene.removeItem(item)
+            item.setParentItem(None)
+        self._manual_overlay_items.clear()
+        if self._video_item.pixmap().isNull():
+            return
+        dpr = self._dpr()
+        img_width = self._video_item.boundingRect().width()
+        pixel_size = max(11, int(img_width) // 90)
+        for t in self._manual_targets:
+            if t.get("reason") == "out_of_frame":
+                continue  # its last box no longer matches the moving camera view
+            x1, y1, x2, y2 = (v / dpr for v in t["bbox"])
+            lost = bool(t.get("lost"))
+            color = QColor(255, 152, 0) if lost else QColor(0, 230, 118)
+            pen = QPen(color, 3)
+            if lost:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            rect = self._scene.addRect(x1, y1, x2 - x1, y2 - y1, pen)
+            self._manual_overlay_items.append(rect)
+            label = f"🎯 #{t['id']}" + (" втрачено" if lost else "")
+            text = self._scene.addText(label)
+            text.setDefaultTextColor(color)
+            font = text.font()
+            font.setBold(True)
+            font.setPixelSize(pixel_size)
+            text.setFont(font)
+            text.setPos(x1, y1 - pixel_size - 6)
+            self._manual_overlay_items.append(text)
+
+    def _manual_target_at(self, ax: float, ay: float) -> int | None:
+        for t in reversed(self._manual_targets):
+            x1, y1, x2, y2 = t["bbox"]
+            if x1 <= ax <= x2 and y1 <= ay <= y2:
+                return int(t["id"])
+        return None
+
+    def keyPressEvent(self, event):
+        if self._selection_mode and event.key() == Qt.Key.Key_Escape:
+            self.set_selection_mode(False)
+            self.selection_cancelled.emit()
+            return
+        super().keyPressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._selection_mode and self._sel_start is not None:
+            p = self._clamped_item_pos(event.pos())
+            r = QRectF(self._sel_start, p).normalized()
+            if self._sel_item is None:
+                pen = QPen(QColor(0, 230, 118), 2, Qt.PenStyle.DashLine)
+                self._sel_item = self._scene.addRect(r, pen, QBrush(QColor(0, 230, 118, 40)))
+            else:
+                self._sel_item.setRect(r)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (
+            self._selection_mode
+            and self._sel_start is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            p = self._clamped_item_pos(event.pos())
+            r = QRectF(self._sel_start, p).normalized()
+            self._sel_start = None
+            self._remove_selection_rect()
+            if r.width() >= 4 and r.height() >= 4:
+                x1, y1 = self._item_to_actual(r.topLeft())
+                x2, y2 = self._item_to_actual(r.bottomRight())
+                self.roi_selected.emit(x1, y1, x2, y2)
+            return
+        super().mouseReleaseEvent(event)
+
     # ── Events ───────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
+        if not self._video_item.pixmap().isNull():
+            if self._selection_mode:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._sel_start = self._clamped_item_pos(event.pos())
+                elif event.button() == Qt.MouseButton.RightButton:
+                    self.set_selection_mode(False)
+                    self.selection_cancelled.emit()
+                return
+            if event.button() == Qt.MouseButton.RightButton and self._manual_targets:
+                item_pos = self._video_item.mapFromScene(self.mapToScene(event.pos()))
+                tid = self._manual_target_at(*self._item_to_actual(item_pos))
+                if tid is not None:
+                    self.target_remove_requested.emit(tid)
+                    return
+
         if self._video_item.pixmap().isNull():
             super().mousePressEvent(event)
             return

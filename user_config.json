@@ -40,6 +40,16 @@
         "show_on_map": true,
         "project_to_gps": true
     },
+    "manual_tracking": {
+        "enabled": true,
+        "tracker": "csrt",
+        "max_side": 960,
+        "reacquire_ncc": 0.6,
+        "template_refresh_frames": 30,
+        "gps_smoothing_alpha": 0.5,
+        "map_update_hz": 5.0,
+        "trail_max_points": 500
+    },
     "global_descriptor": {
         "backend": "dinov3",
         "dinov2": {

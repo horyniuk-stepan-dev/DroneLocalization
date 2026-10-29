@@ -25,7 +25,7 @@ from config.access import (
 from config.app import (
     AppConfig,
     DebugViewsConfig,
-    GuiConfig,
+    FlightDataConfig,
     LiveStreamConfig,
     NetworkApiConfig,
     ObjectTrackingConfig,
@@ -40,15 +40,20 @@ from config.localization import (
     TrackingConfig,
 )
 from config.models import (
+    AlikedSettings,
     CespConfig,
+    DepthEstimatorConfig,
     Dinov2ModelConfig,
     Dinov3ModelConfig,
     GlobalDescriptorConfig,
+    LightGlueSettings,
     ModelsCacheConfig,
     ModelsConfig,
-    ModelSettings,
     PerformanceConfig,
+    RddSettings,
+    SuperPointSettings,
     VramManagementConfig,
+    XFeatSettings,
     YoloConfig,
     get_default_local_extractor,
 )
@@ -64,7 +69,12 @@ __all__ = [
     "Dinov3ModelConfig",
     "GlobalDescriptorConfig",
     "YoloConfig",
-    "ModelSettings",
+    "DepthEstimatorConfig",
+    "AlikedSettings",
+    "XFeatSettings",
+    "SuperPointSettings",
+    "RddSettings",
+    "LightGlueSettings",
     "CespConfig",
     "VramManagementConfig",
     "ModelsCacheConfig",
@@ -84,8 +94,8 @@ __all__ = [
     "PropagationConfig",
     # app
     "PreprocessingConfig",
-    "GuiConfig",
     "DebugViewsConfig",
+    "FlightDataConfig",
     "ObjectTrackingConfig",
     "LiveStreamConfig",
     "NetworkApiConfig",
@@ -292,6 +302,8 @@ APP_CONFIG = APP_SETTINGS.model_dump()
 # ================================================================================
 """Application-level configuration and the top-level AppConfig aggregator."""
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 from config.database import DatabaseConfig
@@ -303,17 +315,14 @@ from config.models import GlobalDescriptorConfig, ModelsConfig
 class PreprocessingConfig(BaseModel):
     clahe_clip_limit: float = 3.0
     clahe_tile_grid: list[int] = [8, 8]
-    # УВАГА: histogram matching ще НЕ реалізований в ImagePreprocessor
-    # (працює лише CLAHE). Прапорець вимкнено, щоб не вводити в оману.
-    histogram_matching: bool = False
-    reference_image_path: str = "config/reference_style.png"
+    # histogram_matching / reference_image_path ВИДАЛЕНО (2026-10): histogram
+    # matching ніколи не був реалізований в ImagePreprocessor (лише CLAHE).
     masking_strategy: str = "yolo"
 
 
-class GuiConfig(BaseModel):
-    video_fps: int = 30
-    verify_display_mode: str = "center"  # "center" | "center_corners" | "full"
-    verify_label_mode: str = "number"
+# Секцію gui (video_fps, verify_display_mode, verify_label_mode) ВИДАЛЕНО
+# (2026-10): діалог налаштувань показував ці поля, але жоден код їх не читав
+# (FPS береться з відео, вигляд перевірки якорів фіксований).
 
 
 class DebugViewsConfig(BaseModel):
@@ -341,6 +350,9 @@ class ObjectTrackingConfig(BaseModel):
     track_activation_threshold: float = 0.25
     lost_track_buffer: int = 30
     minimum_matching_threshold: float = 0.8
+    # COCO ids to track. YOLO detects only the dynamic classes it masks
+    # (person, bicycle, car, motorcycle, bus, truck), so ids outside that set
+    # never appear. Empty list = track every detected class.
     tracked_classes: list[int] = [
         0,
         1,
@@ -349,19 +361,52 @@ class ObjectTrackingConfig(BaseModel):
         5,
         7,
     ]  # COCO: person, bicycle, car, motorcycle, bus, truck
-    show_on_video: bool = True
-    show_on_map: bool = True
-    project_to_gps: bool = True
+    show_on_video: bool = True  # boxes on the video widget
+    show_on_map: bool = True  # markers on the map (export keeps every object)
+    project_to_gps: bool = True  # False = track in the image only, no GPS
 
 
 class LiveStreamConfig(BaseModel):
-    enabled: bool = False
-    source_type: str = "file"  # "file" | "rtsp" | "usb"
-    rtsp_url: str = ""
-    usb_device: int = 0
+    """Live / file video input (src/video/video_source.py).
+
+    The source itself comes from the project (video sources) or --source;
+    enabled / source_type / rtsp_url / usb_device were never read and were
+    removed (2026-10). The type is detected from the source string.
+    """
+
     reconnect_attempts: int = 5
     reconnect_delay_sec: float = 2.0
     buffer_size: int = 1
+
+
+class FlightDataConfig(BaseModel):
+    """Optional drone telemetry (src/flight_data). Default: none — vision only.
+
+    Used as a PRIOR only: heading → rotation prior of each keyframe (a wrong
+    heading costs one retrieval pass, then the vision scan takes over); height
+    → the layer scales tried first (localization.altitude_hint, default off).
+    """
+
+    source: Literal["none", "csv", "mavlink"] = "none"
+    csv_path: str = ""
+    # "mavlink": live stream (pymavlink connection string), e.g. DroneSimUE on
+    # udp 14550. time_offset_s < 0 compensates video latency for this source.
+    mavlink_url: str = "udpin:0.0.0.0:14550"
+    # "generic": time_s, heading_deg, alt_agl_m, alt_rel_m, alt_msl_m, pitch_deg,
+    # roll_deg, lat, lon. "flightsim": FlightSimulator telemetry.csv (timestamp,
+    # yaw_rad, alt_z = height above the simulator's base plane, read as alt_rel_m).
+    csv_preset: Literal["generic", "flightsim"] = "generic"
+    time_offset_s: float = 0.0  # log time = video time + offset (mavlink: now + offset)
+    max_gap_s: float = 1.0  # no row within this → no sample (stale data is not used)
+    use_heading: bool = True
+    # Height above ground (else above take-off) for localization.altitude_hint;
+    # it has an effect only while that hint is enabled.
+    use_altitude: bool = True
+    # Heading the TOP of the reference frames pointed to (heading-hold layers: 0).
+    reference_heading_deg: float = 0.0
+    # Camera mounted rotated relative to the nose (clockwise, degrees);
+    # scripts/fit_yaw_offset.py estimates it from a continuous-mode replay.
+    camera_yaw_offset_deg: float = 0.0
 
 
 class NetworkApiConfig(BaseModel):
@@ -416,13 +461,13 @@ class AppConfig(BaseModel):
     localization: LocalizationConfig = LocalizationConfig()
     tracking: TrackingConfig = TrackingConfig()
     preprocessing: PreprocessingConfig = PreprocessingConfig()
-    gui: GuiConfig = GuiConfig()
     debug_views: DebugViewsConfig = DebugViewsConfig()
     models: ModelsConfig = ModelsConfig()
     projection: ProjectionConfig = ProjectionConfig()
     homography: HomographyConfig = HomographyConfig()
     graph_optimization: GraphOptimizationConfig = GraphOptimizationConfig()
     propagation: PropagationConfig = PropagationConfig()
+    flight_data: FlightDataConfig = FlightDataConfig()
 
 
 # ================================================================================
@@ -499,6 +544,14 @@ class DatabaseConfig(BaseModel):
     sift_max_keypoints: int = 2048
     lancedb_batch_size: int = 64
     lancedb_index_min_frames: int = 256
+    # HDF5 layout (db_writer). Read since schema v2 but undeclared until 2026-10,
+    # so user_config could not change them. max_keypoints_stored is part of the
+    # schema fingerprint: databases built with another value are refused.
+    hdf5_compression: str = "lzf"  # "lzf" | "gzip" | "none"
+    hdf5_chunk_frames: int = 64
+    max_keypoints_stored: int = 2048
+    # Offline database extraction at source resolution. Does not alter live input sizes.
+    accuracy_features: bool = False
     yolo_batch_size: int = 1
 
 
@@ -507,7 +560,9 @@ class DatabaseConfig(BaseModel):
 # ================================================================================
 """Graph-optimization and projection configuration."""
 
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 class ProjectionConfig(BaseModel):
@@ -516,15 +571,13 @@ class ProjectionConfig(BaseModel):
     # з реальними метрами. Існуючі калібрування зберігають свою проєкцію
     # з файлу — зміна впливає лише на нові.
     default_mode: str = "UTM"
-    strict_projection: bool = True
-    fallback_to_webmercator: bool = True
     anchor_rmse_threshold_m: float = 3.0
     anchor_max_error_m: float = 5.0
     # propagation_disagreement_threshold_m ВИДАЛЕНО: жоден код його не читав.
     # Живий поріг розбіжності якорів — graph_optimization.anchor_loo_threshold_m
     # (див. PoseGraphDiagnostics.leave_one_out_anchor_check).
-    localizer_sample_points: int = 9
-    localizer_expected_spread_m: float = 150.0
+    # strict_projection, fallback_to_webmercator, localizer_sample_points,
+    # localizer_expected_spread_m ВИДАЛЕНО (2026-10): жоден код їх не читав.
 
 
 class PropagationConfig(BaseModel):
@@ -549,6 +602,33 @@ class PropagationConfig(BaseModel):
     # На повторюваній ріллі LightGlue місцями «сліпне» (12–28 матчів) там, де
     # MNN по тих самих дескрипторах дає 100–800 пар (перевірено офлайн на lasttest).
     mnn_fallback: bool = False
+
+    # Offline accuracy profile. Legacy behavior stays available for old projects.
+    high_accuracy: bool = False
+    temporal_neighbors: int = Field(4, ge=1, le=20)
+    point_pair_limit: int = Field(512, ge=0)  # 0 retains every verified point
+    pair_min_inlier_ratio: float = Field(0.3, gt=0, le=1)
+    pair_min_spread: float = Field(0.025, ge=0)
+    pair_max_error_px: float = Field(3.0, gt=0)
+    subpixel_refinement: bool = True
+    subpixel_max_correction_px: float = Field(2.0, gt=0)
+    projective_max_evaluations: int = Field(150, ge=1)
+    # Accuracy-profile solver fixes (defaults reproduce the original profile).
+    # Global sparse Levenberg-Marquardt instead of windowed trust-region sweeps:
+    # windows with fixed boundaries cannot carry corrections along long chains.
+    projective_solver: Literal["trf", "lm_sparse"] = "trf"
+    projective_window_frames: int = Field(64, ge=0)  # 0 = always one global solve
+    projective_train_points: int = Field(96, ge=8)  # training observations per link
+    # Anchors as observations: their reference points (points_2d -> points_metric)
+    # constrain the solve instead of freezing the anchor frames at the graph result.
+    accuracy_anchor_points: bool = False
+    accuracy_anchor_sigma_px: float = Field(1.0, gt=0)
+    # DEM + altitude scale prior (same target as the graph terrain prior); 0 = off.
+    accuracy_terrain_scale_sigma: float = Field(0.0, ge=0)
+    # Zero-mean prior on perspective, as expected corner deviation in px; 0 = off.
+    accuracy_perspective_sigma_px: float = Field(0.0, ge=0)
+    # Extra nearby-overlap links found from the map footprint (original: on).
+    accuracy_extra_overlaps: bool = True
 
 
 class GraphOptimizationConfig(BaseModel):
@@ -741,11 +821,42 @@ class GraphOptimizationConfig(BaseModel):
     # справжню анізотропію, але робить _predict_inverse менш точним.
     isotropy_weight: float = 200.0
 
+    # ── Рельєф (terrain scale prior, 2026-10-04). Дефолт off = поточна поведінка. ──
+    # Пласка 5-DoF модель кадру не бачить рельєфу: при сталій висоті польоту
+    # сусідні кадри дивляться на ту саму землю (масштаб ребра ≈ 1), а GSD кадру
+    # = (H − DEM під кадром)/f змінюється. Ланцюг між рідкими якорями тримає
+    # масштаб якоря → похибка росте вздовж галсу (testtopboch_hh: до 460 м).
+    # on: DEM з відкритих джерел (кешується в <проєкт>/terrain), висота польоту
+    # H з якорів (H_a = GSD_a·f + DEM_a), унарний prior масштабу кожного вузла і
+    # корекція ребер на висоту зони перекриття. Див. src/geometry/terrain_scale.py.
+    terrain_scale_prior: bool = False
+    # Вага унарного prior: r = w·cx·(log GSD − log((H − DEM)/f)), як у scale-резидуалі
+    # ребра (вага temporal-ребра ≈ √inliers/(1+rmse), типово 5–15). 0 = лише корекція ребер.
+    terrain_prior_weight: float = 10.0
+    terrain_edge_correction: bool = True
+    # piecewise: H лінійно між якорями (повільна зміна висоти); constant: медіана
+    # (чистий баро-утримання висоти).
+    terrain_altitude_model: Literal["piecewise", "constant"] = "piecewise"
+    # terrarium: AWS Terrain Tiles (PNG, без GDAL), кеш = terrain_dem_path або
+    # <проєкт>/terrain; file: terrain_dem_path = GeoTIFF (метри або terrarium RGB).
+    terrain_dem_source: Literal["terrarium", "file"] = "terrarium"
+    terrain_dem_path: str = ""
+    terrain_dem_zoom: int = Field(13, ge=8, le=15)
+    terrain_dem_download: bool = True
+    # Фокусна у пікселях кадру БД; 0 = з project.json (focal_length_mm /
+    # sensor_width_mm × ширина кадру). Хибна f масштабує лише поправку рельєфу.
+    terrain_focal_px: float = Field(0.0, ge=0.0)
+    # Скільки разів перерахувати DEM-члени за оновленими позиціями й перерозв'язати
+    # граф (після базового розв'язку без рельєфу).
+    terrain_iterations: int = Field(2, ge=1, le=5)
+
 
 # ================================================================================
 # File: config\localization.py
 # ================================================================================
 """Localization, tracking and homography configuration."""
+
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -770,6 +881,36 @@ class LayerSearchConfig(BaseModel):
     max_center_extrapolation: float = Field(default=0.1, ge=0, le=1)
     scale_drift_per_s: float = Field(default=0.1, gt=0)
     require_schema: bool = False
+    # Handoff motion gate: after a gap in the active layer's fixes (LOST, or it
+    # did not verify this frame) accept one observation within
+    # agreement_m + growth * gap of the constant-velocity track prediction,
+    # instead of waiting for `confirmations` fresh observations.
+    motion_gate: bool = False
+    motion_gate_growth_mps: float = Field(default=30.0, gt=0)
+    motion_gate_max_gap_s: float = Field(default=10.0, gt=0)
+    # Verify each retrieved frame once before retrying any frame at another scale.
+    diverse_candidates: bool = False
+    # Stop verifying once the active layer yields a strong, near-native-scale fix
+    # (1/ratio..ratio) that agrees with the confirmed track.
+    early_stop: bool = False
+    early_stop_min_quality: float = Field(default=150.0, ge=0)
+    early_stop_max_scale_ratio: float = Field(default=1.5, ge=1)
+
+
+class AltitudeHintConfig(BaseModel):
+    """Altitude-guided layer scales (src/localization/altitude_hint.py). Default off.
+
+    The query's ground pixel size comes from telemetry (flight_data: height above
+    ground, else above take-off) or, without telemetry, from the last fix's scale;
+    the expected query/layer scale of the ``max_layers`` layers nearest to it is
+    tried before the rest of the scale pyramid. Neither known -> unchanged search.
+    """
+
+    enabled: bool = False
+    max_layers: int = Field(default=2, ge=1, le=8)
+    # Weight of each telemetry + visual fix in refining the camera footprint factor
+    # (ground width per metre of altitude, initially sensor width / focal length).
+    telemetry_scale_ema: float = Field(default=0.3, gt=0, le=1)
 
 
 class ConfidenceConfig(BaseModel):
@@ -782,6 +923,7 @@ class ConfidenceConfig(BaseModel):
 
 class LocalizationConfig(BaseModel):
     layer_search: LayerSearchConfig = Field(default_factory=LayerSearchConfig)
+    altitude_hint: AltitudeHintConfig = Field(default_factory=AltitudeHintConfig)
     min_matches: int = 12
     min_inliers_accept: int = 10
     # Absolute post-fit reprojection gate. Adaptive RANSAC may refine its own
@@ -805,6 +947,24 @@ class LocalizationConfig(BaseModel):
     # (1 DINO-forward замість 4). Якщо retrieval-score prior-кута нижчий за цей
     # поріг — повний батчований скан 4 кутів.
     rotation_rescan_min_score: float = 0.70
+    # ── Query rotation (src/localization/query_rotation.py) ──
+    # "quarter"    — legacy: only 0/90/180/270 via np.rot90 (current behaviour).
+    # "continuous" — any angle: bootstrap scans every rotation_scan_step_deg,
+    #                steady state applies the angle measured on the previous fix
+    #                (or the telemetry yaw), so ALIKED/LightGlue see ~0° residual.
+    #                The view keeps the reference frame size, so DINO sees the
+    #                same aspect as the database at every angle.
+    rotation_mode: Literal["quarter", "continuous"] = "quarter"
+    # Bootstrap / recovery scan step (45 → 8 angles, 30 → 12). Residual after
+    # the scan is at most step/2; the refine pass below removes it.
+    rotation_scan_step_deg: float = Field(default=45.0, gt=0, le=180)
+    # After a verified match whose residual rotation exceeds this, re-extract
+    # the query at the corrected angle and re-verify that candidate once
+    # (more inliers, better geometry). 0 disables the refine pass.
+    rotation_refine_min_deg: float = Field(default=12.0, ge=0)
+    # Erosion of the valid area of a rotated view: keypoints on the artificial
+    # border of the rotated frame are dropped.
+    rotation_border_erode_px: int = Field(default=8, ge=0)
     enable_lightglue_fallback: bool = True
     # ── RESEARCH 2.2: аварійний SIFT+LightGlue фолбек ──
     # Одноразовий перезапуск матчингу через SIFT, коли ALIKED дав
@@ -820,6 +980,51 @@ class LocalizationConfig(BaseModel):
         1  # Кількість патчів за один DINOv2 інференс (1 = послідовно, 4-7 = батч)
     )
     patchify_merge_weight: float = 0.4
+    # False (old behaviour): a patchify frame score sums every reference-patch hit, so
+    # it can exceed 1 and outrank cosine-scored standard candidates in the merge.
+    # True: best hit per (query patch, frame); score = coverage x mean <= 1.
+    patchify_unique_coverage: bool = False
+    # Legacy multi-layer retrieval: 0 = the layer with the best top score is verified
+    # (old behaviour). N > 0: candidates of all layers are ranked together and a layer
+    # of higher priority (project.json `priority`, main = 0) wins while its best
+    # candidate is within the first N + 1 ranks (src/database/source_priority.py).
+    source_priority_rank_margin: int = Field(default=0, ge=0, le=100)
+    # Multi-layer + patchify: 0 = old order (the chosen layer's merged candidates).
+    # N > 0: candidates found only by patchify are verified after the main layer's
+    # standard candidates unless they rank more than N places above the main layer's best
+    # (patchify 1st, main 2nd -> main first; main 10th -> patchify first with N = 3).
+    patchify_main_rank_margin: int = Field(default=0, ge=0, le=100)
+    # Multi-layer: one verification list for all layers (default False = old path).
+    # True: the standard candidates of every layer and, with use_patchify, every layer's
+    # patchify-only candidates are ranked together; the first joint_top_k are verified in
+    # that order, each on its own layer at its own (angle, scale). Place = rank by score
+    # within its kind (the standard and patchify scores are not on one scale) + N places
+    # per priority step of its layer (N = source_priority_rank_margin; project.json
+    # `priority` for standard candidates, `patchify_priority` (default: priority) for
+    # patchify ones) + joint_patchify_rank_penalty for patchify candidates.
+    # patchify_main_rank_margin is not used while this is on
+    # (src/database/source_priority.py::joint_order).
+    joint_candidate_ranking: bool = False
+    joint_top_k: int = Field(default=5, ge=1, le=50)
+    joint_patchify_rank_penalty: int = Field(default=2, ge=0, le=100)
+    # Effective layer priority = project priority step + layer_fineness_weight x log2(layer
+    # ground pixel size / the finest layer's); pixel size measured from each layer's
+    # calibration (a finer layer has the more accurate map). 0 = project priority only (old
+    # behaviour). Used by source_priority_rank_margin and for the main layer of
+    # patchify_main_rank_margin (src/database/source_priority.py::effective_steps).
+    layer_fineness_weight: float = Field(default=0.0, ge=0, le=10)
+    # Patchify only where no real layer is close in scale: the query's ground pixel size is
+    # estimated from the scale prior and the active layer; with a layer within
+    # patchify_gap_ratio of it patchify is skipped for the frame, otherwise it runs on the
+    # layers whose crops come closer than any real layer. Unknown scale -> every layer.
+    patchify_adaptive: bool = False
+    patchify_gap_ratio: float = Field(default=1.5, ge=1.0, le=4.0)
+    # Lazy patchify (not with joint_candidate_ranking): the patch search runs only after the
+    # chosen layer's standard candidates fail verification, on the same view (the one the
+    # scale / rotation priors chose); then the main layer (patchify_main_rank_margin) and the
+    # patchify-only candidates as before. Standard candidates keep their retrieval order.
+    # False = patch search before every verification (old behaviour).
+    patchify_lazy: bool = False
     # ── Scale-invariance (ScaleManager) ──
     # GSD-ratio pyramid for altitude-invariant localization (r = query_alt / db_alt).
     # Scanned when no temporal prior exists (bootstrap / out-of-coverage).
@@ -845,6 +1050,13 @@ class LocalizationConfig(BaseModel):
     spread_ref: float = 0.15
     # Нижня межа множника — вироджена хмара не обнуляє confidence.
     spread_floor: float = 0.35
+    # Як часто (у keyframe-ах) логувати статистику розкиду (spread stats).
+    spread_log_every: int = 50
+
+    # Після стількох поспіль невдалих keyframe-ів локалізатор повертає
+    # out_of_coverage і скидає пріори кута/масштабу (наступний кадр — повний скан).
+    # Читався з 2026-07, але не був оголошений — user_config не міг його змінити.
+    max_consecutive_failures: int = 10
 
     # ── ADDENDUM 2.1: каскадний recovery замість повного добутку. Дефолт off. ──
     # off = ПОТОЧНА поведінка: 4 кути × 5 масштабів = 20 ViT-forward одним батчем.
@@ -862,6 +1074,12 @@ class LocalizationConfig(BaseModel):
     candidate_prefilter: bool = False
     # Скільки найкращих (за MNN-парами) кандидатів іде в повний LightGlue.
     prefilter_keep: int = 2
+    # When no candidate has a single MNN pair (Lowe ratio 0.75), the prefilter
+    # keeps the whole list and LightGlue runs on all top-K. N > 0 = LightGlue
+    # only the first N by global score instead. 0 = whole list (old behaviour).
+    # Measured 2026-10-10 on 6 routes: that case ran 63 % of all LightGlue
+    # calls; 3 of its 163 calls found a frame, at global positions 0, 3, 0.
+    prefilter_fallback_keep: int = 0
 
     # ── PIPELINE_OPTIMIZATION_PLAN §A3: довга сторона кадру для локального
     # екстрактора. Раніше жила ЛИШЕ як дефолт у get_cfg(..., 1600) і не була
@@ -890,6 +1108,43 @@ class LocalizationConfig(BaseModel):
     # Кожен N-й keyframe примусово йде повним шляхом — аудит проти дрейфу.
     # 0 = аудит вимкнено (не рекомендується).
     temporal_prior_audit_every: int = 10
+    # Temporal prior при наявній підказці курсу (2026-10-28). None = стара
+    # поведінка: будь-яка підказка вимикає prior. Число = допуск у градусах:
+    # якщо курс з телеметрії збігається з кутом останнього фіксу в межах
+    # допуску, prior працює (на wayback-маршруті з телеметрією без нього
+    # успішність keyframe падала 0.87 → 0.15). Рекомендовано 20.
+    temporal_prior_yaw_hint_tol_deg: float | None = None
+    # Query keypoint budget for the temporal-prior check only (MNN probe, its
+    # LightGlue verification and the rotation refine of a temporal-prior hit):
+    # the strongest N of the extracted keypoints. Retrieval / rescan frames keep
+    # the full models.aliked.max_keypoints set. 0 = all keypoints (behaviour
+    # before 2026-10-10). Measured 2026-10-10 with a global 2048 cap: GTX 1650
+    # temporal-prior frames 348 -> 241 ms median, same fixes on own imagery.
+    temporal_prior_max_keypoints: int = 0
+    # temporal_prior_max_keypoints applies only when the previous frame's fix had at least
+    # this many inliers (0 = always). After a weak or failed fix every keypoint is used:
+    # 2026-10-17 a plain 2048 cap lost the wb2019 recovery on the RTX 5070 Ti (161 -> 91
+    # fixes; on the GTX 1650 the same 91 came from models.aliked.max_keypoints=2048, the plain
+    # prior cap was not run to the end there); its borderline spatial-prior matches have
+    # 12-30 inliers, healthy fixes have hundreds (median 772 on the route3min flights).
+    temporal_prior_kp_min_inliers: int = Field(default=0, ge=0)
+    # Spatial prior (src/localization/spatial_prior.py): when the index-neighbour
+    # temporal prior finds nothing, probe the map frames nearest to the
+    # constant-velocity prediction from the last two fixes, with the last
+    # confirmed angle and scale (the in-frame retry clears those priors, which
+    # otherwise turns the temporal prior off for a whole loss), and LightGlue the
+    # best `spatial_prior_verify` of them without the temporal_prior_min_mnn
+    # gate. Acceptance stays temporal_prior_accept_inliers. Once per frame, only
+    # within spatial_prior_max_age_s of the last fix, active layer only.
+    # Diagnosed 2026-10-10 on wb2019 (other-satellite imagery): the right frame
+    # was accepted by LightGlue 22 of 22 times it got there, but got there in
+    # 22 of 176 slots; at each loss start it was the nearest frame of its layer
+    # to the prediction. False = old behaviour.
+    spatial_prior: bool = False
+    spatial_prior_max_age_s: float = 30.0
+    spatial_prior_nearest_k: int = 4
+    spatial_prior_radius_m: float = 1500.0
+    spatial_prior_verify: int = 2
 
 
 class TrackingConfig(BaseModel):
@@ -962,6 +1217,10 @@ class TrackingConfig(BaseModel):
     smoother_deadband_m: float = 2.0
     smoother_gain: float = 0.25
     smoother_max_step_m: float = 3.0
+    # LOCALIZER_IMPROVEMENT_PLAN 1.2: Huber на OF-ребрах одометрії (0 = старі
+    # квадратичні ребра). Зрив LK на повторюваній текстурі інакше тягне вікно
+    # з повною вагою. Типове значення для ввімкнення — те саме, що для фіксів (1.2).
+    smoother_odom_huber_k: float = 0.0
 
     # ── ADDENDUM 1.2: forward-backward перевірка optical flow. Дефолт off. ──
     # Зараз LK фільтрується лише за status==1; треки, що «сповзли», доживають
@@ -969,6 +1228,62 @@ class TrackingConfig(BaseModel):
     # вплив малий — але вони роздувають знаменник inlier_ratio і ЗАНИЖУЮТЬ
     # flow_quality, який іде в Kalman R. Це фікс чесності метрики.
     of_fb_check: bool = False
+    # Вікно і рівні піраміди LK (2026-10-28). LK трекає ВІД keyframe, тож зсув
+    # росте до кінця інтервалу; 15 px / 2 рівні покривають ~60 px, а на 500 м
+    # при 50 м/с сцена за 25 кадрів зсувається на ~160 px — трек губиться
+    # (route3min: похибка 37–74 px на кадрах 15–25 проти ~1 px при 21 / 4).
+    # 15 / 2 = стара поведінка.
+    of_lk_win_px: int = 15
+    of_lk_max_level: int = 2
+    # Максимальний вік якоря OF, с (0 = без ліміту, стара поведінка). Якір
+    # оновлюється лише на ПРИЙНЯТОМУ keyframe; після провалу LK трекає від
+    # кадру 1–2 с тому, далеко поза зоною захоплення (route3min: сирий OF
+    # 235–435 м убік). Застарілий якір скидається, наступний кадр — спроба keyframe.
+    of_max_anchor_age_s: float = 0.0
+    # Мінімальна flow_quality OF-виміру (0 = без порогу, стара поведінка).
+    # Загублений LK-трек дає 0.026–0.042 (route3min 2026-10-28: усі 11 OF-вимірів
+    # з похибкою > 20 м), нормальний — ≥ 0.075 на 0.5-му перцентилі.
+    # Рекомендовано 0.05: відсікає 11/11 поганих і 0.15% добрих.
+    of_min_flow_quality: float = 0.0
+    # Ланцюжок OF через провалені keyframe-и (2026-10-28). False = стара поведінка:
+    # після провалу якір старіє, потім жодної позиції до наступного успішного
+    # keyframe (wayback 2019: ~22 с польоту без виходу). True = якір переноситься
+    # на останній добрий OF-кадр, позиція йде далі як візуальна одометрія з
+    # повільним дрейфом, але не довше of_chain_max_s від останнього справжнього фіксу.
+    of_chain_on_keyframe_fail: bool = False
+    of_chain_max_s: float = 30.0
+    # Коли якоря немає, спроба keyframe робиться лише на кожному N-му кадрі
+    # (1 = кожен кадр, стара поведінка). Інакше провал перетворює кожен кадр на
+    # ~0.3 с локалізації, і GUI відстає від відео.
+    keyframe_retry_every: int = 1
+    # Базовий множник шуму OF-виміру для KF (1.5 = стара поведінка: «OF шумніший
+    # за keyframe»). Після глибшої піраміди LK і порогу якості OF такий самий
+    # точний, як фікс; офлайн на 6 маршрутах: q 8 / 1.5 → p95 5.9 м, max 50 м,
+    # 46 стрибків; q 128 / 0.1 → 4.1 / 28 / 5 (сирий вихід 4.0 / 15 / 3).
+    of_noise_scale: float = 1.5
+    # LOCALIZER_IMPROVEMENT_PLAN 1.3: декореляція OF. Усі OF-позиції
+    # проєктуються через ту саму гомографію keyframe, тож її похибка спільна;
+    # KF рахував їх незалежними. R OF-виміру множиться на (1 + g·(n-1)), n —
+    # номер OF-семплу після keyframe. 0.0 = стара поведінка; кандидат — 1.0.
+    of_noise_growth_per_step: float = 0.0
+    # Інтервал прогнозу KF (2026-10-28). Воркер дає keyframe-у dt від ПОПЕРЕДНЬОГО
+    # keyframe (~0.9 с), хоча KF востаннє оновлював OF ~0.17 с тому: модель
+    # постійної швидкості щоразу прогнозувала на 0.9 с і між keyframe-ами
+    # відставала (сирий OF: крок 0.99 від справжнього, вихід KF: 0.62–0.71,
+    # пилка з «стрибком» на кожному keyframe). True = dt для KF з міток часу
+    # кадрів від останнього оновлення фільтра; детектор аутлаєрів і smoother
+    # лишаються на dt воркера. False = стара поведінка.
+    kalman_dt_from_timestamps: bool = False
+    # Швидкість при re-anchor до сильного фіксу (2026-10-28). Стара поведінка:
+    # (фікс − останній СИРИЙ вимір) / dt, а сирий вимір зазвичай OF; загублений
+    # OF-трек перетворює точний фікс на швидкість у сотні м/с. True = швидкість
+    # між двома останніми сильними фіксами (≤ 5 с), інакше власна швидкість KF.
+    kalman_reanchor_velocity_from_fixes: bool = False
+    # Перезапуск KF після довгої паузи без вимірів, с (0 = стара поведінка).
+    # Прогноз обмежено 5 с, тож після довшої паузи вся розбіжність ішла у
+    # швидкість (wayback 2026-10-28: 15 с без фіксу → 214 м/с замість 45,
+    # вихід на 56 м убік при сирих вимірах з похибкою 5 м). Рекомендовано 3.0.
+    kalman_max_gap_s: float = 0.0
     of_fb_max_px: float = 2.0
 
     # ── Аудит §1.2: гейт аутлаєрів на OF-шляху. Дефолт off = стара поведінка. ──
@@ -1016,6 +1331,18 @@ class TrackingConfig(BaseModel):
     # модель шуму адекватна. p=0.99 → 9.21, p=0.95 → 5.99 (жорсткіше).
     outlier_chi2_threshold: float = 13.816
 
+    # ── LOCALIZER_IMPROVEMENT_PLAN 1.1: повторне захоплення замість стрибка ──
+    # Стара поведінка: max_consecutive_outliers-те відкинуте вимірювання
+    # приймається БЕЗУМОВНО — пряме джерело стрибка, якщо відкидання були
+    # випадковими хибними фіксами. True = серію приймаємо лише тоді, коли два
+    # поспіль відкинуті кандидати мають ОДНАКОВЕ зміщення від прогнозу KF
+    # (справжня релокація: фільтр помиляється на сталий вектор), з допуском
+    # outlier_reacquire_tol_m. outlier_reacquire_max_wait — скільки ще
+    # відкидань чекати узгодженості, перш ніж прийняти примусово (0 = ніколи).
+    outlier_reacquire_consistent: bool = False
+    outlier_reacquire_tol_m: float = 15.0
+    outlier_reacquire_max_wait: int = 10
+
     # ── Обхід кінематичного гейта за силою НЕЗАЛЕЖНИХ доказів ────────────────
     # Спостереження з живого прогону: гейт відкидав keyframe-фікси з 1191–1881
     # інлаєрами, а на OF-шляху — фікси з flow_quality 0.89–1.0. І те, й інше —
@@ -1057,7 +1384,9 @@ class TrackingConfig(BaseModel):
 
 class HomographyConfig(BaseModel):
     backend: str = "opencv"  # "poselib" | "opencv"
-    ransac_threshold: float = 3.0
+    # ransac_threshold REMOVED (2026-10): never read. The thresholds in use are
+    # localization.ransac_threshold (localization + propagation) and
+    # database.inter_frame_ransac_thresh (database build).
     max_iters: int = 2000
     confidence: float = 0.99
     use_mad_ransac: bool = True  # Адаптивне уточнення порогу через MAD
@@ -1112,25 +1441,81 @@ class GlobalDescriptorConfig(BaseModel):
 
 
 class YoloConfig(BaseModel):
+    """YOLOv11n-seg (Nano) for dynamic object masking."""
+
     model_path: str = "models/yolo11n-seg.pt"
     vram_required_mb: float = 200.0
-    description: str = "YOLOv11n-seg (Nano) for dynamic object masking"
 
 
-class ModelSettings(BaseModel):
-    hub_repo: str | None = ""
-    hub_model: str | None = ""
+class DepthEstimatorConfig(BaseModel):
+    """Monocular depth during the database build (metadata/depth_scales) and for
+    localization.scale_use_depth_hint. "none" skips the model entirely."""
+
+    backend: str = "depth_anything_v2"  # "depth_anything_v2" | "none"
+
+
+# ── Local feature models ───────────────────────────────────────────────────────
+# One schema per model: every field below is passed to that model's loader.
+# (Until 2026-10 all extractors and matchers shared one generic ModelSettings,
+# so most of its fields — nms_radius / detection_threshold for ALIKED,
+# depth/width_confidence for LightGlue, dtype, hub_* for local models — were
+# written to user_config.json but never reached the model.)
+#
+# Defaults equal the values the code ACTUALLY ran with before the split
+# (the lightglue library defaults), so moving to these classes changes nothing.
+
+
+class AlikedSettings(BaseModel):
+    """ALIKED (lightglue.ALIKED). Feeds both the database build and localization."""
+
+    model_name: str = "aliked-n16"
+    max_keypoints: int = 4096
+    # > 0: threshold mode — keypoints with score > threshold, capped at
+    # max_keypoints. <= 0: exact top-k (always max_keypoints points).
+    # Changing it changes the keypoint set: rebuild databases for a fair A/B.
+    detection_threshold: float = 0.2
+    nms_radius: int = 2
+    vram_required_mb: float = 400.0
+
+
+class XFeatSettings(BaseModel):
+    hub_repo: str = "verlab/accelerated_features"
+    hub_model: str = "XFeat"
     top_k: int = 2048
-    vram_required_mb: float = 500.0
-    model_path: str | None = ""
-    backend: str = "git"  # "git" | "torchscript" | "tensorrt"
-    auto_convert: bool = True
-    dtype: str = "float16"  # "float16" | "float32"
+    # quality_preset of forks that support it ("fast" | ...); ignored otherwise.
+    preset: str = "fast"
+    vram_required_mb: float = 300.0
+
+
+class SuperPointSettings(BaseModel):
     max_keypoints: int = 4096
     nms_radius: int = 4
-    depth_confidence: float = -1.0
-    width_confidence: float = -1.0
-    detection_threshold: float = 0.001
+    detection_threshold: float = 0.0005
+    vram_required_mb: float = 500.0
+
+
+class RddSettings(BaseModel):
+    model_path: str = "models/RDD-v2.pth"
+    max_keypoints: int = 4096
+    vram_required_mb: float = 500.0
+
+
+class LightGlueSettings(BaseModel):
+    """LightGlue matcher (one block per feature type)."""
+
+    model_path: str | None = ""
+    backend: str = "git"  # "git" | "torchscript" | "tensorrt"
+    auto_convert: bool = False
+    vram_required_mb: float = 800.0
+    # Adaptive early exit (lightglue: depth_confidence). -1 disables it.
+    depth_confidence: float = 0.95
+    # Point pruning (lightglue: width_confidence); active on CUDA with
+    # >= 1024 keypoints. -1 disables it.
+    width_confidence: float = 0.99
+    # Matches with assignment score below this are dropped.
+    filter_threshold: float = 0.1
+    flash: bool = True  # FlashAttention when available
+    mixed_precision: bool = False  # lightglue "mp"
 
 
 class CespConfig(BaseModel):
@@ -1168,15 +1553,14 @@ class VramManagementConfig(BaseModel):
 
 class ModelsCacheConfig(BaseModel):
     engine_cache_dir: str = "models/engines/"
-    auto_compile: bool = False
+    # auto_compile REMOVED (2026-10): nothing compiled engines on demand; build
+    # them with scripts/compile_dinov2_trt.py.
 
 
 class PerformanceConfig(BaseModel):
     auto_tune: bool = True  # Auto-detect hardware and tune batch sizes, threads, VRAM limits
-    auto_tune_vram_headroom: float = (
-        0.0  # Extra VRAM (MB) to reserve beyond tier default (0 = auto)
-    )
-    propagation_max_workers: int = 4
+    # auto_tune_vram_headroom and propagation_max_workers REMOVED (2026-10):
+    # nothing read them — propagation matches pairs sequentially on one GPU.
     fp16_enabled: bool = True
     # ADDENDUM §3 (слабкі GPU): максимальний батч ViT-форварда в
     # extract_global_descriptors_multi (recovery: до 20 кадрів разом).
@@ -1261,46 +1645,16 @@ class ModelsConfig(BaseModel):
         default_factory=get_default_local_extractor
     )  # "aliked" | "rdd" | "xfeat"
     yolo: YoloConfig = YoloConfig()
-    xfeat: ModelSettings = ModelSettings(
-        hub_repo="verlab/accelerated_features",
-        hub_model="XFeat",
-        top_k=2048,
-        vram_required_mb=300.0,
-    )
-    aliked: ModelSettings = ModelSettings(max_keypoints=4096, vram_required_mb=400.0)
-    rdd: ModelSettings = ModelSettings(
-        vram_required_mb=500.0,
-        model_path="models/RDD-v2.pth",
-        max_keypoints=4096,
-    )
-    superpoint: ModelSettings = ModelSettings(
-        nms_radius=4, max_keypoints=4096, vram_required_mb=500.0
-    )
-    lightglue: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        # git backend: official weights download into TORCH_HOME (models/.cache)
-        model_path="",
-        auto_convert=False,
-    )
-    lightglue_superpoint: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        # git backend: official weights download into TORCH_HOME (models/.cache)
-        model_path="",
-        auto_convert=False,
-    )
-    lightglue_rdd: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        model_path="models/RDD_lg-v2.pth",
-        auto_convert=False,
-    )
-    lightglue_sift: ModelSettings = ModelSettings(
-        vram_required_mb=800.0,
-        backend="git",
-        auto_convert=False,
-    )
+    depth_estimator: DepthEstimatorConfig = DepthEstimatorConfig()
+    xfeat: XFeatSettings = XFeatSettings()
+    aliked: AlikedSettings = AlikedSettings()
+    rdd: RddSettings = RddSettings()
+    superpoint: SuperPointSettings = SuperPointSettings()
+    # git backend: official weights download into TORCH_HOME (models/.cache)
+    lightglue: LightGlueSettings = LightGlueSettings()
+    lightglue_superpoint: LightGlueSettings = LightGlueSettings()
+    lightglue_rdd: LightGlueSettings = LightGlueSettings(model_path="models/RDD_lg-v2.pth")
+    lightglue_sift: LightGlueSettings = LightGlueSettings()
     cesp: CespConfig = CespConfig()
     vlad: VladConfig = VladConfig()
     vram_management: VramManagementConfig = VramManagementConfig()
@@ -1817,6 +2171,11 @@ class MultiAnchorCalibration:
 """Multi-calibration manager.
 
 Stores dict[source_id -> MultiAnchorCalibration] for multi-source projects.
+
+Invariant: a layer whose calibration file exists on disk is never handed out
+as an empty in-memory calibration — the first anchor save would overwrite the
+file and silently drop every earlier anchor.  ``get_or_load`` enforces it for
+layers that were disabled or added after the project was opened.
 """
 
 from __future__ import annotations
@@ -1825,12 +2184,39 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.core.layer_status import CALIBRATION_OWNER_KEY
 from src.utils.logging_utils import get_logger
 
 if TYPE_CHECKING:
     from src.core.project_video_source import ProjectVideoSource
 
 logger = get_logger(__name__)
+
+
+def load_layer_calibration(src: ProjectVideoSource, project_dir: Path) -> MultiAnchorCalibration:
+    """Reads a layer's calibration file; empty calibration if the file is absent.
+
+    Raises on an unreadable file so callers never mistake a broken file for an
+    empty one (and later overwrite it).
+    """
+    cal = MultiAnchorCalibration()
+    calib_path = Path(project_dir) / src.calibration_file
+    if calib_path.exists():
+        cal.load(str(calib_path))
+        logger.info(
+            f"Calibration loaded for '{src.source_id}': "
+            f"{len(cal.anchors)} anchors from {calib_path}"
+        )
+    else:
+        logger.debug(f"No calibration file for '{src.source_id}' at {calib_path}")
+    return cal
+
+
+def save_layer_calibration(cal: MultiAnchorCalibration, path: str | Path, source_id: str) -> None:
+    """Saves ``cal`` to ``path`` stamped with the owning layer id."""
+    cal.extra_metadata[CALIBRATION_OWNER_KEY] = source_id
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    cal.save(str(path))
 
 
 class MultiCalibrationManager:
@@ -1842,11 +2228,31 @@ class MultiCalibrationManager:
     # ── Public API ───────────────────────────────────────────────────────────
 
     def get(self, source_id: str) -> MultiAnchorCalibration:
-        """Returns calibration for source_id, creating an empty one if missing."""
+        """Returns calibration for source_id, creating an empty one if missing.
+
+        Prefer ``get_or_load`` when the source config is at hand: this method
+        cannot know whether a file for the layer exists on disk.
+        """
         if source_id not in self._calibrations:
             self._calibrations[source_id] = MultiAnchorCalibration()
             logger.debug(f"Created empty calibration for source '{source_id}'")
         return self._calibrations[source_id]
+
+    def get_or_load(self, src: ProjectVideoSource, project_dir: Path) -> MultiAnchorCalibration:
+        """Returns the in-memory calibration, loading it from disk on first use."""
+        cal = self._calibrations.get(src.source_id)
+        if cal is None:
+            cal = load_layer_calibration(src, project_dir)
+            self._calibrations[src.source_id] = cal
+        return cal
+
+    def set(self, source_id: str, calibration: MultiAnchorCalibration) -> None:
+        """Replaces the calibration object of a layer (e.g. after loading a JSON)."""
+        self._calibrations[source_id] = calibration
+
+    def discard(self, source_id: str) -> None:
+        """Forgets a layer's in-memory calibration (the file stays on disk)."""
+        self._calibrations.pop(source_id, None)
 
     def load_all(
         self,
@@ -1858,22 +2264,17 @@ class MultiCalibrationManager:
         for src in sources:
             if not src.enabled:
                 continue
-            calib_path = project_dir / src.calibration_file
-            cal = MultiAnchorCalibration()
-            if calib_path.exists():
-                try:
-                    cal.load(str(calib_path))
-                    logger.info(
-                        f"Calibration loaded for '{src.source_id}': "
-                        f"{len(cal.anchors)} anchors from {calib_path}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to load calibration for '{src.source_id}' "
-                        f"from {calib_path}: {e}. Using empty calibration."
-                    )
-            else:
-                logger.debug(f"No calibration file for '{src.source_id}' at {calib_path}")
+            try:
+                cal = load_layer_calibration(src, project_dir)
+            except Exception as e:
+                # Not cached: get_or_load will retry instead of handing out an
+                # empty calibration that would overwrite the file on first save.
+                logger.error(
+                    f"Failed to load calibration for '{src.source_id}' "
+                    f"from {project_dir / src.calibration_file}: {e}. "
+                    f"The file is left untouched."
+                )
+                continue
             self._calibrations[src.source_id] = cal
 
     def save_all(
@@ -1889,9 +2290,8 @@ class MultiCalibrationManager:
             calib_path = project_dir / src.calibration_file
             if not cal.is_calibrated and not calib_path.exists():
                 continue
-            calib_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                cal.save(str(calib_path))
+                save_layer_calibration(cal, calib_path, src.source_id)
             except Exception as e:
                 logger.error(f"Failed to save calibration for '{src.source_id}': {e}")
 
@@ -1907,8 +2307,10 @@ class MultiCalibrationManager:
         """List of loaded calibration source_ids."""
         return list(self._calibrations.keys())
 
+    def items(self) -> list[tuple[str, MultiAnchorCalibration]]:
+        return list(self._calibrations.items())
+
     def __contains__(self, source_id: str) -> bool:
-        return source_id in self._calibrations
         return source_id in self._calibrations
 
     def __len__(self) -> int:
@@ -1951,11 +2353,22 @@ class ResultExporter:
             "matched_frame",
             "inliers",
         ]
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            if all(r.get("coordinate_kind") == "local_planar" for r in results):
+                fieldnames = [k for k in fieldnames if k not in ("lat", "lon")]
+            fieldnames += ["x", "y", "coordinate_kind", "coordinate_units"]
+        if any("fix_source" in r for r in results):
+            # keyframe / optical_flow / dead_reckoning (not confirmed by the map)
+            fieldnames.append("fix_source")
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for row in results:
+                row = dict(row)
+                if row.get("coordinate_kind") == "local_planar":
+                    row.pop("lat", None)
+                    row.pop("lon", None)
                 writer.writerow(row)
 
         logger.success(f"Exported {len(results)} results to CSV: {output_path}")
@@ -1963,6 +2376,8 @@ class ResultExporter:
     @staticmethod
     def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
         """Exports localization results to GeoJSON format including FOV polygons."""
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            raise ValueError("Local maps have no GPS coordinates. Export as CSV instead.")
         assert_project_writable(output_path)
         features = []
         for r in results:
@@ -1978,6 +2393,7 @@ class ResultExporter:
                     "confidence": r.get("confidence"),
                     "timestamp": r.get("timestamp"),
                     "matched_frame": r.get("matched_frame"),
+                    "fix_source": r.get("fix_source", "keyframe"),
                 },
             )
             features.append(point)
@@ -2016,6 +2432,8 @@ class ResultExporter:
         results: list[dict[str, Any]], output_path: str, name: str = "Drone Track"
     ) -> None:
         """Exports localization trajectory and points to KML (Google Earth)."""
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            raise ValueError("Local maps have no GPS coordinates. Export as CSV instead.")
         assert_project_writable(output_path)
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
@@ -2088,16 +2506,29 @@ class ResultExporter:
             return
         assert_project_writable(output_path)
         fieldnames = ["track_id", "class_name", "timestamp", "lat", "lon", "confidence"]
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            if all(r.get("coordinate_kind") == "local_planar" for r in results):
+                fieldnames = [k for k in fieldnames if k not in ("lat", "lon")]
+            fieldnames += ["x", "y", "coordinate_kind", "coordinate_units"]
+        if any("fix_source" in r for r in results):
+            # keyframe / optical_flow / dead_reckoning (not confirmed by the map)
+            fieldnames.append("fix_source")
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             for row in results:
+                row = dict(row)
+                if row.get("coordinate_kind") == "local_planar":
+                    row.pop("lat", None)
+                    row.pop("lon", None)
                 writer.writerow(row)
         logger.success(f"Exported {len(results)} objects to CSV: {output_path}")
 
     @staticmethod
     def export_objects_geojson(results: list[dict[str, Any]], output_path: str) -> None:
         """Exports tracked objects to GeoJSON format."""
+        if any(r.get("coordinate_kind") == "local_planar" for r in results):
+            raise ValueError("Local maps have no GPS coordinates. Export as CSV instead.")
         if not results:
             return
         assert_project_writable(output_path)
@@ -2257,6 +2688,8 @@ class HeadlessRunner:
             if calib_path.exists():
                 self.calibration.load(str(calib_path))
 
+        if self.database.converter is not None:
+            self.calibration.converter = self.database.converter
         if not self.database.is_propagated:
             logger.warning("Database is not propagated! Precision will be degraded.")
 
@@ -2307,6 +2740,7 @@ class HeadlessRunner:
             sys.exit(1)
 
         localizer = self._build_localizer()
+        self.coordinates_broker.set_coordinate_mode(self.calibration.converter.mode)
 
         self.tracking_worker = RealtimeTrackingWorker(
             self.video_source,
@@ -2316,6 +2750,7 @@ class HeadlessRunner:
         )
 
         # Connect coordinates broker
+        self.tracking_worker.fix_info.connect(self.coordinates_broker.on_fix_info)
         self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
         self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
         self.tracking_worker.objects_gps_updated.connect(
@@ -2347,6 +2782,338 @@ class HeadlessRunner:
         # Cleanup
         self.coordinates_broker.stop()
         logger.info("Headless runner exited gracefully.")
+
+
+# ================================================================================
+# File: src\core\layer_status.py
+# ================================================================================
+"""Qt-free bookkeeping for project layers (video sources).
+
+A *layer* is one ``ProjectVideoSource``: its own video, ``database.h5`` and
+``calibration.json``.  The GUI keeps one live ``DatabaseLoader`` and one live
+``MultiAnchorCalibration`` per layer.  Status is computed from those live
+objects (the same ones calibration and propagation mutate), and only falls
+back to the filesystem for what is not loaded — so it changes the moment an
+anchor is saved or propagation finishes, not on the next project reopen.
+
+``find_layer_conflicts`` detects the ways two layers can end up sharing or
+swapping calibration data: colliding file paths, a calibration file stamped
+with another layer's id, anchors that do not fit the layer's database and
+byte-identical anchor sets copied between layers.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+# Key written into calibration.json by the GUI to record which layer owns it.
+CALIBRATION_OWNER_KEY = "source_id"
+
+
+class LayerState(str, Enum):
+    DISABLED = "disabled"
+    NO_DB = "no_db"
+    DB_NOT_LOADED = "db_not_loaded"  # file exists, but the manager skipped/failed it
+    NO_CALIBRATION = "no_calibration"
+    NOT_PROPAGATED = "not_propagated"  # anchors exist, propagation never ran
+    STALE = "stale"  # anchors changed after the last propagation
+    READY = "ready"
+
+
+_LABELS: dict[LayerState, str] = {
+    LayerState.DISABLED: "🔇 Вимкнено",
+    LayerState.NO_DB: "❌ Без БД",
+    LayerState.DB_NOT_LOADED: "⛔ БД не завантажена",
+    LayerState.NO_CALIBRATION: "⚠ Без калібр.",
+    LayerState.NOT_PROPAGATED: "🟡 Потрібна пропагація",
+    LayerState.STALE: "🟡 Пропагація застаріла",
+    LayerState.READY: "✅ Готово",
+}
+
+_HINTS: dict[LayerState, str] = {
+    LayerState.DISABLED: "Шар вимкнено — він не бере участі в локалізації.",
+    LayerState.NO_DB: "Бази даних ще немає — побудуйте її (ПКМ → Побудувати БД).",
+    LayerState.DB_NOT_LOADED: (
+        "Файл бази є, але його не завантажено (несумісна схема дескрипторів "
+        "або помилка читання) — див. лог."
+    ),
+    LayerState.NO_CALIBRATION: "Немає якорів і пропагації — відкрийте калібрування шару.",
+    LayerState.NOT_PROPAGATED: "Якорі додано, але пропагацію GPS ще не запущено.",
+    LayerState.STALE: "Якорі змінено після останньої пропагації — запустіть її знову.",
+    LayerState.READY: "База має GPS-пропагацію, що відповідає поточним якорям.",
+}
+
+
+@dataclass(frozen=True)
+class LayerStatus:
+    source_id: str
+    area_id: str
+    enabled: bool
+    state: LayerState
+    has_db_file: bool
+    db_loaded: bool
+    num_anchors: int | None  # None = calibration not loaded (unknown)
+    num_valid: int | None  # frames with GPS after propagation
+    num_frames: int | None  # DB slots
+    coordinate_mode: str = "GEOGRAPHIC"
+
+    @property
+    def label(self) -> str:
+        if self.state == LayerState.READY and self.coordinate_mode == "LOCAL":
+            return "✅ Локальна X/Y"
+        return _LABELS[self.state]
+
+    @property
+    def hint(self) -> str:
+        if self.state == LayerState.READY and self.coordinate_mode == "LOCAL":
+            return "Відносна карта з міжкадрових зв’язків. Умовні X/Y, без GPS і метричного масштабу."
+        return _HINTS[self.state]
+
+    @property
+    def anchors_text(self) -> str:
+        return "—" if self.num_anchors is None else str(self.num_anchors)
+
+    @property
+    def gps_text(self) -> str:
+        if self.num_valid is None or not self.num_frames:
+            return "—"
+        return f"{self.num_valid}/{self.num_frames}"
+
+
+def _field(source: Any, name: str, default: Any = None) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def _anchor_frame_id(anchor: Any) -> int:
+    return int(_field(anchor, "frame_id"))
+
+
+def _anchor_matrix(anchor: Any) -> np.ndarray:
+    return np.asarray(_field(anchor, "affine_matrix"), dtype=np.float64)
+
+
+def anchor_sets_equal(a: Iterable[Any], b: Iterable[Any], rtol: float = 1e-9) -> bool:
+    """True if both anchor collections have the same frame ids and matrices."""
+    left = {_anchor_frame_id(x): _anchor_matrix(x) for x in a}
+    right = {_anchor_frame_id(x): _anchor_matrix(x) for x in b}
+    if left.keys() != right.keys():
+        return False
+    for fid, matrix in left.items():
+        other = right[fid]
+        if matrix.shape != other.shape or not np.allclose(matrix, other, rtol=rtol, atol=1e-9):
+            return False
+    return True
+
+
+def propagation_matches_anchors(anchors_json: Any, anchors: Iterable[Any]) -> bool | None:
+    """Compare anchors stored with the last propagation against current anchors.
+
+    Returns None when the database carries no anchor record (older propagation
+    or produced elsewhere) — staleness is then unknown, not assumed.
+    """
+    if anchors_json is None:
+        return None
+    if isinstance(anchors_json, bytes):
+        anchors_json = anchors_json.decode("utf-8")
+    try:
+        stored = json.loads(anchors_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(stored, list):
+        return None
+    try:
+        return anchor_sets_equal(stored, anchors)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def compute_layer_status(
+    source: Any,
+    project_dir: str | Path | None,
+    *,
+    database: Any = None,
+    calibration: Any = None,
+) -> LayerStatus:
+    """Status of one layer from its live objects (``database``/``calibration``).
+
+    ``database`` is the loaded ``DatabaseLoader`` of this layer or None when it
+    is not loaded; ``calibration`` is its ``MultiAnchorCalibration`` or None
+    when unknown.  The filesystem is consulted only for the DB file presence.
+    """
+    sid = str(_field(source, "source_id", "?"))
+    area = str(_field(source, "area_id", "") or "")
+    enabled = bool(_field(source, "enabled", True))
+    db_file = _field(source, "database_file", "") or ""
+
+    has_db_file = False
+    if project_dir and db_file:
+        has_db_file = (Path(project_dir) / db_file).is_file()
+
+    num_anchors = len(calibration.anchors) if calibration is not None else None
+    num_frames = num_valid = None
+    propagated = False
+    if database is not None:
+        has_db_file = True
+        try:
+            num_frames = int(database.get_num_frames())
+        except Exception:
+            num_frames = None
+        propagated = bool(getattr(database, "is_propagated", False))
+        valid = getattr(database, "frame_valid", None)
+        if propagated and valid is not None:
+            num_valid = int(np.asarray(valid).sum())
+
+    if not enabled:
+        state = LayerState.DISABLED
+    elif database is None:
+        state = LayerState.DB_NOT_LOADED if has_db_file else LayerState.NO_DB
+    elif propagated:
+        state = LayerState.READY
+        if num_anchors:
+            same = propagation_matches_anchors(
+                getattr(database, "propagation_anchors_json", None), calibration.anchors
+            )
+            if same is False:
+                state = LayerState.STALE
+    elif num_anchors:
+        state = LayerState.NOT_PROPAGATED
+    else:
+        state = LayerState.NO_CALIBRATION
+
+    return LayerStatus(
+        source_id=sid,
+        area_id=area,
+        enabled=enabled,
+        state=state,
+        has_db_file=has_db_file,
+        db_loaded=database is not None,
+        num_anchors=num_anchors,
+        num_valid=num_valid,
+        num_frames=num_frames,
+        coordinate_mode=getattr(getattr(database, "converter", None), "mode", "GEOGRAPHIC"),
+    )
+
+
+@dataclass(frozen=True)
+class LayerConflict:
+    kind: str  # "path" | "owner" | "range" | "duplicate"
+    source_ids: tuple[str, ...]
+    message: str
+
+
+def _norm(project_dir: Path, rel: str) -> str:
+    # casefold: the app runs on Windows, where "Layer" and "layer" are one folder.
+    return str((project_dir / rel).resolve()).casefold()
+
+
+def find_path_conflicts(sources: Iterable[Any], project_dir: str | Path) -> list[LayerConflict]:
+    """Two layers must never share a DB, a calibration file or a DB folder.
+
+    The DB folder matters too: ``vectors.lance`` lives next to ``database.h5``,
+    so two databases in one folder silently share (and overwrite) one index.
+    """
+    root = Path(project_dir)
+    owners: dict[tuple[str, str], list[str]] = {}
+    for src in sources:
+        sid = str(_field(src, "source_id", "?"))
+        db = _field(src, "database_file", "") or ""
+        cal = _field(src, "calibration_file", "") or ""
+        keys = []
+        if db:
+            keys.append(("database_file", _norm(root, db)))
+            keys.append(("database folder", _norm(root, str(Path(db).parent))))
+        if cal:
+            keys.append(("calibration_file", _norm(root, cal)))
+        for key in keys:
+            owners.setdefault(key, []).append(sid)
+
+    shared = {
+        (what, path): tuple(sorted(set(sids)))
+        for (what, path), sids in owners.items()
+        if len(set(sids)) > 1
+    }
+    same_db = {ids for (what, _), ids in shared.items() if what == "database_file"}
+    conflicts = []
+    for (what, path), ids in shared.items():
+        if what == "database folder" and ids in same_db:
+            continue  # already reported as a shared database_file
+        conflicts.append(
+            LayerConflict(
+                kind="path",
+                source_ids=ids,
+                message=f"Шари {', '.join(ids)} мають спільний {what}: {path}",
+            )
+        )
+    return conflicts
+
+
+def find_layer_conflicts(
+    sources: Iterable[Any],
+    project_dir: str | Path,
+    calibrations: Mapping[str, Any],
+    num_frames: Mapping[str, int] | None = None,
+) -> list[LayerConflict]:
+    """All detectable ways calibration data got mixed between layers."""
+    sources = list(sources)
+    conflicts = find_path_conflicts(sources, project_dir)
+    num_frames = num_frames or {}
+
+    for sid, cal in calibrations.items():
+        if cal is None:
+            continue
+        owner = (getattr(cal, "extra_metadata", None) or {}).get(CALIBRATION_OWNER_KEY)
+        if owner and str(owner) != sid:
+            conflicts.append(
+                LayerConflict(
+                    kind="owner",
+                    source_ids=(sid,),
+                    message=(
+                        f"Калібрування шару «{sid}» записане для шару «{owner}» "
+                        f"(ймовірно, файл скопійовано між шарами)."
+                    ),
+                )
+            )
+        n = num_frames.get(sid)
+        if n:
+            bad = sorted(
+                _anchor_frame_id(a) for a in cal.anchors if not 0 <= _anchor_frame_id(a) < int(n)
+            )
+            if bad:
+                conflicts.append(
+                    LayerConflict(
+                        kind="range",
+                        source_ids=(sid,),
+                        message=(
+                            f"Якорі шару «{sid}» на кадрах {bad} виходять за межі його БД "
+                            f"({n} слотів) — ймовірно, це якорі іншого шару."
+                        ),
+                    )
+                )
+
+    ids = sorted(sid for sid, cal in calibrations.items() if cal is not None and cal.anchors)
+    for i, left in enumerate(ids):
+        for right in ids[i + 1 :]:
+            if anchor_sets_equal(calibrations[left].anchors, calibrations[right].anchors):
+                conflicts.append(
+                    LayerConflict(
+                        kind="duplicate",
+                        source_ids=(left, right),
+                        message=(
+                            f"Шари «{left}» і «{right}» мають однакові якорі — "
+                            f"ймовірно, калібрування скопійоване між шарами."
+                        ),
+                    )
+                )
+    return conflicts
 
 
 # ================================================================================
@@ -2649,6 +3416,7 @@ class ProjectManager:
 # File: src\core\project_registry.py
 # ================================================================================
 import json
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -2657,8 +3425,20 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+@dataclass
+class ImportResult:
+    """Outcome of ``ProjectRegistry.import_projects`` (resolved folder paths)."""
+
+    added: list[str] = field(default_factory=list)
+    already_known: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+
+
 class ProjectRegistry:
     """Centralized project registry storing metadata in JSON file under home directory."""
+
+    # Folders never searched for projects (in addition to hidden ".*" ones).
+    _SCAN_SKIP_DIRS = frozenset({"__pycache__", "node_modules"})
 
     def __init__(self):
         self._registry_dir = Path.home() / ".drone_localizer"
@@ -2794,6 +3574,99 @@ class ProjectRegistry:
         """Returns all registered projects."""
         return list(self._projects)
 
+    # ── Import of existing project folders ─────────────────────────────────────
+
+    @classmethod
+    def find_projects(cls, root: str | Path, max_depth: int = 2) -> list[Path]:
+        """Project folders (holding a ``project.json``) at or below ``root``.
+
+        ``root`` itself counts when it is a project. A project folder is not
+        searched further: its ``sources/`` are layers, not projects. Hidden and
+        unreadable folders are skipped, so a broad root cannot abort the scan.
+        ``max_depth`` counts levels below ``root`` (2 = children and grandchildren).
+        """
+        found: list[Path] = []
+        pending: list[tuple[Path, int]] = [(Path(root), 0)]
+        while pending:
+            folder, depth = pending.pop()
+            try:
+                if (folder / "project.json").is_file():
+                    found.append(folder.resolve())
+                    continue
+                if depth >= max_depth:
+                    continue
+                entries = list(folder.iterdir())
+            except OSError as e:
+                logger.debug(f"Project scan skipped {folder}: {e}")
+                continue
+            for child in entries:
+                if child.name.startswith(".") or child.name in cls._SCAN_SKIP_DIRS:
+                    continue
+                try:
+                    if child.is_dir():
+                        pending.append((child, depth + 1))
+                except OSError:
+                    continue
+        return sorted(found, key=lambda p: str(p).casefold())
+
+    @staticmethod
+    def _read_manifest(project_dir: Path) -> dict:
+        """Plaintext project.json fields, or {} if encrypted or unreadable."""
+        try:
+            data = json.loads((project_dir / "project.json").read_bytes())
+        except (OSError, ValueError) as e:  # encrypted bytes fail to decode/parse
+            logger.debug(f"project.json not readable as plaintext in {project_dir}: {e}")
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def import_projects(self, project_dirs: list[str | Path]) -> ImportResult:
+        """Adds existing project folders to the registry without opening them.
+
+        Used for projects built outside the GUI (e.g. by
+        ``scripts/build_multilayer_project.py``), which never reach the registry.
+        New entries get the name, video and creation date from project.json
+        (folder name if the manifest is encrypted) and ``last_opened`` = now, so
+        they appear at the top of the list. Entries already registered only get
+        their name and status refreshed; their dates are kept. Folders without
+        project.json are skipped.
+        """
+        result = ImportResult()
+        now = datetime.now().isoformat()
+        for project_dir in project_dirs:
+            p = Path(project_dir).resolve()
+            if not (p / "project.json").is_file():
+                result.skipped.append(str(p))
+                continue
+            manifest = self._read_manifest(p)
+            update = {
+                "name": str(manifest.get("project_name") or p.name),
+                "has_database": self._check_has_database(p),
+                "has_calibration": self._check_has_calibration(p),
+            }
+            idx = self._find_index(str(p))
+            if idx >= 0:
+                self._projects[idx].update(update)
+                result.already_known.append(str(p))
+                continue
+            self._projects.append(
+                {
+                    "path": str(p),
+                    "video_path": str(manifest.get("video_path") or ""),
+                    "created_at": str(manifest.get("created_at") or now),
+                    "last_opened": now,
+                    **update,
+                }
+            )
+            result.added.append(str(p))
+
+        if result.added or result.already_known:
+            self._save()
+        logger.info(
+            f"Projects imported: {len(result.added)} added, "
+            f"{len(result.already_known)} already known, {len(result.skipped)} skipped"
+        )
+        return result
+
 
 # ================================================================================
 # File: src\core\project_video_source.py
@@ -2912,6 +3785,9 @@ class ProjectVideoSource:
     # Optional versioned layer description; legacy projects remain readable.
     # Unknown GSD/coverage is represented by absent fields, never invented height.
     scale_layer: ScaleLayerMetadata | None = None
+    # Priority of this layer's patchify candidates (localization.joint_candidate_ranking);
+    # None = same as ``priority``. 0 = highest, like ``priority``.
+    patchify_priority: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.scale_layer, dict):
@@ -3125,8 +4001,17 @@ class DatabaseBuilder:
             except Exception:
                 logger.warning("CESP loading failed during DB build, continuing without it")
 
+        import copy
+
+        feature_config = (
+            self.config.model_dump()
+            if hasattr(self.config, "model_dump")
+            else copy.deepcopy(self.config)
+        )
+        if get_cfg(self.config, "database.accuracy_features", False):
+            feature_config.setdefault("localization", {})["max_local_edge"] = 0
         feature_extractor = FeatureExtractor(
-            local_model, nv_model, model_manager.device, config=self.config, cesp_module=cesp
+            local_model, nv_model, model_manager.device, config=feature_config, cesp_module=cesp
         )
         logger.success("All models loaded successfully")
 
@@ -3207,8 +4092,7 @@ class DatabaseBuilder:
         forced_frame_ids.update(int(fid) for fid in (required_frame_ids or set()))
         if forced_frame_ids:
             logger.info(
-                "Calibration contract requires keyframes at slots: "
-                f"{sorted(forced_frame_ids)}"
+                f"Calibration contract requires keyframes at slots: {sorted(forced_frame_ids)}"
             )
 
         processor = FrameProcessor(
@@ -3480,6 +4364,8 @@ class DatabaseBuilder:
             homography_backend=get_cfg(self.config, "homography.backend", "opencv"),
             use_mad_ransac=get_cfg(self.config, "homography.use_mad_ransac", True),
             mad_k_factor=get_cfg(self.config, "homography.mad_k_factor", 2.5),
+            max_iters=int(get_cfg(self.config, "homography.max_iters", 2000)),
+            confidence=float(get_cfg(self.config, "homography.confidence", 0.99)),
         )
 
     def _is_significant_motion(self, H: np.ndarray, frame_w: int, frame_h: int) -> bool:
@@ -3745,6 +4631,7 @@ class DatabaseLoader:
                 self.depth_scales = None
 
             # Load frame_gps if present (multi-source geo-localisation)
+            self.spatial_index = None
             if "frame_gps" in self.db_file:
                 self.frame_gps = self.db_file["frame_gps"][:]
                 # Check whether any non-NaN values exist
@@ -3787,6 +4674,7 @@ class DatabaseLoader:
             raise
 
     def _load_propagation_data(self) -> None:
+        self.frame_homography = None
         self.frame_origin = None
         self.frame_georef_status = None
         self.frame_support_distance_slots = None
@@ -3794,6 +4682,9 @@ class DatabaseLoader:
         self.frame_support_anchor_count = None
         self.frame_rmse_units = None
         self.disagreement_kind = None
+        # JSON list of anchors the last propagation was computed from; lets the
+        # GUI tell "propagated" from "anchors changed since propagation".
+        self.propagation_anchors_json = None
         if self.db_file is None or "calibration" not in self.db_file:
             logger.info("No propagation data in database (not calibrated yet)")
             self.frame_affine = None
@@ -3835,24 +4726,38 @@ class DatabaseLoader:
             if "frame_affine" in grp:
                 self.frame_affine = grp["frame_affine"][:]
                 self.frame_valid = grp["frame_valid"][:].astype(bool)
+                if "frame_homography" in grp:
+                    from src.geometry.frame_transform import valid_footprint
+
+                    matrices = grp["frame_homography"][:]
+                    if matrices.shape != (len(self.frame_valid), 3, 3) or not all(
+                        valid_footprint(
+                            H, self.metadata["frame_width"], self.metadata["frame_height"]
+                        )
+                        for H in matrices[self.frame_valid]
+                    ):
+                        raise ValueError("Invalid projective calibration dataset")
+                    self.frame_homography = matrices
                 self.frame_origin = grp["frame_origin"][:] if "frame_origin" in grp else None
                 self.frame_georef_status = (
                     grp["frame_georef_status"][:] if "frame_georef_status" in grp else None
                 )
                 self.frame_support_distance_slots = (
                     grp["frame_support_distance_slots"][:]
-                    if "frame_support_distance_slots" in grp else None
+                    if "frame_support_distance_slots" in grp
+                    else None
                 )
                 self.frame_graph_component = (
-                    grp["frame_graph_component"][:]
-                    if "frame_graph_component" in grp else None
+                    grp["frame_graph_component"][:] if "frame_graph_component" in grp else None
                 )
                 self.frame_support_anchor_count = (
                     grp["frame_support_anchor_count"][:]
-                    if "frame_support_anchor_count" in grp else None
+                    if "frame_support_anchor_count" in grp
+                    else None
                 )
                 self.frame_rmse_units = grp.attrs.get("frame_rmse_units")
                 self.disagreement_kind = grp.attrs.get("disagreement_kind")
+                self.propagation_anchors_json = grp.attrs.get("anchors_json")
 
                 # Quality metrics (QA)
                 self.frame_rmse = grp["frame_rmse"][:] if "frame_rmse" in grp else None
@@ -3874,6 +4779,7 @@ class DatabaseLoader:
                 exc_info=True,
             )
             self.frame_affine = None
+            self.frame_homography = None
             self.frame_valid = None
 
     @property
@@ -4122,8 +5028,10 @@ class DbWriter:
     ):
         """Create optimal HDF5 hierarchy with pre-allocated chunked arrays (schema v2)"""
         compression = get_cfg(self.config, "database.hdf5_compression", "lzf")
-        chunk_f = get_cfg(self.config, "database.hdf5_chunk_frames", 64)
-        max_kps = get_cfg(self.config, "database.max_keypoints_stored", 2048)
+        if compression in (None, "", "none"):
+            compression = None  # h5py: no compression filter
+        chunk_f = int(get_cfg(self.config, "database.hdf5_chunk_frames", 64))
+        max_kps = int(get_cfg(self.config, "database.max_keypoints_stored", 2048))
         local_desc_dim = self.local_descriptor_dim
 
         logger.info(
@@ -4479,7 +5387,8 @@ class FrameProcessor:
     """Processes decoded+masked frames into database rows.
 
     Args:
-        feature_extractor: provides ``extract_features(rgb, mask)``.
+        feature_extractor: provides ``extract_local_features(rgb, mask)`` and
+            ``extract_global_descriptor(rgb)``.
         db_writer: :class:`src.database.db_writer.DbWriter`.
         compute_inter_frame_h: ``(prev_features, features) -> H | None``.
         is_significant_motion: ``(H, width, height) -> bool`` keyframe gate.
@@ -4550,13 +5459,15 @@ class FrameProcessor:
         self._frames_since_keyframe = 0
 
     def process(self, p_idx: int, p_frame, p_frame_rgb, p_static_mask) -> None:
-        """Processes one frame: feature extraction, pose calculation, keyframe selection."""
-        features = self.feature_extractor.extract_features(p_frame_rgb, p_static_mask)
-        features["coords_2d"] = features["keypoints"]
+        """Processes one frame: feature extraction, pose calculation, keyframe selection.
 
-        # Patchify descriptors
-        if self.patchify is not None:
-            features["patch_descriptors"] = self.patchify.compute_patch_descriptors(p_frame_rgb)
+        Only local features are extracted up front: they drive the pose chain and
+        the keyframe decision. The global descriptor and the patchify descriptors
+        (1 + 14 DINO passes) are computed for saved frames only; for a skipped
+        frame they were computed and thrown away. Saved rows are unchanged.
+        """
+        features = self.feature_extractor.extract_local_features(p_frame_rgb, p_static_mask)
+        features["coords_2d"] = features["keypoints"]
 
         # Depth scale estimation (reuse scale across interval to save compute)
         features["depth_scale"] = np.float32(
@@ -4629,6 +5540,9 @@ class FrameProcessor:
         self.db_writer.write_pose(p_idx, self.current_pose)
 
         if save_this_frame:
+            features["global_desc"] = self.feature_extractor.extract_global_descriptor(p_frame_rgb)
+            if self.patchify is not None:
+                features["patch_descriptors"] = self.patchify.compute_patch_descriptors(p_frame_rgb)
             # SIFT features extracted only for keyframes being saved
             if self.store_sift:
                 try:
@@ -4683,265 +5597,6 @@ class FrameProcessor:
             return True
 
         return bool(self.overlap_gate(H_rel, self.width, self.height))
-
-
-# ================================================================================
-# File: src\database\keyframe_scan.py
-# ================================================================================
-"""Select the database's image-driven keyframes without creating a database.
-
-The simulator uses this on the *encoded* reference video before writing its
-calibration anchors.  It deliberately runs the same decoder, local feature
-extractor, mask, matcher and :class:`FrameProcessor` decision path as
-``DatabaseBuilder``.  No HDF5 or LanceDB file is opened.
-"""
-
-from __future__ import annotations
-
-import hashlib
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable
-
-import numpy as np
-
-from config import get_cfg
-from src.database import keyframe_selector
-from src.database.frame_processor import FrameProcessor
-from src.database.video_frame_source import EOF_INDEX, VideoFrameSource
-
-
-def selection_settings(config: dict) -> dict[str, Any]:
-    """Effective config keys that can affect the selected DB slot IDs."""
-    g = lambda path, default: get_cfg(config, path, default)
-    return {
-        "frame_step": int(g("database.frame_step", 30)),
-        "criterion": str(g("database.keyframe_criterion", "step")),
-        "max_overlap": float(g("database.keyframe_max_overlap", 0.5)),
-        "max_gap_frames": int(g("database.keyframe_max_gap_frames", 0)),
-        "min_translation_px": float(g("database.keyframe_min_translation_px", 0.0)),
-        "min_rotation_deg": float(g("database.keyframe_min_rotation_deg", 1.5)),
-        "always_save_first": bool(g("database.keyframe_always_save_first", True)),
-        "required_frame_ids": [int(x) for x in (g("database.required_frame_ids", []) or [])],
-        "inter_frame_min_matches": int(g("database.inter_frame_min_matches", 15)),
-        "inter_frame_ransac_thresh": float(g("database.inter_frame_ransac_thresh", 3.0)),
-        "homography_backend": str(g("homography.backend", "opencv")),
-        "use_mad_ransac": bool(g("homography.use_mad_ransac", True)),
-        "mad_k_factor": float(g("homography.mad_k_factor", 2.5)),
-        "masking_strategy": str(g("preprocessing.masking_strategy", "yolo")),
-        "yolo_batch_size": int(g("database.yolo_batch_size", 1)),
-        "local_extractor": str(g("models.local_extractor", "aliked")),
-        "fallback_extractor": str(g("localization.fallback_extractor", "aliked")),
-        "ratio_threshold": float(g("localization.ratio_threshold", 0.75)),
-        "max_local_edge": int(g("localization.max_local_edge", 1600)),
-        "use_decord": bool(g("database.use_decord", True)),
-        "decode_batch_size": int(g("database.decode_batch_size", 32)),
-        "prefetch_queue_size": int(g("database.prefetch_queue_size", 32)),
-    }
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-class _NullWriter:
-    """FrameProcessor storage hooks; the decision state remains unchanged."""
-
-    def write_pose(self, frame_id: int, pose: np.ndarray) -> None:
-        pass
-
-    def save_frame_data(self, frame_id: int, features: dict, pose: np.ndarray) -> None:
-        pass
-
-
-class _LocalOnlyAdapter:
-    """Skip DINO descriptors, which do not participate in keyframe decisions."""
-
-    def __init__(self, extractor):
-        self.extractor = extractor
-
-    def extract_features(self, image: np.ndarray, mask: np.ndarray) -> dict:
-        return self.extractor.extract_local_features(image, mask)
-
-
-@dataclass(frozen=True)
-class ScanResult:
-    selected_slots: list[int]
-    featureless_selected_slots: list[int]
-    source_total_frames: int
-    total_slots: int
-    frame_width: int
-    frame_height: int
-    frame_step: int
-
-
-def scan_with_components(
-    source,
-    feature_extractor,
-    matcher,
-    masking_strategy,
-    config: dict,
-    *,
-    progress_callback: Callable[[int], None] | None = None,
-) -> ScanResult:
-    """Run DatabaseBuilder's keyframe decision path with injected collaborators.
-
-    This narrow seam allows deterministic tests with fake models, while the
-    production wrapper below constructs the exact DB components.
-    """
-    settings = selection_settings(config)
-    if settings["frame_step"] != int(source.frame_step):
-        raise ValueError("source frame_step differs from database.frame_step")
-    criterion = settings["criterion"]
-    use_selection = settings["min_translation_px"] > 0 or criterion == "overlap"
-
-    def compute_h(fa: dict, fb: dict) -> np.ndarray | None:
-        return keyframe_selector.compute_inter_frame_homography(
-            matcher,
-            fa,
-            fb,
-            min_matches=settings["inter_frame_min_matches"],
-            ransac_thresh=settings["inter_frame_ransac_thresh"],
-            homography_backend=settings["homography_backend"],
-            use_mad_ransac=settings["use_mad_ransac"],
-            mad_k_factor=settings["mad_k_factor"],
-        )
-
-    def significant(H: np.ndarray, width: int, height: int) -> bool:
-        return keyframe_selector.is_significant_motion(
-            H,
-            width,
-            height,
-            min_translation_px=settings["min_translation_px"],
-            min_rotation_deg=settings["min_rotation_deg"],
-        )
-
-    processor = FrameProcessor(
-        feature_extractor=_LocalOnlyAdapter(feature_extractor),
-        db_writer=_NullWriter(),
-        compute_inter_frame_h=compute_h,
-        is_significant_motion=significant,
-        draw_keypoints=lambda *args: None,
-        config=config,
-        width=source.width,
-        height=source.height,
-        num_frames=source.num_frames,
-        use_keyframe_selection=use_selection,
-        always_save_first=settings["always_save_first"],
-        keyframe_criterion=criterion,
-        overlap_gate=lambda H, w, h: keyframe_selector.is_overlap_below(
-            H, w, h, max_overlap=settings["max_overlap"]
-        ),
-        keyframe_max_gap_frames=settings["max_gap_frames"],
-        forced_frame_ids=set(settings["required_frame_ids"]),
-        progress_callback=progress_callback,
-    )
-    batch_size = max(1, settings["yolo_batch_size"])
-    featureless_selected: list[int] = []
-    pending: list[tuple] = []
-    processed_count = 0
-    frame_queue = source.start_prefetch()
-    try:
-        while True:
-            idx, data = frame_queue.get()
-            if idx != EOF_INDEX and data is not None:
-                bgr, rgb = data
-                pending.append((idx, bgr, rgb))
-                if len(pending) < batch_size:
-                    continue
-            if not pending:
-                break
-
-            masks = masking_strategy.get_mask_batch([item[2] for item in pending])
-            if len(masks) != len(pending):
-                raise RuntimeError("Masking strategy returned a different batch size")
-            for (slot, bgr, rgb), static_mask in zip(pending, masks):
-                previous_saved = processor.saved_count
-                processor.process(slot, bgr, rgb, static_mask)
-                processed_count += 1
-                if processor.saved_count > previous_saved and len(processor.prev_features["keypoints"]) == 0:
-                    featureless_selected.append(int(slot))
-            pending = []
-            if idx == EOF_INDEX:
-                break
-        source.raise_if_failed()
-    finally:
-        source.join(timeout=5)
-        source.release()
-
-    if processed_count != source.num_frames:
-        raise RuntimeError(
-            f"Decoded {processed_count} sampled slots, expected {source.num_frames}; "
-            "refusing incomplete keyframe selection"
-        )
-    if not processor.frame_index_map:
-        raise RuntimeError("No keyframes selected from reference video")
-    if len(featureless_selected) == len(processor.frame_index_map):
-        raise RuntimeError("No local features in any selected keyframe")
-
-    return ScanResult(
-        selected_slots=processor.frame_index_map,
-        featureless_selected_slots=featureless_selected,
-        source_total_frames=int(source.total_frames),
-        total_slots=int(source.num_frames),
-        frame_width=int(source.width),
-        frame_height=int(source.height),
-        frame_step=int(source.frame_step),
-    )
-
-
-def scan_video_keyframes(
-    video_path: str | Path,
-    config: dict,
-    *,
-    progress_callback: Callable[[int], None] | None = None,
-) -> ScanResult:
-    """Scan a finished MP4 using the same local-vision path as DatabaseBuilder."""
-    from src.localization.matcher import FeatureMatcher
-    from src.models.model_manager import ModelManager
-    from src.models.wrappers.feature_extractor import FeatureExtractor
-    from src.models.wrappers.masking_strategy import create_masking_strategy
-
-    path = Path(video_path).resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"Reference video not found: {path}")
-    settings = selection_settings(config)
-    source = VideoFrameSource(
-        str(path),
-        frame_step=settings["frame_step"],
-        use_decord=settings["use_decord"],
-        decode_batch_size=settings["decode_batch_size"],
-        prefetch_size=settings["prefetch_queue_size"],
-    )
-    try:
-        manager = ModelManager(config=config)
-        masking_strategy = create_masking_strategy(
-            settings["masking_strategy"], manager, manager.device
-        )
-        # DatabaseBuilder branches on fallback_extractor, even when
-        # models.local_extractor names a different model. Mirror that exact
-        # choice so descriptor dimensions and matching stay identical.
-        local_model = (
-            manager.load_xfeat()
-            if settings["fallback_extractor"] == "xfeat"
-            else manager.load_local_extractor()
-        )
-        extractor = FeatureExtractor(local_model, None, manager.device, config=config)
-        matcher = FeatureMatcher(model_manager=manager, config=config)
-        return scan_with_components(
-            source,
-            extractor,
-            matcher,
-            masking_strategy,
-            config,
-            progress_callback=progress_callback,
-        )
-    finally:
-        source.release()
 
 
 # ================================================================================
@@ -5094,6 +5749,8 @@ def compute_inter_frame_homography(
     homography_backend: str = "opencv",
     use_mad_ransac: bool = True,
     mad_k_factor: float = 2.5,
+    max_iters: int = 2000,
+    confidence: float = 0.99,
 ) -> np.ndarray | None:
     """Estimates H(fb -> fa) as 3x3 float64, returning None if match count is insufficient."""
     mkpts_a, mkpts_b = matcher.match(fa, fb)
@@ -5106,6 +5763,8 @@ def compute_inter_frame_homography(
         mkpts_b,
         mkpts_a,
         ransac_threshold=ransac_thresh,
+        max_iters=max_iters,
+        confidence=confidence,
         backend=homography_backend,
         use_mad_ransac=use_mad_ransac,
         mad_k_factor=mad_k_factor,
@@ -5224,7 +5883,16 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from config import get_cfg
 from src.database.database_loader import DatabaseLoader
+from src.database.source_priority import (
+    choose_source,
+    choose_source_weighted,
+    coverage_cells,
+    effective_steps,
+    layer_gsd,
+    priority_conflicts,
+)
 from src.localization.geo_aware_retriever import GeoAwareRetriever
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
 from src.utils.logging_utils import get_logger
@@ -5250,6 +5918,8 @@ class MultiDatabaseManager:
         self._active_source_ids: set[str] = set()
         self._project_dir = project_dir
         self._config = config or {}
+        # source_id -> (loader, ground pixel size); recomputed after a reload
+        self._gsd_cache: dict[str, tuple[object, float | None]] = {}
 
         self._load_sources(sources)
 
@@ -5282,6 +5952,15 @@ class MultiDatabaseManager:
                         f"Source '{src.source_id}' declares descriptor schema "
                         f"'{expected_schema}', but database contains '{actual_schema}'. "
                         "Skipping this layer until it is rebuilt or its metadata is corrected."
+                    )
+                    loader.close()
+                    continue
+                vlad_problem = self._vlad_mismatch(loader)
+                if vlad_problem:
+                    logger.error(
+                        f"Source '{src.source_id}': global descriptors were built with "
+                        f"other settings ({vlad_problem}). Skipping this layer until it is "
+                        "rebuilt with the current models.vlad / global_descriptor settings."
                     )
                     loader.close()
                     continue
@@ -5334,6 +6013,94 @@ class MultiDatabaseManager:
         )
 
         self._check_interchangeability()
+        self._check_priorities()
+
+    def _check_priorities(self) -> list[str]:
+        """Warn about overlapping layers that share a priority (or a patchify priority).
+
+        Overlap: the layers' map frames share a ~2 km grid cell (``frame_gps``); a
+        layer without frame positions overlaps every layer of its ``area_id``.
+        Layers of different terrain may share a number. Warnings only while a rule
+        that reads the priorities is on, info otherwise (then priority only breaks
+        exact score ties).
+        """
+        cells = {
+            sid: coverage_cells(getattr(loader, "frame_gps", None))
+            for sid, loader in self._databases.items()
+        }
+
+        def overlap(a, b) -> bool:
+            ca, cb = cells.get(a.source_id), cells.get(b.source_id)
+            if ca and cb:
+                return bool(ca & cb)
+            return a.area_id == b.area_id
+
+        weight = float(get_cfg(self._config, "localization.layer_fineness_weight", 0.0) or 0.0)
+
+        def distinguishable(a, b) -> bool:
+            # with the fineness term on, layers of clearly different pixel size are ordered
+            ga, gb = self.layer_gsd(a.source_id), self.layer_gsd(b.source_id)
+            return weight > 0 and bool(ga) and bool(gb) and abs(np.log2(ga / gb)) >= 0.25
+
+        messages = priority_conflicts(
+            [self._sources[sid] for sid in sorted(self._sources)], overlap, distinguishable
+        )
+        rules_on = (
+            int(get_cfg(self._config, "localization.source_priority_rank_margin", 0) or 0) > 0
+            or int(get_cfg(self._config, "localization.patchify_main_rank_margin", 0) or 0) > 0
+            or bool(get_cfg(self._config, "localization.joint_candidate_ranking", False))
+        )
+        rules_on = rules_on or weight > 0
+        for message in messages:
+            text = (
+                f"Layer priority: {message} - the layer priority rules cannot order them; "
+                "give layers stacked over one area different numbers (main 0, then 1, 2, ...)."
+            )
+            if rules_on:
+                logger.warning(text)
+            else:
+                logger.info(text)
+        return messages
+
+    def layer_gsd(self, source_id: str) -> float | None:
+        """Ground size of one map pixel of a layer (``source_priority.layer_gsd``), cached."""
+        loader = self._databases.get(source_id)
+        if loader is None:
+            return None
+        cached = self._gsd_cache.get(source_id)
+        if cached is None or cached[0] is not loader:
+            cached = (loader, layer_gsd(loader))
+            self._gsd_cache[source_id] = cached
+        return cached[1]
+
+    def effective_priority_steps(self) -> dict[str, float]:
+        """Project priority step + fineness term of every active layer."""
+        weight = float(get_cfg(self._config, "localization.layer_fineness_weight", 0.0) or 0.0)
+        ids = sorted(self._active_source_ids)
+        return effective_steps(
+            {sid: self._sources[sid].priority for sid in ids},
+            {sid: self.layer_gsd(sid) for sid in ids},
+            weight,
+        )
+
+    def _vlad_mismatch(self, loader: DatabaseLoader) -> str | None:
+        """Compare a database's VLAD settings (incl. vocabulary hash) with the config."""
+        import json
+
+        from src.database.schema_fingerprint import (
+            build_components,
+            extra_mismatch,
+            vlad_mismatch,
+        )
+
+        raw = loader.metadata.get("schema_components")
+        try:
+            stored = json.loads(raw) if isinstance(raw, str | bytes) else raw
+        except ValueError:
+            return None  # reported by _check_interchangeability
+        runtime = build_components(self._config, descriptor_dim=0, local_descriptor_dim=0)
+        problems = [p for p in (vlad_mismatch(stored, runtime), extra_mismatch(stored, runtime)) if p]
+        return "; ".join(problems) or None
 
     def _check_interchangeability(self) -> None:
         """Warn if loaded databases were built with incompatible schema settings."""
@@ -5447,7 +6214,7 @@ class MultiDatabaseManager:
         """
         import json
 
-        from src.database.schema_fingerprint import build_components
+        from src.database.schema_fingerprint import build_components, extra_mismatch, vlad_mismatch
 
         dimension = int(np.asarray(global_desc).size)
         runtime = build_components(
@@ -5467,6 +6234,9 @@ class MultiDatabaseManager:
             retriever = self._retrievers.get(sid)
             if loader is None or retriever is None:
                 continue
+            if getattr(getattr(loader, "converter", None), "mode", "") == "LOCAL":
+                # Independently built local maps have unrelated coordinate gauges.
+                continue
             raw = loader.metadata.get("schema_components")
             try:
                 components = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
@@ -5476,6 +6246,15 @@ class MultiDatabaseManager:
                     continue
                 if any(key in components and components[key] != runtime[key] for key in fields):
                     logger.warning(f"Skipping incompatible localization source '{sid}'")
+                    continue
+                if components and vlad_mismatch(components, runtime):
+                    logger.warning(f"Skipping localization source '{sid}': other VLAD vocabulary")
+                    continue
+                if components and extra_mismatch(components, runtime):
+                    logger.warning(
+                        f"Skipping localization source '{sid}': "
+                        f"{extra_mismatch(components, runtime)}"
+                    )
                     continue
                 candidates = retriever.find_similar_frames(global_desc, top_k=top_k)
                 if candidates:
@@ -5490,6 +6269,7 @@ class MultiDatabaseManager:
         top_k: int = 8,
     ) -> tuple[str | None, list[tuple[int, float]]]:
         """Performs vector search across active databases, returning best match."""
+        self.last_matches_by_source = {}
         if not self._active_source_ids:
             logger.warning("No active sources for retrieval")
             return None, []
@@ -5497,6 +6277,8 @@ class MultiDatabaseManager:
         best_source_id: str | None = None
         best_candidates: list[tuple[int, float]] = []
         best_top_score: float = -1.0
+        rank_margin = int(get_cfg(self._config, "localization.source_priority_rank_margin", 0) or 0)
+        per_source: dict[str, list[tuple[int, float]]] = {}
 
         # Sort by priority (0 = highest)
         sorted_ids = sorted(
@@ -5505,6 +6287,9 @@ class MultiDatabaseManager:
         )
 
         for source_id in sorted_ids:
+            loader = self._databases.get(source_id)
+            if getattr(getattr(loader, "converter", None), "mode", "") == "LOCAL":
+                continue
             retriever = self._retrievers.get(source_id)
             if retriever is None:
                 continue
@@ -5514,6 +6299,7 @@ class MultiDatabaseManager:
                 if not candidates:
                     continue
 
+                per_source[source_id] = candidates
                 top_score = candidates[0][1]
                 if top_score > best_top_score:
                     best_top_score = top_score
@@ -5525,6 +6311,31 @@ class MultiDatabaseManager:
                     f"Retrieval failed for source '{source_id}': {e}",
                     exc_info=True,
                 )
+
+        # Per-layer standard candidates of this call (RotationSelector keeps the best
+        # (angle, scale) per layer for localization.patchify_main_rank_margin).
+        self.last_matches_by_source = per_source
+
+        weight = float(get_cfg(self._config, "localization.layer_fineness_weight", 0.0) or 0.0)
+        if rank_margin > 0 and per_source:
+            if weight > 0:
+                chosen = choose_source_weighted(
+                    per_source, self.effective_priority_steps(), rank_margin
+                )
+            else:
+                chosen = choose_source(
+                    per_source,
+                    {sid: self._sources[sid].priority for sid in per_source},
+                    rank_margin,
+                )
+            if chosen is not None and chosen != best_source_id:
+                logger.debug(
+                    f"Layer priority: '{chosen}' instead of '{best_source_id}' "
+                    f"(its best candidate within the first {rank_margin + 1} ranks)"
+                )
+                best_source_id = chosen
+                best_candidates = per_source[chosen]
+                best_top_score = best_candidates[0][1]
 
         if best_source_id is not None:
             logger.debug(
@@ -5646,8 +6457,10 @@ matches. Pure stdlib (hashlib, json) — safe to import anywhere.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 # Ordered, fixed list of structure/content-defining fields. The order is part of
@@ -5669,12 +6482,56 @@ SCHEMA_FIELDS: tuple[str, ...] = (
     # CPU-resize before DINO uses cv2.INTER_AREA instead of torchvision Resize(antialias)
     # Different filter creates different descriptor values -> databases are not interchangeable.
     "dino_cpu_resize",
+    # VLAD identity: content hash of the vocabulary file, ViT layer, low-norm filter.
+    # Two VLAD databases built with different vocabularies have the same descriptor
+    # dimension but incomparable descriptors.
+    "vlad_vocab",
+    "vlad_layer",
+    "vlad_low_norm_fraction",
 )
+
+# Fields that are None while VLAD is off and are then left out of the hash, so
+# every database built without VLAD keeps the fingerprint it was built with.
+OPTIONAL_FIELDS: tuple[str, ...] = ("vlad_vocab", "vlad_layer", "vlad_low_norm_fraction")
+
+# Recorded in schema_components but NOT hashed (so existing fingerprints stay valid):
+# the DINO input resolution. Descriptors from different resolutions are not
+# comparable; databases built before 2026-10-06 lack it and are not checked.
+CHECKED_EXTRA_FIELDS: tuple[str, ...] = ("dino_input_size",)
+
+
+@functools.lru_cache(maxsize=8)
+def _file_digest(path: str, mtime_ns: int, size: int) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def vocab_identity(path: Any) -> str:
+    """Content hash of a VLAD vocabulary file (16 hex chars), or "missing".
+
+    Content, not path: the same vocabulary copied to another machine matches.
+    Cached per (path, mtime, size), so runtime checks stay cheap.
+    """
+    if not path:
+        return "missing"
+    try:
+        resolved = Path(path).resolve()
+        stat = resolved.stat()
+    except OSError:
+        return "missing"
+    return _file_digest(str(resolved), stat.st_mtime_ns, stat.st_size)
 
 
 def compute_fingerprint(components: dict[str, Any]) -> str:
     """Short deterministic hash of the schema-defining components (16 hex chars)."""
-    canonical = {k: components.get(k) for k in SCHEMA_FIELDS}
+    canonical = {
+        k: components.get(k)
+        for k in SCHEMA_FIELDS
+        if k not in OPTIONAL_FIELDS or components.get(k) is not None
+    }
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -5698,16 +6555,25 @@ def build_components(
     def g(path: str, default: Any) -> Any:
         return get_cfg(config, path, default)
 
-    # global_descriptor lives at top level; fall back to models.* for safety.
-    backend = g("global_descriptor.backend", None)
-    if backend is None:
-        backend = g("models.global_descriptor.backend", "dinov3")
+    # global_descriptor lives at top level ("models.global_descriptor" never existed).
+    backend = g("global_descriptor.backend", "dinov3")
 
+    vlad_enabled = bool(g("models.vlad.enabled", False))
+    vlad_layer = g("models.vlad.layer", None)
+    default_size = 224 if backend == "dinov3" else 336
     return {
+        # Diagnostic only: local matching supports cross-resolution images and
+        # this offline extraction choice must not disable live retrieval.
+        "local_extraction_max_edge": (
+            0
+            if g("database.accuracy_features", False)
+            else int(g("localization.max_local_edge", 1600))
+        ),
+        "dino_input_size": int(g(f"global_descriptor.{backend}.input_size", default_size)),
         "schema_version": schema_version,
         "global_backend": backend,
         "descriptor_dim": int(descriptor_dim),
-        "vlad_enabled": bool(g("models.vlad.enabled", False)),
+        "vlad_enabled": vlad_enabled,
         "vlad_pca_dim": int(g("models.vlad.pca_dim", 512)),
         "local_extractor": g("models.local_extractor", "aliked"),
         "local_descriptor_dim": int(local_descriptor_dim),
@@ -5717,7 +6583,55 @@ def build_components(
         "store_sift_features": bool(g("database.store_sift_features", False)),
         "sift_max_keypoints": int(g("database.sift_max_keypoints", 2048)),
         "dino_cpu_resize": bool(g("models.performance.dino_cpu_resize", False)),
+        "vlad_vocab": vocab_identity(g("models.vlad.vocab_path", None)) if vlad_enabled else None,
+        "vlad_layer": (int(vlad_layer) if vlad_layer is not None else "last")
+        if vlad_enabled
+        else None,
+        "vlad_low_norm_fraction": float(g("models.vlad.low_norm_fraction", 0.0))
+        if vlad_enabled
+        else None,
     }
+
+
+def vlad_mismatch(stored: Any, runtime: dict[str, Any]) -> str | None:
+    """Why a database's VLAD settings differ from the runtime ones, or None.
+
+    ``stored`` is the database's ``schema_components`` (None/non-dict for older
+    builders: unknown, not a mismatch). A database without VLAD fields counts as
+    built without VLAD; a VLAD database built before the vocabulary hash was
+    recorded has no ``vlad_vocab`` and therefore never matches a VLAD runtime.
+    """
+    if not isinstance(stored, dict):
+        return None
+    stored_on = bool(stored.get("vlad_enabled", False))
+    runtime_on = bool(runtime.get("vlad_enabled", False))
+    if stored_on != runtime_on:
+        return f"vlad_enabled: database {stored_on} != runtime {runtime_on}"
+    if not runtime_on:
+        return None
+    diffs = [
+        f"{key}: database {stored.get(key)!r} != runtime {runtime.get(key)!r}"
+        for key in OPTIONAL_FIELDS
+        if stored.get(key) != runtime.get(key)
+    ]
+    return "; ".join(diffs) or None
+
+
+def extra_mismatch(stored: Any, runtime: dict[str, Any]) -> str | None:
+    """Differences in the unhashed checked fields (e.g. DINO input size), or None.
+
+    A field missing on either side (older database) is not a mismatch.
+    """
+    if not isinstance(stored, dict):
+        return None
+    diffs = [
+        f"{key}: database {stored.get(key)!r} != runtime {runtime.get(key)!r}"
+        for key in CHECKED_EXTRA_FIELDS
+        if stored.get(key) is not None
+        and runtime.get(key) is not None
+        and stored.get(key) != runtime.get(key)
+    ]
+    return "; ".join(diffs) or None
 
 
 def describe(components: dict[str, Any]) -> str:
@@ -5728,6 +6642,384 @@ def describe(components: dict[str, Any]) -> str:
 def compare(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
     """Human-readable list of differing fields between two component dicts."""
     return [f"{k}: {a.get(k)!r} != {b.get(k)!r}" for k in SCHEMA_FIELDS if a.get(k) != b.get(k)]
+
+
+# ================================================================================
+# File: src\database\source_priority.py
+# ================================================================================
+"""Which layer's candidates a legacy multi-layer retrieval hands to verification.
+
+Without a margin the layer with the best top score wins (``MultiDatabaseManager``'s
+behaviour so far; ``priority`` only orders equal scores). With
+``localization.source_priority_rank_margin = N`` the candidates of all layers are
+ranked together by score, and a layer of higher priority (lower ``priority``
+number, the main layer first) still wins when its best candidate is within the
+first ``N + 1`` ranks. N = 3: the main layer's best candidate at rank 2 beats
+another layer's rank 1; at rank 10 the rank-1 layer is used.
+
+``localization.joint_candidate_ranking`` goes one step further: one verification
+list from the standard candidates of every layer and the patchify-only candidates
+of every layer (``joint_order``). Each layer has two priorities: ``priority`` for its
+standard candidates and ``patchify_priority`` (default: ``priority``) for its patch
+candidates. Layers that overlap need distinct priorities, otherwise no rule can
+order them; layers of different terrain may share one (``priority_conflicts``).
+
+``localization.layer_fineness_weight`` adds the layer's map accuracy to the project
+priority: effective step = priority step + weight x log2(ground pixel size / the
+finest layer's), the pixel size measured from the layer's calibration
+(``layer_gsd``). ``patchify_layers`` decides where patchify can help: only where no
+real layer is close in scale to the query.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+
+def choose_source(
+    per_source: dict[str, list[tuple[int, float]]],
+    priorities: dict[str, int],
+    rank_margin: int,
+) -> str | None:
+    """Source id whose candidates are verified, or None without candidates."""
+    ranked = sorted(
+        (
+            (float(score), sid)
+            for sid, candidates in per_source.items()
+            for _frame, score in candidates
+        ),
+        key=lambda item: (-item[0], priorities.get(item[1], 0), item[1]),
+    )
+    if not ranked:
+        return None
+    if rank_margin <= 0:
+        return ranked[0][1]
+    best_rank: dict[str, int] = {}
+    for rank, (_score, sid) in enumerate(ranked, start=1):
+        best_rank.setdefault(sid, rank)
+    for sid in sorted(best_rank, key=lambda s: (priorities.get(s, 0), s)):
+        if best_rank[sid] <= rank_margin + 1:
+            return sid
+    return ranked[0][1]
+
+
+def main_before_patchify(
+    expanded: list[tuple[int, float]],
+    standard_ids: set[int],
+    main_candidates: list[tuple[int, float]],
+    rank_margin: int,
+) -> bool:
+    """Verify the main layer's candidates before this layer's patchify-only ones?
+
+    ``expanded``: the chosen layer's candidates after patchify (standard and
+    patchify-only, merged scores); ``standard_ids``: the frames of its standard
+    retrieval; ``main_candidates``: the main layer's standard retrieval. All are
+    ranked together by score: the patchify-only candidates go first only when the
+    best of them is more than ``rank_margin`` ranks above the main layer's best
+    (patchify 1st, main 2nd -> main; main 10th -> patchify with a margin of 3).
+    ``rank_margin`` 0 never puts the main layer first (old behaviour).
+    """
+    patch_only = [score for frame, score in expanded if int(frame) not in standard_ids]
+    if rank_margin <= 0 or not patch_only or not main_candidates:
+        return False
+    ranked = sorted(
+        [(float(score), 0) for _frame, score in main_candidates]
+        + [(float(score), 1) for score in patch_only]
+        + [(float(score), 2) for frame, score in expanded if int(frame) in standard_ids],
+        key=lambda item: (-item[0], item[1]),
+    )
+    kinds = [kind for _score, kind in ranked]
+    main_rank = kinds.index(0) + 1
+    patch_rank = kinds.index(1) + 1
+    return main_rank - patch_rank <= rank_margin
+
+
+# ── Joint candidate list (localization.joint_candidate_ranking) ──────────────────
+
+
+@dataclass(frozen=True)
+class JointCandidate:
+    """One candidate of the joint list: a frame of one layer, standard or patchify."""
+
+    source_id: str
+    frame_id: int
+    score: float
+    patch: bool = False
+
+
+def effective_patchify_priority(source: Any) -> int:
+    """``patchify_priority`` of a layer (ProjectVideoSource or dict), else its ``priority``."""
+    get = source.get if isinstance(source, dict) else lambda key: getattr(source, key, None)
+    priority = int(get("priority") or 0)
+    patchify = get("patchify_priority")
+    return priority if patchify is None else int(patchify)
+
+
+def priority_steps(priorities: dict[str, int]) -> dict[str, int]:
+    """Dense rank of the priority values: {main: 0, 2: 1, 3: 2}; equal values share a step.
+
+    Gaps in the numbers (0, 2, 3) do not add penalty steps.
+    """
+    values = sorted({int(p) for p in priorities.values()})
+    index = {value: i for i, value in enumerate(values)}
+    return {sid: index[int(p)] for sid, p in priorities.items()}
+
+
+def joint_order(
+    candidates: Iterable[JointCandidate],
+    priorities: dict[str, int],
+    patch_priorities: dict[str, int],
+    rank_step: int,
+    patch_penalty: int,
+    top_k: int | None = None,
+) -> list[JointCandidate]:
+    """Verification order of the joint candidate list, first ``top_k``.
+
+    Place = rank by score within the candidate's kind + ``rank_step`` per priority
+    step of its layer (``priorities`` for standard candidates, ``patch_priorities``
+    for patchify ones) + ``patch_penalty`` for patchify candidates. Standard and
+    patchify scores are not on one scale (cosine of the global descriptors vs
+    coverage x mean similarity of the crops, which can exceed 1), so each kind is
+    ranked on its own: the best patchify candidate competes with the standard
+    candidate ``patch_penalty`` places below the best one. Ties: standard first,
+    then the higher priority, then the better rank in its kind. Two layers, no
+    patchify: the main layer's best goes first while it ranks at most ``rank_step``
+    places below the other layer's best (rank_step 2: main 3rd behind the other's
+    1st -> main first; 4th -> the other), the rule of ``choose_source``.
+    """
+    std_steps = priority_steps(priorities) if priorities else {}
+    patch_steps = priority_steps(patch_priorities) if patch_priorities else {}
+    pool = list(candidates)
+
+    def ranked(kind_is_patch: bool, steps: dict[str, int]) -> list[JointCandidate]:
+        return sorted(
+            (c for c in pool if c.patch == kind_is_patch),
+            key=lambda c: (-c.score, steps.get(c.source_id, 0), c.source_id, c.frame_id),
+        )
+
+    keyed = []
+    for pos, cand in enumerate(ranked(False, std_steps), start=1):
+        step = std_steps.get(cand.source_id, 0)
+        keyed.append((pos + rank_step * step, 0, step, pos, cand))
+    for pos, cand in enumerate(ranked(True, patch_steps), start=1):
+        step = patch_steps.get(cand.source_id, 0)
+        keyed.append((pos + patch_penalty + rank_step * step, 1, step, pos, cand))
+    keyed.sort(key=lambda item: item[:4])
+    ordered = [item[4] for item in keyed]
+    return ordered if top_k is None else ordered[: max(0, int(top_k))]
+
+
+def verification_runs(
+    ordered: Iterable[JointCandidate],
+) -> list[tuple[str, list[JointCandidate]]]:
+    """Consecutive candidates of one layer, in order: one verifier call each."""
+    runs: list[tuple[str, list[JointCandidate]]] = []
+    for cand in ordered:
+        if runs and runs[-1][0] == cand.source_id:
+            runs[-1][1].append(cand)
+        else:
+            runs.append((cand.source_id, [cand]))
+    return runs
+
+
+# ── Priority validation ──────────────────────────────────────────────────────────
+
+
+def next_priority(used: Iterable[int]) -> int:
+    """Next number for a layer stacked on the given ones: one past the largest, 0 first."""
+    values = [int(v) for v in used]
+    return max(values) + 1 if values else 0
+
+
+def coverage_cells(gps: Any, cell_deg: float = 0.02) -> set[tuple[int, int]]:
+    """Grid cells (~2 km at cell_deg 0.02) that contain at least one map frame position."""
+    if gps is None:
+        return set()
+    cells = set()
+    for row in gps:
+        try:
+            lat, lon = float(row[0]), float(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if lat != lat or lon != lon:  # NaN: frame without a position
+            continue
+        cells.add((int(lat // cell_deg), int(lon // cell_deg)))
+    return cells
+
+
+def priority_conflicts(
+    sources: Iterable[Any],
+    overlap: Callable[[Any, Any], bool],
+    distinguishable: Callable[[Any, Any], bool] | None = None,
+) -> list[str]:
+    """Pairs of overlapping layers whose priorities cannot be told apart.
+
+    Each message names the two layers and the shared number, for ``priority``
+    (standard candidates) and ``patchify_priority`` (patchify candidates).
+    Layers that do not overlap may share a number, and so may layers that
+    ``distinguishable`` tells apart otherwise (e.g. by map accuracy).
+    """
+    items = list(sources)
+
+    def sid(source: Any) -> str:
+        return str(source.get("source_id") if isinstance(source, dict) else source.source_id)
+
+    def prio(source: Any) -> int:
+        value = source.get("priority") if isinstance(source, dict) else source.priority
+        return int(value or 0)
+
+    def explicit_patch(source: Any) -> Any:
+        if isinstance(source, dict):
+            return source.get("patchify_priority")
+        return getattr(source, "patchify_priority", None)
+
+    messages = []
+    for i, a in enumerate(items):
+        for b in items[i + 1 :]:
+            same = prio(a) == prio(b)
+            # a patchify priority that only follows the layer priority adds no new clash
+            same_patch = effective_patchify_priority(a) == effective_patchify_priority(b) and not (
+                same and explicit_patch(a) is None and explicit_patch(b) is None
+            )
+            if not (same or same_patch) or not overlap(a, b):
+                continue
+            if distinguishable is not None and distinguishable(a, b):
+                continue
+            if same:
+                messages.append(
+                    f"layers '{sid(a)}' and '{sid(b)}' overlap but share priority {prio(a)}"
+                )
+            if same_patch:
+                messages.append(
+                    f"layers '{sid(a)}' and '{sid(b)}' overlap but share patchify priority "
+                    f"{effective_patchify_priority(a)}"
+                )
+    return messages
+
+
+# ── Layer accuracy (localization.layer_fineness_weight, patchify_adaptive) ───────────
+
+
+def layer_gsd(database: Any) -> float | None:
+    """Median ground size of one map pixel of a layer, from its frame calibration.
+
+    sqrt(|det|) of the 2x2 part of each valid frame affine (pixel -> map units);
+    None without a calibration. Only ratios between layers are used.
+    """
+    affine = getattr(database, "frame_affine", None)
+    if affine is None:
+        return None
+    a = np.asarray(affine, dtype=float)
+    if a.ndim == 2 and a.shape[1] == 6:
+        a = a.reshape(-1, 2, 3)
+    if a.ndim != 3 or a.shape[1] < 2 or a.shape[2] < 2:
+        return None
+    valid = getattr(database, "frame_valid", None)
+    if valid is not None and len(valid) == len(a):
+        a = a[np.asarray(valid, dtype=bool)]
+    det = np.abs(a[:, 0, 0] * a[:, 1, 1] - a[:, 0, 1] * a[:, 1, 0])
+    det = det[np.isfinite(det) & (det > 0)]
+    return float(np.sqrt(np.median(det))) if det.size else None
+
+
+def effective_steps(
+    priorities: dict[str, int],
+    gsds: dict[str, float | None],
+    weight: float,
+) -> dict[str, float]:
+    """Priority step of each layer + weight x log2(its pixel size / the finest layer's).
+
+    Relief project (main 1000 m = 0, 2000 m = 1, 500 m = 2; 0.72 / 1.51 / 0.33 m/px),
+    weight 2: main 2.3, 2000 m 5.4, 500 m 2.0. Layers without a pixel size get no
+    fineness term.
+    """
+    steps = {sid: float(v) for sid, v in priority_steps(priorities).items()}
+    known = {sid: float(g) for sid, g in gsds.items() if g and g > 0 and sid in steps}
+    if weight > 0 and known:
+        finest = min(known.values())
+        for sid, g in known.items():
+            steps[sid] += weight * math.log2(g / finest)
+    return steps
+
+
+def choose_source_weighted(
+    per_source: dict[str, list[tuple[int, float]]],
+    steps: dict[str, float],
+    rank_step: int,
+) -> str | None:
+    """Layer whose best candidate has the lowest rank + rank_step x effective step.
+
+    Ranks are over the candidates of all layers by score (as ``choose_source``);
+    ties go to the lower effective step. With two layers one whole step apart it
+    is ``choose_source``'s rule.
+    """
+    ranked = sorted(
+        (
+            (float(score), sid)
+            for sid, candidates in per_source.items()
+            for _frame, score in candidates
+        ),
+        key=lambda item: (-item[0], steps.get(item[1], 0.0), item[1]),
+    )
+    if not ranked:
+        return None
+    best_rank: dict[str, int] = {}
+    for rank, (_score, sid) in enumerate(ranked, start=1):
+        best_rank.setdefault(sid, rank)
+    return min(
+        best_rank,
+        key=lambda sid: (
+            best_rank[sid] + rank_step * steps.get(sid, 0.0),
+            steps.get(sid, 0.0),
+            sid,
+        ),
+    )
+
+
+def patchify_layers(
+    query_gsd: float | None,
+    gsds: dict[Any, float | None],
+    factors: Iterable[float],
+    gap_ratio: float,
+) -> set | None:
+    """Layers whose patchify search can help a query of ground pixel size ``query_gsd``.
+
+    None (unknown query scale or layer sizes): every layer, the old behaviour.
+    Empty: a real layer is within ``gap_ratio`` of the query's pixel size. Otherwise
+    the layers with a crop factor (2x2 crop -> pixel size / 2) that comes closer to
+    the query than any real layer: layers 500 m + 2000 m and a drone near 1000 m ->
+    the 2000 m layer.
+    """
+    known = {sid: float(g) for sid, g in gsds.items() if g and g > 0}
+    if query_gsd is None or query_gsd <= 0 or not known:
+        return None
+
+    def distance(size: float) -> float:
+        return abs(math.log(size / query_gsd))
+
+    nearest_real = min(distance(g) for g in known.values())
+    if nearest_real <= math.log(max(gap_ratio, 1.0)):
+        return set()
+    crops = [float(f) for f in factors if float(f) > 1.0]
+    return {sid for sid, g in known.items() if any(distance(g / f) < nearest_real for f in crops)}
+
+
+def grid_factors(grids: Iterable[Any]) -> list[float]:
+    """Linear crop factor of each patchify grid: (2, 2) -> 2, (2, 3) -> sqrt(6)."""
+    factors = []
+    for grid in grids:
+        try:
+            rows, cols = int(grid[0]), int(grid[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if rows > 0 and cols > 0:
+            factors.append(math.sqrt(rows * cols))
+    return factors
 
 
 # ================================================================================
@@ -6064,10 +7356,20 @@ class DepthEstimator:
         raise NotImplementedError
 
     def get_relative_scale(self, image_rgb: np.ndarray) -> float:
-        """Returns a scalar relative depth scale (1/median_depth).
+        """Returns 1 / median of the model output over the central region.
 
-        Smaller value = object farther away (greater altitude) = smaller GSD.
-        Larger value = object closer (lower altitude) = larger GSD.
+        Semantics (corrected 2026-10-27): Depth Anything V2 relative models output
+        affine-invariant DISPARITY (inverse depth; the vendored
+        third_party/Depth-Anything-V2/app.py labels the raw output "can be
+        considered as disparity"). 1 / median(disparity) therefore GROWS with
+        distance: larger value = farther = higher altitude = larger GSD (m/px).
+        ScaleManager.set_depth_hint divides query by DB value, which yields
+        r = query_alt / db_alt in the correct direction.
+
+        Caveat: the output's scale and shift are unknown per image, so the ratio
+        between two images carries little altitude information on near-planar
+        nadir scenes. Check with scripts/check_depth_scale_vs_altitude.py before
+        enabling localization.scale_use_depth_hint.
         """
         depth = self.estimate(image_rgb)
         # Take the central region (ignore edges where artifacts occur)
@@ -6264,6 +7566,427 @@ class CalibrationError(DroneLocError):
 
 class VideoDecodeError(DroneLocError):
     """A video source could not be opened or a frame could not be decoded."""
+
+
+# ================================================================================
+# File: src\flight_data\__init__.py
+# ================================================================================
+"""Optional flight data (drone telemetry) for localization.
+
+The system must work WITHOUT it — that is the default (``flight_data.source =
+"none"``). When a stream is available it is used only as a PRIOR:
+
+* heading → the rotation prior of the next keyframe (``yaw_hint_deg`` of
+  ``Localizer.localize_frame``). A wrong heading costs one retrieval pass and
+  falls back to the vision-only scan (rotation_rescan_min_score).
+* height above ground (else above take-off) → ``localization.altitude_hint``
+  (default off): the expected scale of the layers nearest that height is tried
+  first. A rough value is enough; without it the hint uses the last fix's scale.
+* MSL altitude, attitude and GNSS are carried in ``FlightSample`` for the terrain
+  work; nothing consumes them yet.
+
+Sources implement ``FlightDataSource.sample_at(time_s)``. Shipped:
+``NullFlightData``, ``CsvFlightData`` (a time-indexed log; preset "flightsim"
+reads FlightSimulator's telemetry.csv, "generic" also reads DroneSimUE's
+telemetry.csv / frames.csv) and ``MavlinkFlightData`` (a live MAVLink stream:
+ATTITUDE, GLOBAL_POSITION_INT incl. relative_alt, TERRAIN_REPORT / downward
+DISTANCE_SENSOR).
+
+Conventions
+-----------
+heading_deg: compass, clockwise from north, of the direction the TOP of the
+image points to (for a nadir camera whose image top is the nose: the drone
+heading; otherwise add ``camera_yaw_offset_deg``).
+yaw hint: the angle to rotate the query frame by (cv2 / np.rot90 sense,
+positive = counter-clockwise on screen) so it matches reference frames whose
+image top pointed to ``reference_heading_deg`` (0 for north-up / heading-hold
+layers): ``hint = reference_heading - heading`` (mod 360). Example: drone
+flying east (90) over north-up layers → hint 270 = rotate 90° clockwise.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+import math
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import ClassVar, Protocol
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class FlightSample:
+    time_s: float
+    heading_deg: float | None = None
+    alt_agl_m: float | None = None
+    alt_rel_m: float | None = None  # above take-off / home (baro), when AGL is unknown
+    alt_msl_m: float | None = None
+    pitch_deg: float | None = None
+    roll_deg: float | None = None
+    lat: float | None = None
+    lon: float | None = None
+
+
+class FlightDataSource(Protocol):
+    def sample_at(self, time_s: float) -> FlightSample | None: ...
+
+
+class NullFlightData:
+    """No telemetry: every query returns None (vision-only localization)."""
+
+    def sample_at(self, time_s: float) -> FlightSample | None:
+        return None
+
+
+def heading_to_yaw_hint(
+    heading_deg: float, reference_heading_deg: float = 0.0, camera_yaw_offset_deg: float = 0.0
+) -> float:
+    """Rotation (cv2 sense, degrees in [0, 360)) aligning the query to the references."""
+    return (
+        float(reference_heading_deg) - float(heading_deg) - float(camera_yaw_offset_deg)
+    ) % 360.0
+
+
+# Column mapping per preset: field -> (column, transform).
+_PRESETS: dict[str, dict[str, tuple[str, object]]] = {
+    "generic": {
+        "time_s": ("time_s", float),
+        "heading_deg": ("heading_deg", float),
+        "alt_agl_m": ("alt_agl_m", float),
+        "alt_rel_m": ("alt_rel_m", float),
+        "alt_msl_m": ("alt_msl_m", float),
+        "pitch_deg": ("pitch_deg", float),
+        "roll_deg": ("roll_deg", float),
+        "lat": ("lat", float),
+        "lon": ("lon", float),
+    },
+    # FlightSimulator telemetry.csv: yaw_rad is counter-clockwise from north
+    # (AutoPilot: atan2(-vx, vy)), alt_z is height above the simulator base plane
+    # (also the relative height for the altitude hint).
+    "flightsim": {
+        "time_s": ("timestamp", float),
+        "heading_deg": ("yaw_rad", lambda v: (-math.degrees(float(v))) % 360.0),
+        "alt_msl_m": ("alt_z", float),
+        "alt_rel_m": ("alt_z", float),
+    },
+}
+
+
+@dataclass
+class CsvFlightData:
+    """Time-indexed telemetry log with linear interpolation (heading on the circle).
+
+    ``time_offset_s`` maps video time to log time (log = video + offset). A query
+    farther than ``max_gap_s`` from the nearest row returns None (stale data is
+    worse than none).
+    """
+
+    path: str | Path
+    preset: str = "generic"
+    time_offset_s: float = 0.0
+    max_gap_s: float = 1.0
+    _t: np.ndarray = field(init=False, repr=False)
+    _cols: dict[str, np.ndarray] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.preset not in _PRESETS:
+            raise ValueError(f"unknown flight data preset {self.preset!r}")
+        mapping = _PRESETS[self.preset]
+        rows: dict[str, list[float]] = {k: [] for k in mapping}
+        with open(self.path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            header = set(reader.fieldnames or [])
+            time_col = mapping["time_s"][0]
+            if time_col not in header:
+                raise ValueError(f"{self.path}: no time column {time_col!r}")
+            present = {k: v for k, v in mapping.items() if v[0] in header}
+            for row in reader:
+                for key, (col, fn) in present.items():
+                    raw = row.get(col, "")
+                    rows[key].append(fn(raw) if raw not in ("", None) else np.nan)
+        order = np.argsort(np.asarray(rows["time_s"], dtype=np.float64), kind="stable")
+        self._t = np.asarray(rows["time_s"], dtype=np.float64)[order]
+        self._cols = {
+            k: np.asarray(v, dtype=np.float64)[order]
+            for k, v in rows.items()
+            if k != "time_s" and len(v) == len(order)
+        }
+        if len(self._t) == 0:
+            raise ValueError(f"{self.path}: no rows")
+
+    def sample_at(self, time_s: float) -> FlightSample | None:
+        t = float(time_s) + float(self.time_offset_s)
+        i = int(np.searchsorted(self._t, t))
+        lo, hi = max(0, i - 1), min(len(self._t) - 1, i)
+        if min(abs(self._t[lo] - t), abs(self._t[hi] - t)) > self.max_gap_s:
+            return None
+        w = (
+            0.0
+            if hi == lo
+            else float(np.clip((t - self._t[lo]) / (self._t[hi] - self._t[lo]), 0, 1))
+        )
+        values: dict[str, float | None] = {}
+        for key, col in self._cols.items():
+            a, b = col[lo], col[hi]
+            if not (np.isfinite(a) and np.isfinite(b)):
+                v = a if np.isfinite(a) else b
+                values[key] = float(v) if np.isfinite(v) else None
+            elif key == "heading_deg":
+                d = ((b - a + 180.0) % 360.0) - 180.0
+                values[key] = float((a + w * d) % 360.0)
+            else:
+                values[key] = float(a + w * (b - a))
+        return FlightSample(time_s=t, **values)
+
+
+_LIVE_FIELDS = (
+    "heading_deg",
+    "alt_agl_m",
+    "alt_rel_m",
+    "alt_msl_m",
+    "pitch_deg",
+    "roll_deg",
+    "lat",
+    "lon",
+)
+_MAV_TYPES = ["ATTITUDE", "GLOBAL_POSITION_INT", "TERRAIN_REPORT", "DISTANCE_SENSOR"]
+_MAV_SENSOR_ROTATION_PITCH_270 = 25  # DISTANCE_SENSOR.orientation: facing down
+_log = logging.getLogger(__name__)
+
+
+class MavlinkFlightData:
+    """Live telemetry from a MAVLink stream (DroneSimUE, or a flight controller
+    behind a telemetry radio / OpenIPC link).
+
+    A daemon thread keeps the last ``history_s`` seconds of state, stamped with
+    the LOCAL receive time; the stream's own clock is not used. ``sample_at``
+    ignores its argument's origin (live video time starts at the worker's start)
+    and returns the state at ``now + time_offset_s``: use a negative offset to
+    compensate the video latency (e.g. -0.15 when frames arrive 150 ms late).
+    No message newer than ``max_gap_s`` around that time -> None.
+
+    The UDP socket opens on the first query and closes with ``close()``; a new
+    instance on the same URL closes the previous one (so a worker that exited
+    early does not keep the port).
+    """
+
+    _active: ClassVar[dict[str, MavlinkFlightData]] = {}
+    # Re-entrant: start() closes the previous owner while holding it.
+    _active_lock: ClassVar[threading.RLock] = threading.RLock()
+
+    def __init__(
+        self,
+        url: str = "udpin:0.0.0.0:14550",
+        time_offset_s: float = 0.0,
+        max_gap_s: float = 1.0,
+        history_s: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+        autostart: bool = True,
+    ) -> None:
+        self.url = url
+        self.autostart = autostart
+        self.time_offset_s = float(time_offset_s)
+        self.max_gap_s = float(max_gap_s)
+        self.history_s = float(history_s)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._state: dict[str, float] = {}
+        self._history: deque[tuple[float, dict[str, float]]] = deque()
+        self._last_attitude_t: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._conn = None
+
+    # -- receiving ---------------------------------------------------------
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        try:
+            from pymavlink import mavutil
+        except ImportError as e:  # optional dependency
+            raise RuntimeError(
+                "flight_data.source = mavlink needs pymavlink: python -m pip install pymavlink"
+            ) from e
+        with MavlinkFlightData._active_lock:
+            previous = MavlinkFlightData._active.get(self.url)
+            if previous is not None and previous is not self:
+                previous.close()
+            self._conn = mavutil.mavlink_connection(self.url, dialect="common")
+            MavlinkFlightData._active[self.url] = self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="MavlinkFlightData", daemon=True)
+        self._thread.start()
+        _log.info("MAVLink flight data: listening on %s", self.url)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                msg = self._conn.recv_match(type=_MAV_TYPES, blocking=True, timeout=0.2)
+            except Exception as e:  # socket closed by close(), or a broken frame
+                if self._stop.is_set():
+                    break
+                _log.debug("MAVLink receive error: %s", e)
+                continue
+            if msg is not None:
+                self.ingest(msg.get_type(), msg.to_dict(), self._clock())
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        with MavlinkFlightData._active_lock:
+            if MavlinkFlightData._active.get(self.url) is self:
+                del MavlinkFlightData._active[self.url]
+
+    def ingest(self, kind: str, fields: dict, t: float) -> None:
+        """One decoded message (``msg.get_type()``, ``msg.to_dict()``) received at ``t``."""
+        updates: dict[str, float] = {}
+        if kind == "ATTITUDE":
+            updates["heading_deg"] = math.degrees(float(fields["yaw"])) % 360.0
+            updates["pitch_deg"] = math.degrees(float(fields["pitch"]))
+            updates["roll_deg"] = math.degrees(float(fields["roll"]))
+            self._last_attitude_t = t
+        elif kind == "GLOBAL_POSITION_INT":
+            updates["lat"] = float(fields["lat"]) / 1e7
+            updates["lon"] = float(fields["lon"]) / 1e7
+            updates["alt_msl_m"] = float(fields["alt"]) / 1000.0
+            if fields.get("relative_alt") is not None:
+                updates["alt_rel_m"] = float(fields["relative_alt"]) / 1000.0
+            hdg = int(fields.get("hdg", 65535))
+            attitude_fresh = self._last_attitude_t is not None and t - self._last_attitude_t <= 1.0
+            if hdg != 65535 and not attitude_fresh:
+                updates["heading_deg"] = (hdg / 100.0) % 360.0
+        elif kind == "TERRAIN_REPORT":
+            updates["alt_agl_m"] = float(fields["current_height"])
+        elif kind == "DISTANCE_SENSOR":
+            if int(fields.get("orientation", -1)) == _MAV_SENSOR_ROTATION_PITCH_270:
+                updates["alt_agl_m"] = float(fields["current_distance"]) / 100.0
+        if not updates:
+            return
+        with self._lock:
+            self._state.update(updates)
+            snapshot = (t, dict(self._state))
+            if self._history and abs(t - self._history[-1][0]) < 1e-3:
+                self._history[-1] = snapshot  # same packet burst: keep the complete state
+            else:
+                self._history.append(snapshot)
+            while self._history and t - self._history[0][0] > self.history_s:
+                self._history.popleft()
+
+    # -- querying ------------------------------------------------------------
+    def sample_at(self, time_s: float) -> FlightSample | None:
+        if self.autostart and self._thread is None:
+            self.start()
+        target = self._clock() + self.time_offset_s
+        with self._lock:
+            history = list(self._history)
+        if not history:
+            return None
+        times = [h[0] for h in history]
+        i = int(np.searchsorted(times, target))
+        lo, hi = max(0, i - 1), min(len(history) - 1, i)
+        if min(abs(times[lo] - target), abs(times[hi] - target)) > self.max_gap_s:
+            return None
+        a, b = history[lo][1], history[hi][1]
+        w = (
+            0.0
+            if hi == lo
+            else float(np.clip((target - times[lo]) / (times[hi] - times[lo]), 0, 1))
+        )
+        values: dict[str, float | None] = {}
+        for key in _LIVE_FIELDS:
+            va, vb = a.get(key), b.get(key)
+            if va is None or vb is None:
+                values[key] = vb if vb is not None else va
+            elif key == "heading_deg":
+                d = ((vb - va + 180.0) % 360.0) - 180.0
+                values[key] = (va + w * d) % 360.0
+            else:
+                values[key] = va + w * (vb - va)
+        return FlightSample(time_s=float(time_s), **values)
+
+
+class FlightPrior:
+    """Turns ``flight_data.*`` config + a source into per-keyframe priors."""
+
+    def __init__(self, source: FlightDataSource, config) -> None:
+        from config import get_cfg
+
+        self.source = source
+        self.use_heading = bool(get_cfg(config, "flight_data.use_heading", True))
+        self.use_altitude = bool(get_cfg(config, "flight_data.use_altitude", True))
+        self.reference_heading_deg = float(
+            get_cfg(config, "flight_data.reference_heading_deg", 0.0)
+        )
+        self.camera_yaw_offset_deg = float(
+            get_cfg(config, "flight_data.camera_yaw_offset_deg", 0.0)
+        )
+
+    def close(self) -> None:
+        """Releases a live source (MAVLink socket); no-op for logs."""
+        close = getattr(self.source, "close", None)
+        if callable(close):
+            close()
+
+    def yaw_hint_deg(self, video_time_s: float) -> float | None:
+        if not self.use_heading:
+            return None
+        sample = self.source.sample_at(video_time_s)
+        if sample is None or sample.heading_deg is None or not math.isfinite(sample.heading_deg):
+            return None
+        return heading_to_yaw_hint(
+            sample.heading_deg, self.reference_heading_deg, self.camera_yaw_offset_deg
+        )
+
+    def altitude_m(self, video_time_s: float) -> float | None:
+        """Height for ``localization.altitude_hint``: above ground, else above take-off."""
+        if not self.use_altitude:
+            return None
+        sample = self.source.sample_at(video_time_s)
+        if sample is None:
+            return None
+        for value in (sample.alt_agl_m, sample.alt_rel_m):
+            if value is not None and math.isfinite(value) and value > 0.0:
+                return float(value)
+        return None
+
+
+def build_flight_prior(config) -> FlightPrior | None:
+    """``None`` when ``flight_data.source == "none"`` (the default)."""
+    from config import get_cfg
+
+    kind = str(get_cfg(config, "flight_data.source", "none"))
+    if kind == "none":
+        return None
+    if kind == "csv":
+        source = CsvFlightData(
+            path=str(get_cfg(config, "flight_data.csv_path", "")),
+            preset=str(get_cfg(config, "flight_data.csv_preset", "generic")),
+            time_offset_s=float(get_cfg(config, "flight_data.time_offset_s", 0.0)),
+            max_gap_s=float(get_cfg(config, "flight_data.max_gap_s", 1.0)),
+        )
+        return FlightPrior(source, config)
+    if kind == "mavlink":
+        source = MavlinkFlightData(
+            url=str(get_cfg(config, "flight_data.mavlink_url", "udpin:0.0.0.0:14550")),
+            time_offset_s=float(get_cfg(config, "flight_data.time_offset_s", 0.0)),
+            max_gap_s=float(get_cfg(config, "flight_data.max_gap_s", 1.0)),
+        )
+        return FlightPrior(source, config)
+    raise ValueError(f"unknown flight_data.source {kind!r}")
 
 
 # ================================================================================
@@ -6691,7 +8414,7 @@ def mercator_scale_factor(lat: float) -> float:
 
 
 class CoordinateConverter:
-    """Deterministic coordinate conversion (WebMercator or UTM) based on instance configuration."""
+    """Geographic projection, or LOCAL arbitrary XY using legacy (y, x) transport."""
 
     def __init__(
         self, mode: str = "WEB_MERCATOR", reference_gps: tuple[float, float] | None = None
@@ -6702,7 +8425,9 @@ class CoordinateConverter:
         self._transformer_to_gps: Transformer | None = None
         self._initialized = False
 
-        if self._mode == "WEB_MERCATOR":
+        if self._mode == "LOCAL":
+            self._initialized = True
+        elif self._mode == "WEB_MERCATOR":
             self._initialize_projection(0.0, 0.0)
         elif self._reference_gps:
             self._initialize_projection(*self._reference_gps)
@@ -6719,7 +8444,7 @@ class CoordinateConverter:
 
     @property
     def mode(self) -> str:
-        """Projection mode: 'UTM' or 'WEB_MERCATOR' (public access instead of _mode)."""
+        """Coordinate mode: UTM, WEB_MERCATOR or LOCAL (no geographic projection)."""
         return self._mode
 
     def ground_scale_factor(self, lat: float | None = None) -> float:
@@ -6759,6 +8484,10 @@ class CoordinateConverter:
         self._initialized = True
 
     def gps_to_metric(self, lat: float, lon: float) -> tuple[float, float]:
+        # Legacy UI transport is (vertical, horizontal). LOCAL has no GPS;
+        # public outputs must label these as y/x, in arbitrary map units.
+        if self._mode == "LOCAL":
+            return float(lon), float(lat)
         if not self._initialized:
             if self._mode == "WEB_MERCATOR":
                 self._initialize_projection(lat, lon)
@@ -6779,6 +8508,8 @@ class CoordinateConverter:
         return float(x), float(y)
 
     def metric_to_gps(self, x: float, y: float) -> tuple[float, float]:
+        if self._mode == "LOCAL":
+            return float(y), float(x)
         if not self._initialized:
             if self._mode == "WEB_MERCATOR":
                 self._initialize_projection(0.0, 0.0)
@@ -6793,6 +8524,22 @@ class CoordinateConverter:
 
         lon, lat = self._transformer_to_gps.transform(x, y)
         return float(lat), float(lon)
+
+    def metric_to_gps_array(self, x, y):
+        """Vectorised metric_to_gps: arrays of x, y -> (lat, lon) arrays."""
+        import numpy as np
+
+        if self._mode == "LOCAL":
+            return np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)
+        if not self._initialized:
+            if self._mode == "WEB_MERCATOR":
+                self._initialize_projection(0.0, 0.0)
+            else:
+                raise RuntimeError("CoordinateConverter is not initialized.")
+        lon, lat = self._transformer_to_gps.transform(
+            np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+        )
+        return np.asarray(lat, dtype=np.float64), np.asarray(lon, dtype=np.float64)
 
     def export_metadata(self) -> dict[str, Any]:
         """Export settings for serialization."""
@@ -6827,6 +8574,513 @@ class CoordinateConverter:
 
 # Global instance for backward compatibility (temporary)
 DEFAULT_CONVERTER = CoordinateConverter("WEB_MERCATOR")
+
+
+# ================================================================================
+# File: src\geometry\dem.py
+# ================================================================================
+"""Digital elevation model (DEM): open-data download, local rasters, sampling.
+
+Used by the terrain scale model of calibration propagation
+(``graph_optimization.terrain_scale_prior``). Map building happens before the
+flight, on a machine with internet, so the DEM is fetched once and cached in the
+project; nothing here runs during GPS-denied localization.
+
+Sources
+-------
+* ``terrarium`` - AWS Terrain Tiles (open data, registry.opendata.aws/terrain-tiles):
+  256 px Web-Mercator PNG tiles, elevation = R*256 + G + B/256 - 32768 metres.
+  The same source the FlightSimulator renders its relief from, so a simulator
+  run and the propagation see the same terrain. Plain PNG: no GDAL needed.
+* ``file`` - a local GeoTIFF (EPSG:3857, EPSG:4326 or any EPSG pyproj knows),
+  one band in metres or an RGB(A) terrarium raster such as the simulator's
+  ``.tile_cache/elevation_*.tif``. Read with rasterio when installed, else PIL.
+
+Elevations are metres of the source's vertical datum. Only height differences
+inside one mission matter here, so the datum cancels.
+"""
+
+from __future__ import annotations
+
+import math
+import urllib.request
+from collections.abc import Callable
+from pathlib import Path
+
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+EARTH_RADIUS_M = 6378137.0
+TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+TILE_PX = 256
+_MAX_TILES = 4096
+
+
+# ── Web Mercator helpers (closed form, vectorised) ─────────────────────────────
+
+
+def lonlat_to_mercator(lon, lat) -> tuple[np.ndarray, np.ndarray]:
+    lon = np.asarray(lon, dtype=np.float64)
+    lat = np.clip(np.asarray(lat, dtype=np.float64), -85.05112878, 85.05112878)
+    x = EARTH_RADIUS_M * np.radians(lon)
+    y = EARTH_RADIUS_M * np.log(np.tan(np.pi / 4.0 + np.radians(lat) / 2.0))
+    return x, y
+
+
+def mercator_to_lonlat(x, y) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    lon = np.degrees(x / EARTH_RADIUS_M)
+    lat = np.degrees(2.0 * np.arctan(np.exp(y / EARTH_RADIUS_M)) - np.pi / 2.0)
+    return lon, lat
+
+
+def tile_range(
+    lat_min: float, lon_min: float, lat_max: float, lon_max: float, zoom: int
+) -> tuple[int, int, int, int]:
+    """Inclusive XYZ tile range (x0, y0, x1, y1) covering the bbox."""
+    n = 2**zoom
+
+    def tx(lon):
+        return int(np.clip(math.floor((lon + 180.0) / 360.0 * n), 0, n - 1))
+
+    def ty(lat):
+        lat = max(min(lat, 85.05112878), -85.05112878)
+        r = math.radians(lat)
+        return int(
+            np.clip(math.floor((1.0 - math.asinh(math.tan(r)) / math.pi) / 2.0 * n), 0, n - 1)
+        )
+
+    return tx(lon_min), ty(lat_max), tx(lon_max), ty(lat_min)
+
+
+def terrarium_decode(rgb: np.ndarray) -> np.ndarray:
+    """RGB(A) uint8 terrarium pixels -> float32 metres."""
+    a = np.asarray(rgb)
+    r = a[..., 0].astype(np.float64)
+    g = a[..., 1].astype(np.float64)
+    b = a[..., 2].astype(np.float64)
+    return (r * 256.0 + g + b / 256.0 - 32768.0).astype(np.float32)
+
+
+# ── Raster ─────────────────────────────────────────────────────────────────────
+
+
+class RasterDEM:
+    """Elevation raster with a north-up affine georeference.
+
+    ``origin`` is the CRS coordinate of the top-left corner of pixel (0, 0) and
+    ``pixel_size`` the (x, y) size of a pixel (y positive, rows go south).
+    NaN marks no data. ``sample`` is bilinear; any NaN neighbour gives NaN.
+    """
+
+    def __init__(
+        self,
+        data: np.ndarray,
+        origin: tuple[float, float],
+        pixel_size: tuple[float, float],
+        crs: str = "EPSG:3857",
+        source: str = "",
+    ) -> None:
+        self.data = np.asarray(data, dtype=np.float32)
+        if self.data.ndim != 2:
+            raise ValueError("DEM data must be 2-D")
+        self.origin = (float(origin[0]), float(origin[1]))
+        self.pixel_size = (float(pixel_size[0]), float(pixel_size[1]))
+        self.crs = str(crs).upper()
+        self.source = source
+        self._transformer = None
+        if self.crs not in ("EPSG:3857", "EPSG:4326"):
+            from pyproj import Transformer
+
+            self._transformer = Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.data.shape  # type: ignore[return-value]
+
+    def _to_crs(self, lat, lon) -> tuple[np.ndarray, np.ndarray]:
+        if self.crs == "EPSG:3857":
+            return lonlat_to_mercator(lon, lat)
+        if self.crs == "EPSG:4326":
+            return np.asarray(lon, dtype=np.float64), np.asarray(lat, dtype=np.float64)
+        x, y = self._transformer.transform(np.asarray(lon), np.asarray(lat))
+        return np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+
+    def sample(self, lat, lon) -> np.ndarray:
+        """Bilinear elevation at WGS84 points; NaN outside the raster or on no-data."""
+        from scipy.ndimage import map_coordinates
+
+        lat = np.asarray(lat, dtype=np.float64)
+        lon = np.asarray(lon, dtype=np.float64)
+        x, y = self._to_crs(lat, lon)
+        col = (x - self.origin[0]) / self.pixel_size[0] - 0.5
+        row = (self.origin[1] - y) / self.pixel_size[1] - 0.5
+        flat_r = np.ravel(row)
+        flat_c = np.ravel(col)
+        out = np.full(flat_r.shape, np.nan, dtype=np.float64)
+        h, w = self.data.shape
+        inside = (
+            np.isfinite(flat_r)
+            & np.isfinite(flat_c)
+            & (flat_r >= -0.5)
+            & (flat_r <= h - 0.5)
+            & (flat_c >= -0.5)
+            & (flat_c <= w - 0.5)
+        )
+        if np.any(inside):
+            rr = np.clip(flat_r[inside], 0.0, h - 1.0)
+            cc = np.clip(flat_c[inside], 0.0, w - 1.0)
+            out[inside] = map_coordinates(
+                self.data, np.vstack([rr, cc]), order=1, mode="nearest", prefilter=False
+            )
+        return out.reshape(np.shape(lat))
+
+    def bounds_lonlat(self) -> tuple[float, float, float, float]:
+        """(lat_min, lon_min, lat_max, lon_max) of the raster extent."""
+        h, w = self.data.shape
+        x0, y1 = self.origin
+        x1 = x0 + w * self.pixel_size[0]
+        y0 = y1 - h * self.pixel_size[1]
+        if self.crs == "EPSG:4326":
+            return y0, x0, y1, x1
+        if self.crs == "EPSG:3857":
+            lon0, lat0 = mercator_to_lonlat(x0, y0)
+            lon1, lat1 = mercator_to_lonlat(x1, y1)
+            return float(lat0), float(lon0), float(lat1), float(lon1)
+        from pyproj import Transformer
+
+        inv = Transformer.from_crs(self.crs, "EPSG:4326", always_xy=True)
+        lons, lats = inv.transform([x0, x1, x0, x1], [y0, y0, y1, y1])
+        return float(min(lats)), float(min(lons)), float(max(lats)), float(max(lons))
+
+    def covers(self, lat_min: float, lon_min: float, lat_max: float, lon_max: float) -> bool:
+        b = self.bounds_lonlat()
+        return b[0] <= lat_min and b[1] <= lon_min and b[2] >= lat_max and b[3] >= lon_max
+
+
+# ── Terrarium tiles ────────────────────────────────────────────────────────────
+
+
+def _default_fetch(url: str, timeout_s: float = 20.0) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "DroneLocalization-DEM/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:  # noqa: S310 (fixed https URL)
+        return response.read()
+
+
+def _decode_png(payload: bytes) -> np.ndarray:
+    import cv2
+
+    image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if image is None or image.ndim != 3 or image.shape[2] < 3:
+        raise ValueError("not an RGB terrarium tile")
+    return image[..., [2, 1, 0]]  # BGR(A) -> RGB
+
+
+def load_terrarium(
+    lat_min: float,
+    lon_min: float,
+    lat_max: float,
+    lon_max: float,
+    zoom: int,
+    cache_dir: str | Path,
+    *,
+    download: bool = True,
+    fetch: Callable[[str], bytes] | None = None,
+    url_template: str = TERRARIUM_URL,
+) -> RasterDEM | None:
+    """Mosaic of terrarium tiles covering the bbox, cached as PNG files.
+
+    Tiles are stored as ``<cache_dir>/terrarium/<z>/<x>/<y>.png`` exactly as
+    downloaded. A tile that cannot be read or fetched stays NaN; returns None
+    only when no tile is available at all.
+    """
+    zoom = int(zoom)
+    x0, y0, x1, y1 = tile_range(lat_min, lon_min, lat_max, lon_max, zoom)
+    n_tiles = (x1 - x0 + 1) * (y1 - y0 + 1)
+    if n_tiles > _MAX_TILES:
+        raise ValueError(f"DEM bbox needs {n_tiles} tiles at zoom {zoom}; lower the zoom")
+    fetch = fetch or _default_fetch
+    root = Path(cache_dir) / "terrarium" / str(zoom)
+    mosaic = np.full(((y1 - y0 + 1) * TILE_PX, (x1 - x0 + 1) * TILE_PX), np.nan, np.float32)
+    have = fetched = failed = 0
+    for ty in range(y0, y1 + 1):
+        for tx in range(x0, x1 + 1):
+            path = root / str(tx) / f"{ty}.png"
+            payload = None
+            if path.is_file():
+                payload = path.read_bytes()
+            elif download:
+                try:
+                    payload = fetch(url_template.format(z=zoom, x=tx, y=ty))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_suffix(".tmp")
+                    tmp.write_bytes(payload)
+                    tmp.replace(path)
+                    fetched += 1
+                except Exception as exc:  # network / HTTP / disk
+                    failed += 1
+                    logger.warning(f"DEM tile z{zoom}/{tx}/{ty} unavailable: {exc}")
+                    continue
+            if payload is None:
+                continue
+            try:
+                elev = terrarium_decode(_decode_png(payload))
+            except Exception as exc:
+                failed += 1
+                logger.warning(f"DEM tile {path} unreadable: {exc}")
+                continue
+            r0 = (ty - y0) * TILE_PX
+            c0 = (tx - x0) * TILE_PX
+            mosaic[r0 : r0 + TILE_PX, c0 : c0 + TILE_PX] = elev[:TILE_PX, :TILE_PX]
+            have += 1
+    if have == 0:
+        logger.warning(f"No DEM tiles available for zoom {zoom} ({n_tiles} needed)")
+        return None
+    tile_m = 2.0 * math.pi * EARTH_RADIUS_M / 2**zoom
+    origin = (-math.pi * EARTH_RADIUS_M + x0 * tile_m, math.pi * EARTH_RADIUS_M - y0 * tile_m)
+    px = tile_m / TILE_PX
+    logger.info(
+        f"DEM terrarium z{zoom}: {have}/{n_tiles} tiles ({fetched} downloaded, {failed} failed), "
+        f"cache {root}"
+    )
+    return RasterDEM(mosaic, origin, (px, px), "EPSG:3857", source=f"terrarium z{zoom}")
+
+
+# ── Local GeoTIFF ──────────────────────────────────────────────────────────────
+
+
+def _geokey_epsg(geokeys) -> str | None:
+    if not geokeys or len(geokeys) < 4:
+        return None
+    n = int(geokeys[3])
+    keys = {}
+    for i in range(n):
+        key_id, location, _count, value = (int(v) for v in geokeys[4 + 4 * i : 8 + 4 * i])
+        if location == 0:
+            keys[key_id] = value
+    for key_id in (3072, 2048):  # ProjectedCSTypeGeoKey, GeographicTypeGeoKey
+        code = keys.get(key_id)
+        if code and code != 32767:
+            return f"EPSG:{code}"
+    return None
+
+
+def _band_to_metres(array: np.ndarray, elevation_format: str, nodata) -> np.ndarray:
+    a = np.asarray(array)
+    fmt = elevation_format
+    if fmt == "auto":
+        fmt = "terrarium" if (a.ndim == 3 and a.shape[2] >= 3 and a.dtype == np.uint8) else "meters"
+    if fmt == "terrarium":
+        if a.ndim != 3 or a.shape[2] < 3:
+            raise ValueError("terrarium DEM needs at least three bands")
+        out = terrarium_decode(a)
+        if a.shape[2] >= 4:
+            out[a[..., 3] == 0] = np.nan
+        return out
+    band = a[..., 0] if a.ndim == 3 else a
+    out = band.astype(np.float32)
+    if nodata is not None:
+        out[band == nodata] = np.nan
+    return out
+
+
+def load_geotiff(path: str | Path, elevation_format: str = "auto") -> RasterDEM:
+    """North-up GeoTIFF DEM (metres or terrarium RGB). rasterio if present, else PIL."""
+    path = Path(path)
+    if elevation_format not in ("auto", "terrarium", "meters"):
+        raise ValueError("elevation_format must be auto, terrarium or meters")
+    try:
+        import rasterio  # type: ignore[import-not-found]
+    except ImportError:
+        rasterio = None
+    if rasterio is not None:
+        with rasterio.open(path) as src:
+            t = src.transform
+            if abs(t.b) > 1e-12 or abs(t.d) > 1e-12:
+                raise ValueError(f"{path}: rotated rasters are not supported")
+            bands = src.read()  # (bands, rows, cols)
+            array = bands[0] if bands.shape[0] == 1 else np.moveaxis(bands, 0, -1)
+            data = _band_to_metres(array, elevation_format, src.nodata)
+            crs = src.crs.to_string() if src.crs else "EPSG:3857"
+            return RasterDEM(data, (t.c, t.f), (t.a, -t.e), crs, source=str(path))
+
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(path) as image:
+        tags = image.tag_v2
+        scale = tags.get(33550)
+        tie = tags.get(33922)
+        if not scale or not tie or len(tie) < 6:
+            raise ValueError(f"{path}: no GeoTIFF georeference (ModelPixelScale/Tiepoint)")
+        crs = _geokey_epsg(tags.get(34735))
+        if crs is None:
+            raise ValueError(f"{path}: CRS is not an EPSG code; reproject the DEM first")
+        nodata_tag = tags.get(42113)
+        nodata = float(str(nodata_tag).strip("\x00 ")) if nodata_tag else None
+        array = np.asarray(image)
+    origin = (tie[3] - tie[0] * scale[0], tie[4] + tie[1] * scale[1])
+    data = _band_to_metres(array, elevation_format, nodata)
+    return RasterDEM(data, origin, (scale[0], scale[1]), crs, source=str(path))
+
+
+# ── Resolution from config ─────────────────────────────────────────────────────
+
+
+def find_project_dir(start: str | Path) -> Path | None:
+    """Closest ancestor of ``start`` that holds a project.json."""
+    p = Path(start).resolve()
+    for candidate in [p, *p.parents]:
+        if (candidate / "project.json").is_file():
+            return candidate
+    return None
+
+
+def resolve_dem(
+    source: str,
+    dem_path: str,
+    zoom: int,
+    bbox: tuple[float, float, float, float],
+    default_cache_dir: str | Path,
+    *,
+    download: bool = True,
+    fetch: Callable[[str], bytes] | None = None,
+) -> RasterDEM | None:
+    """DEM for ``bbox`` = (lat_min, lon_min, lat_max, lon_max) per config.
+
+    ``file``: ``dem_path`` is a GeoTIFF. ``terrarium``: ``dem_path`` (if set) is
+    the cache folder, else ``default_cache_dir``. Errors are logged; None means
+    "no DEM", and the caller runs without the terrain model.
+    """
+    try:
+        if source == "file":
+            if not dem_path:
+                logger.warning(
+                    "terrain DEM source 'file' needs graph_optimization.terrain_dem_path"
+                )
+                return None
+            dem = load_geotiff(dem_path)
+            if not dem.covers(*bbox):
+                logger.warning(f"DEM {dem_path} does not cover the whole mission bbox {bbox}")
+            return dem
+        if source == "terrarium":
+            cache = Path(dem_path) if dem_path else Path(default_cache_dir)
+            return load_terrarium(*bbox, zoom, cache, download=download, fetch=fetch)
+        logger.warning(f"Unknown terrain DEM source: {source!r}")
+    except Exception as exc:
+        logger.warning(f"DEM unavailable ({source}): {exc}")
+    return None
+
+
+# ================================================================================
+# File: src\geometry\frame_transform.py
+# ================================================================================
+"""Full image-to-map transforms and explicit affine compatibility views."""
+
+import numpy as np
+
+
+def as_homography(matrix):
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.shape == (2, 3):
+        matrix = np.vstack([matrix, [0.0, 0.0, 1.0]])
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        raise ValueError("Expected a finite affine or homography")
+    return matrix
+
+
+def project_points(matrix, points):
+    points = np.asarray(points, dtype=np.float64)
+    H = as_homography(matrix)
+    scale = np.max(np.abs(H[2]))
+    if scale == 0:
+        raise ValueError("Singular projective transform")
+    projected = np.column_stack([points, np.ones(len(points))]) @ (H / scale).T
+    if np.any(np.abs(projected[:, 2]) < 1e-12):
+        raise ValueError("Projective horizon at an image point")
+    result = projected[:, :2] / projected[:, 2:3]
+    if not np.isfinite(result).all():
+        raise ValueError("Non-finite projected points")
+    return result
+
+
+def project_frame_points(matrix, points, width, height, *, min_denominator_ratio=0.2):
+    """Project within the reference frame's finite projective chart.
+
+    Query centers/FOV can lie outside the reference image. Reject points near or
+    across its horizon instead of returning mirrored coordinates or inventing a
+    geographic measurement from an affine approximation.
+    """
+    H = as_homography(matrix)
+    pts = np.asarray(points, dtype=np.float64)
+    reference = H[2] @ [width / 2, height / 2, 1.0]
+    if reference == 0 or not np.isfinite(reference):
+        raise ValueError("Invalid reference projective chart")
+    ratio = (np.column_stack([pts, np.ones(len(pts))]) @ H[2]) / reference
+    if not np.isfinite(ratio).all() or np.any(ratio < min_denominator_ratio):
+        raise ValueError("Point outside safe reference projective chart")
+    return project_points(H, pts)
+
+
+def valid_footprint(matrix, width, height, *, orientation=None):
+    """No horizon, collapse or reflection relative to the requested orientation."""
+    try:
+        H = as_homography(matrix)
+        row_scale = np.max(np.abs(H[2]))
+        if row_scale == 0 or min(width, height) <= 0:
+            return False
+        H = H / row_scale
+        corners = np.array([[0, 0, 1], [width, 0, 1], [width, height, 1], [0, height, 1]])
+        denominators = corners @ H[2]
+        scale = np.max(np.abs(denominators))
+        if scale <= 1e-12 or not (
+            np.all(denominators > scale * 1e-6) or np.all(denominators < -scale * 1e-6)
+        ):
+            return False
+        H = H / scale
+        det = np.linalg.det(H)
+        if not np.isfinite(det) or abs(det) < 1e-15:
+            return False
+        return orientation is None or np.sign(det) * np.sign(denominators[0]) == orientation
+    except (ValueError, np.linalg.LinAlgError):
+        return False
+
+
+def affine_at_center(matrix, width, height):
+    """Tangent affine: exact center and local Jacobian, not a replacement for H."""
+    H = as_homography(matrix)
+    center = np.array([width / 2, height / 2])
+    value = project_points(H, center[None])[0]
+    denominator = H[2, :2] @ center + H[2, 2]
+    jacobian = (H[:2, :2] - value[:, None] * H[2, :2]) / denominator
+    return np.column_stack([jacobian, value - jacobian @ center])
+
+
+def get_frame_transform(database, frame_id):
+    """Use full geometry when present; support old databases and lightweight adapters."""
+    getter = getattr(database, "get_frame_affine", None)
+    if callable(getter):
+        affine = getter(frame_id)
+    else:
+        matrices = getattr(database, "frame_affine", None)
+        valid = getattr(database, "frame_valid", None)
+        affine = (
+            matrices[frame_id]
+            if matrices is not None
+            and 0 <= frame_id < len(matrices)
+            and (valid is None or valid[frame_id])
+            else None
+        )
+    if affine is None:
+        return None
+    matrices = getattr(database, "frame_homography", None)
+    if isinstance(matrices, np.ndarray) and 0 <= frame_id < len(matrices):
+        return matrices[frame_id]
+    return affine
 
 
 # ================================================================================
@@ -6895,6 +9149,376 @@ class GSDCalculator:
 
 
 # ================================================================================
+# File: src\geometry\local_panorama.py
+# ================================================================================
+"""Render reference video frames in the coordinate system of a local map."""
+
+import hashlib
+import json
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+from src.geometry.frame_transform import as_homography, get_frame_transform, project_points
+
+
+@dataclass
+class LocalPanoramaLayout:
+    """An immutable-in-use snapshot; background rendering never reads a live DB."""
+
+    affines: dict[int, np.ndarray]
+    frame_width: int
+    frame_height: int
+    frame_step: int
+    map_to_canvas: np.ndarray
+    canvas_size: tuple[int, int]
+    corners_yx: list[list[float]]
+    map_signature: str
+
+    @classmethod
+    def from_database(cls, database, max_size=2048):
+        if getattr(getattr(database, "converter", None), "mode", "") != "LOCAL":
+            raise ValueError("A local panorama requires a LOCAL map")
+        w = int(database.metadata.get("frame_width", 0))
+        h = int(database.metadata.get("frame_height", 0))
+        step = int(database.metadata.get("frame_step", 0))
+        if min(w, h, step, max_size) <= 0:
+            raise ValueError("Database is missing frame dimensions or frame_step; rebuild it")
+        if database.frame_valid is None or database.frame_affine is None:
+            raise ValueError("Build the local map before creating its panorama")
+        affines = {
+            int(i): np.array(get_frame_transform(database, int(i)), dtype=np.float64, copy=True)
+            for i in np.flatnonzero(database.frame_valid)
+        }
+        if not affines:
+            raise ValueError("The local map has no connected frames")
+        digest = hashlib.sha256()
+        digest.update(np.asarray([w, h, step], dtype="<i8").tobytes())
+        for fid, matrix in affines.items():
+            digest.update(np.asarray([fid], dtype="<i8").tobytes())
+            digest.update(np.asarray(matrix, dtype="<f8").tobytes())
+        # Include the recorded video identity when available.
+        digest.update(
+            str(database.metadata.get("source_sha256") or getattr(database, "db_path", "")).encode()
+        )
+        corners = np.array([[0, 0], [w, 0], [w, h], [0, h]])
+        footprints = np.concatenate([project_points(a, corners) for a in affines.values()])
+        if not np.isfinite(footprints).all():
+            raise ValueError("Non-finite local map geometry")
+        lo, hi = footprints.min(axis=0), footprints.max(axis=0)
+        span = hi - lo
+        if span.min() <= 1e-9:
+            raise ValueError("Degenerate local map geometry")
+        scale = max_size / float(span.max())
+        width, height = np.maximum(1, np.ceil(span * scale).astype(int))
+        transform = np.array([[scale, 0, -lo[0] * scale], [0, -scale, hi[1] * scale], [0, 0, 1]])
+        right, bottom = lo[0] + width / scale, hi[1] - height / scale
+        yx = [[hi[1], lo[0]], [hi[1], right], [bottom, right], [bottom, lo[0]]]
+        return cls(
+            affines,
+            w,
+            h,
+            step,
+            transform,
+            (int(width), int(height)),
+            np.asarray(yx).tolist(),
+            digest.hexdigest(),
+        )
+
+    def metadata(self):
+        return {
+            "version": 1,
+            "coordinate_kind": "local_planar",
+            "coordinate_units": "arbitrary",
+            "corners_yx": self.corners_yx,
+            "map_signature": self.map_signature,
+        }
+
+
+def render_local_panorama(video_path, layout, *, running=lambda: True, progress=lambda *a: None):
+    """Feather-blend connected reference frames with bounded canvas memory.
+
+    Returns BGRA, retaining valid black image pixels and transparent unmapped areas.
+    Cancellation returns None and leaves saving to the caller.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open reference video: {video_path}")
+        cw, ch = layout.canvas_size
+        colors = np.zeros((ch, cw, 3), dtype=np.float32)
+        weights = np.zeros((ch, cw), dtype=np.float32)
+        yy, xx = np.mgrid[: layout.frame_height, : layout.frame_width]
+        feather = np.minimum.reduce(
+            [xx + 1, layout.frame_width - xx, yy + 1, layout.frame_height - yy]
+        ).astype(np.float32)
+        feather /= feather.max()
+        for count, (fid, affine) in enumerate(layout.affines.items(), 1):
+            if not running():
+                return None
+            # frame_index_map lists occupied DB slots, not original video indices.
+            video_frame = fid * layout.frame_step
+            if not cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame):
+                raise ValueError(f"Cannot seek reference video frame {video_frame}")
+            ok, frame = cap.read()
+            if not ok:
+                raise ValueError(
+                    f"Cannot read reference video frame {video_frame}; check the source video"
+                )
+            frame = cv2.resize(frame, (layout.frame_width, layout.frame_height))
+            matrix = layout.map_to_canvas @ as_homography(affine)
+            weighted = frame.astype(np.float32) * feather[..., None]
+            colors += cv2.warpPerspective(weighted, matrix, (cw, ch), flags=cv2.INTER_LINEAR)
+            weights += cv2.warpPerspective(feather, matrix, (cw, ch), flags=cv2.INTER_LINEAR)
+            progress(
+                int(count / len(layout.affines) * 95),
+                f"Панорама локальної карти: {count}/{len(layout.affines)} кадрів",
+            )
+        if not running():
+            return None
+        valid = weights > 1e-6
+        colors /= np.maximum(weights[..., None], 1e-6)
+        image = np.empty((ch, cw, 4), dtype=np.uint8)
+        image[..., :3] = np.clip(colors, 0, 255).astype(np.uint8)
+        image[..., 3] = valid.astype(np.uint8) * 255
+        return image
+    finally:
+        cap.release()
+
+
+def load_local_panorama_metadata(path, layout):
+    """Reject a saved overlay if the selected local map has since changed."""
+    from pathlib import Path
+
+    metadata = json.loads(Path(str(path) + ".json").read_text(encoding="utf-8"))
+    if (
+        metadata.get("coordinate_kind") != "local_planar"
+        or metadata.get("map_signature") != layout.map_signature
+    ):
+        raise ValueError(
+            "Панорама належить іншій або попередній версії локальної карти. Побудуйте її заново."
+        )
+    corners = np.asarray(metadata.get("corners_yx"), dtype=float)
+    if corners.shape != (4, 2) or not np.isfinite(corners).all():
+        raise ValueError("Invalid panorama coordinates")
+    return corners.tolist()
+
+
+# ================================================================================
+# File: src\geometry\pair_refinement.py
+# ================================================================================
+"""Offline pair refinement and quality gates in original image pixels."""
+
+import hashlib
+from collections import OrderedDict
+from pathlib import Path
+
+import cv2
+import numpy as np
+from scipy.optimize import least_squares
+
+from src.geometry.frame_transform import project_points, valid_footprint
+from src.geometry.point_spread import inlier_spread
+
+
+def symmetric_errors(H, first, second):
+    forward = project_points(H, first) - second
+    backward = project_points(np.linalg.inv(H), second) - first
+    return np.sqrt((np.sum(forward**2, axis=1) + np.sum(backward**2, axis=1)) / 2)
+
+
+def refine_pair(H, first, second, width, height):
+    """Robust symmetric refit after MAD, retaining the seed if it gets worse."""
+    size = float(max(width, height))
+    N = np.array(
+        [[1 / size, 0, -width / (2 * size)], [0, 1 / size, -height / (2 * size)], [0, 0, 1.0]]
+    )
+    inv_N = np.linalg.inv(N)
+    p, q = project_points(N, first), project_points(N, second)
+    normalized = N @ H @ inv_N
+    normalized /= normalized[2, 2]
+
+    def unpack(x):
+        return np.r_[x, 1.0].reshape(3, 3)
+
+    def residual(x):
+        matrix = unpack(x)
+        try:
+            return (
+                np.column_stack(
+                    [project_points(matrix, p) - q, project_points(np.linalg.inv(matrix), q) - p]
+                ).ravel()
+                * size
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            return np.full(4 * len(p), 1e6)
+
+    before = residual(normalized.ravel()[:8])
+    fit = least_squares(residual, normalized.ravel()[:8], loss="soft_l1", f_scale=1.0, max_nfev=40)
+    candidate = inv_N @ unpack(fit.x) @ N
+    after = residual(fit.x)
+
+    def cost(r):
+        return np.sum(np.sqrt(1 + r * r) - 1)
+
+    if (
+        valid_footprint(candidate, width, height, orientation=1)
+        and cost(after) <= cost(before) + 1e-8
+    ):
+        return candidate / candidate[2, 2]
+    return H
+
+
+def pair_quality(
+    H,
+    first,
+    second,
+    total_matches,
+    width,
+    height,
+    *,
+    min_ratio=0.3,
+    min_spread=0.025,
+    max_error=3.0,
+    inlier_count=None,
+):
+    """Shared temporal/spatial acceptance and auditable diagnostics."""
+    if not valid_footprint(H, width, height, orientation=1):
+        return False, {"rejection": "invalid_footprint"}
+    if not valid_footprint(np.linalg.inv(H), width, height, orientation=1):
+        return False, {"rejection": "invalid_inverse_footprint"}
+    error = symmetric_errors(H, first, second)
+    spread = min(
+        inlier_spread(first, width, height, principal=True) or 0.0,
+        inlier_spread(second, width, height, principal=True) or 0.0,
+    )
+    coverage, extrapolation = [], []
+    for points in (first, second):
+        hull = cv2.convexHull(np.asarray(points, dtype=np.float32))
+        coverage.append(float(cv2.contourArea(hull) / (width * height)))
+        extrapolation.append(
+            max(0.0, -cv2.pointPolygonTest(hull, (width / 2, height / 2), True))
+            / np.hypot(width, height)
+        )
+    report = {
+        "inliers": len(first) if inlier_count is None else inlier_count,
+        "inlier_ratio": (len(first) if inlier_count is None else inlier_count)
+        / max(total_matches, 1),
+        "spread": spread,
+        "hull_coverage": min(coverage),
+        "center_extrapolation": max(extrapolation),
+        "symmetric_rms_px": float(np.sqrt(np.mean(error**2))),
+        "symmetric_p95_px": float(np.percentile(error, 95)),
+    }
+    reason = None
+    if report["inlier_ratio"] < min_ratio:
+        reason = "inlier_ratio"
+    elif spread < min_spread or min(coverage) < 0.002:
+        reason = "point_support"
+    elif report["symmetric_p95_px"] > max_error or not np.isfinite(error).all():
+        reason = "symmetric_error"
+    elif max(extrapolation) > 0.5:
+        reason = "center_extrapolation"
+    report["rejection"] = reason
+    return reason is None, report
+
+
+def refine_subpixel(first_image, second_image, first, second, max_correction=2.0):
+    """LK initialized by matched observations, with forward/backward validation.
+
+    Keep the original measurement when LK is unsupported; a failed photometric
+    refinement must not discard valid wide-baseline learned correspondences.
+    """
+    p = np.asarray(first, dtype=np.float32).reshape(-1, 1, 2)
+    q = np.asarray(second, dtype=np.float32).reshape(-1, 1, 2)
+    if len(p) == 0:
+        return np.asarray(second).copy(), 0
+    options = dict(
+        winSize=(21, 21),
+        maxLevel=1,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.001),
+        flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+        minEigThreshold=1e-4,
+    )
+    updated, forward, _ = cv2.calcOpticalFlowPyrLK(
+        first_image, second_image, p, q.copy(), **options
+    )
+    if updated is None:
+        return np.asarray(second).copy(), 0
+    back, backward, _ = cv2.calcOpticalFlowPyrLK(
+        second_image, first_image, updated, p.copy(), **options
+    )
+    if back is None:
+        return np.asarray(second).copy(), 0
+    new = updated.reshape(-1, 2)
+    good = (
+        forward.ravel().astype(bool)
+        & backward.ravel().astype(bool)
+        & (np.linalg.norm(back.reshape(-1, 2) - first, axis=1) < 0.5)
+        & (np.linalg.norm(new - second, axis=1) <= max_correction)
+        & np.isfinite(new).all(axis=1)
+    )
+    h, w = second_image.shape[:2]
+    good &= (new[:, 0] >= 10) & (new[:, 0] < w - 10) & (new[:, 1] >= 10) & (new[:, 1] < h - 10)
+    result = np.asarray(second, dtype=np.float64).copy()
+    result[good] = new[good]
+    return result, int(good.sum())
+
+
+class SourceFrames:
+    """Bounded source-frame cache; verify video identity before refining points."""
+
+    def __init__(self, metadata, check_running=lambda: None, capacity=8):
+        self.check_running = check_running
+        self.capacity = capacity
+        self.cache = OrderedDict()
+        self.cap = None
+        self.step = int(metadata.get("frame_step", 0))
+        self.width = int(metadata.get("frame_width", 0))
+        self.height = int(metadata.get("frame_height", 0))
+        path = Path(metadata.get("source_path", ""))
+        expected = metadata.get("source_sha256", "")
+        if not path.is_file() or not expected or min(self.step, self.width, self.height) <= 0:
+            raise ValueError(
+                "Source video identity unavailable; rebuild database to enable subpixel refinement"
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                check_running()
+                digest.update(chunk)
+        if digest.hexdigest() != expected:
+            raise ValueError("Source video changed since database build")
+        self.cap = cv2.VideoCapture(str(path))
+        if not self.cap.isOpened():
+            self.close()
+            raise ValueError("Cannot open source video")
+
+    def get(self, frame_id):
+        self.check_running()
+        if frame_id in self.cache:
+            self.cache.move_to_end(frame_id)
+            return self.cache[frame_id]
+        if self.cap is None or not self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id * self.step):
+            raise ValueError(f"Cannot seek source frame {frame_id}")
+        ok, frame = self.cap.read()
+        if not ok or frame.shape[:2] != (self.height, self.width):
+            raise ValueError(f"Source frame {frame_id} is missing or has wrong dimensions")
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.cache[frame_id] = gray
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
+        return gray
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.cache.clear()
+
+
+# ================================================================================
 # File: src\geometry\point_spread.py
 # ================================================================================
 """Spatial spread of correspondences — ill-conditioning of geometric estimation.
@@ -6929,17 +9553,18 @@ import numpy as np
 UNIFORM_SPREAD = float(1.0 / np.sqrt(12.0))
 
 
-def inlier_spread(points: np.ndarray, frame_w: float, frame_h: float) -> float | None:
-    """min(sigma_x, sigma_y) / min(W, H) — dimensionless spatial point spread.
+def inlier_spread(
+    points: np.ndarray, frame_w: float, frame_h: float, *, principal=False
+) -> float | None:
+    """Axis spread by default; principal spread for offline accuracy validation.
 
     Normalizing by ``min(W, H)`` makes the metric invariant to both resolution and
     aspect ratio: for uniform coverage sigma_x = 0.2887*W, sigma_y = 0.2887*H,
     so min(sigma_x, sigma_y) = 0.2887*min(W, H) -> spread ≈ 0.289 for any aspect.
 
-    Specifically takes ``min`` of the two axes rather than cloud area: typical failure
-    mode is points along a single line/furrow where one sigma is large while the second ≈ 0.
-    The product sigma_x*sigma_y catches this too, but ``min`` gives a linear scale in the
-    same units as frame side, making threshold calibration simpler.
+    With ``principal=True``, uses covariance eigenvalues so diagonal and horizontal
+    lines are equally degenerate. The default preserves the live confidence
+    metric (minimum of the two image-axis standard deviations).
 
     Args:
         points: (N, 2) pixel coordinates in query frame.
@@ -6967,8 +9592,15 @@ def inlier_spread(points: np.ndarray, frame_w: float, frame_h: float) -> float |
         if xy.shape[0] < 2:
             return None
 
-    sigma = xy.std(axis=0)
-    return float(min(sigma[0], sigma[1]) / denom)
+    if not principal:
+        return float(np.min(np.std(xy, axis=0)) / denom)
+    centered = xy - xy.mean(axis=0)
+    eigenvalues = np.linalg.eigvalsh(centered.T @ centered / len(centered))
+    # Roundoff must not turn an exactly collinear cloud into weak 2D support.
+    smallest = max(0.0, float(eigenvalues[0]))
+    if smallest <= np.finfo(float).eps * max(float(eigenvalues[-1]), 1.0) * 8:
+        return 0.0
+    return float(np.sqrt(smallest) / denom)
 
 
 def spread_confidence_factor(
@@ -7045,7 +9677,6 @@ from __future__ import annotations
 
 from collections import deque
 
-import cv2
 import numpy as np
 
 from src.geometry.pose_graph.model_5dof import (
@@ -7287,14 +9918,25 @@ class DiagnosticsMixin:
         return "\n".join(lines)
 
     def export_graph_geojson(
-        self, converter, frame_w: int, frame_h: int, origin_xy: tuple = (0.0, 0.0)
+        self,
+        converter,
+        frame_w: int,
+        frame_h: int,
+        origin_xy: tuple = (0.0, 0.0),
+        frame_transforms: dict | None = None,
+        point_pairs: dict | None = None,
     ) -> dict:
         """origin_xy — Local Origin of propagation: internal graph states are local,
         без цього зсуву GeoJSON опинявся біля (0°, 0°) (баг, сесія 2026-07-12)."""
+        from src.geometry.frame_transform import project_points
+
         features = []
-        results = self._export_results()
+        results = self._export_results() if frame_transforms is None else frame_transforms
         cx, cy = frame_w / 2.0, frame_h / 2.0
         ox, oy = float(origin_xy[0]), float(origin_xy[1])
+        if frame_transforms is not None:
+            # Explicit transforms already contain their absolute map origin.
+            ox = oy = 0.0
 
         # Per-edge residual in properties → edges can be colour-coded on the map
         # by residual magnitude (bad loop closures become visually obvious).
@@ -7303,7 +9945,7 @@ class DiagnosticsMixin:
 
         for fid, affine in results.items():
             pt = np.array([[cx, cy]], dtype=np.float64)
-            metric = cv2.transform(pt.reshape(-1, 1, 2), affine).reshape(-1, 2)[0]
+            metric = project_points(affine, pt)[0]
             try:
                 lat, lon = converter.metric_to_gps(float(metric[0]) + ox, float(metric[1]) + oy)
             except Exception:
@@ -7323,13 +9965,33 @@ class DiagnosticsMixin:
             if affine_from is None or affine_to is None:
                 continue
             try:
-                pt = np.array([[cx, cy]], dtype=np.float64).reshape(-1, 1, 2)
-                m_from = cv2.transform(pt, affine_from).reshape(-1, 2)[0]
-                m_to = cv2.transform(pt, affine_to).reshape(-1, 2)[0]
+                pt = np.array([[cx, cy]], dtype=np.float64)
+                m_from = project_points(affine_from, pt)[0]
+                m_to = project_points(affine_to, pt)[0]
                 lat1, lon1 = converter.metric_to_gps(float(m_from[0]) + ox, float(m_from[1]) + oy)
                 lat2, lon2 = converter.metric_to_gps(float(m_to[0]) + ox, float(m_to[1]) + oy)
             except Exception:
                 continue
+            residual = None if np.isnan(edge_res[e_idx]) else float(edge_res[e_idx])
+            residual_units = "weighted_5dof"
+            if frame_transforms is not None:
+                from src.geometry.frame_transform import as_homography
+                from src.geometry.pair_refinement import symmetric_errors
+
+                residual, residual_units = None, "original_image_pixels"
+                key = (edge.from_id, edge.to_id)
+                pairs = point_pairs or {}
+                if key not in pairs:
+                    key = key[::-1]
+                if key in pairs:
+                    try:
+                        relative = np.linalg.inv(as_homography(results[key[1]])) @ as_homography(
+                            results[key[0]]
+                        )
+                        errors = symmetric_errors(relative, *pairs[key])
+                        residual = float(np.sqrt(np.mean(errors**2)))
+                    except (ValueError, np.linalg.LinAlgError):
+                        pass
             features.append(
                 {
                     "type": "Feature",
@@ -7338,7 +10000,8 @@ class DiagnosticsMixin:
                         "from_id": edge.from_id,
                         "to_id": edge.to_id,
                         "edge_type": edge.edge_type,
-                        "residual": (None if np.isnan(edge_res[e_idx]) else float(edge_res[e_idx])),
+                        "residual": residual,
+                        "residual_units": residual_units,
                         "weight": float(edge.weight),
                     },
                 }
@@ -7543,6 +10206,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         # Soft anchor priors: frame_id -> (state_anchor 5-vector, w_a)
         self._anchor_priors: dict[int, tuple[np.ndarray, float]] = {}
 
+        # Unary log-scale priors (terrain model): frame_id -> (target log GSD, weight).
+        # r = weight·cx·(½(log_sx + log_sy) − target); empty = block absent.
+        self._scale_priors: dict[int, tuple[float, float]] = {}
+
     @property
     def num_nodes(self) -> int:
         return len(self._node_ids)
@@ -7609,6 +10276,25 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
     def sign(self) -> float:
         """Determinant sign (-1.0 for mirrored calibration matrices)."""
         return self._sign
+
+    def set_scale_priors(self, priors: dict[int, tuple[float, float]]) -> None:
+        """Replaces the unary log-scale priors {frame_id: (target_log_scale, weight)}."""
+        self._scale_priors = {
+            int(fid): (float(t), float(w))
+            for fid, (t, w) in priors.items()
+            if np.isfinite(t) and np.isfinite(w) and w > 0
+        }
+
+    def is_free(self, frame_id: int) -> bool:
+        return frame_id in self._free_nodes and frame_id not in self._fixed_nodes
+
+    def node_states(self) -> dict[int, np.ndarray]:
+        """Current states of every initialized node (fixed and free), copies."""
+        states = {fid: st.copy() for fid, st in self._fixed_nodes.items()}
+        for fid, st in self._free_nodes.items():
+            if fid in self._initialized_nodes:
+                states[fid] = st.copy()
+        return states
 
     def anchor_states(self) -> dict[int, np.ndarray]:
         """Returns states of all fixed and soft anchors."""
@@ -7918,7 +10604,18 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         )
         n_kin = len(kin_ids)
 
-        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5 + 2 * n_kin
+        # Unary log-scale priors (terrain): only for free nodes; empty → block absent.
+        sp_var_idx: list[int] = []
+        sp_target: list[float] = []
+        sp_w: list[float] = []
+        for fid, (t, w) in sorted(self._scale_priors.items()):
+            if fid in id_to_var:
+                sp_var_idx.append(id_to_var[fid])
+                sp_target.append(t)
+                sp_w.append(w * self.cx)
+        n_sp = len(sp_var_idx)
+
+        n_residuals = n_edges * 5 + len(free_ids) + n_anch * 5 + 2 * n_kin + n_sp
         jac_sp = self._build_jac_sparsity(
             valid_edges,
             id_to_var,
@@ -7930,6 +10627,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 (id_to_var.get(a, -1), id_to_var.get(b, -1), id_to_var.get(c, -1))
                 for a, b, c in kin_ids
             ],
+            scale_prior_var_idx=sp_var_idx,
         )
 
         logger.info(
@@ -7997,6 +10695,10 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             "kin_alpha": np.array(kin_alpha_l, dtype=np.float64),
             "kin_w": np.array(kin_w_l, dtype=np.float64),
             "n_kin": n_kin,
+            "sp_var_idx": np.array(sp_var_idx, dtype=np.int64),
+            "sp_target": np.array(sp_target, dtype=np.float64),
+            "sp_w": np.array(sp_w, dtype=np.float64),
+            "n_sp": n_sp,
             "callback": progress_callback,
         }
 
@@ -8156,6 +10858,11 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
             wk = d["kin_w"][:, None]
             parts.append((wk * (al * ca + (1.0 - al) * cc - cb)).ravel())
 
+        if d.get("n_sp", 0) > 0:
+            # Terrain log-scale prior: r = w·(½(log_sx + log_sy) − target).
+            sp = x_reshaped[d["sp_var_idx"]]
+            parts.append(d["sp_w"] * (0.5 * (sp[:, 2] + sp[:, 3]) - d["sp_target"]))
+
         return np.concatenate(parts)
 
     def _jacobian_vec(self, x: np.ndarray, d: dict):
@@ -8282,12 +10989,21 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                     add(base_k[m] + 0, 5 * f_idx[m] + 0, coef[m])
                     add(base_k[m] + 1, 5 * f_idx[m] + 1, coef[m])
 
+        # Terrain log-scale prior: ½·w on log_sx and log_sy of the node.
+        n_sp = int(d.get("n_sp", 0))
+        if n_sp > 0:
+            sv = d["sp_var_idx"]
+            half_w = 0.5 * d["sp_w"]
+            s_rows = 5 * n_edges + n_free + 5 * n_anch + 2 * n_kin + np.arange(n_sp)
+            add(s_rows, 5 * sv + 2, half_w)
+            add(s_rows, 5 * sv + 3, half_w)
+
         rows = np.concatenate(rows)
         cols = np.concatenate(cols)
         data = np.concatenate(data)
         J = coo_matrix(
             (data, (rows, cols)),
-            shape=(5 * n_edges + n_free + 5 * n_anch + 2 * n_kin, 5 * n_free),
+            shape=(5 * n_edges + n_free + 5 * n_anch + 2 * n_kin + n_sp, 5 * n_free),
             dtype=np.float64,
         )
         return J.tocsr()
@@ -8301,6 +11017,7 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
         n_edges,
         anchor_var_idx=None,
         kin_free=None,
+        scale_prior_var_idx=None,
     ):
         # COO constructor (list-based rows/cols) is faster than element-wise lil
         # on large graphs. Sparsity pattern is IDENTICAL to the previous version.
@@ -8347,6 +11064,12 @@ class PoseGraphOptimizer(DiagnosticsMixin, PruningMixin):
                 if f_idx >= 0:
                     rows += [base_k + 2 * t, base_k + 2 * t + 1]
                     cols += [5 * f_idx + 0, 5 * f_idx + 1]
+
+        # Terrain log-scale prior: 1 row per prior, log_sx and log_sy of the node.
+        base_s = base_k + 2 * len(kin_free or [])
+        for t, v in enumerate(scale_prior_var_idx or []):
+            rows += [base_s + t, base_s + t]
+            cols += [5 * v + 2, 5 * v + 3]
 
         data = np.ones(len(rows), dtype=np.int8)
         sp = coo_matrix((data, (rows, cols)), shape=(n_residuals, n_vars), dtype=np.int8)
@@ -8761,6 +11484,1526 @@ __all__ = [
 
 
 # ================================================================================
+# File: src\geometry\relative_alignment.py
+# ================================================================================
+"""Refine a LOCAL map using shared image points, with a fixed affine gauge.
+
+The pose graph is an initializer. Its five-parameter relative transforms lose
+shear, so minimizing their parameter residuals need not align image content.
+This sparse affine adjustment minimizes the actual point discrepancies instead.
+It still assumes approximately planar terrain; it cannot remove parallax.
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import cKDTree
+
+from src.geometry.frame_transform import project_points
+
+
+@dataclass
+class PointLink:
+    first: int
+    second: int
+    first_points: np.ndarray
+    second_points: np.ndarray
+    weight: float = 1.0
+
+
+def nearby_frame_pairs(affines, width, height, known_pairs, min_frame_gap, limit=8):
+    """Bounded spatial proposals for overlaps missed by descriptor top-k retrieval.
+
+    Nearby frames are proposals only: the caller must verify their image points.
+    Allow a margin around estimated footprints because the initial map can drift.
+    """
+    if len(affines) < 2 or limit <= 0:
+        return []
+    ids = sorted(affines)
+    center = np.array([[width / 2, height / 2]])
+    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]])
+    centers = np.array([project_points(affines[fid], center)[0] for fid in ids])
+    radii = np.array(
+        [
+            0.5
+            * (
+                np.linalg.norm(affines[fid][:, 0]) * width
+                + np.linalg.norm(affines[fid][:, 1]) * height
+            )
+            if np.asarray(affines[fid]).shape == (2, 3)
+            else np.linalg.norm(project_points(affines[fid], corners) - centers[i], axis=1).max()
+            for i, fid in enumerate(ids)
+        ]
+    )
+    tree = cKDTree(centers)
+    known = {tuple(sorted(pair)) for pair in known_pairs}
+    proposals = set()
+    for index, fid in enumerate(ids):
+        distances, neighbors = tree.query(centers[index], k=min(64, len(ids)))
+        count = 0
+        for distance, other in zip(distances, neighbors):
+            key = tuple(sorted((fid, ids[other])))
+            if (
+                abs(fid - ids[other]) <= min_frame_gap
+                or key in known
+                or distance > 1.5 * (radii[index] + radii[other])
+            ):
+                continue
+            proposals.add(key)
+            count += 1
+            if count >= limit:
+                break
+    return sorted(proposals)
+
+
+def sample_point_pair(first, second, limit=96):
+    """Keep a deterministic, spatially spread subset of verified matches."""
+    first, second = np.asarray(first, dtype=np.float64), np.asarray(second, dtype=np.float64)
+    if limit <= 0 or len(first) <= limit:
+        return first.copy(), second.copy()
+    selected = [int(np.argmin(first[:, 0]))]
+    distances = np.full(len(first), np.inf)
+    for _ in range(limit - 1):
+        distances = np.minimum(distances, np.sum((first - first[selected[-1]]) ** 2, axis=1))
+        distances[selected] = -1
+        selected.append(int(np.argmax(distances)))
+    return first[selected].copy(), second[selected].copy()
+
+
+def refine_relative_affines(affines, links, width, height, gauge_id, check_running=lambda: None):
+    """Return (affines, summary, per-frame RMS), without mutating the inputs.
+
+    Huber IRLS limits surviving mismatches. Each link retains its graph weight,
+    independent of the number of sampled points. Residuals use *fixed initial* pixel scales,
+    so changing a frame's scale cannot redefine its error units. A weak shape
+    prior stabilizes long chains; the first frame's entire affine is fixed.
+    Invalid/disconnected solutions raise before the caller can save a map.
+    """
+    if width <= 0 or height <= 0 or gauge_id not in affines or len(affines) < 2:
+        raise ValueError("Local point alignment needs dimensions, a gauge and connected frames")
+    initial = {fid: np.asarray(a, dtype=np.float64).copy() for fid, a in affines.items()}
+    for a in initial.values():
+        if a.shape != (2, 3) or not np.isfinite(a).all() or abs(np.linalg.det(a[:, :2])) < 1e-12:
+            raise ValueError("Invalid initial local affine")
+    links = [link for link in links if link.first in initial and link.second in initial]
+    neighbors = {fid: set() for fid in initial}
+    for link in links:
+        p, q = np.asarray(link.first_points), np.asarray(link.second_points)
+        if not np.isfinite(link.weight) or link.weight <= 0:
+            raise ValueError("Local point links need finite positive weights")
+        if (
+            p.ndim != 2
+            or p.shape[1] != 2
+            or p.shape != q.shape
+            or len(p) < 3
+            or not np.isfinite(p).all()
+            or not np.isfinite(q).all()
+            or np.linalg.matrix_rank(p - p.mean(axis=0)) < 2
+            or np.linalg.matrix_rank(q - q.mean(axis=0)) < 2
+        ):
+            raise ValueError("Local point alignment needs non-collinear finite point pairs")
+        neighbors[link.first].add(link.second)
+        neighbors[link.second].add(link.first)
+    reached, pending = {gauge_id}, [gauge_id]
+    while pending:
+        for fid in neighbors[pending.pop()] - reached:
+            reached.add(fid)
+            pending.append(fid)
+    if reached != set(initial):
+        raise ValueError("Local point matches do not connect every frame to the gauge")
+
+    # Pixel basis centred on the image, with unit-sized coordinates. Solve for
+    # corrections to the initial map, not large absolute map translations.
+    basis = np.array([[width, 0, width / 2], [0, height, height / 2], [0, 0, 1.0]])
+    inv_basis = np.linalg.inv(basis)
+    ids = sorted(set(initial) - {gauge_id})
+    columns = {fid: 3 * i for i, fid in enumerate(ids)}
+    rows, cols, values, residuals, weights, slices = [], [], [], [], [], []
+    start = 0
+    weight_scale = float(np.median([link.weight for link in links]))
+    for link in links:
+        check_running()
+        p, q = np.asarray(link.first_points), np.asarray(link.second_points)
+        scale = np.sqrt(abs(np.linalg.det(initial[link.first][:, :2])))
+        pa = np.column_stack([p, np.ones(len(p))])
+        pb = np.column_stack([q, np.ones(len(q))])
+        residuals.append((pa @ initial[link.first].T - pb @ initial[link.second].T) / scale)
+        weights.extend([link.weight / (weight_scale * len(p))] * len(p))
+        row_ids = np.arange(start, start + len(p))
+        for fid, points, sign in ((link.first, pa, 1), (link.second, pb, -1)):
+            if fid == gauge_id:
+                continue
+            normalized = points @ inv_basis.T * (sign / scale)
+            rows.extend(np.repeat(row_ids, 3))
+            cols.extend(np.tile(np.arange(columns[fid], columns[fid] + 3), len(p)))
+            values.extend(normalized.ravel())
+        slices.append(slice(start, start + len(p)))
+        start += len(p)
+    matrix = sparse.csr_matrix((values, (rows, cols)), shape=(start, 3 * len(ids)))
+    residual = np.concatenate(residuals)
+    base_weight = np.asarray(weights)
+    # A 100-pixel change at the image edge costs about one squared pixel per
+    # frame. Translation is practically unregularized; connectivity fixes it.
+    prior = np.concatenate(
+        [np.array([1e-4, 1e-4, 1e-10]) / abs(np.linalg.det(initial[fid][:, :2])) for fid in ids]
+    )
+    correction = np.zeros((3 * len(ids), 2))
+    for iteration in range(12):
+        check_running()
+        norms = np.linalg.norm(residual + matrix @ correction, axis=1)
+        robust_weight = np.minimum(1.0, 3.0 / np.maximum(norms, 1e-12))
+        weighted = matrix.multiply((base_weight * robust_weight)[:, None])
+        normal = (matrix.T @ weighted + sparse.diags(prior)).tocsc()
+        updated = spsolve(normal, -(weighted.T @ residual))
+        if not np.isfinite(updated).all():
+            raise ValueError("Local point alignment produced a non-finite solution")
+        change = np.max(np.abs(matrix @ (updated - correction)))
+        correction = updated
+        if change < 1e-4:
+            break
+    result = {fid: a.copy() for fid, a in initial.items()}
+    for fid in ids:
+        offset = columns[fid]
+        result[fid] += correction[offset : offset + 3].T @ inv_basis
+        relative = result[fid][:, :2] @ np.linalg.inv(initial[fid][:, :2])
+        singular = np.linalg.svd(relative, compute_uv=False)
+        if np.linalg.det(relative) <= 0 or singular.min() < 0.25 or singular.max() > 4:
+            raise ValueError("Local point alignment would fold or excessively distort the map")
+    before = np.linalg.norm(residual, axis=1)
+    after = np.linalg.norm(residual + matrix @ correction, axis=1)
+
+    def huber_cost(errors):
+        return float(np.sum(base_weight * np.where(errors <= 3, errors**2 / 2, 3 * errors - 4.5)))
+
+    if huber_cost(after) > huber_cost(before) + 1e-7:
+        raise ValueError("Local point alignment did not improve point consistency")
+    frame_errors = {fid: [] for fid in initial}
+    for link, section in zip(links, slices):
+        # Per-frame confidence uses that frame's own pixel scale.
+        ratio = np.sqrt(
+            abs(
+                np.linalg.det(initial[link.first][:, :2])
+                / np.linalg.det(initial[link.second][:, :2])
+            )
+        )
+        frame_errors[link.first].extend(after[section] ** 2)
+        frame_errors[link.second].extend((after[section] * ratio) ** 2)
+    summary = {
+        "method": "affine_point_irls_v1",
+        "units": "initial_reference_pixels",
+        "frames": len(initial),
+        "links": len(links),
+        "points": len(after),
+        "iterations": iteration + 1,
+        "before_median_px": float(np.median(before)),
+        "after_median_px": float(np.median(after)),
+        "before_p95_px": float(np.percentile(before, 95)),
+        "after_p95_px": float(np.percentile(after, 95)),
+    }
+    return (
+        result,
+        summary,
+        {fid: float(np.sqrt(np.mean(errors))) for fid, errors in frame_errors.items()},
+    )
+
+
+# ================================================================================
+# File: src\geometry\relative_map.py
+# ================================================================================
+"""Image-motion maps in arbitrary units; no geographic or metric scale implied."""
+
+import numpy as np
+
+from src.geometry.frame_transform import as_homography, project_points, valid_footprint
+
+
+def normalize_relative_map(affines, width, height, extent=100.0):
+    """Fit all connected frame footprints into a square, preserving aspect ratio.
+
+    Returns transformed affines and the single similarity applied to the map.
+    Never stretch x/y independently: that would corrupt subsequent geometry.
+    """
+    if not affines or width <= 0 or height <= 0 or extent <= 0:
+        raise ValueError("A relative map needs frames and positive dimensions")
+    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]])
+    if any(not valid_footprint(a, width, height) for a in affines.values()):
+        raise ValueError("Invalid relative map footprint")
+    footprints = np.concatenate([project_points(a, corners) for a in affines.values()])
+    if not np.isfinite(footprints).all():
+        raise ValueError("Non-finite relative map geometry")
+    lo, hi = footprints.min(axis=0), footprints.max(axis=0)
+    span = float(np.max(hi - lo))
+    if span <= 1e-9:
+        raise ValueError("Degenerate relative map")
+    scale = extent / span
+    offset = (extent - (hi - lo) * scale) / 2 - lo * scale
+    transform = np.array([[scale, 0, offset[0]], [0, scale, offset[1]], [0, 0, 1]])
+    result = {
+        fid: (transform @ as_homography(a))[: 2 if np.shape(a) == (2, 3) else 3]
+        for fid, a in affines.items()
+    }
+    return result, transform
+
+
+# ================================================================================
+# File: src\geometry\relative_projective.py
+# ================================================================================
+"""Robust planar multi-view adjustment in original image pixel coordinates.
+
+Transforms map each image into one fixed gauge. The objective measures symmetric
+image transfer errors, not map distances which can be reduced by shrinking maps.
+Geographic anchors, when supplied, remain exactly fixed at their input transforms.
+"""
+
+import heapq
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy import sparse
+from scipy.optimize import least_squares
+
+from src.geometry.frame_transform import as_homography, project_points, valid_footprint
+
+# Perspective deviation from the centre-tangent affine at a frame corner is about
+# |h| * |u|^2 * s in normalised units (u = corner offset / max(W, H), s = frame scale).
+# For a 16:9 frame |u|^2 = 0.5^2 + 0.28^2 ~= 0.33.
+_CORNER_RADIUS_SQ = 0.33
+
+
+@dataclass
+class FramePriors:
+    """Optional non-image terms for the planar adjustment (all off by default).
+
+    points: frame_id -> (pixels (k, 2), map points (k, 2), sigma_px). Frames with point
+        priors may be free: their observations (e.g. anchor reference points) then
+        constrain the map instead of a fixed matrix.
+    log_scale: frame_id -> (target natural-log map scale at the frame centre in map
+        units per pixel, sigma in log units), e.g. from DEM + altitude.
+    perspective_sigma_px: > 0 adds a zero-mean prior on the two perspective terms,
+        expressed as the expected pixel deviation from the tangent affine at a corner.
+    """
+
+    points: dict = field(default_factory=dict)
+    log_scale: dict = field(default_factory=dict)
+    perspective_sigma_px: float = 0.0
+
+    def restricted(self, ids):
+        ids = set(ids)
+        return FramePriors(
+            {k: v for k, v in self.points.items() if k in ids},
+            {k: v for k, v in self.log_scale.items() if k in ids},
+            self.perspective_sigma_px,
+        )
+
+    def __bool__(self):
+        return bool(self.points or self.log_scale or self.perspective_sigma_px > 0)
+
+
+def _point_prior_terms(H, pn, target, scale):
+    """Residuals and dH (flattened first 8 entries) of projecting normalised points."""
+    z = pn @ H.T
+    proj = z[:, :2] / z[:, 2:3]
+    residual = scale * (proj - target)
+    d = np.zeros((len(pn), 2, 8))
+    inv_z = scale / z[:, 2]
+    d[:, 0, 0:3] = pn * inv_z[:, None]
+    d[:, 1, 3:6] = pn * inv_z[:, None]
+    d[:, 0, 6:8] = -(proj[:, 0] * inv_z)[:, None] * pn[:, :2]
+    d[:, 1, 6:8] = -(proj[:, 1] * inv_z)[:, None] * pn[:, :2]
+    return residual.ravel(), d.reshape(-1, 8)
+
+
+def _log_scale_terms(H):
+    """0.5 log|det J| of H at the normalised origin (H[2,2] == 1) and its gradient."""
+    A, t, h = H[:2, :2], H[:2, 2], H[2, :2]
+    J = A - np.outer(t, h)
+    det = np.linalg.det(J)
+    g = 0.5 * np.linalg.inv(J).T
+    grad = np.zeros(8)
+    grad[[0, 1, 3, 4]] = g.ravel()
+    grad[2] = -g[0] @ h
+    grad[5] = -g[1] @ h
+    grad[6:8] = -(g.T @ t)
+    return 0.5 * np.log(abs(det)), grad
+
+
+def _sparse_lm(objective, jac, x0, max_iterations, check_running=lambda: None):
+    """Levenberg-Marquardt on sparse normal equations (bundle-adjustment style).
+
+    The block-sparse J^T J of a frame graph is small (8 params per frame) and is
+    solved directly, so long chains converge in tens of iterations instead of the
+    thousands an iterative trust-region solver needs. Returns (x, evaluations, ok).
+    """
+    from scipy.sparse.linalg import spsolve
+
+    x = np.asarray(x0, dtype=float).copy()
+    r = objective(x)
+    cost = 0.5 * float(r @ r)
+    lam, evaluations = 1e-4, 1
+    for _ in range(max_iterations):
+        check_running()
+        J = jac(x).tocsr()
+        g = J.T @ r
+        A = (J.T @ J).tocsc()
+        diag = A.diagonal()
+        improved = False
+        while lam < 1e10:
+            damped = A + sparse.diags(lam * np.maximum(diag, 1e-12))
+            step = spsolve(damped.tocsc(), -g)
+            if not np.isfinite(step).all():
+                lam *= 10
+                continue
+            r_new = objective(x + step)
+            evaluations += 1
+            cost_new = 0.5 * float(r_new @ r_new)
+            if np.isfinite(cost_new) and cost_new < cost:
+                x, r = x + step, r_new
+                relative = (cost - cost_new) / max(cost, 1e-300)
+                cost = cost_new
+                lam = max(lam / 3, 1e-12)
+                improved = True
+                break
+            lam *= 4
+        if not improved:
+            return x, evaluations, True  # no descent left at any damping: stationary
+        if relative < 1e-10 or np.max(np.abs(step)) < 1e-10:
+            return x, evaluations, True
+    return x, evaluations, False
+
+
+def connected_links(initial, links, fixed_ids):
+    """Keep finite 2D constraints and only components supported by fixed frames."""
+    valid, neighbors = [], {fid: set() for fid in initial}
+    for link in links:
+        p, q = np.asarray(link.first_points), np.asarray(link.second_points)
+        if (
+            link.first not in initial
+            or link.second not in initial
+            or link.first == link.second
+            or not np.isfinite(link.weight)
+            or link.weight <= 0
+            or p.ndim != 2
+            or p.shape[1] != 2
+            or p.shape != q.shape
+            or len(p) < 8
+            or not np.isfinite(p).all()
+            or not np.isfinite(q).all()
+            or np.linalg.matrix_rank(p - p.mean(axis=0)) < 2
+            or np.linalg.matrix_rank(q - q.mean(axis=0)) < 2
+        ):
+            continue
+        valid.append(link)
+        neighbors[link.first].add(link.second)
+        neighbors[link.second].add(link.first)
+    reached = set(fixed_ids) & initial.keys()
+    pending = list(reached)
+    while pending:
+        for fid in neighbors[pending.pop()] - reached:
+            reached.add(fid)
+            pending.append(fid)
+    return (
+        {fid: initial[fid] for fid in sorted(reached)},
+        [link for link in valid if link.first in reached and link.second in reached],
+    )
+
+
+def symmetric_transfer(H, ia, ib, p, q, size, dof=8, *, jacobian=False):
+    """Symmetric pixel residuals and exact derivatives w.r.t. both frame matrices.
+
+    For z=B^-1 A p, dz=d(B^-1) A p+B^-1 dA p and
+    d(B^-1)=-B^-1 dB B^-1. H[2,2] is fixed in this parameterization.
+    """
+    inverse = np.linalg.inv(H)
+    residual, blocks = [], []
+    rows, cols = np.arange(dof) // 3, np.arange(dof) % 3
+    for source, target, points, observed in ((ia, ib, p, q), (ib, ia, q, p)):
+        inv = inverse[target]
+        z = np.einsum("nij,nj->ni", inv @ H[source], points)
+        denominator = z[:, 2:3]
+        safe = np.where(
+            np.abs(denominator) < 1e-9, np.where(denominator < 0, -1e-9, 1e-9), denominator
+        )
+        projected = z[:, :2] / safe
+        raw = (projected - observed[:, :2]) * size
+        residual.append(np.clip(raw, -1e6, 1e6))
+        if jacobian:
+            D = (inv[:, :2] - projected[:, :, None] * inv[:, 2:3]) / safe[:, :, None]
+            # The clipped residual is locally constant beyond its safety bound.
+            D *= (np.abs(raw) < 1e6)[:, :, None] * (np.abs(denominator) >= 1e-9)[:, :, None]
+            blocks.append(
+                (
+                    size * D[:, :, rows] * points[:, None, cols],
+                    -size * D[:, :, rows] * z[:, None, cols],
+                )
+            )
+    errors = np.concatenate(residual, axis=1)
+    if not jacobian:
+        return errors
+    return (
+        errors,
+        np.concatenate([blocks[0][0], blocks[1][1]], axis=1),
+        np.concatenate([blocks[0][1], blocks[1][0]], axis=1),
+    )
+
+
+def initialize_from_pairs(pair_homographies, weighted_pairs, fixed, width, height):
+    """Maximum-weight spanning forest, composing full H (source -> target).
+
+    Only nodes connected to a fixed seed are returned; unsupported images are
+    never given fabricated coordinates. Invalid accumulated horizons are skipped.
+    """
+    result = {fid: as_homography(H).copy() for fid, H in fixed.items()}
+    adjacency = {}
+    for first, second, weight in weighted_pairs:
+        if weight <= 0:
+            continue
+        H = pair_homographies.get((second, first))
+        if H is None:
+            reverse = pair_homographies.get((first, second))
+            if reverse is None:
+                continue
+            H = np.linalg.inv(reverse)
+        adjacency.setdefault(first, []).append((second, weight, H))
+        adjacency.setdefault(second, []).append((first, weight, np.linalg.inv(H)))
+    queue, counter = [], 0
+
+    def push(fid):
+        nonlocal counter
+        for other, weight, H in adjacency.get(fid, []):
+            if other not in result:
+                counter += 1
+                heapq.heappush(queue, (-weight, counter, fid, other, H))
+
+    for fid in sorted(result):
+        push(fid)
+    while queue:
+        _, _, parent, child, H = heapq.heappop(queue)
+        if child in result:
+            continue
+        composed = result[parent] @ H
+        norm = np.linalg.norm(composed)
+        if norm <= 0 or not valid_footprint(composed, width, height):
+            continue
+        # Prefer a center gauge; H[2,2] can be zero outside the actual footprint.
+        denominator = composed[2] @ np.array([width / 2, height / 2, 1.0])
+        result[child] = composed / denominator
+        push(child)
+    return result
+
+
+def refine_projective_map(
+    initial,
+    links,
+    width,
+    height,
+    fixed_ids,
+    *,
+    max_nfev=150,
+    check_running=lambda: None,
+    priors=None,
+    window_frames=64,
+    train_points=96,
+    solver="trf",
+):
+    """Select full-affine or projective geometry using held-out transfer error.
+
+    The simpler full-affine model wins when its validation loss is within 5% of
+    the projective candidate. This limits perspective extrapolation from noisy,
+    narrow overlaps. Both models use the same points, gauge, weights and units.
+    """
+    candidates, failures = {}, {}
+    for model in ("projective", "affine"):
+        check_running()
+        try:
+            candidates[model] = _refine_map(
+                initial,
+                links,
+                width,
+                height,
+                fixed_ids,
+                model=model,
+                max_nfev=max_nfev,
+                check_running=check_running,
+                priors=priors,
+                window_frames=window_frames,
+                train_points=train_points,
+                solver=solver,
+            )
+        except ValueError as exc:
+            failures[model] = str(exc)
+        if set(initial) == set(fixed_ids):
+            break
+    if not candidates:
+        raise ValueError(f"No valid relative model: {failures}")
+    selected = "projective" if "projective" in candidates else "affine"
+    if len(candidates) == 2:
+        projective_qa = candidates["projective"][1]
+        affine_qa = candidates["affine"][1]
+        if (
+            affine_qa["heldout_points"] > 0
+            and affine_qa["heldout_robust_cost"]
+            <= 1.05 * projective_qa["heldout_robust_cost"] + 1e-6
+        ):
+            selected = "affine"
+    result, report, per_frame = candidates[selected]
+    report["selected_model"] = selected
+    report["model_selection"] = {
+        model: {
+            "heldout_robust_cost": qa[1]["heldout_robust_cost"],
+            "heldout_p95_px": qa[1]["heldout_after_p95_px"],
+        }
+        for model, qa in candidates.items()
+    }
+    report["rejected_models"] = failures
+    return result, report, per_frame
+
+
+def _refine_map(
+    initial,
+    links,
+    width,
+    height,
+    fixed_ids,
+    *,
+    model,
+    max_nfev,
+    check_running,
+    priors=None,
+    window_frames=64,
+    train_points=96,
+    solver="trf",
+):
+    """Return transforms, training/held-out QA and per-frame symmetric pixel RMS.
+
+    Every fifth observation is withheld from the global solve (pairwise RANSAC
+    may already have used it). The fixed first image removes the projective gauge.
+    An analytic sparse Jacobian keeps derivatives local to each pair of cameras.
+    """
+    priors = (priors or FramePriors()).restricted(initial)
+    anchored = set(fixed_ids) | set(priors.points)
+    if not initial or not anchored or not set(fixed_ids) <= initial.keys():
+        raise ValueError("Projective adjustment needs existing fixed frames")
+    if min(width, height) <= 0:
+        raise ValueError("Projective adjustment needs image dimensions")
+    ids = sorted(initial)
+    index = {fid: i for i, fid in enumerate(ids)}
+    free = [fid for fid in ids if fid not in fixed_ids]
+    links = [
+        link
+        for link in links
+        if link.first in initial and link.second in initial and link.weight > 0
+    ]
+    if not links:
+        raise ValueError("Projective adjustment needs verified links")
+    neighbors = {fid: set() for fid in ids}
+    for link in links:
+        p, q = np.asarray(link.first_points), np.asarray(link.second_points)
+        if (
+            p.ndim != 2
+            or p.shape[1] != 2
+            or p.shape != q.shape
+            or len(p) < 8
+            or not np.isfinite(p).all()
+            or not np.isfinite(q).all()
+            or not np.isfinite(link.weight)
+            or np.linalg.matrix_rank(p - p.mean(axis=0)) < 2
+            or np.linalg.matrix_rank(q - q.mean(axis=0)) < 2
+        ):
+            raise ValueError("Projective links need non-collinear finite observations")
+        neighbors[link.first].add(link.second)
+        neighbors[link.second].add(link.first)
+    reached, pending = set(anchored), list(anchored)
+    while pending:
+        for fid in neighbors[pending.pop()] - reached:
+            reached.add(fid)
+            pending.append(fid)
+    if reached != set(ids):
+        raise ValueError("Projective links do not connect every frame to a fixed gauge")
+    if window_frames and len(free) > window_frames:
+        return _refine_windowed(
+            initial,
+            links,
+            width,
+            height,
+            fixed_ids,
+            model=model,
+            max_nfev=max_nfev,
+            check_running=check_running,
+            priors=priors,
+            train_points=train_points,
+            solver=solver,
+        )
+
+    # Normalize both image coordinates and the arbitrary map gauge. This also
+    # removes large geographic translations before any solver arithmetic.
+    size = float(max(width, height))
+    N = np.array(
+        [[1 / size, 0, -width / (2 * size)], [0, 1 / size, -height / (2 * size)], [0, 0, 1.0]]
+    )
+    inv_N = np.linalg.inv(N)
+    # The gauge only defines the local coordinate system; it is fixed unless it
+    # carries point priors (soft anchors), which then hold the map in place.
+    gauge = as_homography(initial[min(fixed_ids) if fixed_ids else min(priors.points)])
+    to_local = N @ np.linalg.inv(gauge)
+    to_map = gauge @ inv_N
+    matrices = np.array([to_local @ as_homography(initial[fid]) @ inv_N for fid in ids])
+    matrices /= matrices[:, 2:3, 2:3]
+    if not np.isfinite(matrices).all():
+        raise ValueError("Invalid projective initialization")
+    free_idx = np.array([index[fid] for fid in free], dtype=int)
+    dof = 6 if model == "affine" else 8
+    columns = {fid: dof * i for i, fid in enumerate(free)}
+    x0 = matrices[free_idx].reshape(-1, 9)[:, :dof].ravel()
+    first_ids, second_ids, ps, qs, weights, training, sections = [], [], [], [], [], [], []
+    validation = []
+    start = 0
+    median_weight = np.median([link.weight for link in links])
+    for link in links:
+        p, q = np.asarray(link.first_points), np.asarray(link.second_points)
+        # Deterministic spatial ordering, rather than matcher confidence order.
+        order = np.lexsort((p[:, 1], p[:, 0]))
+        train = np.ones(len(p), dtype=bool)
+        if len(p) >= 15:
+            train[order[::5]] = False
+        # Keep held-out observations independent of the training cap. Select
+        # a spatially spread 96-point subset from the remaining observations.
+        validation.extend(~train)
+        candidates = np.flatnonzero(train)
+        if len(candidates) > train_points:
+            from src.geometry.relative_alignment import sample_point_pair
+
+            # sample_point_pair returns the paired indices in its second output.
+            _, selected_ids = sample_point_pair(p[candidates], candidates[:, None], train_points)
+            train[:] = False
+            train[selected_ids.ravel().astype(int)] = True
+        first_ids.extend([index[link.first]] * len(p))
+        second_ids.extend([index[link.second]] * len(p))
+        ps.append(np.column_stack([project_points(N, p), np.ones(len(p))]))
+        qs.append(np.column_stack([project_points(N, q), np.ones(len(q))]))
+        # Graph weights are residual multipliers. Keep that convention here.
+        weights.extend([link.weight / median_weight / np.sqrt(train.sum())] * len(p))
+        training.extend(train)
+        sections.append(slice(start, start + len(p)))
+        start += len(p)
+    ia, ib = np.array(first_ids), np.array(second_ids)
+    p, q = np.concatenate(ps), np.concatenate(qs)
+    train = np.array(training, dtype=bool)
+    weight = np.array(weights)
+    heldout = np.array(validation, dtype=bool)
+
+    def unpack(x):
+        H = matrices.copy()
+        if len(free):
+            values = np.zeros((len(free), 9))
+            values[:, :dof] = x.reshape(-1, dof)
+            values[:, 8] = 1.0
+            H[free_idx] = values.reshape(-1, 3, 3)
+        return H
+
+    def errors(x, selected=slice(None), *, jacobian=False):
+        check_running()
+        try:
+            H = unpack(x)
+            if not jacobian:
+                # Full QA can include millions of observations; avoid allocating
+                # multiple 3x3 matrices per observation over the whole flight.
+                indices = np.arange(len(p))[selected]
+                chunks = [indices[i : i + 8192] for i in range(0, len(indices), 8192)]
+                return np.concatenate(
+                    [symmetric_transfer(H, ia[k], ib[k], p[k], q[k], size, dof) for k in chunks]
+                )
+            return symmetric_transfer(
+                H, ia[selected], ib[selected], p[selected], q[selected], size, dof, jacobian=True
+            )
+        except np.linalg.LinAlgError:
+            n = len(p[selected])
+            if jacobian:
+                return np.full((n, 4), 1e6), np.zeros((n, 4, dof)), np.zeros((n, 4, dof))
+            return np.full((n, 4), 1e6)
+
+    row_points = np.flatnonzero(train)
+    row_ids, col_ids, active_indices = [], [], []
+    camera_columns = np.array([columns.get(fid, -1) for fid in ids])
+    for endpoints in (ia, ib):
+        base_columns = camera_columns[endpoints[row_points]]
+        active = np.flatnonzero(base_columns >= 0)
+        active_indices.append(active)
+        rows = (active[:, None] * 4 + np.arange(4)).reshape(-1)
+        row_ids.append(np.repeat(rows, dof))
+        col_ids.append(np.tile(base_columns[active, None] + np.arange(dof), (1, 4)).ravel())
+    n_data = 4 * len(row_points)
+    row_ids = np.concatenate(row_ids + [np.arange(n_data, n_data + len(x0))])
+    col_ids = np.concatenate(col_ids + [np.arange(len(x0))])
+
+    # Optional non-image priors. Residual units: gauge-frame pixels for points,
+    # sigma-normalised for scale and perspective. Rows follow the shape prior.
+    from src.geometry.frame_transform import affine_at_center
+
+    gauge_affine = affine_at_center(gauge, width, height)
+    log_gauge_scale = 0.5 * np.log(abs(np.linalg.det(gauge_affine[:, :2])))
+    point_items = []
+    for fid, (pixels, targets, sigma) in sorted(priors.points.items()):
+        pixels, targets = np.asarray(pixels, float), np.asarray(targets, float)
+        pn = np.column_stack([project_points(N, pixels), np.ones(len(pixels))])
+        point_items.append((index[fid], pn, project_points(to_local, targets), size / float(sigma)))
+    scale_items = [
+        (index[fid], float(target) - log_gauge_scale, 1.0 / float(sigma))
+        for fid, (target, sigma) in sorted(priors.log_scale.items())
+        if np.isfinite(target)
+    ]
+    persp_items = []
+    if dof == 8 and priors.perspective_sigma_px > 0:
+        for fid in free:
+            k = index[fid]
+            s0 = np.exp(_log_scale_terms(matrices[k])[0])
+            persp_items.append((k, size * _CORNER_RADIUS_SQ * s0 / priors.perspective_sigma_px))
+
+    def prior_residuals(H, only_free=True):
+        out = []
+        for k, pn, target, sc in point_items:
+            if not only_free or camera_columns[k] >= 0:
+                out.append(_point_prior_terms(H[k], pn, target, sc)[0])
+        for k, target, w in scale_items:
+            if not only_free or camera_columns[k] >= 0:
+                out.append([w * (_log_scale_terms(H[k])[0] - target)])
+        for k, c in persp_items:
+            out.append(c * H[k][2, :2])
+        return np.concatenate(out) if out else np.zeros(0)
+
+    def prior_jacobian(H):
+        values = []
+        for k, pn, target, sc in point_items:
+            if camera_columns[k] >= 0:
+                values.append(_point_prior_terms(H[k], pn, target, sc)[1][:, :dof].ravel())
+        for k, target, w in scale_items:
+            if camera_columns[k] >= 0:
+                values.append(w * _log_scale_terms(H[k])[1][:dof])
+        for k, c in persp_items:
+            values.append(np.array([c, c]))
+        return np.concatenate(values) if values else np.zeros(0)
+
+    prior_rows, prior_cols = [], []
+    row = n_data + len(x0)
+    for k, pn, target, sc in point_items:
+        if camera_columns[k] >= 0:
+            m = 2 * len(pn)
+            prior_rows.append(np.repeat(np.arange(row, row + m), dof))
+            prior_cols.append(np.tile(camera_columns[k] + np.arange(dof), m))
+            row += m
+    for k, target, w in scale_items:
+        if camera_columns[k] >= 0:
+            prior_rows.append(np.full(dof, row))
+            prior_cols.append(camera_columns[k] + np.arange(dof))
+            row += 1
+    for k, c in persp_items:
+        prior_rows.append(np.array([row, row + 1]))
+        prior_cols.append(camera_columns[k] + np.array([6, 7]))
+        row += 2
+    n_rows = row
+    if prior_rows:
+        row_ids = np.concatenate([row_ids, *prior_rows])
+        col_ids = np.concatenate([col_ids, *prior_cols])
+
+    def prior_cost(x_):
+        r = prior_residuals(unpack(x_), only_free=False)
+        return 0.5 * float(r @ r)
+
+    before = errors(x0)
+    x = x0.copy()
+    evaluations = 0
+    converged = not len(free)
+    for _ in range(3 if len(free) else 0):
+        residual = errors(x, train)
+        norms = np.sqrt(np.sum(residual**2, axis=1) / 2)
+        robust = np.sqrt(np.minimum(1.0, 2.0 / np.maximum(norms, 1e-12)))
+        per_point = weight[train] * robust
+
+        def objective(candidate, per_point=per_point):
+            data = errors(candidate, train) * per_point[:, None]
+            # Tiny shape prior only stabilizes underconstrained directions.
+            return np.r_[data.ravel(), 1e-3 * (candidate - x0), prior_residuals(unpack(candidate))]
+
+        def jac(candidate, per_point=per_point):
+            _, first, second = errors(candidate, train, jacobian=True)
+            values = [
+                (block[active] * per_point[active, None, None]).ravel()
+                for block, active in zip((first, second), active_indices)
+            ]
+            values.append(np.full(len(x0), 1e-3))
+            values.append(prior_jacobian(unpack(candidate)))
+            return sparse.csr_matrix(
+                (np.concatenate(values), (row_ids, col_ids)), shape=(n_rows, len(x0))
+            )
+
+        if solver == "lm_sparse":
+            x_new, nfev, converged = _sparse_lm(objective, jac, x, max_nfev, check_running)
+        else:
+            fit = least_squares(
+                objective,
+                x,
+                jac=jac,
+                method="trf",
+                x_scale="jac",
+                max_nfev=max_nfev,
+                ftol=1e-8,
+                xtol=1e-8,
+                gtol=1e-8,
+            )
+            x_new, nfev, converged = fit.x, fit.nfev, bool(fit.success)
+        evaluations += nfev
+        change = np.max(np.abs(x_new - x))
+        x = x_new
+        if change < 1e-8:
+            break
+    after = errors(x)
+
+    def norms(residual):
+        return np.sqrt(np.sum(residual**2, axis=1) / 2)
+
+    def cost(values, selected):
+        e = norms(values)[selected]
+        return np.sum(weight[selected] ** 2 * np.where(e <= 2, e**2 / 2, 2 * e - 2))
+
+    prior_before, prior_after = prior_cost(x0), prior_cost(x)
+    if cost(after, train) + prior_after > cost(before, train) + prior_before + 1e-5:
+        raise ValueError("Projective refinement increased robust image error")
+    if np.any(heldout) and cost(after, heldout) > cost(before, heldout) * 1.1 + 0.05:
+        raise ValueError("Projective refinement worsened held-out observations")
+    result = {}
+    for fid, H in zip(ids, unpack(x)):
+        matrix = to_map @ H @ N
+        original = as_homography(initial[fid])
+        orientation = np.sign(
+            np.linalg.det(original) / (original[2] @ [width / 2, height / 2, 1]) ** 3
+        )
+        if not valid_footprint(matrix, width, height, orientation=orientation):
+            raise ValueError("Projective refinement would fold a frame or cross a horizon")
+        # Guard local scale relative to the seed at center and corners.
+        corners = np.array([[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]])
+        old = project_points(original, corners)
+        new = project_points(matrix, corners)
+        ratios = np.linalg.norm(new - np.roll(new, 1, axis=0), axis=1) / np.maximum(
+            np.linalg.norm(old - np.roll(old, 1, axis=0), axis=1), 1e-12
+        )
+        if ratios.min() < 0.25 or ratios.max() > 4:
+            raise ValueError("Projective refinement excessively distorted a frame")
+        result[fid] = original.copy() if fid in fixed_ids else matrix / matrix[2, 2]
+    b, a = norms(before), norms(after)
+    per_frame = {fid: [] for fid in ids}
+    for link, section in zip(links, sections):
+        per_frame[link.first].extend(a[section] ** 2)
+        per_frame[link.second].extend(a[section] ** 2)
+    report = {
+        "method": f"{model}_symmetric_irls_v1",
+        "units": "original_image_pixels",
+        "frames": len(ids),
+        "links": len(links),
+        "points": len(p),
+        "training_points": int(train.sum()),
+        "training_point_limit_per_link": train_points,
+        "jacobian": "analytic",
+        "solver_method": solver,
+        "heldout_points": int((heldout).sum()),
+        "before_median_px": float(np.median(b)),
+        "after_median_px": float(np.median(a)),
+        "before_p95_px": float(np.percentile(b, 95)),
+        "after_p95_px": float(np.percentile(a, 95)),
+        "heldout_before_p95_px": float(np.percentile(b[heldout], 95)) if np.any(heldout) else None,
+        "heldout_after_p95_px": float(np.percentile(a[heldout], 95)) if np.any(heldout) else None,
+        "heldout_scope": "global_adjustment_only",
+        "evaluations": evaluations,
+        "converged": converged,
+        "heldout_robust_cost": float(cost(after, heldout)) if np.any(heldout) else None,
+        "training_robust_cost": float(cost(after, train)),
+        "frames_with_single_link": sum(len(n) == 1 for n in neighbors.values()),
+        "prior_cost": prior_after,
+        "gauge_warning": "Relative planar registration cannot establish metric ground accuracy or remove terrain parallax",
+    }
+    if priors:
+        gauge_m_per_px = float(np.exp(log_gauge_scale))
+
+        def anchor_rms_m(x_):
+            H = unpack(x_)
+            r = [
+                _point_prior_terms(H[k], pn, target, size)[0] * gauge_m_per_px
+                for k, pn, target, _ in point_items
+            ]
+            return float(np.sqrt(np.mean(np.concatenate(r) ** 2) * 2)) if r else None
+
+        report["priors"] = {
+            "point_frames": len(point_items),
+            "scale_frames": len(scale_items),
+            "perspective_sigma_px": float(priors.perspective_sigma_px),
+            "prior_cost_before": prior_before,
+            "anchor_points_rms_m_before": anchor_rms_m(x0),
+            "anchor_points_rms_m_after": anchor_rms_m(x),
+        }
+    return (
+        result,
+        report,
+        {fid: float(np.sqrt(np.mean(e))) if e else 0.0 for fid, e in per_frame.items()},
+    )
+
+
+def _refine_windowed(
+    initial,
+    links,
+    width,
+    height,
+    fixed_ids,
+    *,
+    model,
+    max_nfev,
+    check_running,
+    priors=None,
+    train_points=96,
+    solver="trf",
+):
+    """Bounded block-coordinate adjustment; cross-window/loop neighbors stay fixed.
+
+    Each solve includes every incident constraint, including distant loop closures.
+    Forward and backward overlapping sweeps propagate corrections. This is a
+    bounded approximation, not a claim of global convergence on long chains.
+    """
+    options = dict(
+        model=model,
+        max_nfev=max_nfev,
+        check_running=check_running,
+        priors=priors,
+        train_points=train_points,
+        solver=solver,
+    )
+    _, before, _ = _refine_map(initial, links, width, height, set(initial), **options)
+    result = {fid: as_homography(H).copy() for fid, H in initial.items()}
+    free = sorted(set(initial) - set(fixed_ids))
+    windows = [set(free[i : i + 32]) for i in range(0, len(free), 24)]
+    incident = {fid: [] for fid in initial}
+    for index, link in enumerate(links):
+        incident[link.first].append(index)
+        incident[link.second].append(index)
+    evaluations, rejected, solved = 0, 0, 0
+    all_converged, final_motion = True, 0.0
+    probes = np.array(
+        [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height], [width / 2, height / 2]]
+    )
+    completed_sweeps = 0
+    for sweep_index in range(8):
+        sweep = windows if sweep_index % 2 == 0 else windows[::-1]
+        completed_sweeps += 1
+        final_motion = 0.0
+        for active in sweep:
+            check_running()
+            selected = sorted({i for fid in active for i in incident[fid]})
+            local_links = [links[i] for i in selected]
+            nodes = {fid for link in local_links for fid in (link.first, link.second)}
+            boundary = nodes - active
+            if not boundary:
+                raise ValueError("Window has no fixed boundary")
+            try:
+                adjusted, report, _ = _refine_map(
+                    {fid: result[fid] for fid in sorted(nodes)},
+                    local_links,
+                    width,
+                    height,
+                    boundary,
+                    **options,
+                )
+            except ValueError:
+                rejected += 1
+                all_converged = False
+                continue
+            solved += 1
+            evaluations += report["evaluations"]
+            all_converged &= report["converged"]
+            for fid in active:
+                movement = (
+                    project_points(np.linalg.inv(adjusted[fid]) @ result[fid], probes) - probes
+                )
+                final_motion = max(final_motion, float(np.linalg.norm(movement, axis=1).max()))
+                result[fid] = adjusted[fid]
+        if completed_sweeps >= 2 and final_motion < 0.01:
+            break
+    _, after, frame_rmse = _refine_map(result, links, width, height, set(result), **options)
+    if (
+        after["training_robust_cost"] + after["prior_cost"]
+        > before["training_robust_cost"] + before["prior_cost"] + 1e-5
+    ):
+        raise ValueError("Windowed refinement increased robust image error")
+    if (
+        before["heldout_points"]
+        and after["heldout_robust_cost"] > before["heldout_robust_cost"] * 1.1 + 0.05
+    ):
+        raise ValueError("Windowed refinement worsened held-out observations")
+    for key in ("before_median_px", "before_p95_px", "heldout_before_p95_px"):
+        after[key] = before[key]
+    if "priors" in after:
+        after["priors"]["prior_cost_before"] = before["prior_cost"]
+        after["priors"]["anchor_points_rms_m_before"] = before["priors"][
+            "anchor_points_rms_m_after"
+        ]
+    after.update(
+        solver="overlapping_block_coordinate",
+        window_frames=32,
+        window_overlap=8,
+        sweeps=completed_sweeps,
+        max_sweeps=8,
+        windows_solved=solved,
+        windows_rejected=rejected,
+        evaluations=evaluations,
+        converged=bool(all_converged and final_motion < 0.01),
+        final_sweep_max_motion_px=final_motion,
+        convergence_scope="bounded_window_sweeps; global stationarity not certified",
+    )
+    return result, after, frame_rmse
+
+
+# ================================================================================
+# File: src\geometry\terrain_scale.py
+# ================================================================================
+"""Terrain (relief) terms for the propagation pose graph.
+
+Problem
+-------
+Every keyframe is a 5-DoF affine (centre, two scales, angle): a flat ground
+model. Over relief that model is biased in a way the edges cannot see. With
+the drone at a constant altitude H (barometric hold, the usual survey mode and
+what the FlightSimulator flies), a nadir camera sees ground at height h with
+GSD (H - h) / f. Two overlapping frames look at the SAME ground, so the
+homography between them has scale ratio 1, while the frames' own GSDs differ
+by the terrain under each footprint. A temporal chain therefore keeps the
+anchor's scale along the whole leg, and the position error grows with the
+integral of the GSD error. On testtopboch_hh (AGL 746-992 m along the main
+legs) this made the error between turn anchors grow to 460 m.
+
+Terms (flag graph_optimization.terrain_scale_prior, default off)
+---------------------------------------------------------------
+* Altitude profile H(frame): H_a = GSD_a * f + D_a at every anchor (GSD_a from
+  the anchor affine in ground metres, D_a = DEM under its footprint), linear
+  between anchors in frame id (or one robust constant). A later telemetry
+  stream can supply H(frame) directly through the same interface.
+* Node prior: log GSD_k -> log((H(k) - D_k) / f), a unary factor per free node.
+* Edge correction: an edge i->j measured over the overlap (mean height h_ov)
+  is rewritten to what the per-frame model expects:
+  scale  += log((H_j - D_j)/(H_i - D_i)) - log((H_j - h_ov)/(H_i - h_ov)),
+  shift  *= (H_i - h_ov) / (H_i - D_i).
+  With exact anchors at both ends, the corrected chain alone follows the relief.
+
+D_k is the DEM under frame k weighted by r^2 from the frame centre, the
+weighting a least-squares affine fit gives its points, so D_k matches what an
+anchor affine fitted to corner points encodes. A wrong focal length scales only
+the relief correction (by f_true/f_used), never the anchors' own scale.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from src.geometry.dem import RasterDEM, mercator_to_lonlat
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+PIECEWISE = "piecewise"
+CONSTANT = "constant"
+_MIN_VALID_FRACTION = 0.5
+_MIN_OVERLAP_POINTS = 4
+_MAX_LOG_SCALE_FIX = float(np.log(1.5))
+
+
+def states_to_affines(states: np.ndarray, cx: float, cy: float, sign: float = 1.0) -> np.ndarray:
+    """(N, 5) node states -> (N, 2, 3) affines (same formula as model_5dof)."""
+    s = np.atleast_2d(np.asarray(states, dtype=np.float64))
+    sx = np.exp(np.clip(s[:, 2], -30, 30))
+    sy = np.exp(np.clip(s[:, 3], -30, 30))
+    c, sn = np.cos(s[:, 4]), np.sin(s[:, 4])
+    m = np.empty((len(s), 2, 3), dtype=np.float64)
+    m[:, 0, 0] = c * sx
+    m[:, 0, 1] = -sn * sign * sy
+    m[:, 1, 0] = sn * sx
+    m[:, 1, 1] = c * sign * sy
+    m[:, 0, 2] = s[:, 0] - (m[:, 0, 0] * cx + m[:, 0, 1] * cy)
+    m[:, 1, 2] = s[:, 1] - (m[:, 1, 0] * cx + m[:, 1, 1] * cy)
+    return m
+
+
+def frame_grid(width: int, height: int, nx: int = 16, ny: int = 9) -> tuple[np.ndarray, np.ndarray]:
+    """Cell-centre pixel grid (G, 2) over the frame and r^2 weights (G,), sum 1."""
+    xs = (np.arange(nx) + 0.5) * width / nx
+    ys = (np.arange(ny) + 0.5) * height / ny
+    gx, gy = np.meshgrid(xs, ys)
+    pts = np.column_stack([gx.ravel(), gy.ravel()])
+    r2 = (pts[:, 0] - width / 2.0) ** 2 + (pts[:, 1] - height / 2.0) ** 2
+    return pts, r2 / r2.sum()
+
+
+def metric_to_latlon(x, y, converter) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorised converter.metric_to_gps (closed form for WEB_MERCATOR)."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if str(getattr(converter, "mode", "WEB_MERCATOR")).upper() == "WEB_MERCATOR":
+        lon, lat = mercator_to_lonlat(x, y)
+        return lat, lon
+    lat, lon = converter.metric_to_gps_array(x, y)
+    return np.asarray(lat), np.asarray(lon)
+
+
+def ground_scale(lat, converter) -> np.ndarray:
+    """Projected metre -> ground metre: cos(lat) for WEB_MERCATOR, else 1."""
+    lat = np.asarray(lat, dtype=np.float64)
+    if str(getattr(converter, "mode", "WEB_MERCATOR")).upper() == "WEB_MERCATOR":
+        return np.cos(np.radians(lat))
+    return np.ones_like(lat)
+
+
+class AltitudeProfile:
+    """Flight altitude (DEM datum) per frame id.
+
+    ``piecewise``: linear in frame id between anchors, constant outside.
+    ``constant``: the median of all anchor estimates (pure barometric hold).
+    """
+
+    def __init__(self, frame_ids, altitudes, mode: str = PIECEWISE) -> None:
+        ids = np.asarray(frame_ids, dtype=np.float64)
+        alts = np.asarray(altitudes, dtype=np.float64)
+        ok = np.isfinite(ids) & np.isfinite(alts)
+        if not np.any(ok):
+            raise ValueError("no anchor altitude available")
+        order = np.argsort(ids[ok])
+        self.frame_ids = ids[ok][order]
+        self.altitudes = alts[ok][order]
+        if mode not in (PIECEWISE, CONSTANT):
+            raise ValueError(f"altitude mode must be {PIECEWISE!r} or {CONSTANT!r}")
+        self.mode = mode
+        self._const = float(np.median(self.altitudes))
+
+    def __call__(self, frame_ids) -> np.ndarray:
+        f = np.asarray(frame_ids, dtype=np.float64)
+        if self.mode == CONSTANT or len(self.frame_ids) == 1:
+            return np.full(f.shape, self._const if self.mode == CONSTANT else self.altitudes[0])
+        return np.interp(f, self.frame_ids, self.altitudes)
+
+
+def fit_constant_altitude(gsd_ground, dem_heights, min_spread_m: float = 30.0):
+    """Diagnostic: GSD_a = (H - D_a)/f by least squares over anchors.
+
+    Returns (f_px, H) or None when the anchors do not span enough relief.
+    """
+    g = np.asarray(gsd_ground, dtype=np.float64)
+    d = np.asarray(dem_heights, dtype=np.float64)
+    ok = np.isfinite(g) & np.isfinite(d)
+    if ok.sum() < 3 or np.ptp(d[ok]) < min_spread_m:
+        return None
+    beta, alpha = np.polyfit(d[ok], g[ok], 1)
+    if beta >= 0:
+        return None
+    return float(-1.0 / beta), float(-alpha / beta)
+
+
+def altitude_terrain_slope(altitudes, dem_heights, min_spread_m: float = 30.0) -> float | None:
+    """dH/dDEM over the anchors: ~0 for a barometric hold, ~1 for terrain following.
+
+    The terrain terms assume H does not follow the ground between anchors; a
+    slope near 1 means the flight kept a constant height above ground, where
+    the flat per-frame model is already right and the terms would add error.
+    None when there are fewer than 3 anchors or they span too little relief.
+    """
+    a = np.asarray(altitudes, dtype=np.float64)
+    d = np.asarray(dem_heights, dtype=np.float64)
+    ok = np.isfinite(a) & np.isfinite(d)
+    if ok.sum() < 3 or np.ptp(d[ok]) < min_spread_m:
+        return None
+    return float(np.polyfit(d[ok], a[ok], 1)[0])
+
+
+@dataclass
+class TerrainScaleModel:
+    dem: RasterDEM
+    converter: object
+    origin_xy: tuple[float, float]
+    frame_w: int
+    frame_h: int
+    f_px: float
+    sign: float = 1.0
+    grid: tuple[int, int] = (16, 9)
+    _pts: np.ndarray = field(init=False, repr=False)
+    _w: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not (self.f_px > 0):
+            raise ValueError("focal length in pixels must be positive")
+        self._pts, self._w = frame_grid(self.frame_w, self.frame_h, *self.grid)
+
+    @property
+    def cx(self) -> float:
+        return self.frame_w / 2.0
+
+    @property
+    def cy(self) -> float:
+        return self.frame_h / 2.0
+
+    def sample_footprints(self, states: np.ndarray) -> dict:
+        """DEM under each frame: heights (N, G), weighted mean D (N,), centre lat (N,)."""
+        s = np.atleast_2d(np.asarray(states, dtype=np.float64))
+        aff = states_to_affines(s, self.cx, self.cy, self.sign)
+        pts_h = np.column_stack([self._pts, np.ones(len(self._pts))])  # (G, 3)
+        ground = np.einsum("nij,gj->ngi", aff, pts_h)  # (N, G, 2) local metric
+        gx = ground[..., 0] + self.origin_xy[0]
+        gy = ground[..., 1] + self.origin_xy[1]
+        lat, lon = metric_to_latlon(gx, gy, self.converter)
+        heights = self.dem.sample(lat, lon)  # (N, G)
+        valid = np.isfinite(heights)
+        w = np.where(valid, self._w[None, :], 0.0)
+        wsum = w.sum(axis=1)
+        mean = np.where(
+            (valid.mean(axis=1) >= _MIN_VALID_FRACTION) & (wsum > 0),
+            np.nansum(np.where(valid, heights, 0.0) * w, axis=1) / np.maximum(wsum, 1e-12),
+            np.nan,
+        )
+        clat, _clon = metric_to_latlon(
+            s[:, 0] + self.origin_xy[0], s[:, 1] + self.origin_xy[1], self.converter
+        )
+        return {"heights": heights, "mean": mean, "lat": np.asarray(clat), "affines": aff}
+
+    def ground_gsd(self, states: np.ndarray, lat) -> np.ndarray:
+        """Geometric-mean GSD of the node affines in ground metres per pixel."""
+        s = np.atleast_2d(np.asarray(states, dtype=np.float64))
+        return np.exp(0.5 * (s[:, 2] + s[:, 3])) * ground_scale(lat, self.converter)
+
+    def overlap_plane(
+        self, fp: dict, idx_i: np.ndarray, idx_j: np.ndarray, dt_pix: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Plane fit to the DEM over the overlap of frames i and j, in frame-i pixels.
+
+        A homography between two views of non-planar ground is (close to) the
+        homography of the best plane through the overlap. Returns, per edge, the
+        plane height at frame j's centre (pixel ``centre + dt`` of frame i) and
+        the plane gradient (m per frame-i pixel, shape (E, 2)). NaN when the
+        overlap holds too few DEM samples; zero gradient when it is degenerate.
+        """
+        aff = fp["affines"]
+        heights = fp["heights"]
+        n = len(idx_i)
+        h_at = np.full(n, np.nan)
+        grad = np.zeros((n, 2))
+        if n == 0:
+            return h_at, grad
+        pts_h = np.column_stack([self._pts, np.ones(len(self._pts))])
+        ground_i = np.einsum("eij,gj->egi", aff[idx_i], pts_h)  # (E, G, 2)
+        a_j = aff[idx_j]
+        lin = a_j[:, :, :2]
+        det = lin[:, 0, 0] * lin[:, 1, 1] - lin[:, 0, 1] * lin[:, 1, 0]
+        ok_det = np.abs(det) > 1e-12
+        inv = np.zeros_like(lin)
+        inv[:, 0, 0] = lin[:, 1, 1]
+        inv[:, 0, 1] = -lin[:, 0, 1]
+        inv[:, 1, 0] = -lin[:, 1, 0]
+        inv[:, 1, 1] = lin[:, 0, 0]
+        inv /= np.where(ok_det, det, 1.0)[:, None, None]
+        pix_j = np.einsum("eij,egj->egi", inv, ground_i - a_j[:, None, :, 2])
+        inside = (
+            (pix_j[..., 0] >= 0)
+            & (pix_j[..., 0] <= self.frame_w)
+            & (pix_j[..., 1] >= 0)
+            & (pix_j[..., 1] <= self.frame_h)
+            & ok_det[:, None]
+        )
+        h = heights[idx_i]
+        good = inside & np.isfinite(h)
+        cnt = good.sum(axis=1)
+        enough = cnt >= _MIN_OVERLAP_POINTS
+        wgt = good.astype(np.float64)
+        hz = np.where(good, h, 0.0)
+        # plane h = a + b*(u - cx) + c*(v - cy) by weighted least squares
+        u = (self._pts[:, 0] - self.cx) / self.frame_w
+        v = (self._pts[:, 1] - self.cy) / self.frame_w
+        basis = np.stack([np.ones_like(u), u, v], axis=1)  # (G, 3)
+        ata = np.einsum("eg,gk,gl->ekl", wgt, basis, basis)
+        atb = np.einsum("eg,gk,eg->ek", wgt, basis, hz)
+        mean = np.where(enough, atb[:, 0] / np.maximum(cnt, 1), np.nan)
+        cond = np.linalg.cond(ata + np.eye(3)[None] * 1e-12)
+        plane_ok = enough & (cnt >= 6) & (cond < 1e6)
+        coef = np.zeros((n, 3))
+        if np.any(plane_ok):
+            coef[plane_ok] = np.linalg.solve(ata[plane_ok], atb[plane_ok][..., None])[..., 0]
+        du = dt_pix[:, 0] / self.frame_w
+        dv = dt_pix[:, 1] / self.frame_w
+        h_at = np.where(plane_ok, coef[:, 0] + coef[:, 1] * du + coef[:, 2] * dv, mean)
+        grad[plane_ok, 0] = coef[plane_ok, 1] / self.frame_w
+        grad[plane_ok, 1] = coef[plane_ok, 2] / self.frame_w
+        return h_at, grad
+
+
+class TerrainTerms:
+    """Applies the node prior and the edge correction to a PoseGraphOptimizer.
+
+    ``apply`` may be called repeatedly (fixed point): the raw edge measurements
+    are kept on the first call and every call recomputes the terms from the
+    optimizer's current node states.
+    """
+
+    def __init__(
+        self,
+        model: TerrainScaleModel,
+        profile: AltitudeProfile,
+        prior_weight: float,
+        edge_correction: bool = True,
+        min_agl_m: float = 10.0,
+    ) -> None:
+        self.model = model
+        self.profile = profile
+        self.prior_weight = float(prior_weight)
+        self.edge_correction = bool(edge_correction)
+        self.min_agl_m = float(min_agl_m)
+        self._raw: dict[int, tuple[float, float, float, float]] = {}
+
+    def apply(self, optimizer) -> dict:
+        states = optimizer.node_states()
+        anchor_ids = set(optimizer.anchor_states())
+        fids = sorted(states)
+        stats = {"nodes": len(fids), "priors": 0, "edges_corrected": 0, "edges": 0}
+        if not fids:
+            optimizer.set_scale_priors({})
+            return stats
+        idx = {fid: k for k, fid in enumerate(fids)}
+        mat = np.array([states[f] for f in fids], dtype=np.float64)
+        fp = self.model.sample_footprints(mat)
+        dem_mean = fp["mean"]
+        alt = self.profile(np.array(fids, dtype=np.float64))
+        agl = alt - dem_mean
+        ok = np.isfinite(agl) & (agl > self.min_agl_m)
+        stats["nodes_with_dem"] = int(np.isfinite(dem_mean).sum())
+
+        priors: dict[int, tuple[float, float]] = {}
+        if self.prior_weight > 0:
+            k = ground_scale(fp["lat"], self.model.converter)
+            target = np.log(np.where(ok, agl, 1.0) / (self.model.f_px * k))
+            for fid in fids:
+                n = idx[fid]
+                if ok[n] and fid not in anchor_ids and optimizer.is_free(fid):
+                    priors[fid] = (float(target[n]), self.prior_weight)
+        optimizer.set_scale_priors(priors)
+        stats["priors"] = len(priors)
+
+        edges = [e for e in optimizer.edges if e.from_id in idx and e.to_id in idx]
+        stats["edges"] = len(edges)
+        if self.edge_correction and edges:
+            for e in edges:
+                self._raw.setdefault(id(e), (e.dtx, e.dty, e.log_dsx, e.log_dsy, e.dtheta))
+            raw = np.array([self._raw[id(e)] for e in edges], dtype=np.float64)
+            ii = np.array([idx[e.from_id] for e in edges])
+            jj = np.array([idx[e.to_id] for e in edges])
+            fixes = edge_corrections(
+                raw,
+                alt[ii],
+                alt[jj],
+                dem_mean[ii],
+                dem_mean[jj],
+                *self.model.overlap_plane(fp, ii, jj, raw[:, :2]),
+                min_agl_m=self.min_agl_m,
+            )
+            valid = fixes["valid"] & ok[ii] & ok[jj]
+            for n, e in enumerate(edges):
+                r = raw[n]
+                if valid[n]:
+                    e.dtx, e.dty = fixes["dtx"][n], fixes["dty"][n]
+                    e.log_dsx, e.log_dsy = fixes["log_dsx"][n], fixes["log_dsy"][n]
+                    e.dtheta = fixes["dtheta"][n]
+                else:
+                    e.dtx, e.dty, e.log_dsx, e.log_dsy, e.dtheta = (float(v) for v in r)
+            stats["edges_corrected"] = int(valid.sum())
+            if valid.any():
+                dls = 0.5 * (fixes["log_dsx"] + fixes["log_dsy"] - raw[:, 2] - raw[:, 3])
+                stats["edge_scale_fix_p95"] = float(np.percentile(np.abs(dls[valid]), 95))
+                stats["edge_shift_fix_p95"] = float(
+                    np.percentile(np.abs(fixes["shift_factor"][valid] - 1.0), 95)
+                )
+                stats["edge_angle_fix_p95_deg"] = float(
+                    np.degrees(np.percentile(np.abs(fixes["dtheta"] - raw[:, 4])[valid], 95))
+                )
+        if np.any(ok):
+            stats["agl_min_m"] = float(np.min(agl[ok]))
+            stats["agl_max_m"] = float(np.max(agl[ok]))
+        return stats
+
+
+def edge_corrections(
+    raw: np.ndarray,
+    alt_i: np.ndarray,
+    alt_j: np.ndarray,
+    dem_i: np.ndarray,
+    dem_j: np.ndarray,
+    h_at_j: np.ndarray,
+    grad_i: np.ndarray,
+    min_agl_m: float = 10.0,
+) -> dict:
+    """Rewrite raw edges (dtx, dty, log_dsx, log_dsy, dtheta) for the per-frame model.
+
+    Measured (frame-i pixels): j's centre lies at dt = f(C_j - C_i)/(H_i - h~),
+    h~ the overlap plane at C_j, and the linear part is
+    rho * (I + dt g^T / (H_i - h~)) * R(dtheta), rho = (H_j - h~)/(H_i - h~),
+    g the plane gradient per frame-i pixel. The per-frame model wants the shift
+    in units of node i's GSD, (H_i - D_i)/f, and the scale ratio
+    (H_j - D_j)/(H_i - D_i) without the slope term. Corrections are first order
+    in the slope term and clamped.
+    """
+    raw = np.asarray(raw, dtype=np.float64)
+    dt = raw[:, :2]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        agl_i_ov = alt_i - h_at_j
+        agl_j_ov = alt_j - h_at_j
+        valid = (
+            np.isfinite(h_at_j)
+            & np.isfinite(dem_i)
+            & np.isfinite(dem_j)
+            & (agl_i_ov > min_agl_m)
+            & (agl_j_ov > min_agl_m)
+            & (alt_i - dem_i > min_agl_m)
+            & (alt_j - dem_j > min_agl_m)
+        )
+        shift = np.where(valid, agl_i_ov / (alt_i - dem_i), 1.0)
+        iso = np.where(
+            valid,
+            np.log((alt_j - dem_j) / (alt_i - dem_i)) - np.log(agl_j_ov / agl_i_ov),
+            0.0,
+        )
+        denom = np.where(valid, agl_i_ov, 1.0)
+    shift = np.clip(shift, 1.0 / 1.5, 1.5)
+    iso = np.clip(iso, -_MAX_LOG_SCALE_FIX, _MAX_LOG_SCALE_FIX)
+    g = np.where(valid[:, None], np.nan_to_num(grad_i), 0.0)
+    # slope term E = dt g^T / (H_i - h~), expressed after R(dtheta): E' = R^T E R
+    e = dt[:, :, None] * g[:, None, :] / denom[:, None, None]
+    c, s_ = np.cos(raw[:, 4]), np.sin(raw[:, 4])
+    rot = np.stack([np.stack([c, -s_], -1), np.stack([s_, c], -1)], -2)
+    e_rot = np.einsum("eki,ekl,elj->eij", rot, e, rot)
+    e_rot = np.clip(e_rot, -0.2, 0.2)
+    return {
+        "valid": valid,
+        "dtx": dt[:, 0] * shift,
+        "dty": dt[:, 1] * shift,
+        "log_dsx": raw[:, 2] + iso - e_rot[:, 0, 0],
+        "log_dsy": raw[:, 3] + iso - e_rot[:, 1, 1],
+        "dtheta": raw[:, 4] - e_rot[:, 1, 0],
+        "shift_factor": shift,
+    }
+
+
+def anchor_altitudes(model: TerrainScaleModel, anchor_states: dict[int, np.ndarray]) -> dict:
+    """H_a = ground GSD_a * f + D_a for every anchor with DEM under it."""
+    fids = sorted(anchor_states)
+    if not fids:
+        return {"ids": [], "alt": np.zeros(0), "gsd": np.zeros(0), "dem": np.zeros(0)}
+    mat = np.array([anchor_states[f] for f in fids], dtype=np.float64)
+    fp = model.sample_footprints(mat)
+    gsd = model.ground_gsd(mat, fp["lat"])
+    alt = gsd * model.f_px + fp["mean"]
+    return {"ids": fids, "alt": alt, "gsd": gsd, "dem": fp["mean"]}
+
+
+# ================================================================================
 # File: src\geometry\transformations.py
 # ================================================================================
 import cv2
@@ -8984,6 +13227,7 @@ class GeometryTransforms:
         backend: str = "opencv",
         use_mad_ransac: bool = False,
         mad_k_factor: float = 2.5,
+        frame_size: tuple[int, int] | None = None,
     ):
         """
         Estimate Homography with configurable backend.
@@ -8998,12 +13242,26 @@ class GeometryTransforms:
             )
             return None, None
 
+        def valid(matrix):
+            if frame_size is None:
+                return GeometryTransforms.is_matrix_valid(matrix, is_homography=True)
+            from src.geometry.frame_transform import affine_at_center, valid_footprint
+
+            if matrix is None or not valid_footprint(matrix, *frame_size, orientation=1):
+                return False
+            inverse = np.linalg.inv(matrix)
+            if not valid_footprint(inverse, *frame_size, orientation=1):
+                return False
+            # Judge local scale, not the top-left block of a projective matrix.
+            scale = np.linalg.svd(affine_at_center(matrix, *frame_size)[:, :2], compute_uv=False)
+            return 0.1 < scale.min() and scale.max() < 10.0
+
         # PoseLib backend (LO-RANSAC)
         if backend == "poselib" and _POSELIB_AVAILABLE:
             H, mask = GeometryTransforms._estimate_homography_poselib(
                 src_pts, dst_pts, ransac_threshold, max_iters, confidence
             )
-            if GeometryTransforms.is_matrix_valid(H, is_homography=True):
+            if valid(H):
                 if use_mad_ransac:
                     mask = GeometryTransforms._refine_mask_mad(
                         src_pts, dst_pts, H, mask, mad_k_factor, ransac_threshold
@@ -9026,11 +13284,11 @@ class GeometryTransforms:
         )
 
         # Validate Homography
-        if not GeometryTransforms.is_matrix_valid(H, is_homography=True):
+        if not valid(H):
             if fallback_to_affine:
                 logger.warning(
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
-                    f"Falling back to Full Affine (5 DoF)."
+                    f"Falling back to Full Affine (6 DoF)."
                 )
                 M, mask = GeometryTransforms.estimate_affine(src_pts, dst_pts, ransac_threshold)
                 if M is not None:
@@ -9077,13 +13335,23 @@ class GeometryTransforms:
         if H is None:
             return None, None
 
-        # Convert inlier mask to (N, 1) uint8 format — OpenCV analog
-        inliers = info.get("inliers", [])
+        # Convert inlier mask to (N, 1) uint8 format — OpenCV analog.
+        # PoseLib returns info["inliers"] as one bool PER POINT, not a list of
+        # indices. The old loop ``mask[idx] = 1`` indexed with those bools:
+        # numpy treats a scalar True as "select everything", so any inlier set
+        # the WHOLE mask to 1 — every match counted as an inlier. With
+        # homography.use_mad_ransac=true the MAD refinement re-thresholded all
+        # points under H and hid this; with it off, outliers went straight into
+        # the inlier count, the RMSE gate and the spread estimate.
         n_pts = len(pts_src)
-        mask = np.zeros((n_pts, 1), dtype=np.uint8)
-        for idx in inliers:
-            if 0 <= idx < n_pts:
-                mask[idx] = 1
+        flags = np.asarray(info.get("inliers", []), dtype=bool).ravel()
+        if flags.size != n_pts:
+            logger.warning(
+                f"PoseLib inlier mask has {flags.size} entries for {n_pts} points — "
+                "falling back to OpenCV"
+            )
+            return None, None
+        mask = flags.astype(np.uint8).reshape(-1, 1)
 
         return np.array(H, dtype=np.float64), mask
 
@@ -9183,7 +13451,11 @@ class GeometryTransforms:
         if M is None or len(points) == 0:
             return points
         if M.shape == (3, 3):
-            M = M[:2, :]
+            # Full projective maps must retain the homogeneous denominator.
+            # Keep this compatibility entry point for callers with old affines.
+            from src.geometry.frame_transform import project_points
+
+            return project_points(M, points)
         points_cv = points.reshape(-1, 1, 2).astype(np.float64)
         transformed_pts_cv = cv2.transform(points_cv, M.astype(np.float64))
         return transformed_pts_cv.reshape(-1, 2)
@@ -9228,6 +13500,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.project_video_source import ProjectVideoSource
+from src.database.source_priority import effective_patchify_priority, next_priority
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -9236,11 +13509,18 @@ logger = get_logger(__name__)
 class AddVideoSourceDialog(QDialog):
     """Dialog for adding a new video source to a multi-source project."""
 
-    def __init__(self, existing_area_ids: list[str] | None = None, parent=None):
+    def __init__(
+        self,
+        existing_area_ids: list[str] | None = None,
+        parent=None,
+        existing_sources: list[dict] | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Додати відеоджерело")
         self.setMinimumWidth(500)
         self._existing_areas = existing_area_ids or []
+        # project.json video_sources: the priorities already taken in each area
+        self._existing_sources = [dict(s) for s in existing_sources or []]
         self._init_ui()
 
     def _init_ui(self):
@@ -9286,14 +13566,27 @@ class AddVideoSourceDialog(QDialog):
         self.area_combo.lineEdit().setPlaceholderText("Виберіть або введіть area_id")
         form.addRow("Area ID:", self.area_combo)
 
-        # Priority
+        # Priority (standard candidates) and patchify priority (patch candidates).
+        # Layers stacked over one area need different numbers, layers of other areas
+        # may share one; the spins start at the next free number of the chosen area.
         self.priority_spin = QSpinBox()
         self.priority_spin.setRange(0, 100)
         self.priority_spin.setValue(0)
         self.priority_spin.setToolTip(
-            "0 = highest priority. When cosine scores match, source with lower priority is chosen."
+            "0 = найвищий. Шари, що накладаються в одній зоні, мають мати різні номери "
+            "(основний 0, далі 1, 2, ...); шари різних зон можуть мати однаковий."
         )
         form.addRow("Пріоритет:", self.priority_spin)
+
+        self.patchify_priority_spin = QSpinBox()
+        self.patchify_priority_spin.setRange(0, 100)
+        self.patchify_priority_spin.setValue(0)
+        self.patchify_priority_spin.setToolTip(
+            "Пріоритет патч-кандидатів цього шару (localization.joint_candidate_ranking). "
+            "0 = найвищий; правило те саме, що для пріоритету шару."
+        )
+        form.addRow("Пріоритет патчифаю:", self.patchify_priority_spin)
+        self.area_combo.currentTextChanged.connect(self._suggest_priorities)
 
         layout.addWidget(basic_group)
 
@@ -9387,6 +13680,35 @@ class AddVideoSourceDialog(QDialog):
             self.area_combo.setCurrentText(self._existing_areas[0])
         else:
             self.area_combo.setCurrentText("")
+        self._suggest_priorities()
+
+    def _area_sources(self) -> list[dict]:
+        """Existing layers of the chosen area (the ones a new overlay layer stacks on)."""
+        area_id = self.area_combo.currentText().strip()
+        if not area_id or self.mode_combo.currentData() != "layer":
+            return []
+        return [s for s in self._existing_sources if s.get("area_id", "") == area_id]
+
+    def _suggest_priorities(self, *_args):
+        """Next free numbers of the chosen area for an overlay layer; 0 for a new zone."""
+        stacked = self._area_sources()
+        self.priority_spin.setValue(next_priority(int(s.get("priority") or 0) for s in stacked))
+        self.patchify_priority_spin.setValue(
+            next_priority(effective_patchify_priority(s) for s in stacked)
+        )
+
+    def _priority_clashes(self) -> list[str]:
+        """Layers of the chosen area that already use the entered numbers."""
+        clashes = []
+        for s in self._area_sources():
+            sid = s.get("source_id", "?")
+            if int(s.get("priority") or 0) == self.priority_spin.value():
+                clashes.append(f"пріоритет {self.priority_spin.value()} вже має шар '{sid}'")
+            if effective_patchify_priority(s) == self.patchify_priority_spin.value():
+                clashes.append(
+                    f"пріоритет патчифаю {self.patchify_priority_spin.value()} вже має шар '{sid}'"
+                )
+        return clashes
 
     @pyqtSlot()
     def _on_accept(self):
@@ -9409,6 +13731,21 @@ class AddVideoSourceDialog(QDialog):
             QMessageBox.warning(self, "Помилка", "Введіть або виберіть Area ID!")
             self.area_combo.setFocus()
             return
+
+        clashes = self._priority_clashes()
+        if clashes:
+            answer = QMessageBox.question(
+                self,
+                "Пріоритет шару",
+                "Шари цієї зони накладаються, а правила пріоритету шарів не розрізнять "
+                "однакові номери:\n\n"
+                + "\n".join(f"• {c}" for c in clashes)
+                + "\n\nЗберегти все одно?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
         if self.geo_group.isChecked():
             if self.lat_min_spin.value() >= self.lat_max_spin.value():
@@ -9442,6 +13779,7 @@ class AddVideoSourceDialog(QDialog):
             description=self.description_edit.text().strip(),
             enabled=True,
             priority=self.priority_spin.value(),
+            patchify_priority=self.patchify_priority_spin.value(),
             geo_bounds=geo_bounds,
             camera_params={
                 "altitude_m": self.altitude_spinbox.value(),
@@ -9455,6 +13793,7 @@ class AddVideoSourceDialog(QDialog):
 # ================================================================================
 # File: src\gui\dialogs\calibration_dialog.py
 # ================================================================================
+import html
 import re
 from collections import OrderedDict
 from pathlib import Path
@@ -9516,11 +13855,16 @@ class CalibrationDialog(QDialog):
         db_num_frames: int | None = None,
         frame_step: int = 1,
         keypoints_video_path: str | None = None,
+        layer_info: dict | None = None,
     ):
         super().__init__(parent)
         self.database_path = database_path
         self.existing_anchors = list(existing_anchors or [])
         self.source_id = source_id
+        # Which layer is being calibrated (shown in a banner): area_id,
+        # description, video_path, database_file, calibration_file, gsd_m_per_px,
+        # num_layers. Optional so older callers keep working.
+        self.layer_info = dict(layer_info or {})
 
         # Video frame ↔ DB slot mapping.
         # DB indexed as video_frame // frame_step, so dialog must
@@ -9550,7 +13894,7 @@ class CalibrationDialog(QDialog):
         self._frame_cache = OrderedDict()
         self._MAX_CACHE_SIZE = 32
 
-        self.setWindowTitle(f"GPS Калібрування [{self.source_id}] — Мульти-якірний режим")
+        self.setWindowTitle(f"GPS Калібрування — шар «{self.source_id}» (мульти-якірний режим)")
         self.resize(1200, 800)
         self._init_ui()
         self._refresh_anchors_list()
@@ -9561,8 +13905,54 @@ class CalibrationDialog(QDialog):
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
+    def _build_layer_banner(self) -> QLabel:
+        """Помітна плашка: який саме шар (БД + файл калібрування) зараз калібрується."""
+        info = self.layer_info
+        esc = html.escape
+        head = f"🗺 Калібрується шар: <b>{esc(str(self.source_id))}</b>"
+        if info.get("area_id"):
+            head += f" &nbsp;·&nbsp; зона <b>{esc(str(info['area_id']))}</b>"
+        if info.get("num_layers", 0) > 1:
+            head += f" &nbsp;·&nbsp; шарів у проєкті: {info['num_layers']}"
+        if info.get("description"):
+            head += f" &nbsp;·&nbsp; <i>{esc(str(info['description']))}</i>"
+
+        details = []
+        if info.get("video_path"):
+            details.append(f"Відео: {esc(Path(str(info['video_path'])).name)}")
+        db_name = info.get("database_file") or Path(self.database_path).name
+        details.append(f"БД: {esc(str(db_name))}")
+        if self.db_num_frames:
+            details.append(f"{self.db_num_frames} слотів, крок {self.frame_step}")
+        if info.get("gsd_m_per_px"):
+            details.append(f"GSD ≈ {float(info['gsd_m_per_px']):.3f} м/px")
+        if info.get("calibration_file"):
+            details.append(f"якорі → {esc(str(info['calibration_file']))}")
+
+        banner = QLabel(
+            f"{head}<br><span style='font-size:11px; color:#5d4037;'>"
+            + " &nbsp;|&nbsp; ".join(details)
+            + "</span>"
+        )
+        banner.setTextFormat(Qt.TextFormat.RichText)
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel { background: #fff3e0; border: 1px solid #ffb74d; "
+            "border-left: 6px solid #ef6c00; border-radius: 4px; "
+            "padding: 6px 10px; font-size: 13px; color: #3e2723; }"
+        )
+        banner.setToolTip(
+            "Усі якорі з цього вікна зберігаються лише в калібрування цього шару, "
+            "а пропагація запускається лише по його базі даних."
+        )
+        return banner
+
     def _init_ui(self):
-        main_layout = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
+        self.layer_banner = self._build_layer_banner()
+        outer.addWidget(self.layer_banner)
+        main_layout = QHBoxLayout()
+        outer.addLayout(main_layout, stretch=1)
         self.setAcceptDrops(True)  # На майбутнє, якщо знадобиться
 
         # Left panel — video
@@ -9720,7 +14110,7 @@ class CalibrationDialog(QDialog):
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setWordWrap(True)
 
-        self.btn_done = QPushButton("Готово — запустити пропагацію по всій базі")
+        self.btn_done = QPushButton(f"Готово — запустити пропагацію для шару «{self.source_id}»")
         self.btn_done.setStyleSheet(
             "background:#2e7d32; color:white; font-weight:bold; padding:11px; font-size:13px;"
         )
@@ -9895,7 +14285,7 @@ class CalibrationDialog(QDialog):
         QMessageBox.information(
             self,
             "⚓ Якір додано",
-            f"Якір для кадру {frame_id} успішно збережено!",
+            f"Якір для кадру {frame_id} збережено в шар «{self.source_id}».",
         )
 
     # ── Video loading ────────────────────────────────────────────────────────
@@ -10382,21 +14772,21 @@ COMBO_OPTIONS = {
         "lightglue": ["git", "torchscript", "tensorrt"],
         "lightglue_superpoint": ["git", "torchscript", "tensorrt"],
         "lightglue_rdd": ["git", "torchscript", "tensorrt"],
-        "aliked": ["git", "torchscript", "tensorrt"],
-        "xfeat": ["git", "torchscript", "tensorrt"],
-        "rdd": ["git", "torchscript", "tensorrt"],
-        "superpoint": ["git", "torchscript", "tensorrt"],
+        "lightglue_sift": ["git", "torchscript", "tensorrt"],
+        "depth_estimator": ["depth_anything_v2", "none"],
     },
     "device": ["auto", "cuda", "cpu"],
     "masking_strategy": ["yolo", "none"],
     "local_extractor": ["rdd", "aliked", "superpoint", "xfeat"],
     "fallback_extractor": ["aliked", "rdd", "superpoint", "xfeat"],
-    "dtype": ["float16", "float32"],
+    "hdf5_compression": ["lzf", "gzip", "none"],
     "log_level": ["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
     "default_mode": ["UTM", "WEB_MERCATOR"],
-    "verify_display_mode": ["center", "center_corners", "full"],
-    "verify_label_mode": ["number", "number_rmse", "full"],
-    "source_type": ["file", "rtsp", "usb"],
+    "rotation_mode": ["quarter", "continuous"],
+    "source": {"flight_data": ["none", "csv", "mavlink"]},
+    "csv_preset": ["generic", "flightsim"],
+    "terrain_altitude_model": ["piecewise", "constant"],
+    "terrain_dem_source": ["terrarium", "file"],
 }
 
 
@@ -10741,7 +15131,7 @@ class NewMissionDialog(QDialog):
 
         self.image_width_spinbox = QSpinBox()
         self.image_width_spinbox.setRange(640, 8000)
-        self.image_width_spinbox.setValue(4000)
+        self.image_width_spinbox.setValue(1200)
         self.image_width_spinbox.setSuffix(" px")
         form.addRow("Ширина зображення:", self.image_width_spinbox)
 
@@ -10890,8 +15280,19 @@ class OpenProjectDialog(QDialog):
         buttons_row = QHBoxLayout()
 
         self.btn_browse = QPushButton("📂 Інша папка...")
-        self.btn_browse.setToolTip("Відкрити проєкт з довільної папки")
+        self.btn_browse.setToolTip(
+            "Відкрити проєкт з довільної папки. Якщо обрана папка сама не є проєктом, "
+            "проєкти всередині неї буде імпортовано до списку"
+        )
         self.btn_browse.clicked.connect(self._on_browse)
+
+        self.btn_import = QPushButton("📥 Імпортувати...")
+        self.btn_import.setToolTip(
+            "Додати до списку наявні проєкти (папки з project.json), не відкриваючи їх.\n"
+            "Можна обрати саму папку проєкту або папку, що містить кілька проєктів "
+            "(пошук до 2 рівнів вкладеності)."
+        )
+        self.btn_import.clicked.connect(self._on_import)
 
         self.btn_remove = QPushButton("🗑 Видалити зі списку")
         self.btn_remove.setToolTip("Видаляє лише зі списку, файли залишаються")
@@ -10910,6 +15311,7 @@ class OpenProjectDialog(QDialog):
         self.btn_cancel.clicked.connect(self.reject)
 
         buttons_row.addWidget(self.btn_browse)
+        buttons_row.addWidget(self.btn_import)
         buttons_row.addWidget(self.btn_remove)
         buttons_row.addStretch()
         buttons_row.addWidget(self.btn_cancel)
@@ -10972,7 +15374,9 @@ class OpenProjectDialog(QDialog):
             self.project_list.addItem(item)
 
         if self.project_list.count() == 0:
-            item = QListWidgetItem("    (немає проєктів — створіть новий або відкрийте папку)")
+            item = QListWidgetItem(
+                "    (немає проєктів — створіть новий, відкрийте або імпортуйте папку)"
+            )
             item.setForeground(QColor("#999"))
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             self.project_list.addItem(item)
@@ -11005,11 +15409,18 @@ class OpenProjectDialog(QDialog):
         except (ValueError, TypeError):
             pass
 
+        # Legacy projects keep database.h5 in the root, layered ones under sources/<id>/.
         db_size = "—"
-        db_path = Path(path) / "database.h5"
-        if db_path.exists():
-            size_mb = db_path.stat().st_size / (1024 * 1024)
-            db_size = f"{size_mb:.1f} MB"
+        try:
+            root = Path(path)
+            db_files = [root / "database.h5", *root.glob("sources/*/database.h5")]
+            sizes = [f.stat().st_size for f in db_files if f.is_file()]
+        except OSError:
+            sizes = []
+        if sizes:
+            db_size = f"{sum(sizes) / (1024 * 1024):.1f} MB"
+            if len(sizes) > 1:
+                db_size += f" (шарів: {len(sizes)})"
 
         self.lbl_preview.setText(
             f"<b>Назва:</b> {proj.get('name', '—')}<br>"
@@ -11047,9 +15458,70 @@ class OpenProjectDialog(QDialog):
 
     def _on_browse(self):
         path = QFileDialog.getExistingDirectory(self, "Виберіть папку проєкту", "")
-        if path:
+        if not path:
+            return
+        if (Path(path) / "project.json").is_file():
             self.selected_path = path
             self.accept()
+            return
+        # The usual slip is picking the folder that holds the projects: instead of
+        # failing on load, list what is inside and let the user pick.
+        self._import_from(path)
+
+    def _default_import_dir(self) -> str:
+        """Parent folder of the most recent project — projects usually sit together."""
+        for proj in self.registry.get_recent(limit=1):
+            parent = Path(proj.get("path", "")).parent
+            if parent.is_dir():
+                return str(parent)
+        return ""
+
+    def _on_import(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Папка проєкту або папка з проєктами", self._default_import_dir()
+        )
+        if path:
+            self._import_from(path)
+
+    def _import_from(self, folder: str):
+        """Registers every project found at/below ``folder`` and selects the first."""
+        projects = ProjectRegistry.find_projects(folder)
+        if not projects:
+            QMessageBox.warning(
+                self,
+                "Імпорт проєктів",
+                f"У папці не знайдено жодного проєкту (файлу project.json):\n{folder}\n\n"
+                f"Пошук охоплює саму папку і до 2 рівнів вкладених папок.",
+            )
+            return
+
+        result = self.registry.import_projects(projects)
+        self.search_input.clear()
+        self._populate_list()
+        self._select_path(result.added[0] if result.added else projects[0])
+
+        names = [p.name for p in projects]
+        shown = "\n".join(f"  • {n}" for n in names[:15])
+        if len(names) > 15:
+            shown += f"\n  … і ще {len(names) - 15}"
+        QMessageBox.information(
+            self,
+            "Імпорт проєктів",
+            f"Знайдено проєктів: {len(projects)}\n"
+            f"Додано до списку: {len(result.added)}\n"
+            f"Вже були у списку: {len(result.already_known)}\n\n{shown}",
+        )
+
+    def _select_path(self, path: str | Path):
+        """Makes the list item of the project at ``path`` current, if listed."""
+        target = str(Path(path).resolve()).casefold()
+        for row in range(self.project_list.count()):
+            item = self.project_list.item(row)
+            proj = item.data(Qt.ItemDataRole.UserRole)
+            if proj and str(Path(proj.get("path", "")).resolve()).casefold() == target:
+                self.project_list.setCurrentItem(item)
+                self.project_list.scrollToItem(item)
+                return
 
     def _on_remove(self):
         current = self.project_list.currentItem()
@@ -11259,7 +15731,7 @@ from src.gui.widgets.map_widget import MapWidget
 from src.gui.widgets.video_widget import VideoWidget
 from src.models.model_manager import ModelManager
 from src.network.coordinates_broker import CoordinatesBroker
-from src.utils.logging_utils import fmt_coord, get_logger
+from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -11275,6 +15747,17 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         self.project_manager = ProjectManager()
         self.database: DatabaseLoader | None = None
         self.calibration = MultiAnchorCalibration()
+        # Multi-source managers are created only when a multi-source project is
+        # loaded (DatabaseMixin.on_load_database); None = single-source mode.
+        self.db_manager = None
+        self.calib_manager = None
+        # The layer (video source) every layer-scoped button acts on. The single
+        # source of truth: self.database / self.calibration are always this
+        # layer's live objects (DatabaseMixin._activate_source switches both).
+        self.active_source_id: str | None = None
+        self._db_build_source_id: str | None = None
+        self._calib_target = None  # (source_id, calibration, database) of the open dialog
+        self._propagation_target = None  # (source_id, database, calibration) being propagated
 
         self.coordinates_broker = CoordinatesBroker(config=APP_SETTINGS.network_api)
 
@@ -11398,6 +15881,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.start_live_tracking_clicked.connect(self.on_start_live_tracking)
         cp.stop_tracking_clicked.connect(self.on_stop_tracking)
         cp.calibrate_clicked.connect(self.on_calibrate)
+        cp.relative_map_clicked.connect(self.on_build_relative_map)
         cp.load_calibration_clicked.connect(self.on_load_calibration)
         cp.generate_panorama_clicked.connect(self.on_generate_panorama)
         cp.show_panorama_clicked.connect(self.on_show_panorama)
@@ -11413,9 +15897,11 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
 
     def _on_map_clicked(self, lat: float, lon: float):
         """Handle map click by showing coordinates in the status bar."""
-        msg = f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}"
+        local = self.calibration.converter.mode == "LOCAL"
+        msg = (f"Локальна карта: X={lon:.3f}, Y={lat:.3f} · умовні одиниці"
+               if local else f"Координати на карті: Lat {lat:.6f}, Lon {lon:.6f}")
         self.status_bar.showMessage(msg, 5000)  # Show for 5 seconds
-        logger.info(f"Map click: {fmt_coord(lat, lon)}")
+        logger.info(msg)
 
     def on_open_config(self):
         """Open the configuration editor dialog."""
@@ -11468,6 +15954,17 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
 
     def closeEvent(self, event):
         """Зберігає стан видимості debug-вікон, не чіпаючи інші налаштування."""
+        # Map mosaics run in the background. Do not destroy a running QThread
+        # when closing the window, or leave a partially written overlay.
+        from src.workers.local_panorama_worker import LocalPanoramaWorker
+
+        panorama = getattr(self, "pano_worker", None)
+        if isinstance(panorama, LocalPanoramaWorker) and panorama.isRunning():
+            panorama.stop()
+            if not panorama.wait(5000):
+                self.status_bar.showMessage("Завершується побудова панорами. Закрийте вікно ще раз за кілька секунд.")
+                event.ignore()
+                return
         try:
             from config import load_user_config, save_user_config
 
@@ -11530,6 +16027,9 @@ from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
 
 from config import get_cfg
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.calibration.multi_calibration_manager import save_layer_calibration
+from src.core.layer_status import CALIBRATION_OWNER_KEY
 from src.geometry.coordinates import CoordinateConverter
 from src.geometry.transformations import GeometryTransforms
 from src.gui.dialogs.calibration_dialog import CalibrationDialog
@@ -11557,10 +16057,70 @@ def _materialize_keypoints_video(path: str) -> tuple[str, str | None]:
 class CalibrationMixin:
     # ── Calibration dialog ───────────────────────────────────────────────────
 
+    def _layer_info(self, source_id: str) -> dict:
+        """What the calibration dialog shows about the layer being calibrated."""
+        settings = self.project_manager.settings if self.project_manager.is_loaded else None
+        src = settings.get_source(source_id) if settings else None
+        info: dict = {"num_layers": len(settings.video_sources or []) if settings else 1}
+        if src is not None:
+            info.update(
+                area_id=src.area_id,
+                description=src.description,
+                video_path=src.video_path,
+                database_file=src.database_file,
+                calibration_file=src.calibration_file,
+            )
+            if src.scale_layer is not None and src.scale_layer.nominal_gsd_m_per_px:
+                info["gsd_m_per_px"] = src.scale_layer.nominal_gsd_m_per_px
+        return info
+
+    def _calibration_target_ok(self) -> bool:
+        """Anchors may only land in the layer the calibration dialog was opened for."""
+        target = getattr(self, "_calib_target", None)
+        if target is None:
+            return True
+        sid, calibration, database = target
+        current = self._get_current_source_id()
+        if sid == current and calibration is self.calibration and database is self.database:
+            return True
+        logger.error(
+            f"Calibration target mismatch: dialog layer '{sid}', active layer '{current}' — "
+            f"anchor change refused to keep layer calibrations apart"
+        )
+        QMessageBox.critical(
+            self,
+            "Інший шар",
+            f"Вікно калібрування відкрите для шару «{sid}», а активним став шар «{current}».\n\n"
+            f"Зміну не збережено, щоб не змішати калібрування шарів. "
+            f"Закрийте вікно і відкрийте калібрування потрібного шару знову.",
+        )
+        return False
+
     @pyqtSlot()
     def on_calibrate(self):
+        if self.calibration.converter.mode == "LOCAL":
+            QMessageBox.information(
+                self,
+                "Локальна карта",
+                "Цей шар використовує умовні X/Y. Для GPS-калібрування створіть окремий шар із відео.",
+            )
+            return
+        source_id = self._get_current_source_id()
         if not self.database or self.database.db_file is None:
-            QMessageBox.warning(self, "Помилка", "Спочатку завантажте або створіть базу даних!")
+            QMessageBox.warning(
+                self,
+                "Помилка",
+                f"Для шару «{source_id}» ще немає бази даних.\n\n"
+                f"Спочатку побудуйте її (ПКМ по шару → Побудувати базу даних).",
+            )
+            return
+        if self._get_calibration_save_path() is None:
+            QMessageBox.critical(
+                self,
+                "Помилка",
+                f"Не вдалося визначити файл калібрування шару «{source_id}» — "
+                f"перевірте calibration_file у project.json.",
+            )
             return
 
         anchors_data = [a.to_dict() for a in self.calibration.anchors]
@@ -11583,14 +16143,18 @@ class CalibrationMixin:
         # lifetime and wiped as soon as it closes.
         kp_video_path, kp_tempfile = _materialize_keypoints_video(kp_video_path)
 
+        # Bind the dialog to THIS layer's objects: every anchor change is checked
+        # against them, so an anchor can never be saved into another layer.
+        self._calib_target = (source_id, self.calibration, self.database)
         self._calib_dialog = CalibrationDialog(
             database_path=self.database.db_path,
             existing_anchors=anchors_data,
-            source_id=self._get_current_source_id(),
+            source_id=source_id,
             parent=self,
             db_num_frames=db_num_frames,
             frame_step=frame_step,
             keypoints_video_path=kp_video_path,
+            layer_info=self._layer_info(source_id),
         )
         self._calib_dialog.anchor_added.connect(self.on_anchor_added)
         self._calib_dialog.anchor_removed.connect(self.on_anchor_removed)
@@ -11599,6 +16163,7 @@ class CalibrationMixin:
             self._calib_dialog.exec()
         finally:
             self._calib_dialog = None
+            self._calib_target = None
             if kp_tempfile:
                 wipe_file(kp_tempfile)
                 logger.info("Decrypted keypoint video wiped")
@@ -11609,6 +16174,15 @@ class CalibrationMixin:
         # leave the anchor list out of sync with what is on disk. Viewing an
         # encrypted project's calibration stays allowed.
         if self._refuse_if_encrypted_project("Додавання якоря"):
+            return
+        if not self._calibration_target_ok():
+            return
+        source_id = self._get_current_source_id()
+        cal_path = self._get_calibration_save_path()
+        if self.project_manager and self.project_manager.is_loaded and not cal_path:
+            QMessageBox.critical(
+                self, "Помилка", f"Невідомий файл калібрування шару «{source_id}» — якір не додано."
+            )
             return
         try:
             points_2d = anchor_data.get("points_2d")
@@ -11765,13 +16339,12 @@ class CalibrationMixin:
 
             self.calibration.add_anchor(frame_id=frame_id, affine_matrix=best_M, qa_data=qa_data)
 
-            if self.project_manager and self.project_manager.is_loaded:
-                cal_path = self._get_calibration_save_path()
-                if cal_path:
-                    self.calibration.save(cal_path)
+            if cal_path:
+                save_layer_calibration(self.calibration, cal_path, source_id)
 
-            if hasattr(self, "_update_project_info_panel"):
-                self._update_project_info_panel()
+            # Layer table / info / registry reflect the new anchor immediately.
+            if hasattr(self, "_after_layer_data_changed"):
+                self._after_layer_data_changed()
 
             # Point-by-point diagnostic logging
             logger.info(f"--- Anchor {frame_id} Point-by-Point Analysis ---")
@@ -11804,7 +16377,9 @@ class CalibrationMixin:
                 f"RMSE={rmse_p:.3f}м | MedianErr={median_p:.3f}м | MaxErr={max_p:.3f}м"
             )
 
-            self.status_bar.showMessage(f"Додано якір (кадр {frame_id}, RMSE: {rmse_p:.2f}м)")
+            self.status_bar.showMessage(
+                f"Шар «{source_id}»: додано якір (кадр {frame_id}, RMSE: {rmse_p:.2f}м)"
+            )
 
             if hasattr(self, "_calib_dialog") and self._calib_dialog is not None:
                 saved_anchor = self.calibration.get_anchor(frame_id)
@@ -11823,19 +16398,23 @@ class CalibrationMixin:
         # raise and leave the anchor list out of sync with disk.
         if self._refuse_if_encrypted_project("Видалення якоря"):
             return
+        if not self._calibration_target_ok():
+            return
+        source_id = self._get_current_source_id()
         try:
             if self.calibration.remove_anchor(frame_id):
                 if self.project_manager and self.project_manager.is_loaded:
                     cal_path = self._get_calibration_save_path()
                     if cal_path:
-                        self.calibration.save(cal_path)
+                        save_layer_calibration(self.calibration, cal_path, source_id)
 
-                if hasattr(self, "_update_project_info_panel"):
-                    self._update_project_info_panel()
+                if hasattr(self, "_after_layer_data_changed"):
+                    self._after_layer_data_changed()
 
-                logger.info(f"Anchor {frame_id} removed from project")
+                logger.info(f"Anchor {frame_id} removed from layer '{source_id}'")
                 self.status_bar.showMessage(
-                    f"Якір {frame_id} видалено. Потрібно оновити пропагацію.", 5000
+                    f"Шар «{source_id}»: якір {frame_id} видалено. Потрібно оновити пропагацію.",
+                    5000,
                 )
         except Exception as e:
             logger.error(f"Failed to remove anchor: {e}", exc_info=True)
@@ -11844,14 +16423,34 @@ class CalibrationMixin:
     # ── Propagation ──────────────────────────────────────────────────────────
 
     @pyqtSlot()
-    def on_run_propagation(self):
+    def on_build_relative_map(self):
+        self.on_run_propagation(relative=True)
+
+    @pyqtSlot()
+    def on_run_propagation(self, relative=False):
         if self._refuse_if_encrypted_project("Пропагація калібрування"):
             return
-        if not self.calibration.is_calibrated:
+        current_local = self.calibration.converter.mode == "LOCAL"
+        relative = relative or current_local
+        if (
+            relative
+            and not current_local
+            and (self.calibration.anchors or (self.database and self.database.is_propagated))
+        ):
+            QMessageBox.warning(
+                self,
+                "Локальна карта",
+                "Цей шар уже має геоприв’язку. Створіть окремий шар для FPV-відео.",
+            )
+            return
+        if not relative and not self.calibration.is_calibrated:
             QMessageBox.warning(self, "Увага", "Додайте хоча б один якір калібрування!")
             return
         if not self.database:
             QMessageBox.warning(self, "Увага", "База даних не завантажена!")
+            return
+        existing = getattr(self, "propagation_worker", None)
+        if existing is not None and existing.isRunning():
             return
         # Mutual exclusion with tracking: propagation overwrites HDF5.
         tw = getattr(self, "tracking_worker", None)
@@ -11869,25 +16468,38 @@ class CalibrationMixin:
             QMessageBox.critical(self, "Помилка", f"Не вдалося ініціалізувати матчер:\n{e}")
             return
 
-        anchor_ids = [a.frame_id for a in self.calibration.anchors]
+        source_id = self._get_current_source_id()
+        work_calibration = (
+            MultiAnchorCalibration(CoordinateConverter("LOCAL")) if relative else self.calibration
+        )
+        anchor_ids = [a.frame_id for a in work_calibration.anchors]
         n_frames = self.database.get_num_frames()
-        logger.info(f"Propagation: {len(anchor_ids)} anchors {anchor_ids}, {n_frames} frames")
+        logger.info(
+            f"Propagation of layer '{source_id}': {len(anchor_ids)} anchors {anchor_ids}, "
+            f"{n_frames} frames"
+        )
+        # The report and the map check must use the layer that was propagated.
+        self._propagation_target = (source_id, self.database, work_calibration)
 
         self._propagation_dialog = QProgressDialog(
-            f"Пропагація GPS від {len(anchor_ids)} якорів на {n_frames} кадрів...",
+            f"Шар «{source_id}»: пропагація GPS від {len(anchor_ids)} якорів "
+            f"на {n_frames} кадрів...",
             "Скасувати",
             0,
             100,
             self,
         )
-        self._propagation_dialog.setWindowTitle("Розповсюдження GPS координат")
+        self._propagation_dialog.setWindowTitle(f"Розповсюдження GPS — шар «{source_id}»")
+        if relative:
+            self._propagation_dialog.setWindowTitle("Локальна карта FPV — без GPS")
+            self._propagation_dialog.setLabelText("Побудова карти з міжкадрових зв’язків…")
         self._propagation_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self._propagation_dialog.setMinimumDuration(0)
         self._propagation_dialog.setValue(0)
 
         self.propagation_worker = CalibrationPropagationWorker(
             database=self.database,
-            calibration=self.calibration,
+            calibration=work_calibration,
             matcher=matcher,
             config=self.config,
         )
@@ -11914,7 +16526,10 @@ class CalibrationMixin:
         if self._propagation_dialog:
             self._propagation_dialog.close()
             self._propagation_dialog = None
+        self._propagation_target = None
         self.status_bar.showMessage("Пропагацію скасовано")
+        if hasattr(self, "_after_layer_data_changed"):
+            self._after_layer_data_changed()
 
     @pyqtSlot()
     def on_propagation_completed(self):
@@ -11922,8 +16537,41 @@ class CalibrationMixin:
             self._propagation_dialog.close()
             self._propagation_dialog = None
 
-        num_frames = self.database.get_num_frames()
-        valid_mask = self.database.frame_valid
+        target = getattr(self, "_propagation_target", None)
+        self._propagation_target = None
+        source_id, database = (
+            (target[0], target[1]) if target else (self._get_current_source_id(), self.database)
+        )
+        if target and target[2].converter.mode == "LOCAL":
+            local_cal = target[2]
+            if database is self.database:
+                self.calibration = local_cal
+            manager = getattr(self, "calib_manager", None)
+            if manager is not None:
+                manager.set(source_id, local_cal)
+            if database is self.database:
+                path = self._get_calibration_save_path()
+                if path:
+                    try:
+                        save_layer_calibration(local_cal, path, source_id)
+                    except Exception as exc:
+                        logger.warning(f"Local map is saved in HDF5; JSON save failed: {exc}")
+                self.map_widget.set_coordinate_mode("LOCAL", reset=True)
+            if hasattr(self, "_after_layer_data_changed"):
+                self._after_layer_data_changed()
+            self.status_bar.showMessage(
+                "Локальна карта 0–100 готова. Координати в умовних одиницях."
+            )
+            if database is self.database:
+                self.on_verify_propagation()
+            return
+
+        # Status first: the table must show the new state even while the report is open.
+        if hasattr(self, "_after_layer_data_changed"):
+            self._after_layer_data_changed()
+
+        num_frames = database.get_num_frames()
+        valid_mask = database.frame_valid
         valid_count = int(np.sum(valid_mask)) if valid_mask is not None else 0
 
         avg_rmse = 0.0
@@ -11932,19 +16580,19 @@ class CalibrationMixin:
         avg_matches = 0.0
 
         if valid_count > 0:
-            rmse_data = getattr(self.database, "frame_rmse", None)
+            rmse_data = getattr(database, "frame_rmse", None)
             if rmse_data is not None:
                 valid_rmse = rmse_data[valid_mask]
                 avg_rmse = float(np.mean(valid_rmse))
                 max_rmse = float(np.max(valid_rmse))
 
-            dis_data = getattr(self.database, "frame_disagreement", None)
+            dis_data = getattr(database, "frame_disagreement", None)
             if dis_data is not None:
                 dis_valid = dis_data[valid_mask]
                 if np.any(dis_valid > 0):
                     avg_dis = float(np.mean(dis_valid[dis_valid > 0]))
 
-            matches_data = getattr(self.database, "frame_matches", None)
+            matches_data = getattr(database, "frame_matches", None)
             if matches_data is not None:
                 avg_matches = float(np.mean(matches_data[valid_mask]))
 
@@ -11952,14 +16600,14 @@ class CalibrationMixin:
 
         # NOTE: frame_rmse from propagation is in reprojection pixels between frames, not meters
         report = (
-            f"<b>Пропагація завершена!</b><br><br>"
+            f"<b>Пропагація шару «{source_id}» завершена!</b><br><br>"
             f"Валідних кадрів: <b>{valid_count} / {num_frames}</b> ({valid_count / num_frames * 100:.1f}%)<br>"
             f"Середній RMSE матчингу: <b style='color:{'green' if avg_rmse < rmse_thresh * 0.5 else 'orange'}'>{avg_rmse:.3f} px</b><br>"
             f"Середній матчинг: <b>{avg_matches:.1f} точок</b><br>"
         )
 
         log_msg = (
-            f"Пропагація завершена. "
+            f"Пропагація шару '{source_id}' завершена. "
             f"Валідних: {valid_count}/{num_frames} ({valid_count / num_frames * 100:.1f}%), "
             f"RMSE: {avg_rmse:.3f}px, "
             f"Матчинг: {avg_matches:.1f} точок"
@@ -11979,13 +16627,12 @@ class CalibrationMixin:
 
         QMessageBox.information(self, "Пропагація", report)
         self.status_bar.showMessage(
-            f"Пропагація готова: {valid_count} к., RMSE: {avg_rmse:.2f}px, Mat: {avg_matches:.0f}"
+            f"Шар «{source_id}»: пропагація готова: {valid_count} к., "
+            f"RMSE: {avg_rmse:.2f}px, Mat: {avg_matches:.0f}"
         )
 
-        if hasattr(self, "_update_project_info_panel"):
-            self._update_project_info_panel()
-
-        if self.map_widget:
+        # Map check only for the layer that was actually propagated.
+        if self.map_widget and database is self.database:
             self.on_verify_propagation()
 
     @pyqtSlot()
@@ -11996,6 +16643,7 @@ class CalibrationMixin:
             return
 
         try:
+            self.map_widget.set_coordinate_mode(self.calibration.converter.mode)
             self.map_widget.clear_verification_markers()
             num_frames = self.database.get_num_frames()
             # Limit number of Leaflet markers to ~600 with uniform step
@@ -12009,7 +16657,9 @@ class CalibrationMixin:
             points_to_show = []
             _diag_done = False
             for i in range(0, num_frames, step):
-                affine = self.database.get_frame_affine(i)
+                from src.geometry.frame_transform import get_frame_transform, project_points
+
+                affine = get_frame_transform(self.database, i)
                 if affine is not None:
                     w = self.database.metadata.get("frame_width", 1920)
                     h = self.database.metadata.get("frame_height", 1080)
@@ -12024,8 +16674,7 @@ class CalibrationMixin:
                             ("center", w / 2, h / 2),
                             ("corner2", w, h),
                         ]:
-                            mx_d = affine[0, 0] * px + affine[0, 1] * py + affine[0, 2]
-                            my_d = affine[1, 0] * px + affine[1, 1] * py + affine[1, 2]
+                            mx_d, my_d = project_points(affine, [[px, py]])[0]
                             lat_d, lon_d = self.calibration.converter.metric_to_gps(
                                 float(mx_d), float(my_d)
                             )
@@ -12034,17 +16683,11 @@ class CalibrationMixin:
                             )
 
                     # Frame center
-                    mx, my = (
-                        affine[0, 0] * (w / 2) + affine[0, 1] * (h / 2) + affine[0, 2],
-                        affine[1, 0] * (w / 2) + affine[1, 1] * (h / 2) + affine[1, 2],
-                    )
+                    mx, my = project_points(affine, [[w / 2, h / 2]])[0]
                     lat_c, lon_c = self.calibration.converter.metric_to_gps(float(mx), float(my))
 
                     # Frame bottom
-                    mx_b, my_b = (
-                        affine[0, 0] * (w / 2) + affine[0, 1] * h + affine[0, 2],
-                        affine[1, 0] * (w / 2) + affine[1, 1] * h + affine[1, 2],
-                    )
+                    mx_b, my_b = project_points(affine, [[w / 2, h]])[0]
                     lat_b, lon_b = self.calibration.converter.metric_to_gps(
                         float(mx_b), float(my_b)
                     )
@@ -12099,16 +16742,22 @@ class CalibrationMixin:
         if self._propagation_dialog:
             self._propagation_dialog.close()
             self._propagation_dialog = None
+        self._propagation_target = None
+        if hasattr(self, "_after_layer_data_changed"):
+            self._after_layer_data_changed()
         logger.error(f"Propagation error: {error_msg}")
         QMessageBox.critical(self, "Помилка пропагації", error_msg)
 
     # ── Save / Load calibration ──────────────────────────────────────────────
 
     def _get_current_source_id(self) -> str:
-        """Returns source_id of current active source (based on db_path)."""
+        """Active layer id (DatabaseMixin._activate_source keeps it in sync)."""
+        active = getattr(self, "active_source_id", None)
+        if active:
+            return active
+        # Legacy fallback (no project / nothing activated yet): match the DB path.
         if not self.project_manager or not self.project_manager.is_loaded or not self.database:
             return "main"
-
         current_db = str(Path(self.database.db_path).resolve())
         project_dir = self.project_manager.project_dir
         for src_dict in self.project_manager.settings.video_sources or []:
@@ -12118,35 +16767,24 @@ class CalibrationMixin:
         return "main"
 
     def _get_calibration_save_path(self) -> str | None:
-        """Returns calibration.json path for current active source.
+        """calibration.json of the ACTIVE layer, or None if it cannot be determined.
 
-        Matches `self.database.db_path` with `database_file` of each source in
-        project settings to locate the matching `calibration_file`.
-        Fallback: `project_manager.calibration_path` (project root).
+        Resolved from the active layer's ``calibration_file`` — never guessed from
+        the database path, and never silently redirected to the main layer's file
+        (that fallback is how one layer's anchors ended up in another's file).
         """
         if not self.project_manager or not self.project_manager.is_loaded:
             return None
-
-        project_dir = self.project_manager.project_dir
-
-        # Match source to current DB
-        if self.database and self.project_manager.settings:
-            current_db = str(Path(self.database.db_path).resolve())
-            for src_dict in self.project_manager.settings.video_sources or []:
-                db_file = src_dict.get("database_file", "")
-                cal_file = src_dict.get("calibration_file", "")
-                if not db_file or not cal_file:
-                    continue
-                if str((project_dir / db_file).resolve()) == current_db:
-                    cal_path = project_dir / cal_file
-                    cal_path.parent.mkdir(parents=True, exist_ok=True)
-                    logger.debug(
-                        f"Calibration path: {cal_path} (source='{src_dict.get('source_id', '?')}')"
-                    )
-                    return str(cal_path)
-
-        # Fallback — project-level path
-        return self.project_manager.calibration_path
+        source_id = self._get_current_source_id()
+        settings = self.project_manager.settings
+        src = settings.get_source(source_id) if settings else None
+        if src is None or not src.calibration_file:
+            logger.error(f"No calibration_file for active layer '{source_id}'")
+            return None
+        cal_path = self.project_manager.project_dir / src.calibration_file
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Calibration path: {cal_path} (layer='{source_id}')")
+        return str(cal_path)
 
     @pyqtSlot()
     def on_save_calibration(self):
@@ -12156,42 +16794,114 @@ class CalibrationMixin:
             QMessageBox.warning(self, "Увага", "Немає даних для збереження.")
             return
 
-        # Default path — active source folder
+        source_id = self._get_current_source_id()
+        # Default path — active layer folder
         default_path = self._get_calibration_save_path() or "calibration.json"
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "Зберегти калібрування", default_path, "JSON Files (*.json)"
+            self, f"Зберегти калібрування шару «{source_id}»", default_path, "JSON Files (*.json)"
         )
         if not path:
             return
         try:
-            self.calibration.save(path)
+            # Stamped with the layer id: loading it into another layer warns.
+            save_layer_calibration(self.calibration, path, source_id)
             n = len(self.calibration.anchors)
-            self.status_bar.showMessage(f"Калібрування збережено: {path} ({n} якорів)")
+            self.status_bar.showMessage(
+                f"Калібрування шару «{source_id}» збережено: {path} ({n} якорів)"
+            )
             QMessageBox.information(
-                self, "Збережено", f"Калібрування збережено!\nЯкорів: {n}\nФайл: {path}"
+                self,
+                "Збережено",
+                f"Калібрування шару «{source_id}» збережено!\nЯкорів: {n}\nФайл: {path}",
             )
         except Exception as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося зберегти:\n{e}")
 
+    def _calibration_load_issues(self, loaded: MultiAnchorCalibration, path: str, source_id: str):
+        """Reasons to believe ``loaded`` belongs to another layer (empty = looks fine)."""
+        issues = []
+        owner = loaded.extra_metadata.get(CALIBRATION_OWNER_KEY)
+        if owner and str(owner) != source_id:
+            issues.append(f"Файл записаний для шару «{owner}».")
+
+        if self.project_manager and self.project_manager.is_loaded:
+            try:
+                target = str(Path(path).resolve()).casefold()
+                for src in self.project_manager.settings.source_configs():
+                    if src.source_id == source_id or not src.calibration_file:
+                        continue
+                    other = self.project_manager.project_dir / src.calibration_file
+                    if str(other.resolve()).casefold() == target:
+                        issues.append(f"Це файл калібрування шару «{src.source_id}».")
+            except OSError:
+                pass
+
+        if self.database is not None:
+            n = self.database.get_num_frames()
+            bad = sorted(a.frame_id for a in loaded.anchors if not 0 <= int(a.frame_id) < n)
+            if n and bad:
+                issues.append(
+                    f"Якорі на кадрах {bad} виходять за межі БД шару «{source_id}» ({n} слотів)."
+                )
+        return issues
+
     @pyqtSlot()
     def on_load_calibration(self):
+        source_id = self._get_current_source_id()
         default_dir = ""
         if self.project_manager and self.project_manager.is_loaded:
             default_dir = str(self.project_manager.project_dir)
+            own = self._get_calibration_save_path()
+            if own:
+                default_dir = str(Path(own).parent)
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Завантажити калібрування", default_dir, "JSON Files (*.json);;All Files (*)"
+            self,
+            f"Завантажити калібрування в шар «{source_id}»",
+            default_dir,
+            "JSON Files (*.json);;All Files (*)",
         )
         if not path:
             return
         try:
-            self.calibration.load(path)
+            # Parse into a fresh object first: a wrong or broken file must not
+            # wipe the anchors of the active layer.
+            loaded = MultiAnchorCalibration()
+            loaded.load(path)
+            db_mode = getattr(getattr(self.database, "converter", None), "mode", None)
+            if db_mode and (db_mode == "LOCAL") != (loaded.converter.mode == "LOCAL"):
+                QMessageBox.warning(
+                    self,
+                    "Несумісні координати",
+                    "Локальну карту X/Y і GPS-калібрування не можна змішувати в одному шарі. Створіть окремий шар.",
+                )
+                return
+
+            issues = self._calibration_load_issues(loaded, path, source_id)
+            if issues:
+                reply = QMessageBox.warning(
+                    self,
+                    "Калібрування іншого шару?",
+                    f"Цей файл, схоже, не належить шару «{source_id}»:\n\n"
+                    + "\n".join(f"• {msg}" for msg in issues)
+                    + f"\n\nВсе одно завантажити його в шар «{source_id}»?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            calib_manager = getattr(self, "calib_manager", None)
+            if calib_manager is not None:
+                calib_manager.set(source_id, loaded)
+            self.calibration = loaded
+
             ids = [a.frame_id for a in self.calibration.anchors]
             propagated = self.database and self.database.is_propagated
-            self.control_panel.update_status("Калібрування завантажено")
+            self.control_panel.update_status(f"Калібрування шару «{source_id}» завантажено")
 
-            # Automatically save copy into current source folder
+            # Automatically save copy into current layer folder
             source_cal_path = self._get_calibration_save_path()
             copied_to_source = False
             # An encrypted copy is immutable: load into memory for viewing, but
@@ -12204,26 +16914,29 @@ class CalibrationMixin:
                 norm_source = str(Path(source_cal_path).resolve())
                 if norm_loaded != norm_source:
                     # Copy calibration file if loaded from external location
-                    Path(source_cal_path).parent.mkdir(parents=True, exist_ok=True)
-                    self.calibration.save(source_cal_path)
+                    save_layer_calibration(self.calibration, source_cal_path, source_id)
                     copied_to_source = True
-                    logger.info(f"Calibration copied to source folder: {source_cal_path}")
+                    logger.info(
+                        f"Calibration copied to layer '{source_id}' folder: {source_cal_path}"
+                    )
                 else:
                     logger.debug("Calibration loaded directly from source folder, no copy needed.")
 
-            if hasattr(self, "_update_project_info_panel"):
-                self._update_project_info_panel()
+            if hasattr(self, "_after_layer_data_changed"):
+                self._after_layer_data_changed()
 
             copy_note = (
-                f"\n\n📋 Також збережено у папці джерела:\n{source_cal_path}"
+                f"\n\n📋 Також збережено у папці шару:\n{source_cal_path}"
                 if copied_to_source
                 else ""
             )
-            self.status_bar.showMessage(f"Калібрування: {len(ids)} якорів, кадри {ids}")
+            self.status_bar.showMessage(
+                f"Шар «{source_id}»: калібрування {len(ids)} якорів, кадри {ids}"
+            )
             QMessageBox.information(
                 self,
                 "Успіх",
-                f"Завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
+                f"Шар «{source_id}»: завантажено {len(ids)} якір(ів)!\nКадри: {ids}\n\n"
                 f"{'✅ БД вже має дані пропагації.' if propagated else '⚠ Запустіть пропагацію.'}"
                 f"{copy_note}",
             )
@@ -12240,9 +16953,19 @@ import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from src.calibration.multi_calibration_manager import MultiCalibrationManager
+from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
+from src.calibration.multi_calibration_manager import (
+    MultiCalibrationManager,
+    save_layer_calibration,
+)
 from src.core.export_results import ResultExporter
+from src.core.layer_status import (
+    compute_layer_status,
+    find_layer_conflicts,
+    find_path_conflicts,
+)
 from src.core.project_registry import ProjectRegistry
+from src.core.project_video_source import ProjectVideoSource
 from src.database.database_loader import DatabaseLoader
 from src.database.multi_database_manager import MultiDatabaseManager
 from src.geometry.coordinates import CoordinateConverter
@@ -12285,10 +17008,16 @@ class DatabaseMixin:
         if not workspace_dir or not video_path:
             return
 
+        # A new project must not inherit the previous project's databases,
+        # managers or anchors: the old db_manager used to capture the new DB and
+        # the old anchors were saved into the new project's calibration.
+        self._reset_session_state()
+
         # Create project directory structure
         if not self.project_manager.create_project(workspace_dir, mission_data):
             QMessageBox.critical(self, "Помилка", "Не вдалося створити проєкт!")
             return
+        self.active_source_id = "main"
 
         # Register in the project registry
         self._get_registry().register(
@@ -12298,7 +17027,186 @@ class DatabaseMixin:
         )
 
         self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
-        self._start_database_generation(video_path, self.project_manager.database_path)
+        self._start_database_generation(
+            video_path, self.project_manager.database_path, source_id="main"
+        )
+
+    # ── Layer (video source) state ───────────────────────────────────────────
+    #
+    # One layer = one ProjectVideoSource with its own video, database.h5 and
+    # calibration.json. ``active_source_id`` is the single source of truth for
+    # "which layer the buttons act on"; self.database / self.calibration are
+    # always that layer's live objects — the same instances db_manager and
+    # calib_manager hold — and only _activate_source switches them, together.
+
+    def _is_multi_source(self) -> bool:
+        return getattr(self, "db_manager", None) is not None
+
+    def _wants_multi_source(self) -> bool:
+        """The rule the project loader has always used to choose the mode."""
+        settings = self.project_manager.settings if self.project_manager.is_loaded else None
+        if settings is None:
+            return False
+        sources = settings.get_enabled_sources()
+        return len(sources) > 1 or any(s.source_id != "main" for s in sources)
+
+    def _source_config(self, source_id: str | None) -> ProjectVideoSource | None:
+        if not source_id or not self.project_manager.is_loaded:
+            return None
+        settings = self.project_manager.settings
+        return settings.get_source(source_id) if settings else None
+
+    def _layer_ops_busy(self, action: str = "", quiet: bool = False) -> bool:
+        """True (and says why) while a worker that uses the layer databases runs."""
+        running = []
+        for attr, what in (
+            ("db_worker", "генерація БД"),
+            ("propagation_worker", "пропагація GPS"),
+            ("tracking_worker", "відстеження"),
+        ):
+            worker = getattr(self, attr, None)
+            if worker is not None and worker.isRunning():
+                running.append(what)
+        if not running:
+            return False
+        msg = f"{action or 'Дія'}: недоступно, поки виконується {', '.join(running)}."
+        if quiet:
+            self.status_bar.showMessage(msg, 6000)
+        else:
+            QMessageBox.information(self, "Зачекайте", msg)
+        return True
+
+    def _activate_source(self, source_id: str, *, quiet: bool = False) -> bool:
+        """Makes ``source_id`` the active layer; its DB and calibration switch together."""
+        src = self._source_config(source_id)
+        if src is None:
+            if not quiet:
+                QMessageBox.warning(self, "Помилка", f"Шар '{source_id}' не знайдено в проєкті!")
+            return False
+
+        if self._is_multi_source():
+            try:
+                # get_or_load: a layer disabled at open time or added later still
+                # gets its anchors from disk instead of an empty object whose first
+                # save would overwrite the file.
+                calibration = self.calib_manager.get_or_load(src, self.project_manager.project_dir)
+            except Exception as e:
+                logger.error(f"Cannot read calibration of layer '{source_id}': {e}", exc_info=True)
+                if not quiet:
+                    QMessageBox.critical(
+                        self,
+                        "Помилка калібрування",
+                        f"Не вдалося прочитати калібрування шару «{source_id}»:\n{e}\n\n"
+                        f"Файл не змінено. Виправте або перейменуйте його і повторіть.",
+                    )
+                return False
+            self.database = self.db_manager.get_database(source_id)  # None: no DB yet
+            self.calibration = calibration
+        elif source_id != (self.active_source_id or self._single_layer_id()):
+            # Single-source mode holds exactly one layer; the other rows are
+            # disabled layers. Switching would pair this DB with their files.
+            if not quiet:
+                QMessageBox.information(
+                    self,
+                    "Шар вимкнено",
+                    f"Шар «{source_id}» вимкнено. Увімкніть його "
+                    f"(ПКМ по шару → Увімкнути), щоб з ним працювати.",
+                )
+            return False
+
+        self.active_source_id = source_id
+        if self.database is not None and self.database.converter is not None:
+            self.calibration.converter = self.database.converter
+        if getattr(self, "map_widget", None):
+            self.map_widget.set_coordinate_mode(self.calibration.converter.mode, reset=True)
+        logger.info(
+            f"Active layer: '{source_id}' (db={'loaded' if self.database else 'none'}, "
+            f"anchors={len(self.calibration.anchors)})"
+        )
+        self._update_project_info_panel()
+        return True
+
+    def _single_layer_id(self) -> str:
+        """The layer single-source mode loads: 'main', else the first one."""
+        settings = self.project_manager.settings if self.project_manager.is_loaded else None
+        if settings is None or settings.get_source("main") is not None:
+            return "main"
+        first = next(iter(settings.source_configs()), None)
+        return first.source_id if first is not None else "main"
+
+    def _ensure_active(self, source_id: str) -> bool:
+        return source_id == self.active_source_id or self._activate_source(source_id)
+
+    def _close_layer_objects(self) -> None:
+        """Closes every open layer database and forgets all per-layer objects."""
+        try:
+            if getattr(self, "database", None) is not None:
+                self.database.close()
+            if getattr(self, "db_manager", None) is not None:
+                self.db_manager.close_all()
+        except Exception as e:
+            logger.warning(f"Error closing layer databases: {e}")
+        self.db_manager = None
+        self.calib_manager = None
+        self.database = None
+        self.calibration = MultiAnchorCalibration()
+        self.active_source_id = None
+
+    def _reset_session_state(self) -> None:
+        """Drops everything that belongs to the previously open project."""
+        self._close_layer_objects()
+        if getattr(self, "map_widget", None):
+            self.map_widget.clear_trajectory()
+            self.map_widget.clear_verification_markers()
+        if hasattr(self, "_tracking_results"):
+            self._tracking_results = []
+
+    def _load_project_layers(self, prefer_source_id: str | None = None) -> None:
+        """(Re)creates the per-layer objects of the loaded project and activates one.
+
+        Used on project open and whenever enabling/adding/removing a layer changes
+        the mode, so a new layer is usable immediately — same result as reopening.
+        """
+        settings = self.project_manager.settings
+        project_dir = self.project_manager.project_dir
+        self._close_layer_objects()
+
+        if self._wants_multi_source():
+            sources = settings.get_enabled_sources()
+            self.db_manager = MultiDatabaseManager(sources, project_dir, config=self.config)
+            self.calib_manager = MultiCalibrationManager()
+            self.calib_manager.load_all(sources, project_dir)
+            candidates = [prefer_source_id, *self.db_manager.all_source_ids]
+            candidates += [s.source_id for s in sources]
+            for sid in candidates:
+                if sid and self._activate_source(sid, quiet=True):
+                    break
+            logger.info(
+                f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
+                f"sources={self.db_manager.all_source_ids}, active='{self.active_source_id}'"
+            )
+        else:
+            src = settings.get_source(self._single_layer_id())
+            if src is not None:
+                sid = src.source_id
+                db_path = Path(project_dir) / src.database_file
+                cal_path = Path(project_dir) / src.calibration_file
+            else:
+                sid = "main"
+                db_path = Path(self.project_manager.database_path)
+                cal_path = Path(self.project_manager.calibration_path)
+            self.database = DatabaseLoader(str(db_path)) if db_path.exists() else None
+            self.calibration = MultiAnchorCalibration()
+            if cal_path.exists():
+                self.calibration.load(str(cal_path))
+            self.active_source_id = sid
+
+        # Projection: the DB (what propagation used) has priority over the JSON.
+        if self.database is not None and self.database.converter is not None:
+            self.calibration.converter = self.database.converter
+        if getattr(self, "map_widget", None):
+            self.map_widget.set_coordinate_mode(self.calibration.converter.mode, reset=True)
+        self._update_project_info_panel()
 
     # ── Database generation ────────────────────────────────────────────────────────
 
@@ -12328,13 +17236,18 @@ class DatabaseMixin:
         video_path: str,
         save_path: str,
         required_frame_ids: set[int] | None = None,
+        source_id: str | None = None,
     ):
         if self._refuse_if_encrypted_project("Генерація бази даних"):
             return
 
+        sid = source_id or self._find_source_id_by_db_path(save_path)
+        self._db_build_source_id = sid
+
         # Do NOT initialize WEB_MERCATOR when starting database generation.
         # UTM converter will be initialized automatically after first GPS anchor.
-        if not self.calibration.is_calibrated:
+        # (Build actions activate the target layer first, so this is its calibration.)
+        if not self.calibration.is_calibrated and self.calibration.converter.mode != "LOCAL":
             self.calibration.converter = CoordinateConverter(
                 "UTM"
             )  # ref_gps=None → auto on first anchor
@@ -12344,20 +17257,21 @@ class DatabaseMixin:
         self.control_panel.update_progress(0)
         self.control_panel.set_db_generation_running(True)
 
-        # CRITICAL: Close and release the database file handle before overwriting/truncating it
-        if hasattr(self, "database") and self.database:
+        # CRITICAL: release exactly the database file that is about to be
+        # overwritten. Other layers stay open — closing the active loader while
+        # building another layer used to leave a dead HDF5 handle in db_manager.
+        if self._is_multi_source() and sid:
+            if self.database is not None and self.database is self.db_manager.get_database(sid):
+                self.database = None
+            # Unload also before overwriting vectors.lance
+            self.db_manager.unload_source(sid)
+        elif self.database is not None:
             try:
                 self.database.close()
                 logger.info("Current database closed before starting new generation.")
             except Exception as e:
                 logger.warning(f"Could not close database: {e}")
-        self.database = None
-
-        # Unload source from multi-manager before overwriting vectors.lance
-        if getattr(self, "db_manager", None):
-            sid = self._find_source_id_by_db_path(save_path)
-            if sid:
-                self.db_manager.unload_source(sid)
+            self.database = None
 
         self.db_worker = DatabaseGenerationWorker(
             video_path=video_path,
@@ -12375,6 +17289,7 @@ class DatabaseMixin:
         # Connect stop button
         self.control_panel.stop_db_generation_clicked.connect(self.on_stop_db_generation)
 
+        self._update_project_info_panel()
         self.db_worker.start()
 
     @pyqtSlot()
@@ -12394,55 +17309,55 @@ class DatabaseMixin:
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.current_database_path = db_path
+        sid = self._db_build_source_id or self._find_source_id_by_db_path(db_path)
+        self._db_build_source_id = None
 
-        if self.database:
-            self.database.close()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            # Reload source in db_manager for fresh LanceDB handle
-            reloaded = False
-            if getattr(self, "db_manager", None):
-                sid = self._find_source_id_by_db_path(db_path)
-                src = (
-                    self.project_manager.settings.get_source(sid)
-                    if sid and self.project_manager.settings
-                    else None
-                )
-                if src is not None and self.db_manager.reload_source(src):
-                    self.database = self.db_manager.get_database(sid)
-                    reloaded = True
-
-            if not reloaded:
+            if self._is_multi_source() and sid:
+                # Fresh loader + LanceDB handle for the rebuilt layer, then switch
+                # database AND calibration to it together.
+                src = self._source_config(sid)
+                if src is not None and src.enabled:
+                    self.db_manager.reload_source(src)
+                self._activate_source(sid)
+            else:
+                if self.database:
+                    self.database.close()
                 self.database = DatabaseLoader(db_path)
+                if sid:
+                    self.active_source_id = sid
         finally:
             QApplication.restoreOverrideCursor()
+        layer = sid or "main"
         self.control_panel.update_progress(100)
-        self.control_panel.update_status("Базу успішно створено")
+        self.control_panel.update_status(f"Базу шару «{layer}» успішно створено")
         self.status_bar.showMessage(
-            f"Проєкт: {self.project_manager.project_name} | База: {db_path}"
+            f"Проєкт: {self.project_manager.project_name} | Шар: {layer} | База: {db_path}"
         )
 
-        # Update registry and info panel
-        if self.project_manager.is_loaded:
-            self._get_registry().refresh_status(str(self.project_manager.project_dir))
-        self._update_project_info_panel()
+        self._after_layer_data_changed()
 
-        QMessageBox.information(self, "Успіх", "Проєкт та базу даних успішно згенеровано!")
+        QMessageBox.information(self, "Успіх", f"Базу даних шару «{layer}» успішно згенеровано!")
 
     @pyqtSlot(str)
     def on_db_error(self, error_msg: str):
+        self._db_build_source_id = None
         self.control_panel.set_db_generation_running(False)
         self.control_panel.btn_new_mission.setEnabled(True)
         self.control_panel.btn_load_db.setEnabled(True)
         self.control_panel.update_progress(0)
         self.control_panel.update_status("Помилка генерації")
+        self._update_project_info_panel()
         QMessageBox.critical(self, "Помилка", f"Помилка генерації:\n{error_msg}")
 
     @pyqtSlot()
     def on_db_cancelled(self):
+        self._db_build_source_id = None
         self.control_panel.set_db_generation_running(False)
         self.control_panel.update_status("Генерацію скасовано користувачем")
         self.control_panel.update_progress(0)
+        self._update_project_info_panel()
 
     # ── Project opening ────────────────────────────────────────────────────────
 
@@ -12579,77 +17494,44 @@ class DatabaseMixin:
             QMessageBox.critical(self, "Error", "Selected folder is not a valid project!")
             return
 
+        # Nothing of the previous project may survive — including on the
+        # "generate missing database" path below, where the old db_manager used
+        # to reload the OLD project's database under the new project's name.
+        self._reset_session_state()
+        self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+
+        loaded = False
         try:
-            db_path = self.project_manager.database_path
-
-            # Check whether the database file exists
-            if not Path(db_path).exists():
-                video_path = self.project_manager.settings.video_path
-                reply = QMessageBox.question(
-                    self,
-                    "Database missing",
-                    f"Project '{self.project_manager.project_name}' has no generated database.\n\n"
-                    f"Generate database now from video:\n{Path(video_path).name}?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            settings = self.project_manager.settings
+            if not self._wants_multi_source():
+                src = settings.get_source("main") or next(iter(settings.source_configs()), None)
+                db_path = (
+                    str(self.project_manager.project_dir / src.database_file)
+                    if src is not None
+                    else self.project_manager.database_path
                 )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.setWindowTitle(
-                        f"Drone Topometric Localizer - {self.project_manager.project_name}"
+                if not Path(db_path).exists():
+                    video_path = src.video_path if src is not None else settings.video_path
+                    reply = QMessageBox.question(
+                        self,
+                        "Database missing",
+                        f"Project '{self.project_manager.project_name}' has no generated database.\n\n"
+                        f"Generate database now from video:\n{Path(video_path).name}?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     )
-                    self._start_database_generation(video_path, db_path)
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.active_source_id = src.source_id if src is not None else "main"
+                        self._start_database_generation(
+                            video_path, db_path, source_id=self.active_source_id
+                        )
+                    else:
+                        self.status_bar.showMessage("Loading cancelled: missing database")
                     return
-                else:
-                    self.status_bar.showMessage("Loading cancelled: missing database")
-                    return
-
-            if self.database:
-                self.database.close()
-            # Shut down previous multi-source managers
-            if hasattr(self, "db_manager") and self.db_manager:
-                self.db_manager.close_all()
-
-            # Clear previous project state
-            if hasattr(self, "calibration") and self.calibration:
-                self.calibration.clear()
-
-            if hasattr(self, "map_widget") and self.map_widget:
-                self.map_widget.clear_trajectory()
-                self.map_widget.clear_verification_markers()
-
-            if hasattr(self, "_tracking_results"):
-                self._tracking_results = []
+            # Multi-source projects open even if some (or all) layers have no DB
+            # yet: such layers are listed as "Без БД" and can be built from the table.
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            sources = self.project_manager.settings.get_enabled_sources()
-            is_multi = len(sources) > 1 or any(s.source_id != "main" for s in sources)
-            if is_multi and len(sources) > 0:
-                # Multi-source mode
-                project_dir = self.project_manager.project_dir
-                self.db_manager = MultiDatabaseManager(sources, project_dir, config=self.config)
-                self.calib_manager = MultiCalibrationManager()
-                self.calib_manager.load_all(sources, project_dir)
-
-                # self.database — first source for UI compatibility
-                first_id = (
-                    self.db_manager.all_source_ids[0] if self.db_manager.all_source_ids else None
-                )
-                if first_id:
-                    self.database = self.db_manager.get_database(first_id)
-                    self.calibration = self.calib_manager.get(first_id)
-                else:
-                    raise RuntimeError("Multi-source project: no databases loaded")
-
-                logger.info(
-                    f"Multi-source project loaded: {self.db_manager.num_databases} databases, "
-                    f"sources={self.db_manager.all_source_ids}"
-                )
-            else:
-                # Single-source mode (backwards compatibility)
-                self.db_manager = None
-                self.calib_manager = None
-                self.database = DatabaseLoader(db_path)
-
-            self.setWindowTitle(f"Drone Topometric Localizer - {self.project_manager.project_name}")
+            self._load_project_layers()
 
             # Update registry
             registry = self._get_registry()
@@ -12661,35 +17543,31 @@ class DatabaseMixin:
                 else "",
             )
 
-            # Load calibration if present (single mode)
-            if self.calib_manager is None:
-                calib_path = self.project_manager.calibration_path
-                if calib_path and Path(calib_path).exists():
-                    self.calibration.load(calib_path)
-
-            # Sync converter (DB priority, then calibration file)
-            if self.database and self.database.converter is not None:
-                self.calibration.converter = self.database.converter
-            elif self.calibration.converter and self.calibration.converter.is_initialized:
-                pass  # converter loaded from calibration.json
-
+            layer = self.active_source_id or "main"
             if self.database and self.database.is_propagated:
                 n_valid = int(self.database.frame_valid.sum())
                 n_total = self.database.get_num_frames()
+                kind = "Local X/Y" if self.calibration.converter.mode == "LOCAL" else "GPS"
                 self.status_bar.showMessage(
-                    f"Project: {self.project_manager.project_name} (GPS: {n_valid}/{n_total} frames)"
+                    f"Project: {self.project_manager.project_name} | layer '{layer}' "
+                    f"({kind}: {n_valid}/{n_total} frames)"
                 )
             else:
                 self.status_bar.showMessage(
-                    f"Project: {self.project_manager.project_name} (no GPS propagation)"
+                    f"Project: {self.project_manager.project_name} | layer '{layer}' "
+                    f"(no GPS propagation)"
                 )
             self.control_panel.update_status("Project loaded")
             self._update_project_info_panel()
+            loaded = True
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load project database:\n{e}")
         finally:
             QApplication.restoreOverrideCursor()
+
+        if loaded:
+            self._warn_layer_conflicts()
 
     # ── Propagation check ───────────────────────────────────────────────────────
 
@@ -12718,10 +17596,11 @@ class DatabaseMixin:
         for i in range(0, num_frames, step):
             if frame_valid[i]:
                 # Apply affine matrix (2x3)
-                M = frame_affine[i]
+                from src.geometry.frame_transform import get_frame_transform, project_points
+
+                M = get_frame_transform(self.database, i)
                 # Metric = M * [x, y, 1]^T
-                metric_x = M[0, 0] * center_px[0, 0] + M[0, 1] * center_px[0, 1] + M[0, 2]
-                metric_y = M[1, 0] * center_px[0, 0] + M[1, 1] * center_px[0, 1] + M[1, 2]
+                metric_x, metric_y = project_points(M, center_px)[0]
 
                 lat, lon = self.calibration.converter.metric_to_gps(
                     float(metric_x), float(metric_y)
@@ -12739,6 +17618,7 @@ class DatabaseMixin:
 
     @pyqtSlot()
     def on_rebuild_database(self):
+        """Rebuilds the database of the ACTIVE layer (not always the main one)."""
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Warning", "Please load the project first!")
             return
@@ -12747,13 +17627,28 @@ class DatabaseMixin:
         # that save is a write into the project and would otherwise raise.
         if self._refuse_if_encrypted_project("Database rebuild"):
             return
+        if self._layer_ops_busy("Перегенерація бази"):
+            return
 
-        video_path = self.project_manager.settings.video_path
+        sid = self._get_current_source_id()
+        src = self._source_config(sid)
+        if src is not None:
+            if not src.enabled:
+                QMessageBox.information(
+                    self, "Шар вимкнено", f"Увімкніть шар «{sid}» перед побудовою його бази."
+                )
+                return
+            video_path = src.video_path
+            db_path = str(self.project_manager.project_dir / src.database_file)
+        else:
+            video_path = self.project_manager.settings.video_path
+            db_path = self.project_manager.database_path
+
         if not video_path or not Path(video_path).exists():
             QMessageBox.warning(
                 self,
                 "Warning",
-                f"Project video not found:\n{video_path}\n\n"
+                f"Video of layer '{sid}' not found:\n{video_path}\n\n"
                 "Check the video path in project settings.",
             )
             return
@@ -12761,25 +17656,22 @@ class DatabaseMixin:
         reply = QMessageBox.question(
             self,
             "Database rebuild",
-            f"The database will be overwritten!\n\n"
+            f"The database of layer «{sid}» will be overwritten!\n\n"
             f"Video: {Path(video_path).name}\n"
-            f"Calibration will be saved.\n\n"
+            f"DB: {db_path}\n"
+            f"Calibration of this layer will be saved.\n\n"
             f"Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Save calibration before regeneration
+        # Save calibration before regeneration (into THIS layer's file)
         if self.calibration.is_calibrated:
-            calib_path = (
-                self._get_calibration_save_path()
-                if hasattr(self, "_get_calibration_save_path")
-                else self.project_manager.calibration_path
-            )
+            calib_path = self._get_calibration_save_path()
             if calib_path:
-                self.calibration.save(calib_path)
-                logger.info(f"Calibration saved before rebuild: {calib_path}")
+                save_layer_calibration(self.calibration, calib_path, sid)
+                logger.info(f"Calibration of layer '{sid}' saved before rebuild: {calib_path}")
 
         required_frame_ids = {int(anchor.frame_id) for anchor in self.calibration.anchors}
         if required_frame_ids:
@@ -12787,10 +17679,12 @@ class DatabaseMixin:
                 "Rebuild will preserve exact calibration anchor slots: "
                 f"{sorted(required_frame_ids)}"
             )
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._start_database_generation(
             video_path,
-            self.project_manager.database_path,
+            db_path,
             required_frame_ids=required_frame_ids,
+            source_id=sid,
         )
 
     # ── Results export ───────────────────────────────────────────────────────────
@@ -12801,11 +17695,14 @@ class DatabaseMixin:
             QMessageBox.warning(self, "Warning", "No results to export!\n\nPerform tracking first.")
             return
 
+        local_results = any(
+            r.get("coordinate_kind") == "local_planar" for r in self._tracking_results
+        )
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export results",
             "tracking_results",
-            "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
+            "CSV (*.csv)" if local_results else "CSV (*.csv);;GeoJSON (*.geojson);;KML (*.kml)",
         )
         if not path:
             return
@@ -12856,12 +17753,23 @@ class DatabaseMixin:
 
     # ── Info panel ──────────────────────────────────────────────────────────────
 
+    def _after_layer_data_changed(self) -> None:
+        """Anchors, propagation or a layer's DB changed: refresh every status view."""
+        if self.project_manager.is_loaded:
+            try:
+                self._get_registry().refresh_status(str(self.project_manager.project_dir))
+            except Exception as e:
+                logger.warning(f"Project registry refresh failed: {e}")
+        self._update_project_info_panel()
+
     def _update_project_info_panel(self):
-        """Update the project info panel in control_panel."""
+        """Update the project info panel (data of the ACTIVE layer) and the layer table."""
         if not self.project_manager.is_loaded:
             self.control_panel.update_project_info()
             return
 
+        sid = self._get_current_source_id()
+        src = self._source_config(sid)
         num_frames = self.database.get_num_frames() if self.database else None
         num_anchors = len(self.calibration.anchors) if self.calibration else None
         num_propagated = None
@@ -12870,205 +17778,376 @@ class DatabaseMixin:
         if self.database and self.database.is_propagated:
             num_propagated = int(self.database.frame_valid.sum())
 
-        db_path = self.project_manager.database_path
+        if src is not None:
+            db_path = str(self.project_manager.project_dir / src.database_file)
+            video_path = src.video_path
+        else:
+            db_path = self.project_manager.database_path
+            video_path = self.project_manager.settings.video_path
         if db_path and Path(db_path).exists():
             db_size_mb = Path(db_path).stat().st_size / (1024 * 1024)
 
         self.control_panel.update_project_info(
             project_name=self.project_manager.project_name,
-            video_path=self.project_manager.settings.video_path
-            if self.project_manager.settings
-            else None,
+            video_path=video_path,
             num_frames=num_frames,
             num_anchors=num_anchors,
             num_propagated=num_propagated,
             db_size_mb=db_size_mb,
+            layer_id=sid,
         )
 
-        # Update video sources panel
+        # Update layer table
         self._refresh_sources_panel()
 
+    def _layer_snapshot(self):
+        """Live (database, calibration) of every layer + detected cross-layer conflicts."""
+        settings = self.project_manager.settings
+        project_dir = self.project_manager.project_dir
+        active_id = self._get_current_source_id()
+        sources = settings.source_configs()
+        databases: dict = {}
+        calibrations: dict = {}
+        for src in sources:
+            sid = src.source_id
+            db = cal = None
+            if self._is_multi_source():
+                db = self.db_manager.get_database(sid)
+                if src.enabled:
+                    try:
+                        cal = self.calib_manager.get_or_load(src, project_dir)
+                    except Exception as e:
+                        logger.warning(f"Layer '{sid}': calibration unreadable: {e}")
+            elif sid == active_id:
+                db, cal = self.database, self.calibration
+            databases[sid] = db
+            calibrations[sid] = cal
+        num_frames = {sid: db.get_num_frames() for sid, db in databases.items() if db is not None}
+        conflicts = find_layer_conflicts(
+            sources,
+            project_dir,
+            {sid: cal for sid, cal in calibrations.items() if cal is not None},
+            num_frames,
+        )
+        return sources, databases, calibrations, conflicts
+
+    def _layer_rows(self) -> list[dict]:
+        project_dir = self.project_manager.project_dir
+        active_id = self._get_current_source_id()
+        sources, databases, calibrations, conflicts = self._layer_snapshot()
+        conflict_msgs: dict[str, list[str]] = {}
+        for c in conflicts:
+            for sid in c.source_ids:
+                conflict_msgs.setdefault(sid, []).append(c.message)
+
+        rows = []
+        for src in sources:
+            sid = src.source_id
+            st = compute_layer_status(
+                src, project_dir, database=databases.get(sid), calibration=calibrations.get(sid)
+            )
+            lines = [f"Шар: {sid}" + (f" — {src.description}" if src.description else "")]
+            lines.append(f"Зона: {src.area_id} · пріоритет {src.priority}")
+            lines.append(f"Відео: {src.video_path}")
+            lines.append(f"БД: {src.database_file}")
+            lines.append(f"Калібрування: {src.calibration_file}")
+            layer = src.scale_layer
+            if layer is not None and layer.nominal_gsd_m_per_px:
+                lines.append(f"GSD ≈ {layer.nominal_gsd_m_per_px:.3f} м/px ({layer.scale_quality})")
+            lines.append(f"Статус: {st.label} — {st.hint}")
+            lines.extend(f"⚠ {msg}" for msg in conflict_msgs.get(sid, []))
+            rows.append(
+                {
+                    "source_id": sid,
+                    "area_id": src.area_id,
+                    "anchors": st.anchors_text,
+                    "gps": st.gps_text,
+                    "label": st.label,
+                    "state": st.state.value,
+                    "tooltip": "\n".join(lines),
+                    "enabled": st.enabled,
+                    "db_loaded": st.db_loaded,
+                    "has_db_file": st.has_db_file,
+                    "num_anchors": st.num_anchors or 0,
+                    "is_active": sid == active_id,
+                    "conflict": sid in conflict_msgs,
+                }
+            )
+        return rows
+
     def _refresh_sources_panel(self):
-        """Updates video sources table and active source badge in ControlPanel."""
+        """Updates the layer table and the active-layer badge in ControlPanel."""
         if not self.project_manager.is_loaded or not self.project_manager.settings:
             return
-        sources_raw = self.project_manager.settings.video_sources or []
-        project_dir = (
-            str(self.project_manager.project_dir) if self.project_manager.project_dir else ""
-        )
-
-        # Get active source ID
         active_id = self._get_current_source_id()
-
-        # Get video_path for active source
-        video_path = ""
-        for src_dict in sources_raw:
-            if src_dict.get("source_id") == active_id:
-                video_path = src_dict.get("video_path", "")
-                break
-
-        # Fallback to default video_path if missing
-        if not video_path and self.project_manager.settings:
-            video_path = self.project_manager.settings.video_path
-
+        src = self._source_config(active_id)
+        video_path = src.video_path if src is not None else self.project_manager.settings.video_path
         self.control_panel.set_active_source(active_id, video_path or "")
 
-        # Check which sources are propagated
-        propagated_ids: set[str] = set()
-        if hasattr(self, "db_manager") and self.db_manager:
-            for sid in self.db_manager.all_source_ids:
-                db = self.db_manager.get_database(sid)
-                if db and db.is_propagated:
-                    propagated_ids.add(sid)
-        elif hasattr(self, "database") and self.database and self.database.is_propagated:
-            propagated_ids.add("main")
+        try:
+            rows = self._layer_rows()
+        except Exception as e:
+            logger.error(f"Layer table refresh failed: {e}", exc_info=True)
+            return
+        self.control_panel.update_sources_list(rows)
+        self.control_panel.set_active_layer_context(active_id, len(rows))
 
-        self.control_panel.update_sources_list(
-            sources_raw,
-            project_dir=project_dir,
-            active_source_id=active_id,
-            propagated_source_ids=propagated_ids,
+    def _warn_layer_conflicts(self) -> None:
+        """Warns (once, on open) if layer files look mixed up. Changes nothing."""
+        if not self.project_manager.is_loaded:
+            return
+        try:
+            conflicts = self._layer_snapshot()[3]
+        except Exception as e:
+            logger.warning(f"Layer conflict check failed: {e}")
+            return
+        if not conflicts:
+            return
+        for c in conflicts:
+            logger.error(f"Layer conflict ({c.kind}): {c.message}")
+        QMessageBox.warning(
+            self,
+            "Можливе змішування шарів",
+            "Схоже, що файли шарів переплутані:\n\n"
+            + "\n".join(f"• {c.message}" for c in conflicts)
+            + "\n\nАвтоматично нічого не змінено. Перевірте калібрування цих шарів "
+            "(ПКМ по шару → Калібрувати) або завантажте правильний JSON "
+            "(ПКМ → Завантажити калібрування).",
         )
 
-    # ── Multi-source slots ────────────────────────────────────────────────────
+    # ── Layer slots ──────────────────────────────────────────────────────────
 
     @pyqtSlot()
     def on_add_video_source(self):
-        """Slot for 'Add Source' button."""
+        """Slot for 'Add layer' button."""
         if not self.project_manager.is_loaded:
             QMessageBox.warning(self, "Помилка", "Спочатку відкрийте або створіть проєкт!")
+            return
+        if self._refuse_if_encrypted_project("Додавання шару"):
+            return
+        if self._layer_ops_busy("Додавання шару"):
             return
 
         from src.gui.dialogs.add_video_source_dialog import AddVideoSourceDialog
 
-        # Collect existing area_ids
-        existing_areas = set()
-        for src in self.project_manager.settings.video_sources or []:
-            area = src.get("area_id", "")
-            if area:
-                existing_areas.add(area)
+        settings = self.project_manager.settings
+        project_dir = self.project_manager.project_dir
+        existing_areas = sorted(
+            {src.get("area_id", "") for src in settings.video_sources or []} - {""}
+        )
 
-        dialog = AddVideoSourceDialog(existing_area_ids=sorted(existing_areas), parent=self)
+        dialog = AddVideoSourceDialog(
+            existing_area_ids=existing_areas,
+            parent=self,
+            existing_sources=list(settings.video_sources or []),
+        )
         if not dialog.exec():
             return
 
         new_source = dialog.get_source_config()
+        sid = new_source.source_id
 
-        # Duplicate check
-        if self.project_manager.settings.get_source(new_source.source_id) is not None:
+        # IDs become folder names; on Windows "Low" and "low" are one folder.
+        taken = {str(s.get("source_id", "")).casefold() for s in settings.video_sources or []}
+        if sid.casefold() in taken:
             QMessageBox.warning(
-                self, "Помилка", f"Джерело з ID '{new_source.source_id}' вже існує в проєкті!"
+                self,
+                "Помилка",
+                f"Шар з ID '{sid}' вже існує в проєкті (ID не розрізняють регістр)!",
+            )
+            return
+        clashes = [
+            c
+            for c in find_path_conflicts([*settings.source_configs(), new_source], project_dir)
+            if sid in c.source_ids
+        ]
+        if clashes:
+            QMessageBox.warning(
+                self,
+                "Конфлікт файлів",
+                "Новий шар ділив би файли з існуючим:\n\n"
+                + "\n".join(f"• {c.message}" for c in clashes),
             )
             return
 
-        # Add to project
-        self.project_manager.settings.add_source(new_source)
+        settings.add_source(new_source)
         self.project_manager.save_project()
-
-        # Create directory for this source
-        source_dir = self.project_manager.project_dir / "sources" / new_source.source_id
-        source_dir.mkdir(parents=True, exist_ok=True)
-
+        (project_dir / "sources" / sid).mkdir(parents=True, exist_ok=True)
         logger.info(
-            f"Video source added: {new_source.source_id} "
-            f"(area={new_source.area_id}, video={Path(new_source.video_path).name})"
+            f"Layer added: {sid} (area={new_source.area_id}, "
+            f"video={Path(new_source.video_path).name})"
         )
 
-        self._refresh_sources_panel()
-        self.status_bar.showMessage(
-            f"Додано відеоджерело '{new_source.source_id}'. "
-            f"Побудуйте БД через контекстне меню таблиці."
+        # A second layer switches the project to multi-source mode right away
+        # (previously the project had to be reopened before the layer worked).
+        if self._wants_multi_source() != self._is_multi_source():
+            self._reload_layers_keeping_active()
+        self._after_layer_data_changed()
+
+        reply = QMessageBox.question(
+            self,
+            "Новий шар",
+            f"Шар «{sid}» додано до проєкту.\n\n"
+            f"Побудувати для нього базу даних зараз?\n"
+            f"Відео: {Path(new_source.video_path).name}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.on_source_action(sid, "build_db")
+        else:
+            self.status_bar.showMessage(
+                f"Шар «{sid}» додано. Побудуйте його БД через ПКМ по шару в таблиці."
+            )
+
+    def _reload_layers_keeping_active(self, exclude: str | None = None) -> None:
+        prefer = self.active_source_id if self.active_source_id != exclude else None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._load_project_layers(prefer_source_id=prefer)
+        except Exception as e:
+            logger.error(f"Reloading project layers failed: {e}", exc_info=True)
+            QMessageBox.critical(self, "Помилка", f"Не вдалося перезавантажити шари:\n{e}")
+        finally:
+            QApplication.restoreOverrideCursor()
 
     @pyqtSlot(str)
     def on_active_source_changed(self, source_id: str):
-        """Обробка зміни активного джерела при кліку в таблиці."""
-        if not self.db_manager:
+        """Table click: make the clicked layer the active one."""
+        if not self.project_manager.is_loaded or source_id == self.active_source_id:
             return
-
-        if source_id not in self.db_manager.all_source_ids:
-            # Source is disabled or has no database
-            self.database = None
-            self.calibration = None
-            self.status_bar.showMessage(f"Джерело '{source_id}' вимкнено або недоступне")
-            self._update_project_info_panel()
+        if self._layer_ops_busy("Зміна активного шару", quiet=True):
+            self._refresh_sources_panel()  # put the selection back on the active layer
             return
-
-        self.database = self.db_manager.get_database(source_id)
-        self.calibration = self.calib_manager.get(source_id)
-        logger.info(f"Active source switched to: {source_id}")
-
-        self.status_bar.showMessage(f"Обрано джерело: {source_id}")
-        self._update_project_info_panel()
-        self._refresh_sources_panel()  # Щоб оновити підсвічування рядка в таблиці
+        if self._activate_source(source_id):
+            self.status_bar.showMessage(f"Активний шар: {source_id}")
+        else:
+            self._refresh_sources_panel()
 
     @pyqtSlot(str, str)
     def on_source_action(self, source_id: str, action: str):
-        """Обробка дій з контекстного меню таблиці джерел."""
+        """Layer table actions: each one acts on exactly the clicked layer."""
         if not self.project_manager.is_loaded:
             return
 
         settings = self.project_manager.settings
         source = settings.get_source(source_id)
         if source is None:
-            QMessageBox.warning(self, "Помилка", f"Джерело '{source_id}' не знайдено!")
+            QMessageBox.warning(self, "Помилка", f"Шар '{source_id}' не знайдено!")
             return
 
-        if action == "build_db":
-            # Generate database for this specific source
-            video_path = source.video_path
-            db_path = str(self.project_manager.project_dir / source.database_file)
-            db_dir = Path(db_path).parent
-            db_dir.mkdir(parents=True, exist_ok=True)
-            self._start_database_generation(video_path, db_path)
+        if action == "activate":
+            self.on_active_source_changed(source_id)
+            return
 
-        elif action == "calibrate":
-            # For now: open the standard calibration dialog
-            self.status_bar.showMessage(
-                f"Для калібрування '{source_id}' використовуйте стандартний калібрувальний інструмент."
-            )
+        if action in ("calibrate", "load_calibration", "propagate", "build_db"):
+            if self._layer_ops_busy():
+                return
+            if action == "build_db" and not source.enabled:
+                QMessageBox.information(
+                    self, "Шар вимкнено", f"Увімкніть шар «{source_id}» перед побудовою його бази."
+                )
+                return
+            # Activate first: every handler below works on the active layer only.
+            if not self._ensure_active(source_id):
+                return
+            if action == "calibrate":
+                self.on_calibrate()
+            elif action == "load_calibration":
+                self.on_load_calibration()
+            elif action == "propagate":
+                self.on_run_propagation()
+            else:
+                self._build_layer_database(source)
+            return
 
-        elif action == "toggle":
+        if action == "toggle":
+            if self._refuse_if_encrypted_project("Увімкнення/вимкнення шару"):
+                return
+            if self._layer_ops_busy("Увімкнення/вимкнення шару"):
+                return
             source.enabled = not source.enabled
             settings.update_source(source)
             self.project_manager.save_project()
 
-            if hasattr(self, "db_manager") and self.db_manager:
+            if self._wants_multi_source() != self._is_multi_source():
+                self._reload_layers_keeping_active(exclude=None if source.enabled else source_id)
+            elif self._is_multi_source():
                 self.db_manager.toggle_source(source)
+                if source_id == self.active_source_id:
+                    # Its loader was just opened/closed: re-pair DB + calibration.
+                    fallback = source_id
+                    if not source.enabled:
+                        fallback = next(
+                            (s for s in self.db_manager.all_source_ids if s != source_id),
+                            source_id,
+                        )
+                    self._activate_source(fallback, quiet=True)
 
-                # If the currently active source was disabled, switch to the first available one
-                if not source.enabled and self._get_current_source_id() == source_id:
-                    avail = self.db_manager.all_source_ids
-                    if avail:
-                        self.on_active_source_changed(avail[0])
-                    else:
-                        self.database = None
-                        self.calibration = None
-                        self._update_project_info_panel()
-
-            self._refresh_sources_panel()
+            self._after_layer_data_changed()
             state = "увімкнено" if source.enabled else "вимкнено"
-            self.status_bar.showMessage(f"Джерело '{source_id}' {state}")
+            self.status_bar.showMessage(f"Шар «{source_id}» {state}")
+            return
 
-        elif action == "remove":
+        if action == "remove":
+            if self._refuse_if_encrypted_project("Видалення шару"):
+                return
+            if self._layer_ops_busy("Видалення шару"):
+                return
+            if len(settings.video_sources or []) <= 1:
+                QMessageBox.information(
+                    self, "Видалення шару", "Це єдиний шар проєкту — його не можна видалити."
+                )
+                return
             reply = QMessageBox.question(
                 self,
-                "Видалення джерела",
-                f"Видалити відеоджерело '{source_id}'?\n\n"
-                f"Файли бази та калібрації НЕ будуть видалені з диску.",
+                "Видалення шару",
+                f"Видалити шар «{source_id}» з проєкту?\n\n"
+                f"Файли бази та калібрування НЕ будуть видалені з диску.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.StandardButton.Yes:
-                settings.remove_source(source_id)
-                self.project_manager.save_project()
-                self._refresh_sources_panel()
-                self.status_bar.showMessage(f"Джерело '{source_id}' видалено з проєкту")
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            settings.remove_source(source_id)
+            self.project_manager.save_project()
+            if self._wants_multi_source() != self._is_multi_source():
+                self._reload_layers_keeping_active(exclude=source_id)
+            elif self._is_multi_source():
+                self.db_manager.unload_source(source_id)
+                self.calib_manager.discard(source_id)
+                if source_id == self.active_source_id:
+                    self.active_source_id = None
+                    remaining = [*self.db_manager.all_source_ids]
+                    remaining += [s.source_id for s in settings.source_configs()]
+                    for sid in remaining:
+                        if self._activate_source(sid, quiet=True):
+                            break
+            self._after_layer_data_changed()
+            self.status_bar.showMessage(f"Шар «{source_id}» видалено з проєкту")
+
+    def _build_layer_database(self, source: ProjectVideoSource) -> None:
+        """Builds (or, if it exists, rebuilds) the DB of the already active layer."""
+        db_path = self.project_manager.project_dir / source.database_file
+        if db_path.exists():
+            # Same path as the "rebuild" button: confirmation + anchor slots kept.
+            self.on_rebuild_database()
+            return
+        if not source.video_path or not Path(source.video_path).exists():
+            QMessageBox.warning(
+                self,
+                "Відео не знайдено",
+                f"Відео шару «{source.source_id}» не знайдено:\n{source.video_path}",
+            )
+            return
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._start_database_generation(source.video_path, str(db_path), source_id=source.source_id)
 
 
 # ================================================================================
 # File: src\gui\mixins\panorama_mixin.py
 # ================================================================================
 import base64
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -13077,10 +18156,12 @@ from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from config import get_cfg
+from src.geometry.local_panorama import LocalPanoramaLayout, load_local_panorama_metadata
 from src.geometry.transformations import GeometryTransforms
 from src.localization.localizer import Localizer
 from src.localization.matcher import FeatureMatcher
 from src.models.wrappers.feature_extractor import FeatureExtractor
+from src.workers.local_panorama_worker import LocalPanoramaWorker
 from src.workers.panorama_worker import PanoramaWorker
 
 _MAX_DISPLAY_PX = 2048
@@ -13096,6 +18177,11 @@ logger = get_logger(__name__)
 class PanoramaMixin:
     @pyqtSlot()
     def on_generate_panorama(self):
+        if getattr(self, "pano_worker", None) is not None and self.pano_worker.isRunning():
+            return
+        if self.calibration.converter.mode == "LOCAL":
+            self._generate_local_panorama()
+            return
         default_video = ""
         default_save = "panorama.jpg"
 
@@ -13132,6 +18218,105 @@ class PanoramaMixin:
         self.pano_worker.error.connect(on_error)
         self.pano_worker.start()
 
+    def _generate_local_panorama(self):
+        if self.database is None or not self.database.is_propagated:
+            QMessageBox.warning(
+                self, "Локальна панорама", "Спочатку побудуйте локальну карту цього шару."
+            )
+            return
+        if self._layer_ops_busy("Панорама локальної карти"):
+            return
+        try:
+            layout = LocalPanoramaLayout.from_database(self.database)
+            source_id = self._get_current_source_id()
+            source = self._source_config(source_id)
+            video_path = self.database.metadata.get("source_path", "") or (
+                source.video_path if source else ""
+            )
+            if not video_path or not Path(video_path).is_file():
+                video_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Вихідне відео активного шару",
+                    str(video_path),
+                    "Video (*.mp4 *.avi *.mkv)",
+                )
+                if not video_path:
+                    return
+            default_path = Path(self.database.db_path).parent / "panoramas" / "local_map.png"
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Зберегти локальну панораму", str(default_path), "PNG (*.png)"
+            )
+            if not path:
+                return
+            if not path.lower().endswith(".png"):
+                path += ".png"
+            worker = LocalPanoramaWorker(
+                video_path, path, layout, self.database.metadata.get("source_sha256", "")
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Локальна панорама", str(exc))
+            return
+        self.pano_worker = worker
+        self.control_panel.btn_gen_pano.setEnabled(False)
+        worker.progress.connect(self.on_db_progress)
+        worker.finished.connect(lambda: self.control_panel.btn_gen_pano.setEnabled(True))
+
+        def completed(saved_path):
+            # A user may have selected another layer while rendering. Never put
+            # the old layer's image on the new layer, or on a rebuilt local map.
+            try:
+                if (
+                    self._get_current_source_id() == source_id
+                    and self.database is not None
+                    and self.calibration.converter.mode == "LOCAL"
+                    and LocalPanoramaLayout.from_database(self.database).map_signature
+                    == layout.map_signature
+                ):
+                    self._display_panorama(saved_path, layout.corners_yx)
+                else:
+                    self.status_bar.showMessage(
+                        f"Панораму збережено: {saved_path}. Відкрийте її у вихідному шарі."
+                    )
+            except Exception as exc:
+                QMessageBox.warning(self, "Відображення панорами", str(exc))
+
+        worker.completed.connect(completed)
+        worker.error.connect(
+            lambda message: QMessageBox.critical(self, "Локальна панорама", message)
+        )
+        worker.start()
+
+    def _display_panorama(self, path, corners=None):
+        # Preserve transparent areas in a generated map mosaic.
+        img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise ValueError("Не вдалося прочитати панораму")
+        if corners is None:
+            color = (
+                img
+                if img.ndim == 3 and img.shape[2] == 3
+                else cv2.cvtColor(img, cv2.COLOR_BGRA2BGR if img.ndim == 3 else cv2.COLOR_GRAY2BGR)
+            )
+            corners = self._localize_panorama_corners(color)
+            if corners is None:
+                return
+        h, w = img.shape[:2]
+        if max(w, h) > _MAX_DISPLAY_PX:
+            scale = _MAX_DISPLAY_PX / max(w, h)
+            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
+        transparent = img.ndim == 3 and img.shape[2] == 4
+        ext = ".png" if transparent else ".jpg"
+        ok, buf = cv2.imencode(
+            ext, img, [] if transparent else [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
+        )
+        if not ok:
+            raise ValueError("Не вдалося закодувати панораму")
+        mime = "png" if transparent else "jpeg"
+        data_url = f"data:image/{mime};base64," + base64.b64encode(buf).decode("ascii")
+        self.map_widget.set_coordinate_mode(self.calibration.converter.mode)
+        self.map_widget.set_panorama_overlay(data_url, *np.asarray(corners).ravel().tolist())
+        self.status_bar.showMessage("Панораму накладено на карту!")
+
     @pyqtSlot()
     def on_show_panorama(self):
         if not (self.calibration.is_calibrated or getattr(self.database, "is_propagated", False)):
@@ -13141,6 +18326,8 @@ class PanoramaMixin:
         default_dir = ""
         if self.project_manager and self.project_manager.is_loaded:
             default_dir = str(self.project_manager.project_dir / "panoramas")
+        if self.calibration.converter.mode == "LOCAL" and self.database is not None:
+            default_dir = str(Path(self.database.db_path).parent / "panoramas")
 
         path, _ = QFileDialog.getOpenFileName(
             self, "Виберіть панораму", default_dir, "Images (*.png *.jpg *.jpeg);;All Files (*)"
@@ -13148,43 +18335,15 @@ class PanoramaMixin:
         if not path:
             return
 
-        img = cv2.imread(path)
-        if img is None:
-            QMessageBox.critical(self, "Помилка", "Не вдалося прочитати зображення.")
-            return
-
-        self.status_bar.showMessage("Аналіз панорами... (10–20 секунд)")
+        self.status_bar.showMessage("Завантаження та прив’язка панорами...")
         self.repaint()
 
         try:
-            corners_gps = self._localize_panorama_corners(img)
-            if corners_gps is None:
-                return
-
-            H, W = img.shape[:2]
-            if max(W, H) > _MAX_DISPLAY_PX:
-                scale = _MAX_DISPLAY_PX / max(W, H)
-                img = cv2.resize(img, (int(W * scale), int(H * scale)))
-
-            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
-            if not ok:
-                raise RuntimeError("Не вдалося закодувати зображення")
-
-            data_url = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
-            (lat_tl, lon_tl), (lat_tr, lon_tr), (lat_br, lon_br), (lat_bl, lon_bl) = corners_gps
-
-            self.map_widget.set_panorama_overlay(
-                data_url,
-                lat_tl,
-                lon_tl,
-                lat_tr,
-                lon_tr,
-                lat_br,
-                lon_br,
-                lat_bl,
-                lon_bl,
-            )
-            self.status_bar.showMessage("Панораму накладено на карту!")
+            corners = None
+            if self.calibration.converter.mode == "LOCAL" and Path(path + ".json").exists():
+                layout = LocalPanoramaLayout.from_database(self.database)
+                corners = load_local_panorama_metadata(path, layout)
+            self._display_panorama(path, corners)
 
         except Exception as e:
             logger.error(f"Panorama overlay failed: {e}", exc_info=True)
@@ -13192,8 +18351,7 @@ class PanoramaMixin:
 
     def _localize_panorama_corners(self, img: np.ndarray):
         """
-        Localizes 4 quarter-crops of the panorama on CPU,
-        fits affine matrix, returns GPS corners or None.
+        Localizes 4 quarter-crops, fits an affine and returns (y,x) or GPS corners.
         """
         H, W = img.shape[:2]
 
@@ -13282,8 +18440,13 @@ class PanoramaMixin:
                 self.status_bar.showMessage(f"Розпізнавання чверті {i + 1}/4...")
                 self.repaint()
 
+                localizer.reset_session()  # Crops are independent locations, not a flight.
                 res = localizer.localize_frame(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                if not res.get("success") or "fov_polygon" not in res:
+                if (
+                    not res.get("success")
+                    or not res.get("fov_polygon")
+                    or res.get("fallback_mode") == "retrieval_only"
+                ):
                     continue
 
                 ch, cw = crop.shape[:2]
@@ -13358,6 +18521,7 @@ class TrackingMixin:
 
         # Pass model_manager in config for SuperPoint+LightGlue fallback
         localizer_config = {**self.config, "_model_manager": self.model_manager}
+        self.map_widget.set_coordinate_mode(self.calibration.converter.mode)
 
         # Multi-source support: pass managers if available
         db_manager = getattr(self, "db_manager", None)
@@ -13479,6 +18643,7 @@ class TrackingMixin:
             config=self.config,
         )
         self.tracking_worker.frame_ready.connect(self.on_frame_ready)
+        self.tracking_worker.fix_info.connect(self.on_fix_info)
         self.tracking_worker.location_found.connect(self.on_location_found)
         self.tracking_worker.status_update.connect(self.control_panel.update_status)
         self.tracking_worker.fov_found.connect(self.map_widget.update_fov)
@@ -13488,6 +18653,8 @@ class TrackingMixin:
         self.tracking_worker.debug_view_ready.connect(self._on_debug_view_ready)
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
+            self.coordinates_broker.set_coordinate_mode(self.calibration.converter.mode)
+            self.tracking_worker.fix_info.connect(self.coordinates_broker.on_fix_info)
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
             self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
             self.tracking_worker.objects_gps_updated.connect(
@@ -13606,7 +18773,8 @@ class TrackingMixin:
                 if "fov_polygon" in result and result["fov_polygon"] is not None:
                     self.map_widget.update_fov(result["fov_polygon"])
 
-                msg = f"{status_prefix}: {lat:.6f}, {lon:.6f} | Впевненість: {conf:.2f} | Якір: {anchor} | Джерело: {source_id}"
+                coords = f"X={lon:.3f}, Y={lat:.3f}" if localizer.relative_mode else f"{lat:.6f}, {lon:.6f}"
+                msg = f"{status_prefix}: {coords} | Впевненість: {conf:.2f} | Якір: {anchor} | Джерело: {source_id}"
                 self.status_bar.showMessage(msg)
                 self.control_panel.update_status(f"Локалізовано ({conf:.2f})")
 
@@ -13618,7 +18786,9 @@ class TrackingMixin:
                     else "Координати знайдено!\n\n"
                 )
                 msg_text += (
-                    f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n"
+                    (f"X: {lon:.3f}\nY: {lat:.3f}\nУмовні одиниці, без GPS\n"
+                     if localizer.relative_mode else f"Широта: {lat:.6f}\nДовгота: {lon:.6f}\n")
+                    +
                     f"Впевненість: {conf:.2f}\nТочок збігу: {inliers}\n"
                     f"Якір: кадр {anchor}\n"
                     f"Джерело: {source_id}"
@@ -13640,7 +18810,7 @@ class TrackingMixin:
 
                 if msg_box.clickedButton() == copy_btn:
                     cb = QApplication.clipboard()
-                    cb.setText(f"{lat:.6f}, {lon:.6f}")
+                    cb.setText(f"X={lon:.3f}, Y={lat:.3f}" if localizer.relative_mode else f"{lat:.6f}, {lon:.6f}")
 
             else:
                 err = result.get("error", "Невідома помилка")
@@ -13658,6 +18828,11 @@ class TrackingMixin:
         if hasattr(self.video_widget, "display_frame"):
             self.video_widget.display_frame(opencv_to_qpixmap(frame_bgr))
 
+    @pyqtSlot(str, float)
+    def on_fix_info(self, fix_source: str, since_fix_s: float):
+        self._fix_source = fix_source
+        self._since_fix_s = since_fix_s
+
     @pyqtSlot(float, float, float, int)
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
         self.map_widget.update_marker(lat, lon)
@@ -13673,16 +18848,33 @@ class TrackingMixin:
                 "confidence": confidence,
                 "inliers": inliers,
                 "timestamp": str(np.datetime64("now")),
+                "fix_source": getattr(self, "_fix_source", "keyframe"),
             }
         )
+        if self.calibration.converter.mode == "LOCAL":
+            row = self._tracking_results[-1]
+            row.pop("lat", None)
+            row.pop("lon", None)
+            row.update(x=lon, y=lat, coordinate_kind="local_planar", coordinate_units="arbitrary")
         if len(self._tracking_results) == 1:
             self.control_panel.btn_export.setEnabled(True)
+        coords = (f"X={lon:.3f}, Y={lat:.3f}" if self.calibration.converter.mode == "LOCAL"
+                  else f"{lat:.6f}, {lon:.6f}")
+        source = getattr(self, "_fix_source", "keyframe")
+        if source == "dead_reckoning":
+            age = getattr(self, "_since_fix_s", -1.0)
+            age_txt = f"{age:.0f} с" if age is not None and age >= 0 else "?"
+            prefix = f"⚠ ОДОМЕТРІЯ без підтвердження мапою ({age_txt}) | "
+        else:
+            prefix = ""
         self.status_bar.showMessage(
-            f"Локалізація: {lat:.6f}, {lon:.6f} | Впевненість: {confidence:.2f} | Точок: {inliers}"
+            f"{prefix}Локалізація: {coords} | Впевненість: {confidence:.2f} | Точок: {inliers}"
         )
 
     @pyqtSlot(object)
     def on_objects_detected(self, objects: list):
+        if not get_cfg(self.config, "object_tracking.show_on_video", True):
+            return
         if hasattr(self.video_widget, "draw_tracked_objects"):
             self.video_widget.draw_tracked_objects(objects)
 
@@ -13711,7 +18903,15 @@ class TrackingMixin:
                     "timestamp": str(np.datetime64("now")),
                 }
             )
+            if self.calibration.converter.mode == "LOCAL":
+                row = self._object_tracking_results[-1]
+                row["x"], row["y"] = row.pop("lon"), row.pop("lat")
+                row.update(coordinate_kind="local_planar", coordinate_units="arbitrary")
 
+        # Export (_object_tracking_results) keeps every object; the flag only
+        # controls the map markers.
+        if not get_cfg(self.config, "object_tracking.show_on_map", True):
+            return
         if hasattr(self.map_widget, "update_object_markers"):
             self.map_widget.update_object_markers(points_to_show)
 
@@ -13756,6 +18956,21 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Status colour per LayerState value (see src/core/layer_status.py).
+_LAYER_STATE_COLORS = {
+    "ready": "#2e7d32",
+    "not_propagated": "#9e6a00",
+    "stale": "#9e6a00",
+    "no_calibration": "#e65100",
+    "no_db": "#c62828",
+    "db_not_loaded": "#c62828",
+    "disabled": "#999999",
+}
+
+
+def _short(text: str, limit: int = 18) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
 
 class ControlPanel(QWidget):
     """Mission control sidebar — emits signals, holds no business logic."""
@@ -13767,6 +18982,7 @@ class ControlPanel(QWidget):
     start_live_tracking_clicked = pyqtSignal()
     stop_tracking_clicked = pyqtSignal()
     calibrate_clicked = pyqtSignal()
+    relative_map_clicked = pyqtSignal()
     load_calibration_clicked = pyqtSignal()
     localize_image_clicked = pyqtSignal()
     generate_panorama_clicked = pyqtSignal()
@@ -13778,9 +18994,9 @@ class ControlPanel(QWidget):
     toggle_objects_clicked = pyqtSignal(bool)
     add_source_clicked = pyqtSignal()
     active_source_changed = pyqtSignal(str)
-    source_action = pyqtSignal(
-        str, str
-    )  # (source_id, action: "build_db"/"calibrate"/"toggle"/"remove")
+    # (source_id, action): "activate" / "calibrate" / "load_calibration" /
+    # "propagate" / "build_db" / "toggle" / "remove"
+    source_action = pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -13829,10 +19045,16 @@ class ControlPanel(QWidget):
             db_layout.addWidget(btn)
 
         # Calibration group
-        self.calib_group = QGroupBox("Калібрування GPS")
+        self.calib_group = QGroupBox("Калібрування / локальна карта")
         calib_layout = QVBoxLayout(self.calib_group)
 
         self.btn_calibrate = QPushButton("Виконати калібрування (Video → Map)")
+        self.btn_relative_map = QPushButton("Локальна карта без GPS (FPV)")
+        self.btn_relative_map.setToolTip(
+            "Побудувати карту 0–100 із руху між кадрами, без опорних точок. "
+            "Умовні одиниці, не метри. Використовується лише вибраний шар."
+        )
+        self.btn_relative_map.clicked.connect(self.relative_map_clicked)
         self.btn_load_calibrate = QPushButton("Завантажити калібрування (JSON)")
         self.btn_verify_propagation = QPushButton("🔍 Перевірити пропагацію на карті")
         self.btn_verify_propagation.setToolTip(
@@ -13847,6 +19069,7 @@ class ControlPanel(QWidget):
         self.btn_clear_map.clicked.connect(self.clear_map_clicked)
 
         calib_layout.addWidget(self.btn_calibrate)
+        calib_layout.addWidget(self.btn_relative_map)
         calib_layout.addWidget(self.btn_load_calibrate)
         calib_layout.addWidget(self.btn_verify_propagation)
         calib_layout.addWidget(self.btn_clear_map)
@@ -13917,8 +19140,8 @@ class ControlPanel(QWidget):
         status_layout.addWidget(self.lbl_status)
         status_layout.addWidget(self.progress_bar)
 
-        # Video Sources group (multi-source support)
-        self.sources_group = QGroupBox("Відеоджерела")
+        # Layers group: one layer = one video source with its own DB + calibration
+        self.sources_group = QGroupBox("Шари (відеоджерела)")
         sources_layout = QVBoxLayout(self.sources_group)
         sources_layout.setSpacing(6)
 
@@ -13959,32 +19182,40 @@ class ControlPanel(QWidget):
         self._lbl_source_video.setWordWrap(True)
         sources_layout.addWidget(self._lbl_source_video)
 
-        # ── Table (only for multi-source projects) ──
+        # ── Layer table (always shown while a project is open) ──
         self.sources_table = QTableWidget()
-        self.sources_table.setColumnCount(3)
-        self.sources_table.setHorizontalHeaderLabels(["Source ID", "Area", "Статус"])
-        self.sources_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        self.sources_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.sources_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
-        )
+        self.sources_table.setColumnCount(5)
+        self.sources_table.setHorizontalHeaderLabels(["Шар", "Зона", "Якорі", "Коорд.", "Статус"])
+        header = self.sources_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in (1, 2, 3, 4):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.sources_table.verticalHeader().setVisible(False)
         self.sources_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.sources_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.sources_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.sources_table.setMaximumHeight(120)
+        self.sources_table.setMinimumHeight(90)
+        self.sources_table.setMaximumHeight(200)
         self.sources_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.sources_table.customContextMenuRequested.connect(self._on_sources_context_menu)
         self.sources_table.itemSelectionChanged.connect(self._on_sources_selection_changed)
-        self.sources_table.setVisible(False)  # Прихований до відкриття мульти-проєкту
+        self.sources_table.itemDoubleClicked.connect(self._on_sources_double_clicked)
+        self.sources_table.setVisible(False)
         sources_layout.addWidget(self.sources_table)
 
+        self._lbl_sources_hint = QLabel(
+            "Клік — зробити шар активним · подвійний клік — калібрувати · ПКМ — дії"
+        )
+        self._lbl_sources_hint.setWordWrap(True)
+        self._lbl_sources_hint.setStyleSheet("font-size: 10px; color: #777; padding-left: 2px;")
+        self._lbl_sources_hint.setVisible(False)
+        sources_layout.addWidget(self._lbl_sources_hint)
+
         btn_row = QHBoxLayout()
-        self.btn_add_source = QPushButton("➕ Додати джерело")
-        self.btn_add_source.setToolTip("Додати нове відеоджерело до проєкту")
+        self.btn_add_source = QPushButton("➕ Додати шар")
+        self.btn_add_source.setToolTip(
+            "Додати новий шар (відео з іншої висоти/часу або нова зона) до проєкту"
+        )
         self.btn_add_source.clicked.connect(self.add_source_clicked)
         self.btn_add_source.setVisible(False)
         btn_row.addWidget(self.btn_add_source)
@@ -14018,6 +19249,9 @@ class ControlPanel(QWidget):
         self.btn_new_mission.setEnabled(not is_running)
         self.btn_load_db.setEnabled(not is_running)
         self.btn_rebuild_db.setEnabled(not is_running)
+        # The layer being built must stay the active one until the build ends.
+        self.sources_table.setEnabled(not is_running)
+        self.btn_add_source.setEnabled(not is_running)
 
     def set_tracking_enabled(self, enabled: bool):
         """
@@ -14034,12 +19268,15 @@ class ControlPanel(QWidget):
             self.btn_load_db,
             self.btn_rebuild_db,
             self.btn_calibrate,
+            self.btn_relative_map,
             self.btn_load_calibrate,
             self.btn_verify_propagation,
             self.btn_clear_map,
             self.btn_localize_image,
             self.btn_gen_pano,
             self.btn_export,
+            self.sources_table,
+            self.btn_add_source,
         ]:
             btn.setEnabled(enabled)
 
@@ -14051,15 +19288,20 @@ class ControlPanel(QWidget):
         num_anchors: int = None,
         num_propagated: int = None,
         db_size_mb: float = None,
+        layer_id: str | None = None,
     ):
-        """Оновити інформаційну панель проєкту."""
+        """Оновити інформаційну панель проєкту (дані — активного шару)."""
         if project_name is None:
             self.lbl_project_info.setText("Проєкт не завантажено")
             self.lbl_project_info.setStyleSheet("font-size: 11px; color: #222;")
             self.btn_rebuild_db.setEnabled(False)
+            self.sources_group.setVisible(False)
+            self.set_active_layer_context(None)
             return
 
         lines = [f"▶ <b>{project_name}</b>"]
+        if layer_id:
+            lines.append(f"🧭 Активний шар: <b>{layer_id}</b>")
         if video_path:
             lines.append(f"🎥 {Path(video_path).name}")
         if num_frames is not None:
@@ -14070,7 +19312,7 @@ class ControlPanel(QWidget):
         if num_anchors is not None:
             lines.append(f"⚓ Якорів: {num_anchors}")
         if num_propagated is not None and num_frames is not None:
-            lines.append(f"📍 GPS: {num_propagated}/{num_frames} кадрів")
+            lines.append(f"📍 З координатами: {num_propagated}/{num_frames} кадрів")
 
         self.lbl_project_info.setText("<br>".join(lines))
         self.lbl_project_info.setStyleSheet("font-size: 11px; color: #000;")
@@ -14078,85 +19320,85 @@ class ControlPanel(QWidget):
 
     # ── Video Sources Panel ──────────────────────────────────────────────────
 
-    def update_sources_list(
-        self,
-        sources: list[dict],
-        project_dir: str = "",
-        active_source_id: str | None = None,
-        propagated_source_ids: set[str] | None = None,
-    ):
-        """Оновлює таблицю відеоджерел.
+    def update_sources_list(self, rows: list[dict]):
+        """Перемальовує таблицю шарів.
 
         Args:
-            sources: Список dict з полями source_id, area_id, enabled,
-                     database_file, calibration_file.
-            project_dir: Шлях до кореня проєкту для перевірки файлів.
-            active_source_id: ID поточного активного джерела (для підсвічування рядка).
-            propagated_source_ids: Множина source_id які вже мають пропагацію
-                                    в HDF5 (навіть без окремого calibration.json).
+            rows: один dict на шар (готує DatabaseMixin._layer_rows): source_id,
+                area_id, anchors, gps, label, state, tooltip, enabled, db_loaded,
+                has_db_file, num_anchors, is_active, conflict.
         """
-        propagated_source_ids = propagated_source_ids or set()
-        is_multi = len(sources) > 1 or any(s.get("source_id") != "main" for s in sources)
-        # Group is always visible when a project is open
         self.sources_group.setVisible(True)
-        # Table is only shown for multi-source projects
-        self.sources_table.setVisible(is_multi)
+        self.sources_table.setVisible(True)
+        self._lbl_sources_hint.setVisible(True)
         self.btn_add_source.setVisible(True)
 
-        if not is_multi:
+        bold = QFont()
+        bold.setBold(True)
+        active_bg = QColor("#e8f5e9")
+
+        # Programmatic re-selection of the active row must not look like a click.
+        self.sources_table.blockSignals(True)
+        try:
+            self.sources_table.clearSelection()
+            self.sources_table.setRowCount(len(rows))
+            active_row = -1
+            for r, row in enumerate(rows):
+                sid = row.get("source_id", "?")
+                is_active = bool(row.get("is_active"))
+                texts = [
+                    ("▶ " if is_active else "") + sid,
+                    row.get("area_id", ""),
+                    row.get("anchors", "—"),
+                    row.get("gps", "—"),
+                    row.get("label", ""),
+                ]
+                for col, text in enumerate(texts):
+                    item = QTableWidgetItem(text)
+                    item.setToolTip(row.get("tooltip", ""))
+                    if col == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, sid)
+                        if row.get("conflict"):
+                            item.setForeground(QColor("#c62828"))
+                    if col == 4:
+                        # Row state for the context menu (sid lives in column 0).
+                        item.setData(
+                            Qt.ItemDataRole.UserRole,
+                            {
+                                "enabled": bool(row.get("enabled", True)),
+                                "db_loaded": bool(row.get("db_loaded")),
+                                "has_db_file": bool(row.get("has_db_file")),
+                                "num_anchors": int(row.get("num_anchors") or 0),
+                                "is_active": is_active,
+                            },
+                        )
+                        item.setForeground(
+                            QColor(_LAYER_STATE_COLORS.get(row.get("state", ""), "#333333"))
+                        )
+                    if is_active:
+                        item.setFont(bold)
+                        item.setBackground(active_bg)
+                    self.sources_table.setItem(r, col, item)
+                if is_active:
+                    active_row = r
+            if active_row >= 0:
+                self.sources_table.selectRow(active_row)
+        finally:
+            self.sources_table.blockSignals(False)
+
+    def set_active_layer_context(self, source_id: str | None, num_layers: int = 1):
+        """Підписує кнопки, що діють на активний шар, його назвою."""
+        if not source_id or num_layers <= 1:
+            self.calib_group.setTitle("Калібрування / локальна карта")
+            self.btn_calibrate.setText("Виконати калібрування (Video → Map)")
+            self.btn_load_calibrate.setText("Завантажити калібрування (JSON)")
+            self.btn_rebuild_db.setText("🔄 Перегенерувати базу")
             return
-
-        self.sources_table.setRowCount(len(sources))
-        for row, src in enumerate(sources):
-            sid = src.get("source_id", "?")
-            area = src.get("area_id", "?")
-            enabled = src.get("enabled", True)
-
-            # Determine status
-            status = "⏳ Очікує"
-            status_color = QColor("#888")
-            if project_dir:
-                db_path = Path(project_dir) / src.get("database_file", "")
-                cal_path = Path(project_dir) / src.get("calibration_file", "")
-                db_exists = db_path.exists()
-                # Calibration is considered done if:
-                # • a separate calibration.json exists, OR
-                # • propagation is already stored inside HDF5 (sid in propagated_source_ids)
-                is_calibrated = cal_path.exists() or sid in propagated_source_ids
-
-                if db_exists and is_calibrated:
-                    status = "✅ Готово"
-                    status_color = QColor("#2e7d32")
-                elif db_exists:
-                    status = "⚠ Без калібр."
-                    status_color = QColor("#e65100")
-                else:
-                    status = "❌ Без БД"
-                    status_color = QColor("#c62828")
-
-            if not enabled:
-                status = "🔇 Вимкнено"
-                status_color = QColor("#999")
-
-            item_sid = QTableWidgetItem(sid)
-            item_area = QTableWidgetItem(area)
-            item_status = QTableWidgetItem(status)
-            item_status.setForeground(status_color)
-
-            # Store source_id as UserRole data for context menu
-            item_sid.setData(Qt.ItemDataRole.UserRole, sid)
-
-            self.sources_table.setItem(row, 0, item_sid)
-            self.sources_table.setItem(row, 1, item_area)
-            self.sources_table.setItem(row, 2, item_status)
-
-            # Highlight active row
-            is_active = sid == active_source_id
-            bg = QColor("#e8f5e9") if is_active else QColor("transparent")
-            for col in range(3):
-                item = self.sources_table.item(row, col)
-                if item:
-                    item.setBackground(bg)
+        name = _short(source_id)
+        self.calib_group.setTitle(f"Калібрування / локальна карта — «{name}»")
+        self.btn_calibrate.setText(f"Калібрувати шар «{name}» (Video → Map)")
+        self.btn_load_calibrate.setText(f"Завантажити калібрування шару «{name}»")
+        self.btn_rebuild_db.setText(f"🔄 Перегенерувати базу шару «{name}»")
 
     def set_active_source(
         self,
@@ -14229,7 +19471,7 @@ class ControlPanel(QWidget):
 
     @pyqtSlot("QPoint")
     def _on_sources_context_menu(self, pos):
-        """Контекстне меню для таблиці джерел."""
+        """Контекстне меню шару: усі дії виконуються саме для цього шару."""
         row = self.sources_table.rowAt(pos.y())
         if row < 0:
             return
@@ -14240,28 +19482,49 @@ class ControlPanel(QWidget):
         source_id = item.data(Qt.ItemDataRole.UserRole)
         if not source_id:
             return
+        state_item = self.sources_table.item(row, 4)
+        state = (state_item.data(Qt.ItemDataRole.UserRole) if state_item else None) or {}
+        enabled = state.get("enabled", True)
+        db_loaded = state.get("db_loaded", False)
 
         menu = QMenu(self)
-        act_build = menu.addAction("🔨 Побудувати базу даних")
-        act_calib = menu.addAction("📐 Калібрувати")
+        title = menu.addAction(f"Шар «{source_id}»")
+        title.setEnabled(False)
         menu.addSeparator()
-        act_toggle = menu.addAction("🔇 Увімкнути/Вимкнути")
-        menu.addSeparator()
-        act_remove = menu.addAction("🗑 Видалити")
 
-        action = menu.exec(self.sources_table.viewport().mapToGlobal(pos))
-        if action == act_build:
-            self.source_action.emit(source_id, "build_db")
-        elif action == act_calib:
-            self.source_action.emit(source_id, "calibrate")
-        elif action == act_toggle:
-            self.source_action.emit(source_id, "toggle")
-        elif action == act_remove:
-            self.source_action.emit(source_id, "remove")
+        def add(text: str, action: str, allowed: bool = True):
+            act = menu.addAction(text)
+            act.setData(action)
+            act.setEnabled(bool(allowed))
+            return act
+
+        add("▶ Зробити активним", "activate", not state.get("is_active"))
+        add("📐 Калібрувати…", "calibrate", enabled and db_loaded)
+        add("📂 Завантажити калібрування (JSON)…", "load_calibration", enabled)
+        add(
+            "🧭 Запустити пропагацію GPS",
+            "propagate",
+            enabled and db_loaded and state.get("num_anchors", 0) > 0,
+        )
+        menu.addSeparator()
+        add(
+            "🔨 Перебудувати базу даних…"
+            if state.get("has_db_file")
+            else "🔨 Побудувати базу даних",
+            "build_db",
+            enabled,
+        )
+        menu.addSeparator()
+        add("🔇 Вимкнути" if enabled else "🔈 Увімкнути", "toggle")
+        add("🗑 Видалити з проєкту…", "remove")
+
+        chosen = menu.exec(self.sources_table.viewport().mapToGlobal(pos))
+        if chosen is not None and chosen.data():
+            self.source_action.emit(source_id, str(chosen.data()))
 
     @pyqtSlot()
     def _on_sources_selection_changed(self):
-        """Обробка зміни вибраного рядка таблиці."""
+        """Клік по рядку робить шар активним."""
         selected_items = self.sources_table.selectedItems()
         if not selected_items:
             return
@@ -14272,6 +19535,16 @@ class ControlPanel(QWidget):
             source_id = item.data(Qt.ItemDataRole.UserRole)
             if source_id:
                 self.active_source_changed.emit(source_id)
+
+    @pyqtSlot(QTableWidgetItem)
+    def _on_sources_double_clicked(self, clicked: QTableWidgetItem):
+        """Подвійний клік — відкрити калібрування саме цього шару."""
+        item = self.sources_table.item(clicked.row(), 0)
+        if item is None:
+            return
+        source_id = item.data(Qt.ItemDataRole.UserRole)
+        if source_id:
+            self.source_action.emit(source_id, "calibrate")
 
 
 # ================================================================================
@@ -14380,6 +19653,12 @@ class MapBridge(QObject):
 
     # JS -> Python: Map Click
     mapClickedSignal = pyqtSignal(float, float)
+    readySignal = pyqtSignal(str)
+
+    @pyqtSlot(str)
+    def ready(self, mode: str):
+        """Flush updates only after the page has connected its signal handlers."""
+        self.readySignal.emit(mode)
 
     @pyqtSlot(float, float)
     def mapClicked(self, lat: float, lon: float):
@@ -14401,6 +19680,10 @@ class MapWidget(QWebEngineView):
 
         self.bridge = MapBridge()
         self.bridge.mapClickedSignal.connect(self.mapClicked)  # Re-emit for convenience
+        self.bridge.readySignal.connect(self._on_map_ready)
+        self._coordinate_mode = "GEOGRAPHIC"
+        self._map_ready = False
+        self._pending_updates = []
 
         self._channel = QWebChannel()
         self._channel.registerObject("mapBridge", self.bridge)
@@ -14411,9 +19694,13 @@ class MapWidget(QWebEngineView):
     # ── Map loading ──────────────────────────────────────────────────────────
 
     def _load_map(self):
-        if _MAP_PATH.exists():
-            self.setUrl(QUrl.fromLocalFile(str(_MAP_PATH)))
-            logger.info(f"Map loaded: {_MAP_PATH}")
+        map_path = (
+            _MAP_PATH.with_name("local_map.html") if self._coordinate_mode == "LOCAL" else _MAP_PATH
+        )
+        self._map_ready = False
+        if map_path.exists():
+            self.setUrl(QUrl.fromLocalFile(str(map_path)))
+            logger.info(f"Map loaded: {map_path}")
         else:
             logger.error(f"Map template not found: {_MAP_PATH}")
             self.setHtml(
@@ -14428,17 +19715,38 @@ class MapWidget(QWebEngineView):
 
     # ── Public API ───────────────────────────────────────────────────────────
 
+    def set_coordinate_mode(self, mode: str, *, reset: bool = False):
+        mode = "LOCAL" if mode == "LOCAL" else "GEOGRAPHIC"
+        if mode != self._coordinate_mode or reset:
+            self._coordinate_mode = mode
+            self._pending_updates.clear()
+            self._load_map()
+
+    def _emit_update(self, signal: str, *args):
+        if self._map_ready:
+            getattr(self.bridge, signal).emit(*args)
+        else:
+            self._pending_updates.append((signal, args))
+
+    def _on_map_ready(self, mode: str):
+        if mode != self._coordinate_mode:
+            return
+        self._map_ready = True
+        pending, self._pending_updates = self._pending_updates, []
+        for signal, args in pending:
+            getattr(self.bridge, signal).emit(*args)
+
     @pyqtSlot(float, float)
     def update_marker(self, lat: float, lon: float):
-        self.bridge.updateMarkerSignal.emit(lat, lon)
+        self._emit_update("updateMarkerSignal", lat, lon)
 
     @pyqtSlot(float, float)
     def add_trajectory_point(self, lat: float, lon: float):
-        self.bridge.addTrajectorySignal.emit(lat, lon)
+        self._emit_update("addTrajectorySignal", lat, lon)
 
     @pyqtSlot()
     def clear_trajectory(self):
-        self.bridge.clearTrajectorySignal.emit()
+        self._emit_update("clearTrajectorySignal")
 
     @pyqtSlot(list)
     def update_fov(self, fov: list):
@@ -14450,7 +19758,8 @@ class MapWidget(QWebEngineView):
             return
 
         try:
-            self.bridge.updateFOVSignal.emit(
+            self._emit_update(
+                "updateFOVSignal",
                 float(fov[0][0]),
                 float(fov[0][1]),
                 float(fov[1][0]),
@@ -14476,7 +19785,8 @@ class MapWidget(QWebEngineView):
         lat_bl: float,
         lon_bl: float,
     ):
-        self.bridge.setPanoramaSignal.emit(
+        self._emit_update(
+            "setPanoramaSignal",
             data_url,
             lat_tl,
             lon_tl,
@@ -14493,22 +19803,22 @@ class MapWidget(QWebEngineView):
         """
         Accepts points as list of dicts [{'lat': float, 'lon': float, 'label': str}]
         """
-        self.bridge.showVerificationMarkersSignal.emit(json.dumps(points))
+        self._emit_update("showVerificationMarkersSignal", json.dumps(points))
 
     @pyqtSlot()
     def clear_verification_markers(self):
-        self.bridge.clearVerificationMarkersSignal.emit()
+        self._emit_update("clearVerificationMarkersSignal")
 
     @pyqtSlot(list)
     def update_object_markers(self, points: list):
         """
         Accepts points as list of dicts [{'lat': float, 'lon': float, 'label': str, 'class_name': str}]
         """
-        self.bridge.updateObjectMarkersSignal.emit(json.dumps(points))
+        self._emit_update("updateObjectMarkersSignal", json.dumps(points))
 
     @pyqtSlot(bool)
     def set_objects_visible(self, visible: bool):
-        self.bridge.toggleObjectMarkersSignal.emit(visible)
+        self._emit_update("toggleObjectMarkersSignal", visible)
 
 
 # ================================================================================
@@ -14782,6 +20092,140 @@ class FrameDatabase(Protocol):
 
 
 # ================================================================================
+# File: src\localization\altitude_hint.py
+# ================================================================================
+"""Altitude hint for multi-layer search (``localization.altitude_hint``, default off).
+
+The layers of an area are flown at different altitudes, so each has its own
+ground pixel size (GSD). Knowing roughly how high the drone is gives the scale
+at which the query matches each layer: r = query GSD / layer GSD (ScaleManager's
+convention: r > 1 = flying higher than the layer). The layers nearest in scale
+are then tried first instead of scanning the whole scale pyramid.
+
+Where the query GSD comes from, in this order:
+
+1. telemetry (``flight_data``: height above ground, else above take-off), times
+   the camera's footprint factor (ground width per metre of altitude = sensor
+   width / focal length), divided by the normalized frame width; the factor is
+   refined from visual fixes, so a wrong camera setting corrects itself;
+2. without telemetry: the last fix's own scale (scale prior x that layer's GSD),
+   which still points to the other layers when the altitude drifts toward them;
+3. neither: no hint, and the search is exactly the vision-only one.
+
+A rough altitude is enough: layers are hundreds of metres apart, and a wrong
+hint costs only the passes it adds before the usual scan.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from config import get_cfg
+
+# DroneSimUE / FlightSimulator camera (8.8 mm sensor, 13.2 mm lens, HFOV 36.87 deg).
+DEFAULT_FOOTPRINT_FACTOR = 8.8 / 13.2
+# ScaleManager's clip range of the query/layer ratio.
+MIN_RATIO = 0.3
+MAX_RATIO = 3.5
+# A visual fix may move the footprint factor at most this far from the camera model
+# (a mismatch beyond it means wrong map units or a bad fix, not a camera error).
+FACTOR_TRUST = 3.0
+
+
+def _positive(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def footprint_factor_from_settings(settings: Any) -> float:
+    """Sensor width / focal length of the project camera, else the default camera's."""
+    focal = _positive(getattr(settings, "focal_length_mm", None))
+    sensor = _positive(getattr(settings, "sensor_width_mm", None))
+    if focal is None or sensor is None:
+        return DEFAULT_FOOTPRINT_FACTOR
+    return sensor / focal
+
+
+@dataclass
+class AltitudeHint:
+    enabled: bool = False
+    max_layers: int = 2
+    ema: float = 0.3
+    footprint_factor: float = DEFAULT_FOOTPRINT_FACTOR
+    # The camera model the learned factor may not leave by more than FACTOR_TRUST.
+    model_factor: float = field(default=DEFAULT_FOOTPRINT_FACTOR)
+
+    @classmethod
+    def from_config(cls, config: Any, project_settings: Any = None) -> AltitudeHint:
+        factor = footprint_factor_from_settings(project_settings)
+        return cls(
+            enabled=bool(get_cfg(config, "localization.altitude_hint.enabled", False)),
+            max_layers=max(1, int(get_cfg(config, "localization.altitude_hint.max_layers", 2))),
+            ema=float(get_cfg(config, "localization.altitude_hint.telemetry_scale_ema", 0.3)),
+            footprint_factor=factor,
+            model_factor=factor,
+        )
+
+    def query_gsd(
+        self, altitude_m: float | None, norm_width_px: float | None, visual_gsd: float | None
+    ) -> tuple[float | None, str]:
+        """(query ground pixel size, "telemetry" | "visual" | "none" | "off")."""
+        if not self.enabled:
+            return None, "off"
+        altitude = _positive(altitude_m)
+        width = _positive(norm_width_px)
+        if altitude is not None and width is not None:
+            return altitude * self.footprint_factor / width, "telemetry"
+        visual = _positive(visual_gsd)
+        if visual is not None:
+            return visual, "visual"
+        return None, "none"
+
+    def layer_scales(
+        self, query_gsd: float | None, layer_gsds: Mapping[Any, float | None]
+    ) -> list[tuple[Any, float]]:
+        """(layer, query/layer ratio) of the layers nearest in scale, nearest first.
+
+        Layers without a known GSD, or whose ratio is outside the range a frame can
+        be normalized to, get no hint.
+        """
+        query = _positive(query_gsd)
+        if not self.enabled or query is None:
+            return []
+        ratios = []
+        for layer, gsd in layer_gsds.items():
+            known = _positive(gsd)
+            if known is None:
+                continue
+            ratio = query / known
+            if MIN_RATIO <= ratio <= MAX_RATIO:
+                ratios.append((layer, ratio))
+        ratios.sort(key=lambda item: (abs(math.log(item[1])), str(item[0])))
+        return ratios[: self.max_layers]
+
+    def learn(
+        self, altitude_m: float | None, norm_width_px: float | None, visual_gsd: float | None
+    ) -> bool:
+        """Refines the footprint factor from a fix made while telemetry was present."""
+        altitude = _positive(altitude_m)
+        width = _positive(norm_width_px)
+        visual = _positive(visual_gsd)
+        if not self.enabled or altitude is None or width is None or visual is None:
+            return False
+        measured = visual * width / altitude
+        if not self.model_factor / FACTOR_TRUST <= measured <= self.model_factor * FACTOR_TRUST:
+            return False
+        self.footprint_factor = (1.0 - self.ema) * self.footprint_factor + self.ema * measured
+        return True
+
+
+# ================================================================================
 # File: src\localization\candidate_retriever.py
 # ================================================================================
 """Candidate retrieval + patchify expansion for localization (IMPROVEMENT_PLAN 1.1).
@@ -14789,6 +20233,11 @@ class FrameDatabase(Protocol):
 Extracted from Localizer as a stateless collaborator: single- or multi-database
 top-k retrieval, plus optional patchify merge for the chosen rotation. Logic and
 log messages are unchanged.
+
+Patchify with several layers: frame ids are per database, so the patch hits merged
+into a candidate list must come from the same layer as the list. ``patchify_factory``
+builds one patch index per layer on the layer's first use and again after the layer's
+database object changes (reload).
 """
 
 from __future__ import annotations
@@ -14803,26 +20252,96 @@ logger = get_logger(__name__)
 class CandidateRetriever:
     """Top-k retrieval (single/multi DB) with optional patch-descriptor merge."""
 
-    def __init__(self, db_manager, retriever, patchify_retrieval, config) -> None:
+    def __init__(
+        self, db_manager, retriever, patchify_retrieval, config, patchify_factory=None
+    ) -> None:
         self.db_manager = db_manager
         self.retriever = retriever
+        # Single-database mode: the index of that database.
         self.patchify_retrieval = patchify_retrieval
+        # Multi-database mode: database -> PatchifyRetrieval | None, called once per layer.
+        self.patchify_factory = patchify_factory
+        self._layer_patchify: dict[str, tuple[object, object]] = {}
+        self.last_by_source: dict | None = None
         self.config = config
 
     def retrieve(self, global_desc, top_k: int):
-        """Retrieve candidates: (source_id | None, [(frame_id, score), ...])."""
+        """Retrieve candidates: (source_id | None, [(frame_id, score), ...]).
+
+        Multi-layer: ``last_by_source`` then holds every layer's candidates of this
+        call (None in single-database mode).
+        """
         if self.db_manager is not None:
-            return self.db_manager.get_best_match(global_desc, top_k=top_k)
+            result = self.db_manager.get_best_match(global_desc, top_k=top_k)
+            self.last_by_source = getattr(self.db_manager, "last_matches_by_source", None)
+            return result
+        self.last_by_source = None
         return None, self.retriever.find_similar_frames(global_desc, top_k=top_k)
 
-    def expand(self, rotated_frame, base_candidates, top_k: int):
-        """Patchify-expand candidates for the chosen rotation (no-op if disabled)."""
-        if self.patchify_retrieval is None:
+    def patchify_for(self, source_id=None):
+        """Patch index whose frame ids belong to the candidates of ``source_id``."""
+        if self.db_manager is None or self.patchify_factory is None:
+            return self.patchify_retrieval
+        if source_id is None:
+            return None
+        database = self.db_manager.get_database(source_id)
+        if database is None:
+            return None
+        cached = self._layer_patchify.get(source_id)
+        if cached is None or cached[0] is not database:
+            cached = (database, self.patchify_factory(database))
+            self._layer_patchify[source_id] = cached
+        return cached[1]
+
+    def patch_candidates(self, rotated_frame, top_k: int, source_id=None, desc_cache=None):
+        """Patchify hits of one layer, ``[(frame_id, score)]`` (joint candidate ranking).
+
+        ``desc_cache`` (one dict per localized frame) keeps the query's crop
+        descriptors per prepared view, so layers that share the view's angle and
+        scale run the 14 crop forward passes once.
+        """
+        patchify = self.patchify_for(source_id)
+        if patchify is None or rotated_frame is None:
+            return []
+        try:
+            with Telemetry.profile("patchify_retrieval"):
+                descs = self._patch_descriptors(patchify, rotated_frame, desc_cache)
+                return list(patchify.search(descs, top_k=top_k))
+        except Exception as e:
+            logger.warning(f"Patchify retrieval failed for layer '{source_id}': {e}")
+            return []
+
+    @staticmethod
+    def _patch_descriptors(patchify, rotated_frame, desc_cache=None):
+        """Crop descriptors of a prepared view, memoised in ``desc_cache`` by view
+        object and patch layout (the 14 crop forward passes run once per view)."""
+        key = (
+            id(rotated_frame),
+            tuple(getattr(patchify, "grids", ()) or ()),
+            getattr(patchify, "descriptor_dim", None),
+        )
+        entry = desc_cache.get(key) if desc_cache is not None else None
+        if entry is not None and entry[0] is rotated_frame:
+            return entry[1]
+        descs = patchify.compute_patch_descriptors(rotated_frame)
+        if desc_cache is not None:
+            # The entry holds the view, so its id cannot be reused by another array
+            # while the cache lives (localize_frame shares it with the in-frame retry).
+            desc_cache[key] = (rotated_frame, descs)
+        return descs
+
+    def expand(self, rotated_frame, base_candidates, top_k: int, source_id=None, desc_cache=None):
+        """Patchify-expand candidates for the chosen rotation (no-op if disabled).
+
+        ``desc_cache``: see ``patch_candidates`` (entries hold the view object).
+        """
+        patchify = self.patchify_for(source_id)
+        if patchify is None:
             return base_candidates
         try:
             with Telemetry.profile("patchify_retrieval"):
-                patch_descs = self.patchify_retrieval.compute_patch_descriptors(rotated_frame)
-                patch_candidates = self.patchify_retrieval.search(patch_descs, top_k=top_k)
+                patch_descs = self._patch_descriptors(patchify, rotated_frame, desc_cache)
+                patch_candidates = patchify.search(patch_descs, top_k=top_k)
             if patch_candidates:
                 merged = self.merge(base_candidates, patch_candidates, max_results=top_k * 2)
                 logger.debug(
@@ -15219,6 +20738,9 @@ class GeometricVerifier:
         min_inlier_ratio: float = 0.2,
         max_center_extrapolation: float = 0.1,
         min_reference_eigenvalue: float = 1e-4,
+        ransac_max_iters: int = 2000,
+        ransac_confidence: float = 0.99,
+        prefilter_fallback_keep: int = 0,
     ) -> None:
         self.matcher = matcher
         self.min_matches = min_matches
@@ -15233,6 +20755,18 @@ class GeometricVerifier:
         self.min_inlier_ratio = float(min_inlier_ratio)
         self.max_center_extrapolation = float(max_center_extrapolation)
         self.min_reference_eigenvalue = float(min_reference_eigenvalue)
+        self.ransac_max_iters = int(ransac_max_iters)
+        self.ransac_confidence = float(ransac_confidence)
+        # When no candidate has a single MNN pair, LightGlue only the first N by
+        # global score instead of the whole list. 0 = whole list (old behaviour).
+        self.prefilter_fallback_keep = int(prefilter_fallback_keep)
+        # Diagnostics only (replay sets a list per frame): one record per verify()
+        # call with every candidate's prefilter pairs and LightGlue / RANSAC
+        # outcome. None = off; nothing below changes what verify() returns.
+        self.trace: list | None = None
+        # MNN pairs of the last mnn_counts() call while tracing:
+        # {candidate_id: [pairs at Lowe ratio 0.75 (used), 0.85, 0.95]}.
+        self._last_mnn: dict | None = None
 
     def _has_spatial_support(
         self,
@@ -15305,7 +20839,21 @@ class GeometricVerifier:
         candidates: list,
         database: Any,
         ref_cache: dict | None = None,
+        tag: str | None = None,
     ) -> VerificationResult | None:
+        """``tag`` names the caller in ``trace`` records (temporal_prior, retrieval, refine)."""
+        rec = None
+        if self.trace is not None:
+            rec = {
+                "tag": tag,
+                "input": [[int(c), round(float(sc), 4)] for c, sc in candidates],
+                "prefilter": None,
+                "tried": [],
+                "winner": None,
+                "early_stop": False,
+            }
+            self.trace.append(rec)
+            self._last_mnn = None
         best_inliers = 0
         best_candidate_id = -1
         best_H_query_to_ref = None
@@ -15321,15 +20869,31 @@ class GeometricVerifier:
         ref_cache = {} if ref_cache is None else ref_cache
         if self.prefilter_enabled and len(candidates) > self.prefilter_keep:
             candidates = self._prefilter(query_features, candidates, database, ref_cache)
+            if rec is not None:
+                mnn = self._last_mnn or {}
+                rec["prefilter"] = {
+                    "pairs": {str(c): v for c, v in mnn.items()},
+                    "all_zero": bool(mnn) and all(v[0] == 0 for v in mnn.values()),
+                    "kept": [int(c) for c, _ in candidates],
+                }
 
         for candidate_id, score in candidates:
             logger.debug(f"  → Trying candidate {candidate_id} (global_score={score:.3f})")
             ref_features = ref_cache.get(candidate_id)
             if ref_features is None:
-                ref_features = database.get_local_features(candidate_id)
+                with Telemetry.profile("ref_read"):
+                    ref_features = database.get_local_features(candidate_id)
 
             with Telemetry.profile("match"):
                 mkpts_q, mkpts_r = self.matcher.match(query_features, ref_features)
+            tried = None
+            if rec is not None:
+                tried = {
+                    "cid": int(candidate_id),
+                    "matches": int(len(mkpts_q)),
+                    "result": "few_matches",
+                }
+                rec["tried"].append(tried)
 
             if len(mkpts_q) >= self.min_matches:
                 with Telemetry.profile("ransac_homography"):
@@ -15337,11 +20901,15 @@ class GeometricVerifier:
                         mkpts_q,
                         mkpts_r,
                         ransac_threshold=self.ransac_thresh,
+                        max_iters=self.ransac_max_iters,
+                        confidence=self.ransac_confidence,
                         backend=self.homography_backend,
                         use_mad_ransac=self.use_mad_ransac,
                         mad_k_factor=self.mad_k_factor,
                     )
 
+                if tried is not None:
+                    tried["result"] = "no_homography"
                 if H_eval is not None:
                     inlier_mask = mask.ravel().astype(bool)
                     inliers = int(np.sum(inlier_mask))
@@ -15354,22 +20922,32 @@ class GeometricVerifier:
                     )
 
                     inlier_ratio = inliers / max(1, len(mkpts_q))
+                    if tried is not None:
+                        tried["inliers"] = inliers
+                        tried["rmse"] = round(rmse, 3) if np.isfinite(rmse) else None
+                        tried["result"] = "rmse"
                     if not np.isfinite(rmse) or rmse > self.max_rmse_px:
                         logger.debug(
                             f"Rejecting candidate {candidate_id}: RMSE {rmse:.2f}px > "
                             f"{self.max_rmse_px:.2f}px"
                         )
                         continue
+                    if tried is not None:
+                        tried["result"] = "inlier_ratio"
                     if inlier_ratio < self.min_inlier_ratio:
                         logger.debug(
                             f"Rejecting candidate {candidate_id}: inlier ratio "
                             f"{inlier_ratio:.3f} < {self.min_inlier_ratio:.3f}"
                         )
                         continue
+                    if tried is not None:
+                        tried["result"] = "spatial_support"
                     if not self._has_spatial_support(
                         query_features, pts_q_in, pts_r_in, H_eval
                     ):
                         continue
+                    if tried is not None:
+                        tried["result"] = "ok" if inliers >= self.min_matches else "few_inliers"
 
                     if inliers > best_inliers and inliers >= self.min_matches:
                         best_inliers = inliers
@@ -15387,7 +20965,12 @@ class GeometricVerifier:
                 logger.debug(
                     f"Early stop triggered with {best_inliers} inliers on candidate {best_candidate_id}"
                 )
+                if rec is not None:
+                    rec["early_stop"] = True
                 break
+
+        if rec is not None and best_candidate_id != -1 and best_inliers >= self.min_matches:
+            rec["winner"] = [int(best_candidate_id), int(best_inliers)]
 
         if (
             best_inliers < self.min_matches
@@ -15448,9 +21031,16 @@ class GeometricVerifier:
         ratio = 0.75
         gpu_failed = False
 
+        tracing = self.trace is not None
+        traced: dict = {}
+        # Pairs at looser Lowe ratios, recorded only while tracing (diagnostics).
+        extra_ratios = (0.85, 0.95)
+        last_extra = [0, 0]
+
         def _mnn_count(r: np.ndarray) -> int:
-            nonlocal use_torch, gpu_failed
+            nonlocal use_torch, gpu_failed, last_extra
             r32 = np.ascontiguousarray(r, dtype=np.float32)
+            last_extra = [0, 0]
             if r32.shape[0] < 2:
                 return 0
             if use_torch:
@@ -15464,6 +21054,11 @@ class GeometricVerifier:
                     nn12 = sim.argmax(dim=1)
                     nn21 = sim.argmax(dim=0)
                     idx = torch.arange(sim.shape[0], device=sim.device)
+                    if tracing:
+                        mutual_t = nn21[nn12] == idx
+                        last_extra = [
+                            int((mutual_t & (d1 < t * d2)).sum().item()) for t in extra_ratios
+                        ]
                     return int(((nn21[nn12] == idx) & ratio_ok).sum().item())
                 except Exception as e:  # noqa: BLE001 — OOM тощо → numpy
                     # Silent fallback to numpy is a performance drop that
@@ -15484,6 +21079,8 @@ class GeometricVerifier:
             nn12 = sim.argmax(axis=1)
             nn21 = sim.argmax(axis=0)
             mutual = nn21[nn12] == np.arange(sim.shape[0])
+            if tracing:
+                last_extra = [int(np.sum(mutual & (d1 < t * d2))) for t in extra_ratios]
             return int(np.sum(mutual & ratio_ok))
 
         scored: list[tuple[int, int, float]] = []
@@ -15505,7 +21102,12 @@ class GeometricVerifier:
                 if r is None or r.ndim != 2 or len(r) == 0 or r.shape[1] != q.shape[1]:
                     scored.append((0, candidate_id, score))
                     continue
-                scored.append((_mnn_count(r), candidate_id, score))
+                pairs = _mnn_count(r)
+                scored.append((pairs, candidate_id, score))
+                if tracing:
+                    traced[int(candidate_id)] = [pairs, *last_extra]
+        if tracing:
+            self._last_mnn = traced
         return scored
 
     def _prefilter(
@@ -15521,6 +21123,16 @@ class GeometricVerifier:
         if scored is None:
             return candidates
         if all(s[0] == 0 for s in scored):
+            if self.prefilter_fallback_keep > 0:
+                # Measured 2026-10-10 on 6 routes: this case ran 63 % of all
+                # LightGlue calls; 3 of its 163 calls found a frame, at global
+                # positions 0, 3 and 0. MNN pairs at looser Lowe ratios did not
+                # single them out, the retrieval order did.
+                logger.debug(
+                    f"Prefilter: no MNN pairs on any candidate — keeping the first "
+                    f"{self.prefilter_fallback_keep} by global score"
+                )
+                return candidates[: self.prefilter_fallback_keep]
             logger.debug("Prefilter: no MNN pairs on any candidate — keeping full list")
             return candidates
         scored.sort(key=lambda t: (-t[0], -t[2]))
@@ -15530,6 +21142,48 @@ class GeometricVerifier:
             f"(mnn top: {[(c, m) for m, c, _ in scored[: self.prefilter_keep]]})"
         )
         return kept
+
+
+# ================================================================================
+# File: src\localization\keypoint_budget.py
+# ================================================================================
+"""Keypoint budget for query features (strongest-first slice).
+
+FeatureExtractor returns query keypoints ordered by detector score, strongest
+first (``FeatureExtractor._by_score``), so the first ``limit`` entries are the
+set ALIKED itself keeps with ``max_keypoints = limit`` (its threshold mode
+keeps the top ``n_limit`` by score). LightGlue and the MNN probe cost grow with
+the keypoint count; a slice lets one extraction serve two budgets.
+"""
+
+from __future__ import annotations
+
+# Per-keypoint arrays in a feature dict; everything else (image_size, ...) is
+# per-image and must not be sliced.
+PER_KEYPOINT_KEYS = ("keypoints", "descriptors", "coords_2d", "scores", "keypoint_scores")
+
+
+def top_keypoints(features: dict | None, limit: int) -> dict | None:
+    """The first ``limit`` keypoints of a score-ordered feature dict.
+
+    ``limit <= 0`` or a set already within the limit returns ``features``
+    itself; otherwise a shallow copy with the per-keypoint arrays sliced (the
+    input, which may sit in a per-call cache, is not modified).
+    """
+    if not features or limit <= 0:
+        return features
+    keypoints = features.get("keypoints")
+    if keypoints is None:
+        return features
+    n = len(keypoints)
+    if n <= limit:
+        return features
+    out = dict(features)
+    for key in PER_KEYPOINT_KEYS:
+        value = out.get(key)
+        if value is not None and len(value) == n:
+            out[key] = value[:limit]
+    return out
 
 
 # ================================================================================
@@ -15544,6 +21198,7 @@ Geographic comparisons use geodesic metres, never two sources' raw map units.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -15553,7 +21208,8 @@ from pyproj import Geod
 from config import get_cfg
 from src.geometry.calibration_provenance import CalibrationOrigin, GeoreferenceStatus
 from src.geometry.transformations import GeometryTransforms
-from src.localization.rotation_selector import RotationSelector
+from src.localization.query_rotation import norm_deg, rotation_matrix
+from src.localization.rotation_selector import RotationSelector, extract_globals
 from src.localization.scale_manager import crop_to_affine
 
 _GEOD = Geod(ellps="WGS84")
@@ -15561,6 +21217,16 @@ _GEOD = Geod(ellps="WGS84")
 
 def distance_m(a, b):
     return abs(float(_GEOD.inv(a[1], a[0], b[1], b[0])[2]))
+
+
+def center_scale(H, dimensions):
+    """Local query->reference scale sqrt|det J| and J's singular values at the image centre."""
+    w, h = dimensions
+    x, y = w / 2, h / 2
+    den = H[2, 0] * x + H[2, 1] * y + H[2, 2]
+    projected = (H @ [x, y, 1])[:2] / den
+    J = (H[:2, :2] - np.outer(projected, H[2, :2])) / den
+    return float(np.sqrt(abs(np.linalg.det(J)))), np.linalg.svd(J, compute_uv=False)
 
 
 @dataclass
@@ -15571,6 +21237,7 @@ class LayerObservation:
     prepared: tuple
     homography: np.ndarray
     dimensions: tuple[int, int]
+    scale_ratio: float | None = None
 
 
 @dataclass
@@ -15578,7 +21245,7 @@ class ScaleBelief:
     log_ratio: float
     sigma: float
     timestamp: float
-    angle: int
+    angle: float  # k*90 in quarter mode, any value in continuous mode
 
     def candidates(self, now, drift):
         sigma = min(0.7, self.sigma + drift * max(0.0, now - self.timestamp))
@@ -15588,14 +21255,31 @@ class ScaleBelief:
 class LayerHandoff:
     """Selection is provisional until commit() follows downstream acceptance."""
 
+    # Shortest baseline for a velocity estimate; shorter ones amplify fix noise.
+    MIN_VELOCITY_BASELINE_S = 0.5
+
     def __init__(
-        self, confirmations=2, margin=0.15, agreement_m=30.0, lost_after_s=3.0, max_speed_mps=120.0
+        self,
+        confirmations=2,
+        margin=0.15,
+        agreement_m=30.0,
+        lost_after_s=3.0,
+        max_speed_mps=120.0,
+        motion_gate=False,
+        motion_gate_growth_mps=30.0,
+        motion_gate_max_gap_s=10.0,
     ):
         self.confirmations = confirmations
         self.margin = margin
         self.agreement_m = agreement_m
         self.lost_after_s = lost_after_s
         self.max_speed_mps = max_speed_mps
+        # Motion gate: after a gap (LOST, or the active layer did not verify),
+        # accept a single observation that lies where the confirmed track
+        # predicts the drone to be, instead of waiting for fresh confirmations.
+        self.motion_gate = bool(motion_gate)
+        self.motion_gate_growth_mps = float(motion_gate_growth_mps)
+        self.motion_gate_max_gap_s = float(motion_gate_max_gap_s)
         self.reset()
 
     def reset(self):
@@ -15603,6 +21287,7 @@ class LayerHandoff:
         self.state = "SEARCHING"
         self.last_confirmed = None
         self.last_confirmed_gps = None
+        self.track = deque(maxlen=8)
         self.pending = None
         self.pending_count = 0
         self.pending_time = None
@@ -15644,6 +21329,15 @@ class LayerHandoff:
                 self.pending_count = 0
                 self.reason = "layer_map_disagreement"
                 return current
+        # A gap in the active layer's fixes (LOST, or it did not verify this
+        # frame) is bridged by one observation that agrees with the track's
+        # motion. Bootstrap and discretionary switches still need confirmations.
+        if self.motion_gate and (was_lost or current is None) and self.motion_consistent(best, now):
+            self.pending = None
+            self.pending_count = 0
+            self.state = "TRACKING"
+            self.reason = "motion_gated"
+            return best
         # Bootstrap, reacquisition and switching require fresh observations.
         if (
             self.pending != best.source_id
@@ -15668,10 +21362,47 @@ class LayerHandoff:
         self.reason = "awaiting_confirmation"
         return None if was_lost else current
 
+    def predict(self, now):
+        """Predicted GPS and acceptance radius (m) from the confirmed track.
+
+        Constant velocity over the longest recent baseline of confirmed fixes.
+        Returns None (no gate) without such a velocity estimate or when the gap
+        exceeds the gate window: a radius bounded only by the platform's
+        maximum speed is too loose to stand in for fresh confirmations.
+        """
+        if self.last_confirmed is None or self.last_confirmed_gps is None:
+            return None
+        gap = now - self.last_confirmed
+        if not 0.0 <= gap <= self.motion_gate_max_gap_s:
+            return None
+        lat, lon = self.last_confirmed_gps
+        for t0, (lat0, lon0) in self.track:
+            baseline = self.last_confirmed - t0
+            if baseline > self.motion_gate_max_gap_s:
+                continue
+            if baseline < self.MIN_VELOCITY_BASELINE_S:
+                break
+            _, back_azimuth, dist = _GEOD.inv(lon0, lat0, lon, lat)
+            speed = abs(float(dist)) / baseline
+            if speed > self.max_speed_mps:
+                break
+            # Heading at the latest fix (reverse of the back azimuth).
+            plon, plat, _ = _GEOD.fwd(lon, lat, back_azimuth + 180.0, speed * gap)
+            return (float(plat), float(plon)), self.agreement_m + self.motion_gate_growth_mps * gap
+        return None
+
+    def motion_consistent(self, observation, now):
+        prediction = self.predict(now)
+        if prediction is None:
+            return False
+        center, radius = prediction
+        return distance_m(observation.gps, center) <= radius
+
     def commit(self, observation, now):
         self.active = observation.source_id
         self.last_confirmed = now
         self.last_confirmed_gps = observation.gps
+        self.track.append((now, tuple(observation.gps)))
         if self.pending == observation.source_id:
             self.pending = None
             self.pending_count = 0
@@ -15688,6 +21419,9 @@ class LayerSearch:
             self.cfg("agreement_m", 30.0),
             self.cfg("lost_after_s", 3.0),
             get_cfg(config, "tracking.max_speed_mps", 120.0),
+            motion_gate=self.cfg("motion_gate", False),
+            motion_gate_growth_mps=self.cfg("motion_gate_growth_mps", 30.0),
+            motion_gate_max_gap_s=self.cfg("motion_gate_max_gap_s", 10.0),
         )
         self.last_diagnostics = {}
         self._source_cursor = 0
@@ -15702,12 +21436,13 @@ class LayerSearch:
         self._source_cursor = 0
         self._probe_cursor = 0
 
-    def _select_sources(self, manager):
+    def _select_sources(self, manager, hinted=()):
         """Prefer the active/geographically plausible layers, probe the rest fairly.
 
         The last accepted GPS is only a routing hint. A rotating slot always
         reaches other loaded sources, including ones excluded by a stale active
-        area or incomplete source coverage metadata.
+        area or incomplete source coverage metadata. ``hinted``: the layers nearest
+        the altitude (localization.altitude_hint), preferred right after the active one.
         """
         all_ids = getattr(manager, "all_source_ids", None)
         if all_ids is None:
@@ -15721,6 +21456,7 @@ class LayerSearch:
         active = self.handoff.active
         if active in ids:
             preferred.append(active)
+        preferred.extend(sid for sid in hinted if sid in ids)
 
         source_config = getattr(manager, "get_source_config", None)
         if callable(source_config):
@@ -15749,17 +21485,35 @@ class LayerSearch:
         self._probe_cursor += probe_count
         return selected
 
-    def search(self, localizer, frame, mask, now, yaw_hint=None):
+    def search(self, localizer, frame, mask, now, yaw_hint=None, altitude_layers=()):
+        """``altitude_layers``: (source id, expected query/layer ratio) of the layers
+        nearest the altitude (localization.altitude_hint), nearest first."""
         start = time.monotonic()
         deadline = start + self.cfg("budget_ms", 2000.0) / 1000.0
         max_verifications = self.cfg("max_verifications", 32)
         top_k = self.cfg("candidates_per_source", 4)
-        source_ids = self._select_sources(localizer.db_manager)
-        angles = [0, 90, 180, 270] if localizer.enable_auto_rotation else [0]
+        hinted_ids = [sid for sid, _ in altitude_layers]
+        if hinted_ids:
+            source_ids = self._select_sources(localizer.db_manager, hinted_ids)
+        else:
+            source_ids = self._select_sources(localizer.db_manager)
+        continuous = bool(getattr(localizer, "_rot_continuous", False))
+        if not localizer.enable_auto_rotation:
+            angles = [0]
+        elif continuous:
+            angles = list(localizer._rot_scan)
+        else:
+            angles = [0, 90, 180, 270]
         if yaw_hint is not None and localizer.enable_auto_rotation:
-            angle = (int(round(yaw_hint / 90)) * 90) % 360
+            if continuous:
+                angle = norm_deg(yaw_hint)
+            else:
+                angle = (int(round(yaw_hint / 90)) * 90) % 360
             angles = [angle] + [a for a in angles if a != angle]
         primary = [(angle, 1.0) for angle in angles]
+        # The hinted layers' scales at the most likely angle (the beliefs, prepended
+        # below, still come first).
+        primary = [(angles[0], ratio) for _, ratio in altitude_layers] + primary
         for belief in self.beliefs.values():
             primary = [
                 (belief.angle, scale)
@@ -15776,6 +21530,9 @@ class LayerSearch:
         verifications = 0
         verified_signatures = set()
         exhausted = False
+        diverse = bool(self.cfg("diverse_candidates", False))
+        early_stop = bool(self.cfg("early_stop", False))
+        stopped_early = False
         for combos in (primary, recovery):
             by_source = {}
             queued_signatures = set()
@@ -15801,24 +21558,30 @@ class LayerSearch:
                     exhausted = True
                     break
                 chunk = planned[offset : offset + batch_size]
-                prepared_chunk = [
-                    RotationSelector._prepare_frame(
-                        frame, angle, scale, localizer._scale_manager
-                    )
-                    for angle, scale, _ in chunk
-                ]
-                frames = [item[0] for item in prepared_chunk]
-                if len(frames) > 1 and hasattr(
-                    localizer.feature_extractor, "extract_global_descriptors_multi"
-                ):
-                    descriptors = localizer.feature_extractor.extract_global_descriptors_multi(
-                        frames
-                    )
-                else:
-                    descriptors = [
-                        localizer.feature_extractor.extract_global_descriptor(item)
-                        for item in frames
+                if continuous:
+                    views = [
+                        RotationSelector._prepare_view(
+                            frame,
+                            angle,
+                            scale,
+                            localizer._scale_manager,
+                            None,
+                            getattr(localizer, "_rot_erode", 8),
+                        )
+                        for angle, scale, _ in chunk
                     ]
+                    prepared_chunk = [(v[0], v[1]) for v in views]
+                    valids = [v[2] for v in views]
+                else:
+                    prepared_chunk = [
+                        RotationSelector._prepare_frame(
+                            frame, angle, scale, localizer._scale_manager
+                        )
+                        for angle, scale, _ in chunk
+                    ]
+                    valids = None
+                frames = [item[0] for item in prepared_chunk]
+                descriptors = extract_globals(localizer.feature_extractor, frames, valids)
                 for (angle, scale, key), (prepared, crop), desc in zip(
                     chunk, prepared_chunk, descriptors
                 ):
@@ -15835,9 +21598,7 @@ class LayerSearch:
                         int(getattr(crop, "crop_w", 0)),
                         int(getattr(crop, "crop_h", 0)),
                     )
-                    image_signature = (
-                        angle, prepared.shape[0], prepared.shape[1], crop_signature
-                    )
+                    image_signature = (angle, prepared.shape[0], prepared.shape[1], crop_signature)
                     for sid, candidates in groups.items():
                         for candidate in candidates:
                             signature = (sid, int(candidate[0]), image_signature)
@@ -15849,10 +21610,29 @@ class LayerSearch:
                             )
             for hypotheses in by_source.values():
                 hypotheses.sort(key=lambda h: h[0][1], reverse=True)
+                if diverse:
+                    # Each retrieved frame gets one attempt (at its best-scoring
+                    # angle/scale) before any frame is retried at another one.
+                    attempts = {}
+                    ranks = []
+                    for hypothesis in hypotheses:
+                        frame_id = int(hypothesis[0][0])
+                        ranks.append(attempts.get(frame_id, 0))
+                        attempts[frame_id] = ranks[-1] + 1
+                    order = sorted(range(len(hypotheses)), key=ranks.__getitem__)
+                    hypotheses[:] = [hypotheses[i] for i in order]
             ids = sorted(by_source)
             if ids:
                 offset = self._source_cursor % len(ids)
                 ids = ids[offset:] + ids[:offset]
+                # Hinted layers verify first (then the active one, if early_stop).
+                for sid in reversed(hinted_ids):
+                    if sid in ids:
+                        ids.remove(sid)
+                        ids.insert(0, sid)
+                if early_stop and self.handoff.active in ids:
+                    ids.remove(self.handoff.active)
+                    ids.insert(0, self.handoff.active)
                 by_source = {sid: by_source[sid] for sid in ids}
                 self._source_cursor += 1
             # Round robin reserves verification opportunities for every source.
@@ -15889,7 +21669,10 @@ class LayerSearch:
                     )
                     if observation is not None:
                         observations.append(observation)
-                if exhausted:
+                        if early_stop and self._settles_frame(observation, now):
+                            stopped_early = True
+                            break
+                if exhausted or stopped_early:
                     break
             if observations or exhausted or verifications >= max_verifications:
                 break
@@ -15897,11 +21680,29 @@ class LayerSearch:
             "verifications": verifications,
             "hypotheses": len(seen),
             "budget_exhausted": exhausted,
+            "early_stop": stopped_early,
             "elapsed_ms": (time.monotonic() - start) * 1000,
             "sources_probed": source_ids,
             "sources_available": len(getattr(localizer.db_manager, "all_source_ids", []) or []),
         }
         return observations
+
+    def _settles_frame(self, observation, now):
+        """True for a strong, near-native-scale fix from the active layer that
+        agrees with the confirmed track: further candidates cannot improve on it."""
+        handoff = self.handoff
+        if (
+            observation.source_id != handoff.active
+            or handoff.last_confirmed is None
+            or now - handoff.last_confirmed > handoff.lost_after_s
+            or observation.quality < self.cfg("early_stop_min_quality", 150.0)
+        ):
+            return False
+        max_ratio = self.cfg("early_stop_max_scale_ratio", 1.5)
+        ratio = observation.scale_ratio
+        if ratio is None or not 1.0 / max_ratio <= ratio <= max_ratio:
+            return False
+        return handoff.motion_consistent(observation, now)
 
     def _observation(self, localizer, sid, database, calibration, ver, prepared, shape):
         _, angle, _, frm, _, crop, features, _ = prepared
@@ -15914,7 +21715,9 @@ class LayerSearch:
         spread = localizer._inlier_spread(ver.mkpts_q_in, features)
         if spread is None or spread < self.cfg("min_spread", 0.015):
             return None
-        affine = database.get_frame_affine(ver.candidate_id)
+        from src.geometry.frame_transform import get_frame_transform, project_frame_points
+
+        affine = get_frame_transform(database, ver.candidate_id)
         if affine is None:
             return None
         statuses = getattr(database, "frame_georef_status", None)
@@ -15944,7 +21747,12 @@ class LayerSearch:
         if crop is not None:
             H = H @ crop_to_affine(crop, frm.shape[1], frm.shape[0])
         h, w = shape[:2]
-        if angle in (90, 270):
+        continuous = bool(getattr(localizer, "_rot_continuous", False))
+        if continuous:
+            # Same-size rotated view: fold the rotation in, so H maps ORIGINAL
+            # frame pixels and w/h stay the frame's (view centre = frame centre).
+            H = H @ rotation_matrix(angle, w, h)
+        elif angle in (90, 270):
             h, w = w, h
         # Matching a small off-centre patch does not support arbitrary projection
         # of the image centre. Measure distance in the actual matcher frame,
@@ -15964,7 +21772,10 @@ class LayerSearch:
         if not np.isfinite(H).all() or not (np.all(den > 1e-9) or np.all(den < -1e-9)):
             return None
         center = GeometryTransforms.apply_homography(np.array([[w / 2, h / 2]]), H)
-        metric = GeometryTransforms.apply_affine(center, affine)
+        try:
+            metric = project_frame_points(affine, center, ref_w, ref_h)
+        except ValueError:
+            return None
         if metric is None or not np.isfinite(metric).all():
             return None
         gps = calibration.converter.metric_to_gps(*map(float, metric[0]))
@@ -15976,18 +21787,13 @@ class LayerSearch:
             * min(1.0, spread / 0.15)
             / (1.0 + ver.rmse)
         )
-        return LayerObservation(sid, tuple(gps), quality, prepared, H, (w, h))
+        return LayerObservation(
+            sid, tuple(gps), quality, prepared, H, (w, h), center_scale(H, (w, h))[0]
+        )
 
     def commit(self, observation, now):
         self.handoff.commit(observation, now)
-        H = observation.homography
-        w, h = observation.dimensions
-        x, y = w / 2, h / 2
-        den = H[2, 0] * x + H[2, 1] * y + H[2, 2]
-        projected = (H @ [x, y, 1])[:2] / den
-        J = (H[:2, :2] - np.outer(projected, H[2, :2])) / den
-        singular = np.linalg.svd(J, compute_uv=False)
-        ratio = float(np.sqrt(abs(np.linalg.det(J))))
+        ratio, singular = center_scale(observation.homography, observation.dimensions)
         if 0.3 <= ratio <= 3.5 and singular[-1] > 1e-9:
             sigma = min(0.7, 0.05 + 0.25 * np.log(singular[0] / singular[-1]))
             old = self.beliefs.get(observation.source_id)
@@ -16004,17 +21810,30 @@ class LayerSearch:
 import numpy as np
 
 from config import get_cfg
+from src.geometry.frame_transform import project_frame_points
 from src.geometry.point_spread import inlier_spread
 from src.geometry.transformations import GeometryTransforms
+from src.localization.altitude_hint import AltitudeHint
 from src.localization.candidate_retriever import CandidateRetriever
 from src.localization.failure_log import FAILURE_TYPES, FailureLogger
 from src.localization.geometric_verifier import GeometricVerifier
+from src.localization.keypoint_budget import top_keypoints
 from src.localization.layer_search import LayerSearch
 from src.localization.matcher import FastRetrieval, LanceDBRetrieval
+from src.localization.query_rotation import (
+    angle_distance_deg,
+    is_continuous,
+    next_prior_deg,
+    norm_deg,
+    rotation_matrix,
+    scan_angles,
+    view_mask,
+)
 from src.localization.result_builder import ResultBuilder
 from src.localization.rotation_geometry import _ROTATION_VEC, _rotate_point_np90
 from src.localization.rotation_selector import RotationSelector
 from src.localization.scale_manager import ScaleManager, crop_to_affine
+from src.localization.spatial_prior import SpatialPrior
 from src.tracking.kalman_filter import TrajectoryFilter
 from src.tracking.outlier_detector import OutlierDetector
 from src.utils.logging_utils import get_logger
@@ -16042,6 +21861,11 @@ class Localizer:
         self.matcher = matcher
         self.calibration = calibration
         self.config = config or {}
+        # Independent relative maps have independent gauges. Search only the
+        # selected database; never compare or switch them by geographic distance.
+        self.relative_mode = getattr(getattr(calibration, "converter", None), "mode", "") == "LOCAL"
+        if self.relative_mode:
+            db_manager = calib_manager = None
         self._failure_logger = FailureLogger()
 
         # Multi-source database and calibration management
@@ -16056,11 +21880,17 @@ class Localizer:
         self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
         self.use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
         self.mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
+        self.ransac_max_iters = int(get_cfg(self.config, "homography.max_iters", 2000))
+        self.ransac_confidence = float(get_cfg(self.config, "homography.confidence", 0.99))
 
         self.trajectory_filter = TrajectoryFilter(
             process_noise=get_cfg(self.config, "tracking.kalman_process_noise", 2.0),
             measurement_noise=get_cfg(self.config, "tracking.kalman_measurement_noise", 5.0),
             dt=1.0,
+            reanchor_velocity_from_fixes=get_cfg(
+                self.config, "tracking.kalman_reanchor_velocity_from_fixes", False
+            ),
+            max_gap_s=get_cfg(self.config, "tracking.kalman_max_gap_s", 0.0),
         )
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
@@ -16070,6 +21900,11 @@ class Localizer:
             zscore_enabled=get_cfg(self.config, "tracking.outlier_zscore_enabled", True),
             mahalanobis_enabled=get_cfg(self.config, "tracking.outlier_mahalanobis_enabled", False),
             chi2_threshold=get_cfg(self.config, "tracking.outlier_chi2_threshold", 13.816),
+            reacquire_consistent=get_cfg(
+                self.config, "tracking.outlier_reacquire_consistent", False
+            ),
+            reacquire_tol_m=get_cfg(self.config, "tracking.outlier_reacquire_tol_m", 15.0),
+            reacquire_max_wait=get_cfg(self.config, "tracking.outlier_reacquire_max_wait", 10),
         )
         self._maha_gate_enabled = get_cfg(
             self.config, "tracking.outlier_mahalanobis_enabled", False
@@ -16077,7 +21912,7 @@ class Localizer:
 
         # Sliding Window Smoother for trajectory optimization over keyframe fixes & optical flow.
         self._smoother = None
-        if get_cfg(self.config, "tracking.smoother_enabled", False):
+        if not self.relative_mode and get_cfg(self.config, "tracking.smoother_enabled", False):
             from src.tracking.smoother import SlidingWindowSmoother
 
             self._smoother = SlidingWindowSmoother(
@@ -16094,6 +21929,7 @@ class Localizer:
                 deadband_m=get_cfg(self.config, "tracking.smoother_deadband_m", 2.0),
                 gain=get_cfg(self.config, "tracking.smoother_gain", 0.25),
                 max_step_m=get_cfg(self.config, "tracking.smoother_max_step_m", 3.0),
+                odom_huber_k=get_cfg(self.config, "tracking.smoother_odom_huber_k", 0.0),
             )
 
         # Retriever: single-database mode fallback
@@ -16126,9 +21962,33 @@ class Localizer:
         self._tp_audit_every = int(
             get_cfg(self.config, "localization.temporal_prior_audit_every", 10)
         )
+        # Temporal prior while a yaw hint is present (flag; None = legacy:
+        # any hint disables the prior). Measured 2026-10-28 on route3min
+        # variants: with telemetry the prior never ran, every keyframe paid a
+        # full retrieval, and on other-epoch imagery (wayback 2019) keyframe
+        # success fell 0.87 -> 0.15. A hint that agrees with the last fix's
+        # angle within this many degrees carries no new orientation info.
+        _tol = get_cfg(self.config, "localization.temporal_prior_yaw_hint_tol_deg", None)
+        self._tp_hint_tol = None if _tol is None else float(_tol)
+        # Strongest-N query keypoints for the temporal-prior check (0 = all).
+        self._tp_max_kp = int(get_cfg(self.config, "localization.temporal_prior_max_keypoints", 0))
+        # ...only after a fix with at least this many inliers (0 = always); see
+        # _tp_keypoint_budget.
+        self._tp_kp_min_inliers = int(
+            get_cfg(self.config, "localization.temporal_prior_kp_min_inliers", 0)
+        )
+        self._prev_fix_inliers = 0
         self._tp_counter = 0
         self._tp_tries = 0
         self._tp_hits = 0
+        # Spatial prior: second temporal-prior stage near the dead-reckoned
+        # position (flag localization.spatial_prior, off by default).
+        self._spatial_prior = SpatialPrior.from_config(self.config, enabled=not self.relative_mode)
+        self._sp_now: float | None = None
+        self._sp_frame_done = False
+        self._tp_verified: list[int] = []  # ids the index stage verified this call
+        self._sp_tries = 0
+        self._sp_hits = 0
 
         # Monitoring of inlier spatial spread across frame
         self._spread_stats_enabled = get_cfg(
@@ -16149,6 +22009,42 @@ class Localizer:
         # Calculating local frame-to-frame velocity instead of accumulated
         self._of_local_speed = get_cfg(self.config, "tracking.of_local_speed", False)
         self._last_of_raw: np.ndarray | None = None
+        # OF decorrelation (flag; 0.0 = legacy). Every OF position is projected
+        # through the SAME keyframe homography (LK always tracks from the
+        # keyframe), so the keyframe's error is shared by all of them; feeding
+        # them to the KF as independent fixes counts that error N times. The OF
+        # measurement noise is therefore inflated by (1 + growth * n), n = OF
+        # samples since the keyframe, which caps their joint information.
+        self._of_noise_growth = max(
+            float(get_cfg(self.config, "tracking.of_noise_growth_per_step", 0.0)), 0.0
+        )
+        self._of_steps_since_kf = 0
+        # KF prediction interval (flag; False = legacy). The worker's dt is
+        # path-specific: a keyframe gets the time since the previous KEYFRAME
+        # although the KF was last updated by optical flow ~1/6 s earlier, so the
+        # constant-velocity model predicted ~0.9 s instead of ~0.17 s on every
+        # keyframe and lagged in between (measured 2026-10-28: raw OF step ratio
+        # 0.99, filtered 0.62-0.71; offline KF replay: jumps >10 m 190 -> 6).
+        # True = KF dt from frame timestamps since its last update; outlier
+        # detector and smoother keep the worker dt.
+        # OF quality floor (flag; 0.0 = legacy). A lost LK track reports
+        # flow_quality 0.026-0.042 (route3min variants 2026-10-28: all 11 OF
+        # samples > 20 m off), good tracking >= 0.075 at its 0.5th percentile;
+        # such samples slipped past the kinematic gate and dragged the KF up
+        # to 178 m off for ~1 s.
+        self._of_min_quality = max(
+            float(get_cfg(self.config, "tracking.of_min_flow_quality", 0.0)), 0.0
+        )
+        # Base KF noise multiplier of an OF measurement (legacy 1.5, "OF is
+        # noisier than a keyframe fix"). With the deeper LK pyramid and the
+        # quality floor OF is as accurate as a fix; offline on six route3min
+        # variants (2026-10-28) the KF output beat raw only when OF was trusted:
+        # q 8 / 1.5 -> p95 5.9 m, max 50 m, 46 jumps; q 128 / 0.1 -> 4.1 m, 28 m, 5.
+        self._of_noise_base = max(float(get_cfg(self.config, "tracking.of_noise_scale", 1.5)), 0.01)
+        self._kf_dt_from_ts = bool(
+            get_cfg(self.config, "tracking.kalman_dt_from_timestamps", False)
+        )
+        self._frame_timestamp: float | None = None
 
         # Accepting measurements when strong independent geometric evidence is present
         self._trust_strong = get_cfg(self.config, "tracking.outlier_trust_strong_evidence", False)
@@ -16173,12 +22069,37 @@ class Localizer:
 
         # A3: temporal prior on rotation angle — angle of last successful
         # localization; full 4-angle scan only on score dip or failure
-        self._last_best_angle: int | None = None
+        self._last_best_angle: float | None = None
+
+        # localization.rotation_mode (src/localization/query_rotation.py)
+        self._rot_continuous = is_continuous(self.config)
+        self._rot_scan = scan_angles(
+            get_cfg(self.config, "localization.rotation_scan_step_deg", 45.0)
+        )
+        self._rot_refine_min = float(
+            get_cfg(self.config, "localization.rotation_refine_min_deg", 12.0)
+        )
+        self._rot_erode = int(get_cfg(self.config, "localization.rotation_border_erode_px", 8))
+        if self._rot_continuous:
+            logger.info(
+                f"Rotation mode: continuous (scan {self._rot_scan}, "
+                f"refine > {self._rot_refine_min:.0f} deg)"
+            )
 
         # ── ScaleManager: GSD-ratio estimation for altitude-invariant localization ─
         self._scale_manager = ScaleManager(self.config)
         self._layer_search = LayerSearch(self.config)
         self._layer_clock = None
+
+        # localization.altitude_hint: the expected scales of the layers nearest the
+        # altitude (telemetry, else the last fix's scale) are tried first.
+        _project_manager = self.config.get("_project_manager", None)
+        self._altitude_hint = AltitudeHint.from_config(
+            self.config, getattr(_project_manager, "settings", None)
+        )
+        self._telemetry_altitude_m = None
+        self._altitude_norm_width = None
+        self._altitude_hint_logged: set = set()
 
         # Depth-based scale hint (soft pyramid reorder; hint only, never a hard scale).
         self._db_depth_scale = getattr(self.database, "median_depth_scale", None)
@@ -16197,42 +22118,58 @@ class Localizer:
         #   1. Enabled via config
         #   2. Database contains patch_descriptors (i.e. built with use_patchify=True)
         # If either condition is not met — patchify is silently disabled (backward compat).
+        # Multi-layer: one patch index per layer, built on the layer's first use. Frame ids
+        # are per database, so patch hits may only be merged into candidates of their own
+        # layer (one index from the first layer used to be merged into every layer's list).
         self.patchify_retrieval = None
-        use_patchify = get_cfg(self.config, "localization.use_patchify", False)
-        if use_patchify:
-            patch_desc = getattr(self.database, "patch_descriptors", None)
-            if patch_desc is not None and len(patch_desc) > 0:
-                try:
-                    from src.localization.patchify import PatchifyRetrieval
-
-                    patchify_grids = get_cfg(
-                        self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
-                    )
-                    patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
-                    desc_dim = int(patch_desc.shape[-1])
-                    self.patchify_retrieval = PatchifyRetrieval(
-                        self.feature_extractor,
-                        descriptor_dim=desc_dim,
-                        grids=patchify_grids,
-                        batch_size=patchify_batch,
-                    )
-                    frame_ids = list(range(self.database.get_num_frames()))
-                    self.patchify_retrieval.build_index(patch_desc, frame_ids)
-                    logger.info(
-                        f"Patchify retrieval initialized: "
-                        f"{self.patchify_retrieval.num_patches} patches/frame, "
-                        f"dim={desc_dim}, grids={patchify_grids}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Patchify retrieval init failed — falling back to standard retrieval: {e}"
-                    )
-                    self.patchify_retrieval = None
+        patchify_factory = None
+        # localization.patchify_main_rank_margin = N > 0 (multi-layer): candidates found
+        # only by patchify are verified after the main layer's standard candidates unless
+        # they rank more than N places above them (src/database/source_priority.py).
+        self._patchify_main_margin = int(
+            get_cfg(self.config, "localization.patchify_main_rank_margin", 0) or 0
+        )
+        # localization.joint_candidate_ranking (multi-layer): one verification list from
+        # the standard and patchify candidates of every layer, ordered by rank, layer
+        # priority and patchify penalty (src/database/source_priority.py::joint_order).
+        self._joint_ranking = bool(
+            get_cfg(self.config, "localization.joint_candidate_ranking", False)
+        )
+        self._joint_top_k = int(get_cfg(self.config, "localization.joint_top_k", 5) or 5)
+        self._joint_patch_penalty = int(
+            get_cfg(self.config, "localization.joint_patchify_rank_penalty", 2) or 0
+        )
+        self._joint_rank_step = int(
+            get_cfg(self.config, "localization.source_priority_rank_margin", 0) or 0
+        )
+        # localization.layer_fineness_weight: layer map accuracy (ground pixel size) joins
+        # the project priority; localization.patchify_adaptive: patchify only where no real
+        # layer is close in scale to the query (src/database/source_priority.py).
+        self._fineness_weight = float(
+            get_cfg(self.config, "localization.layer_fineness_weight", 0.0) or 0.0
+        )
+        self._patchify_adaptive = bool(
+            get_cfg(self.config, "localization.patchify_adaptive", False)
+        )
+        self._patchify_gap_ratio = float(
+            get_cfg(self.config, "localization.patchify_gap_ratio", 1.5) or 1.5
+        )
+        # localization.patchify_lazy: patch search only after the standard candidates fail.
+        self._patchify_lazy = bool(get_cfg(self.config, "localization.patchify_lazy", False))
+        self._layer_gsd_cache: dict = {}
+        self._frame_query_gsd = None
+        if get_cfg(self.config, "localization.use_patchify", False):
+            if self.db_manager is not None:
+                patchify_factory = self._build_patchify_retrieval
             else:
-                logger.info("Patchify enabled in config but database has no patch_descriptors. ")
+                self.patchify_retrieval = self._build_patchify_retrieval(self.database)
 
         self._candidate_retriever = CandidateRetriever(
-            self.db_manager, self.retriever, self.patchify_retrieval, self.config
+            self.db_manager,
+            self.retriever,
+            self.patchify_retrieval,
+            self.config,
+            patchify_factory=patchify_factory,
         )
         self._geometric_verifier = GeometricVerifier(
             self.matcher,
@@ -16245,15 +22182,16 @@ class Localizer:
             prefilter_enabled=get_cfg(self.config, "localization.candidate_prefilter", False),
             prefilter_keep=get_cfg(self.config, "localization.prefilter_keep", 2),
             max_rmse_px=get_cfg(self.config, "localization.max_geometric_rmse_px", 4.0),
-            min_inlier_ratio=get_cfg(
-                self.config, "localization.geometric_min_inlier_ratio", 0.2
-            ),
+            min_inlier_ratio=get_cfg(self.config, "localization.geometric_min_inlier_ratio", 0.2),
             max_center_extrapolation=get_cfg(
                 self.config, "localization.geometric_max_center_extrapolation", 0.1
             ),
             min_reference_eigenvalue=get_cfg(
                 self.config, "localization.geometric_min_reference_eigenvalue", 1e-4
             ),
+            ransac_max_iters=self.ransac_max_iters,
+            ransac_confidence=self.ransac_confidence,
+            prefilter_fallback_keep=get_cfg(self.config, "localization.prefilter_fallback_keep", 0),
         )
         self._result_builder = ResultBuilder(self.config, self.ransac_thresh)
         self._rotation_selector = RotationSelector(
@@ -16288,6 +22226,349 @@ class Localizer:
         """
         return getattr(self, "_last_state", None)
 
+    def _main_source_id(self):
+        """Active layer with the highest priority (lowest ``priority``; main = 0).
+
+        With localization.layer_fineness_weight > 0 the effective priority (project
+        priority + map accuracy) decides.
+        """
+        manager = self.db_manager
+        if manager is None:
+            return None
+        ids = list(getattr(manager, "active_source_ids", None) or [])
+        if not ids:
+            return None
+        if getattr(self, "_fineness_weight", 0.0) > 0 and hasattr(
+            manager, "effective_priority_steps"
+        ):
+            steps = manager.effective_priority_steps()
+            return min(ids, key=lambda sid: (steps.get(sid, 0.0), sid))
+
+        def rank(sid):
+            src = manager.get_source_config(sid)
+            return (getattr(src, "priority", 0) if src is not None else 0, sid)
+
+        return min(ids, key=rank)
+
+    def _main_before_patchify(self, rot, standard, expanded, source_id):
+        """``(main RotationResult | None, own, patchify_only)`` when the main layer goes first.
+
+        None keeps the old order (merged candidates of the chosen layer). ``own`` are
+        the chosen layer's standard candidates, ``patchify_only`` the ones patchify
+        added. ``main RotationResult`` is None when the chosen layer is the main one.
+        """
+        if self._patchify_main_margin <= 0 or self.db_manager is None or source_id is None:
+            return None
+        from src.database.source_priority import main_before_patchify
+
+        std_ids = {int(frame) for frame, _ in standard}
+        own = [c for c in expanded if int(c[0]) in std_ids]
+        patch_only = [c for c in expanded if int(c[0]) not in std_ids]
+        if not patch_only:
+            return None
+        main_sid = self._main_source_id()
+        if main_sid is None:
+            return None
+        if main_sid == source_id:
+            main_rot, main_candidates = None, standard
+        else:
+            main_rot = (getattr(rot, "per_source", None) or {}).get(main_sid)
+            if main_rot is None or not main_rot.candidates:
+                return None
+            main_candidates = main_rot.candidates
+        if not main_before_patchify(expanded, std_ids, main_candidates, self._patchify_main_margin):
+            return None
+        return main_rot, own, patch_only
+
+    def _verify_main_layer(self, main_rot, query_frame, static_mask, cache):
+        """Verify the main layer's candidates at its own (angle, scale); switch on success."""
+        sid = main_rot.source_id
+        database = self.db_manager.get_database(sid)
+        if database is None:
+            return None
+        rotated, rot_mask, crop, feats = self._prepare_and_extract(
+            query_frame,
+            static_mask,
+            main_rot.angle,
+            main_rot.best_scale,
+            cache,
+            prepared=(main_rot.frame, main_rot.crop_info),
+        )
+        candidates = list(main_rot.candidates)
+        support_check = getattr(database, "is_frame_georef_supported", None)
+        if support_check is not None:
+            candidates = [c for c in candidates if support_check(int(c[0]))]
+        ver = self._geometric_verifier.verify(feats, candidates, database, tag="main_priority")
+        if ver is None:
+            return None
+        self._active_source_id = sid
+        self.database = database
+        if self.calib_manager is not None:
+            self.calibration = self.calib_manager.get(sid)
+        logger.debug(f"Main layer '{sid}' verified before patchify candidates")
+        return (
+            ver,
+            main_rot.angle,
+            main_rot.best_scale,
+            rotated,
+            rot_mask,
+            crop,
+            feats,
+            candidates,
+            main_rot.score,
+            sid,
+        )
+
+    def _gsd_of(self, source_id):
+        """Ground pixel size of a layer (multi-layer: by id; single database: None)."""
+        from src.database.source_priority import layer_gsd
+
+        if self.db_manager is not None and source_id is not None:
+            if hasattr(self.db_manager, "layer_gsd"):
+                return self.db_manager.layer_gsd(source_id)
+            database = self.db_manager.get_database(source_id)
+        else:
+            database = self.database
+        if database is None:
+            return None
+        cached = self._layer_gsd_cache.get(id(database))
+        if cached is None or cached[0] is not database:
+            cached = (database, layer_gsd(database))
+            self._layer_gsd_cache[id(database)] = cached
+        return cached[1]
+
+    def _estimated_query_gsd(self):
+        """Query ground pixel size: scale prior x active layer's pixel size, or None.
+
+        The scale prior is query / layer (sqrt of the last homography's scale, EMA).
+        """
+        prior = self._scale_manager.prior
+        if prior is None:
+            return None
+        sid = self._active_source_id if self.db_manager is not None else None
+        gsd = self._gsd_of(sid)
+        return float(prior) * float(gsd) if gsd else None
+
+    # ── localization.altitude_hint ──────────────────────────────────────────────
+
+    def _layer_gsds(self, source_ids=None) -> dict:
+        """Ground pixel size of the given (default: active) layers; one database: {None: it}."""
+        if self.db_manager is None:
+            return {None: self._gsd_of(None)}
+        if source_ids is None:
+            source_ids = list(getattr(self.db_manager, "active_source_ids", None) or [])
+        return {sid: self._gsd_of(sid) for sid in source_ids}
+
+    def _hint_query_gsd(self, norm_width, visual_gsd):
+        """(query ground pixel size, source); telemetry needs metric (geo) layers."""
+        hint = getattr(self, "_altitude_hint", None)
+        if hint is None:
+            return None, "off"
+        relative = bool(getattr(self, "relative_mode", False))
+        telemetry = None if relative else getattr(self, "_telemetry_altitude_m", None)
+        gsd, source = hint.query_gsd(telemetry, norm_width, visual_gsd)
+        logged = getattr(self, "_altitude_hint_logged", None)
+        if gsd is not None and logged is not None and source not in logged:
+            logged.add(source)
+            logger.info(f"Altitude hint active ({source}): query ground pixel {gsd:.3f}")
+        return gsd, source
+
+    def _apply_altitude_hint(self, norm_width) -> None:
+        """The nearest layers' expected scales go to the ScaleManager before retrieval."""
+        hint = getattr(self, "_altitude_hint", None)
+        if hint is None or not hint.enabled:
+            return
+        self._altitude_norm_width = norm_width
+        gsd, source = self._hint_query_gsd(norm_width, getattr(self, "_frame_query_gsd", None))
+        scales = hint.layer_scales(gsd, self._layer_gsds())
+        self._scale_manager.set_altitude_scales([ratio for _, ratio in scales])
+        if source == "telemetry":
+            # localization.patchify_adaptive gates on the same estimate.
+            self._frame_query_gsd = gsd
+        if scales:
+            listed = ", ".join(f"{sid}: x{ratio:.2f}" for sid, ratio in scales)
+            logger.debug(f"Altitude hint ({source}): {listed}")
+
+    def _altitude_layer_scales(self, norm_width) -> list:
+        """Layer search: (source id, expected ratio) of the layers nearest the altitude."""
+        hint = getattr(self, "_altitude_hint", None)
+        if hint is None or not hint.enabled or self.db_manager is None:
+            return []
+        self._altitude_norm_width = norm_width
+        search = self._layer_search
+        active = search.handoff.active
+        belief = search.beliefs.get(active) if active is not None else None
+        active_gsd = self._gsd_of(active) if active is not None else None
+        visual = None
+        if belief is not None and active_gsd:
+            visual = float(np.exp(belief.log_ratio)) * float(active_gsd)
+        gsd, _ = self._hint_query_gsd(norm_width, visual)
+        ids = getattr(self.db_manager, "all_source_ids", None)
+        if ids is None:
+            ids = getattr(self.db_manager, "active_source_ids", None)
+        return hint.layer_scales(gsd, self._layer_gsds(list(ids or [])))
+
+    def _learn_altitude_factor(self) -> None:
+        """A fix made while telemetry was present refines the hint's camera footprint factor."""
+        hint = getattr(self, "_altitude_hint", None)
+        altitude = getattr(self, "_telemetry_altitude_m", None)
+        if hint is None or not hint.enabled or altitude is None:
+            return
+        if getattr(self, "relative_mode", False):
+            return
+        width = getattr(self, "_altitude_norm_width", None)
+        hint.learn(altitude, width, self._estimated_query_gsd())
+
+    def _patchify_allowed(self, source_id) -> bool:
+        """localization.patchify_adaptive: may this layer's patchify search run this frame?"""
+        if not getattr(self, "_patchify_adaptive", False):
+            return True
+        from src.database.source_priority import grid_factors, patchify_layers
+
+        if self.db_manager is not None:
+            ids = list(getattr(self.db_manager, "active_source_ids", None) or [])
+        else:
+            ids = [None]
+        layers = patchify_layers(
+            getattr(self, "_frame_query_gsd", None),
+            {sid: self._gsd_of(sid) for sid in ids},
+            grid_factors(
+                get_cfg(self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]])
+            ),
+            self._patchify_gap_ratio,
+        )
+        return layers is None or source_id in layers
+
+    def _layer_priorities(self) -> tuple[dict, dict]:
+        """``(priority, patchify priority)`` per active layer (project.json numbers)."""
+        from src.database.source_priority import effective_patchify_priority
+
+        manager = self.db_manager
+        standard: dict = {}
+        patch: dict = {}
+        for sid in list(getattr(manager, "active_source_ids", None) or []):
+            src = manager.get_source_config(sid)
+            standard[sid] = int(getattr(src, "priority", 0) or 0) if src is not None else 0
+            patch[sid] = effective_patchify_priority(src) if src is not None else standard[sid]
+        return standard, patch
+
+    def _joint_candidates(self, per_source: dict, top_k: int) -> list:
+        """Every layer's standard and patchify-only candidates (georeferenced frames only)."""
+        from src.database.source_priority import JointCandidate
+
+        entries = []
+        desc_cache: dict = {}
+        for sid, layer in per_source.items():
+            database = self.db_manager.get_database(sid)
+            if database is None:
+                continue
+            usable = getattr(database, "is_frame_georef_supported", None)
+            standard_ids = {int(frame) for frame, _ in layer.candidates}
+            for frame, score in layer.candidates:
+                if usable is None or usable(int(frame)):
+                    entries.append(JointCandidate(sid, int(frame), float(score), False))
+            if not self._patchify_allowed(sid):
+                continue
+            for frame, score in self._candidate_retriever.patch_candidates(
+                layer.frame, top_k, source_id=sid, desc_cache=desc_cache
+            ):
+                if int(frame) in standard_ids or (usable is not None and not usable(int(frame))):
+                    continue
+                entries.append(JointCandidate(sid, int(frame), float(score), True))
+        return entries
+
+    def _verify_joint(self, rot, query_frame, static_mask, cache, top_k):
+        """Verify the joint candidate list in order; the first verified layer becomes active.
+
+        Same return tuple as ``_verify_main_layer``, or None when nothing verified.
+        Consecutive candidates of one layer go to the verifier together (its
+        prefilter then works as before); each layer at its own (angle, scale).
+        """
+        from src.database.source_priority import joint_order, verification_runs
+
+        per_source = rot.per_source or {}
+        priorities, patch_priorities = self._layer_priorities()
+        ordered = joint_order(
+            self._joint_candidates(per_source, top_k),
+            priorities,
+            patch_priorities,
+            self._joint_rank_step,
+            self._joint_patch_penalty,
+            self._joint_top_k,
+        )
+        for sid, run in verification_runs(ordered):
+            layer = per_source.get(sid)
+            database = self.db_manager.get_database(sid)
+            if layer is None or database is None:
+                continue
+            rotated, rot_mask, crop, feats = self._prepare_and_extract(
+                query_frame,
+                static_mask,
+                layer.angle,
+                layer.best_scale,
+                cache,
+                prepared=(layer.frame, layer.crop_info),
+            )
+            candidates = [(c.frame_id, c.score) for c in run]
+            tag = "joint_patchify" if all(c.patch for c in run) else "joint"
+            ver = self._geometric_verifier.verify(feats, candidates, database, tag=tag)
+            if ver is None:
+                continue
+            self._active_source_id = sid
+            self.database = database
+            if self.calib_manager is not None:
+                self.calibration = self.calib_manager.get(sid)
+            logger.debug(f"Joint candidate list: layer '{sid}' verified frame {ver.candidate_id}")
+            return (
+                ver,
+                layer.angle,
+                layer.best_scale,
+                rotated,
+                rot_mask,
+                crop,
+                feats,
+                candidates,
+                layer.score,
+                sid,
+            )
+        return None
+
+    def _build_patchify_retrieval(self, database):
+        """Patch-descriptor index of one database, or None when it has none."""
+        patch_desc = getattr(database, "patch_descriptors", None)
+        if patch_desc is None or len(patch_desc) == 0:
+            logger.info("Patchify enabled in config but database has no patch_descriptors. ")
+            return None
+        try:
+            from src.localization.patchify import PatchifyRetrieval
+
+            patchify_grids = get_cfg(
+                self.config, "localization.patchify_grids", [[1, 1], [2, 2], [3, 3]]
+            )
+            patchify_batch = get_cfg(self.config, "localization.patchify_batch_size", 1)
+            desc_dim = int(patch_desc.shape[-1])
+            retrieval = PatchifyRetrieval(
+                self.feature_extractor,
+                descriptor_dim=desc_dim,
+                grids=patchify_grids,
+                batch_size=patchify_batch,
+                unique_coverage=bool(
+                    get_cfg(self.config, "localization.patchify_unique_coverage", False)
+                ),
+            )
+            retrieval.build_index(patch_desc, list(range(database.get_num_frames())))
+            logger.info(
+                f"Patchify retrieval initialized: "
+                f"{retrieval.num_patches} patches/frame, "
+                f"dim={desc_dim}, grids={patchify_grids}"
+            )
+            return retrieval
+        except Exception as e:
+            logger.warning(
+                f"Patchify retrieval init failed — falling back to standard retrieval: {e}"
+            )
+            return None
+
     def _sync_ground_scale(self, lat: float) -> None:
         """Updates projection-to-ground metric multiplier in outlier detector.
 
@@ -16315,9 +22596,11 @@ class Localizer:
         self.trajectory_filter.reset()
         self.outlier_detector.reset()
         self._last_of_raw = None
+        self._of_steps_since_kf = 0
         self._consecutive_failures = 0
         self._last_best_angle = None
         self._last_state = None
+        self._prev_fix_inliers = 0
         self._scale_manager.reset()
         self._layer_search.reset()
         self._layer_clock = None
@@ -16325,12 +22608,18 @@ class Localizer:
         self._tp_counter = 0
         self._tp_tries = 0
         self._tp_hits = 0
+        self._spatial_prior.reset()
+        self._sp_now = None
+        self._sp_frame_done = False
         if self._smoother is not None:
             self._smoother.reset()
 
     def _maybe_set_depth_hint(self, frame: np.ndarray) -> None:
         """Soft depth-based reorder of the scale pyramid (every N keyframes; hint only)."""
         if not self._use_depth_hint or self._db_depth_scale is None:
+            return
+        depth_backend = get_cfg(self.config, "models.depth_estimator.backend", "depth_anything_v2")
+        if depth_backend == "none":
             return
         self._depth_hint_counter += 1
         if (self._depth_hint_counter - 1) % max(1, self._depth_hint_every_n) != 0:
@@ -16340,7 +22629,7 @@ class Localizer:
                 from src.depth.depth_estimator import DepthEstimator
 
                 device = getattr(self.model_manager, "device", "cuda")
-                self._depth_estimator = DepthEstimator.build(device=device)
+                self._depth_estimator = DepthEstimator.build(backend=depth_backend, device=device)
             q_scale = self._depth_estimator.get_relative_scale(frame)
             self._scale_manager.set_depth_hint(q_scale, self._db_depth_scale)
         except Exception as e:
@@ -16379,17 +22668,33 @@ class Localizer:
             logger.debug(f"Debug depth skipped: {e}")
 
     def localize_frame(
-        self, query_frame, static_mask=None, dt=1.0, yaw_hint_deg=None,
-        collector=None, timestamp=None,
+        self,
+        query_frame,
+        static_mask=None,
+        dt=1.0,
+        yaw_hint_deg=None,
+        collector=None,
+        timestamp=None,
+        altitude_m=None,
     ) -> dict:
+        # Height above ground / take-off from telemetry (localization.altitude_hint).
+        self._telemetry_altitude_m = altitude_m
+        self._frame_timestamp = None if timestamp is None else float(timestamp)
         enabled = get_cfg(self.config, "localization.layer_search.enabled", False)
         if enabled and self.db_manager is not None:
             return self._localize_layers(
                 query_frame, static_mask, dt, yaw_hint_deg, collector, timestamp
             )
         previous = (self.database, self.calibration, self._active_source_id)
+        sp = self._spatial_prior
+        self._sp_now = sp.tick(timestamp, dt) if sp.enabled else None
+        self._sp_frame_done = False
         had_prior = self._scale_manager.prior is not None
-        result = self._localize_frame_impl(query_frame, static_mask, dt, yaw_hint_deg, collector)
+        # Feature / patch-descriptor caches of this frame, shared with the retry below.
+        caches: dict = {}
+        result = self._localize_frame_impl(
+            query_frame, static_mask, dt, yaw_hint_deg, collector, _caches=caches
+        )
         if not result.get("success"):
             self.database, self.calibration, self._active_source_id = previous
         if had_prior and (
@@ -16398,38 +22703,171 @@ class Localizer:
         ):
             self._scale_manager.invalidate()
             self._last_best_angle = None
-            result = self._localize_frame_impl(query_frame, static_mask, dt, yaw_hint_deg, collector)
+            result = self._localize_frame_impl(
+                query_frame, static_mask, dt, yaw_hint_deg, collector, _caches=caches
+            )
             if not result.get("success"):
                 self.database, self.calibration, self._active_source_id = previous
         if result.get("fallback_mode") == "retrieval_only":
             self._consecutive_failures += 1
             self._scale_manager.invalidate()
+        elif sp.enabled and result.get("success") and "lat" in result and "lon" in result:
+            sp.record_fix(
+                self._sp_now,
+                float(result["lat"]),
+                float(result["lon"]),
+                angle=self._last_best_angle,
+                scale=self._scale_manager.prior,
+            )
+        # localization.temporal_prior_kp_min_inliers: the next frame's prior check uses
+        # the keypoint cap only after a strong fix.
+        self._prev_fix_inliers = (
+            int(result.get("inliers") or 0)
+            if result.get("success") and not result.get("fallback_mode")
+            else 0
+        )
+        if result.get("success") and not result.get("fallback_mode"):
+            self._learn_altitude_factor()
+        return self._coordinate_result(result)
+
+    def _tp_keypoint_budget(self) -> int:
+        """Query keypoints for this frame's temporal / spatial prior check (0 = all).
+
+        localization.temporal_prior_max_keypoints, applied only when the previous
+        frame's fix had at least localization.temporal_prior_kp_min_inliers inliers.
+        """
+        cap = int(getattr(self, "_tp_max_kp", 0) or 0)
+        if cap <= 0:
+            return 0
+        need = int(getattr(self, "_tp_kp_min_inliers", 0) or 0)
+        if need > 0 and int(getattr(self, "_prev_fix_inliers", 0) or 0) < need:
+            return 0
+        return cap
+
+    def rebase_optical_flow_anchor(self, flow_affine) -> bool:
+        """Move the OF anchor to a later frame (tracking.of_chain_on_keyframe_fail).
+
+        ``flow_affine`` is the similarity (original px) from the current anchor
+        frame to the new anchor frame, as measured by KeyframeFlow. The new
+        frame's homography to the reference is H_new = H · Sc · S⁻¹ · Sc⁻¹ (Sc =
+        resolution normalisation), i.e. a point of the new frame is mapped back
+        into the old anchor frame and then through the old H. Only for states in
+        the unrotated frame (continuous rotation mode stores angle 0); returns
+        False otherwise and the caller keeps the legacy behaviour.
+        """
+        state = self._last_state
+        if state is None or state.get("H") is None or flow_affine is None:
+            return False
+        if int(round(float(state.get("global_angle", 0) or 0))) % 360 != 0:
+            return False
+        S = np.asarray(flow_affine, dtype=np.float64)
+        if S.shape != (2, 3) or not np.all(np.isfinite(S)):
+            return False
+        scale = float(state.get("scale", self._last_scale) or 1.0)
+        S3 = np.vstack([S, [0.0, 0.0, 1.0]])
+        try:
+            S_inv = np.linalg.inv(S3)
+        except np.linalg.LinAlgError:
+            return False
+        Sc = np.diag([scale, scale, 1.0])
+        Sc_inv = np.diag([1.0 / scale, 1.0 / scale, 1.0])
+        H_new = np.asarray(state["H"], dtype=np.float64) @ Sc @ S_inv @ Sc_inv
+        if not np.all(np.isfinite(H_new)):
+            return False
+        new_state = dict(state)
+        new_state["H"] = H_new
+        new_state["of_chain_links"] = int(state.get("of_chain_links", 0)) + 1
+        self._last_state = new_state
+        self._last_of_raw = None
+        self._of_steps_since_kf = 0
+        return True
+
+    def _hint_allows_temporal_prior(self, yaw_hint_deg: float | None) -> bool:
+        """True when the temporal prior may run under this yaw hint: no hint,
+        or (flag on) a hint within the tolerance of the last fix's angle."""
+        if yaw_hint_deg is None:
+            return True
+        if self._tp_hint_tol is None:
+            return False
+        if self._last_best_angle is None:
+            # No angle to disagree with (after a reset / failures). The prior
+            # checks its own preconditions (last state, dead-reckoned
+            # position); blocking it here also blocked the spatial prior and
+            # kept failing runs failing (wayback 2019 with heading: 0.47).
+            return True
+        hint = norm_deg(yaw_hint_deg)
+        if not self._rot_continuous:
+            hint = float((int(round(hint / 90.0)) * 90) % 360)
+        diff = abs(hint - norm_deg(float(self._last_best_angle))) % 360.0
+        return min(diff, 360.0 - diff) <= self._tp_hint_tol
+
+    def _filter_dt(self, dt: float) -> float:
+        """KF prediction interval: time since the filter's last update when
+        tracking.kalman_dt_from_timestamps is on and both timestamps are known;
+        otherwise the caller's dt (legacy)."""
+        if not self._kf_dt_from_ts or self._frame_timestamp is None:
+            return dt
+        last = self.trajectory_filter.last_update_t
+        if last is None:
+            return dt
+        elapsed = self._frame_timestamp - last
+        return elapsed if elapsed > 0.0 else dt
+
+    def _coordinate_result(self, result):
+        if self.relative_mode:
+            result["coordinate_kind"] = "local_planar"
+            result["coordinate_units"] = "arbitrary"
+            if "lat" in result and "lon" in result:
+                # lat/lon remain internal vertical/horizontal transport for the
+                # existing Qt signals. Network and exports emit x/y only.
+                result["x"], result["y"] = result["lon"], result["lat"]
         return result
 
     def _localize_layers(self, query_frame, static_mask, dt, yaw_hint, collector, timestamp):
         from copy import deepcopy
 
         if self.calib_manager is None:
-            return {"success": False, "status": "lost", "error": "Layer calibration manager missing"}
-        now = (self._layer_clock or 0.0) + max(0.0, float(dt)) if timestamp is None else float(timestamp)
+            return {
+                "success": False,
+                "status": "lost",
+                "error": "Layer calibration manager missing",
+            }
+        now = (
+            (self._layer_clock or 0.0) + max(0.0, float(dt))
+            if timestamp is None
+            else float(timestamp)
+        )
         if not np.isfinite(now) or (self._layer_clock is not None and now <= self._layer_clock):
             return {"success": False, "status": "stale", "error": "Non-increasing frame timestamp"}
         self._layer_clock = now
         frame, _ = self.normalizer.normalize(query_frame)
         mask = self.normalizer.normalize_mask(static_mask) if static_mask is not None else None
-        observations = self._layer_search.search(self, frame, mask, now, yaw_hint)
+        altitude_layers = self._altitude_layer_scales(frame.shape[1])
+        observations = self._layer_search.search(
+            self,
+            frame,
+            mask,
+            now,
+            yaw_hint,
+            **({"altitude_layers": altitude_layers} if altitude_layers else {}),
+        )
         chosen = self._layer_search.handoff.choose(observations, now)
         diagnostics = dict(self._layer_search.last_diagnostics)
         if chosen is None:
             self._consecutive_failures += 1
-            if (self._layer_search.handoff.state == "LOST"
-                    or self._layer_search.handoff.reason == "ambiguous_geometry"):
+            if (
+                self._layer_search.handoff.state == "LOST"
+                or self._layer_search.handoff.reason == "ambiguous_geometry"
+            ):
                 self._last_state = None
             return {
                 "success": False,
-                "status": "ambiguous" if self._layer_search.handoff.reason == "ambiguous_geometry" else "lost",
+                "status": "ambiguous"
+                if self._layer_search.handoff.reason == "ambiguous_geometry"
+                else "lost",
                 "error": self._layer_search.handoff.reason,
-                "layer_state": self._layer_search.handoff.state, "search": diagnostics,
+                "layer_state": self._layer_search.handoff.state,
+                "search": diagnostics,
             }
         previous = (self.database, self.calibration, self._active_source_id, self._scale_manager)
         switching = chosen.source_id != self._active_source_id
@@ -16459,6 +22897,7 @@ class Localizer:
             accepted = bool(result.get("success"))
             if accepted:
                 self._layer_search.commit(chosen, now)
+                self._learn_altitude_factor()
                 result["status"] = "confirmed"
                 result["source_changed"] = switching
                 result["coordinate_kind"] = "ground_observation"
@@ -16467,7 +22906,9 @@ class Localizer:
             return result
         finally:
             if not accepted:
-                self.database, self.calibration, self._active_source_id, self._scale_manager = previous
+                self.database, self.calibration, self._active_source_id, self._scale_manager = (
+                    previous
+                )
                 self.trajectory_filter, self.outlier_detector, self._smoother = filters
                 self._last_state, self._last_best_angle, self._last_of_raw = previous_state
 
@@ -16479,6 +22920,7 @@ class Localizer:
         yaw_hint_deg: float | None = None,
         collector=None,
         _verified=None,
+        _caches: dict | None = None,
     ) -> dict:
         # Fix #1: If too many consecutive failures occurred — return out_of_coverage
         if _verified is None and self._consecutive_failures >= self._max_failures:
@@ -16513,20 +22955,33 @@ class Localizer:
         # Debug: depth map for window (independent of localization success).
         self._maybe_collect_depth(query_frame, collector)
 
-        angles_to_try = [0, 90, 180, 270] if self.enable_auto_rotation else [0]
+        if not self.enable_auto_rotation:
+            angles_to_try = [0]
+        elif self._rot_continuous:
+            angles_to_try = list(self._rot_scan)
+        else:
+            angles_to_try = [0, 90, 180, 270]
 
         top_k = self.retrieval_top_k
 
-        # §A1: cache (angle, scale) -> (frame, mask, crop, features) for ONE call.
+        # §A1: cache (angle, scale) -> (frame, mask, crop, features) for ONE frame.
         # If temporal hypothesis failed, and full path chose the same
         # angle and scale — ALIKED is not recomputed (217-339 ms on GTX 1650).
-        _feat_cache: dict = {}
+        # ``_caches`` (localize_frame) carries it, and the query's patchify
+        # descriptors, into the in-frame retry, which used to recompute both for
+        # the view it had already processed.
+        caches = {} if _caches is None else _caches
+        _feat_cache: dict = caches.setdefault("features", {})
+        _patch_cache: dict = caches.setdefault("patch", {})
 
         # ── §A1: attempt to localize WITHOUT global descriptor ──────────
         # yaw_hint_deg disables this path: external heading is new information
         # about orientation, it must be processed by full rotation path.
         _tp = _verified
-        if _tp is None and self._temporal_prior and yaw_hint_deg is None:
+        # True only for a temporal-prior hit (not layer search's _verified): the
+        # rotation refine then compares inliers under the same keypoint budget.
+        tp_hit = False
+        if _tp is None and self._temporal_prior and self._hint_allows_temporal_prior(yaw_hint_deg):
             self._tp_counter += 1
             audit = self._tp_audit_every
             if audit <= 0 or (self._tp_counter % audit) != 0:
@@ -16534,6 +22989,7 @@ class Localizer:
                 _tp = self._try_temporal_prior(query_frame, static_mask, _feat_cache)
                 if _tp is not None:
                     self._tp_hits += 1
+                    tp_hit = True
                 if self._tp_tries % 50 == 0:
                     logger.info(
                         f"[temporal-prior] tries={self._tp_tries} "
@@ -16560,7 +23016,7 @@ class Localizer:
             best_source_id_per_angle = self._active_source_id
             if collector is not None:
                 collector.global_score = best_global_score
-                collector.global_angle = int(best_global_angle)
+                collector.global_angle = self._angle_out(best_global_angle)
                 collector.scale = float(best_scale)
                 collector.retrieval_candidates = [
                     (int(cid), float(sc)) for cid, sc in best_global_candidates
@@ -16574,16 +23030,24 @@ class Localizer:
             )
         else:
             # ── RESEARCH 2.3: external yaw-hint (simulator / telemetry) ────────
-            # yaw_hint_deg — CW angle in degrees to rotate the frame to match
-            # DB orientation (north-up); conversion from drone heading
-            # is done by caller. Quantized to 90 degrees — full rotation path operates with
-            # k*90. False hint self-heals: if retrieval-score of prior-angle
-            # is lower than rotation_rescan_min_score, RotationSelector performs
-            # full batched 4-angle scan.
+            # yaw_hint_deg — angle to rotate the frame by to match the DB
+            # orientation, in the np.rot90 / cv2.getRotationMatrix2D sense
+            # (positive = counter-clockwise on screen); src/telemetry converts a
+            # compass heading into it. "quarter" mode quantizes it to k*90;
+            # "continuous" uses it as is. A false hint self-heals: if the
+            # retrieval score at the prior angle is below rotation_rescan_min_score,
+            # RotationSelector falls back to the full scan.
+            # Query scale vs the layer of the last fix, before retrieval switches layers
+            # (localization.patchify_adaptive).
+            self._frame_query_gsd = self._estimated_query_gsd()
+            self._apply_altitude_hint(width)
             prior_angle = self._last_best_angle
             use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
             if yaw_hint_deg is not None and self.enable_auto_rotation:
-                prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
+                if self._rot_continuous:
+                    prior_angle = norm_deg(yaw_hint_deg)
+                else:
+                    prior_angle = (int(round((yaw_hint_deg % 360.0) / 90.0)) * 90) % 360
                 use_prior = True
                 logger.debug(f"Yaw hint {yaw_hint_deg:.1f}° → prior rotation {prior_angle}°")
 
@@ -16614,7 +23078,7 @@ class Localizer:
 
             if collector is not None:
                 collector.global_score = float(best_global_score)
-                collector.global_angle = int(best_global_angle)
+                collector.global_angle = self._angle_out(best_global_angle)
                 collector.scale = float(best_scale)
                 collector.retrieval_candidates = [
                     (int(cid), float(sc)) for cid, sc in best_global_candidates
@@ -16657,9 +23121,32 @@ class Localizer:
             # Run ONCE after angle selection — not in a loop.
             # Patchify adds candidates that DINOv2 CLS-token might have missed
             # (e.g., during altitude change).
-            best_global_candidates = self._candidate_retriever.expand(
-                best_rotated_frame, best_global_candidates, top_k
+            standard_candidates = list(best_global_candidates)
+            # Joint candidate list: every layer's patchify candidates are searched there.
+            joint_mode = (
+                self._joint_ranking
+                and self.db_manager is not None
+                and bool(getattr(rot, "per_source", None))
             )
+            # localization.patchify_lazy: the patch search waits until the standard
+            # candidates of this view have failed (see the lazy branch below).
+            lazy_patchify = (
+                getattr(self, "_patchify_lazy", False)
+                and not joint_mode
+                and self._candidate_retriever.patchify_for(best_source_id_per_angle) is not None
+            )
+            if (
+                not joint_mode
+                and not lazy_patchify
+                and self._patchify_allowed(best_source_id_per_angle)
+            ):
+                best_global_candidates = self._candidate_retriever.expand(
+                    best_rotated_frame,
+                    best_global_candidates,
+                    top_k,
+                    source_id=best_source_id_per_angle,
+                    desc_cache=_patch_cache,
+                )
 
             # Map trust participates in candidate selection, not only in final
             # result assembly.  Otherwise an unsupported self-match can win the
@@ -16685,9 +23172,140 @@ class Localizer:
                     except Exception as e:
                         logger.debug(f"Debug DINO tokens skipped: {e}")
 
-            ver = self._geometric_verifier.verify(
-                best_query_features, best_global_candidates, self.database
+            main_first = (
+                None
+                if joint_mode or lazy_patchify
+                else self._main_before_patchify(
+                    rot, standard_candidates, best_global_candidates, best_source_id_per_angle
+                )
             )
+            if joint_mode:
+                ver = None
+                on_layer = self._verify_joint(rot, query_frame, static_mask, _feat_cache, top_k)
+                if on_layer is not None:
+                    (
+                        ver,
+                        best_global_angle,
+                        best_scale,
+                        best_rotated_frame,
+                        best_rotated_mask,
+                        _crop_info,
+                        best_query_features,
+                        best_global_candidates,
+                        best_global_score,
+                        best_source_id_per_angle,
+                    ) = on_layer
+            elif lazy_patchify:
+                ver = self._geometric_verifier.verify(
+                    best_query_features, best_global_candidates, self.database, tag="retrieval"
+                )
+                if ver is None and self._patchify_allowed(best_source_id_per_angle):
+                    expanded = self._candidate_retriever.expand(
+                        best_rotated_frame,
+                        standard_candidates,
+                        top_k,
+                        source_id=best_source_id_per_angle,
+                        desc_cache=_patch_cache,
+                    )
+                    if support_check is not None:
+                        expanded = [c for c in expanded if support_check(int(c[0]))]
+                    std_ids = {int(frame) for frame, _ in standard_candidates}
+                    patch_only = [c for c in expanded if int(c[0]) not in std_ids]
+                    if patch_only:
+                        # Same order as the eager path from here on: the main layer
+                        # (patchify_main_rank_margin), then the patchify-only candidates.
+                        best_global_candidates = expanded
+                        lazy_first = self._main_before_patchify(
+                            rot, standard_candidates, expanded, best_source_id_per_angle
+                        )
+                        main_rot = lazy_first[0] if lazy_first is not None else None
+                        if main_rot is not None:
+                            on_main = self._verify_main_layer(
+                                main_rot, query_frame, static_mask, _feat_cache
+                            )
+                            if on_main is not None:
+                                (
+                                    ver,
+                                    best_global_angle,
+                                    best_scale,
+                                    best_rotated_frame,
+                                    best_rotated_mask,
+                                    _crop_info,
+                                    best_query_features,
+                                    best_global_candidates,
+                                    best_global_score,
+                                    best_source_id_per_angle,
+                                ) = on_main
+                        if ver is None:
+                            ver = self._geometric_verifier.verify(
+                                best_query_features, patch_only, self.database, tag="patchify"
+                            )
+            elif main_first is None:
+                ver = self._geometric_verifier.verify(
+                    best_query_features, best_global_candidates, self.database, tag="retrieval"
+                )
+            else:
+                # Patchify-only candidates come last: this layer's standard candidates,
+                # then the main layer's (another layer: switch + its own scale), then them.
+                main_rot, own, patch_only = main_first
+                ver = self._geometric_verifier.verify(
+                    best_query_features, own, self.database, tag="retrieval"
+                )
+                if ver is None and main_rot is not None:
+                    on_main = self._verify_main_layer(
+                        main_rot, query_frame, static_mask, _feat_cache
+                    )
+                    if on_main is not None:
+                        (
+                            ver,
+                            best_global_angle,
+                            best_scale,
+                            best_rotated_frame,
+                            best_rotated_mask,
+                            _crop_info,
+                            best_query_features,
+                            best_global_candidates,
+                            best_global_score,
+                            best_source_id_per_angle,
+                        ) = on_main
+                if ver is None:
+                    ver = self._geometric_verifier.verify(
+                        best_query_features, patch_only, self.database, tag="patchify"
+                    )
+
+        # ── Continuous rotation: remove the residual the scan step left ──────
+        # The scan lands within step/2 of the true heading; the verified
+        # homography measures the rest. One re-extraction at the corrected angle
+        # turns e.g. a 20° residual (~half the inliers, see query_rotation) into
+        # ~0°. Kept only if it verifies the same frame with more inliers.
+        if (
+            ver is not None
+            and self._rot_continuous
+            and self.enable_auto_rotation
+            and self._rot_refine_min > 0
+        ):
+            refined = self._refine_rotation(
+                query_frame,
+                static_mask,
+                best_global_angle,
+                best_scale,
+                ver,
+                _feat_cache,
+                max_keypoints=self._tp_keypoint_budget() if tp_hit else 0,
+            )
+            if refined is not None:
+                (
+                    ver,
+                    best_global_angle,
+                    best_rotated_frame,
+                    best_rotated_mask,
+                    _crop_info,
+                    best_query_features,
+                ) = refined
+                if collector is not None:
+                    collector.global_angle = self._angle_out(best_global_angle)
+                    collector.rotated_frame = best_rotated_frame
+                    collector.query_features = best_query_features
         if ver is not None:
             best_inliers = ver.inliers
             best_candidate_id = ver.candidate_id
@@ -16791,7 +23409,9 @@ class Localizer:
                     "GPS output suppressed"
                 ),
             }
-        affine_ref = self.database.get_frame_affine(best_candidate_id)
+        from src.geometry.frame_transform import get_frame_transform
+
+        affine_ref = get_frame_transform(self.database, best_candidate_id)
         if affine_ref is None:
             target_id = (
                 best_candidate_id if (best_candidate_id != -1) else best_global_candidates[0][0]
@@ -16813,11 +23433,15 @@ class Localizer:
                 ),
             }
 
-        # Dimensions of rotated normalized image
-        if best_global_angle in (90, 270):
+        # Dimensions of rotated normalized image. Continuous mode keeps the
+        # view the size of the frame and folds the rotation into H below, so
+        # everything downstream works in ORIGINAL frame coordinates.
+        if not self._rot_continuous and best_global_angle in (90, 270):
             rot_height, rot_width = width, height
         else:
             rot_height, rot_width = height, width
+        # Rotation measured by this match (view -> reference), for the next prior.
+        H_view_to_ref = best_H_query_to_ref
 
         M_query_to_ref = best_H_query_to_ref
         if M_query_to_ref is None:
@@ -16847,18 +23471,35 @@ class Localizer:
                     np.asarray(best_mkpts_q_inliers, dtype=np.float64), _A_inv
                 )
 
+        # Continuous mode: view -> original frame. After this, M maps ORIGINAL
+        # (resolution-normalised) frame pixels to the reference frame and the
+        # rest of the pipeline treats the keyframe as unrotated (angle 0).
+        downstream_angle = best_global_angle
+        if self._rot_continuous:
+            R_view = rotation_matrix(best_global_angle, width, height)
+            M_query_to_ref = M_query_to_ref @ R_view
+            if best_mkpts_q_inliers is not None and len(best_mkpts_q_inliers) > 0:
+                best_mkpts_q_inliers = GeometryTransforms.apply_homography(
+                    np.asarray(best_mkpts_q_inliers, dtype=np.float64), np.linalg.inv(R_view)
+                )
+            downstream_angle = 0
+
         # ── Step 5: State for Optical Flow (commit — AFTER outlier gate) ─────
+        ref_h, ref_w = self.database.get_frame_size(best_candidate_id)
         pending_state = {
+            "reference_size": (ref_w, ref_h),
             "H": M_query_to_ref,
             "affine": affine_ref,
             "candidate_id": best_candidate_id,
             "inliers": best_inliers,
-            "global_angle": best_global_angle,
+            "global_angle": downstream_angle,
             "source_id": self._active_source_id,
             # Normalization scale of THIS SPECIFIC keyframe: OF operates in
             # frame system belonging to H (fresh self._last_scale on
             # subsequent frames may already differ).
             "scale": self._last_scale,
+            # Frame time of this real keyframe fix (dead-reckoning age for OF).
+            "fix_t": self._frame_timestamp,
         }
 
         # ── Step 6: Query center → Reference → Metric → GPS ─────────────────
@@ -16881,7 +23522,10 @@ class Localizer:
                 "error": "Coordinate transformation error (homography failed)",
             }
 
-        pts_metric = GeometryTransforms.apply_affine(pts_in_ref, affine_ref)
+        try:
+            pts_metric = project_frame_points(affine_ref, pts_in_ref, ref_w, ref_h)
+        except ValueError:
+            return {"success": False, "error": "Center outside safe reference projection"}
         mx = float(pts_metric[0, 0])
         my = float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
@@ -16891,7 +23535,9 @@ class Localizer:
         # RANSAC inliers should not be discarded due to platform speed assumptions.
         # Position is still appended to history so detector window
         # corresponded to reality, not to a filtered version of it.
-        _strong = self._trust_strong and best_inliers >= self._trust_min_inliers
+        _strong = self.relative_mode or (
+            self._trust_strong and best_inliers >= self._trust_min_inliers
+        )
         if _strong:
             logger.debug(
                 f"Kinematic gate bypassed: {best_inliers} inliers "
@@ -16902,12 +23548,18 @@ class Localizer:
         # yet computed (it is below in Step 8), and reordering for the sake of
         # the gate would mean changing more than the task requires. Consequence: for
         # fixes with low confidence gate is slightly stricter than subsequent update.
+        _kf_dt = self._filter_dt(dt)
         _maha_d2 = (
-            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.0)
+            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=_kf_dt, noise_scale=1.0)
             if self._maha_gate_enabled
             else None
         )
-        if not _strong and self.outlier_detector.is_outlier(metric_pt, dt, maha_d2=_maha_d2):
+        if not _strong and self.outlier_detector.is_outlier(
+            metric_pt,
+            dt,
+            maha_d2=_maha_d2,
+            pred_position=self.trajectory_filter.predict_position(_kf_dt),
+        ):
             logger.warning(
                 f"Outlier filtered | matched_frame={best_candidate_id}, "
                 f"metric=({mx:.1f}, {my:.1f}), inliers={best_inliers}, dt={dt:.3f}s. "
@@ -16943,11 +23595,16 @@ class Localizer:
             best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
         )
 
-        filtered_pt = self.trajectory_filter.update(
-            metric_pt,
-            dt=dt,
-            noise_scale=1.0 / max(confidence, 0.25),
-            trusted_max_offset_m=(self._trusted_fix_max_filter_offset if _strong else None),
+        filtered_pt = (
+            metric_pt
+            if self.relative_mode
+            else self.trajectory_filter.update(
+                metric_pt,
+                dt=_kf_dt,
+                noise_scale=1.0 / max(confidence, 0.25),
+                trusted_max_offset_m=(self._trusted_fix_max_filter_offset if _strong else None),
+                timestamp=self._frame_timestamp,
+            )
         )
         # RESEARCH 3.1: back-end smoother — fix window + OF-odometry;
         # KF correction by shift BEFORE writing to detector history and GPS/FOV,
@@ -16983,15 +23640,14 @@ class Localizer:
                 else:
                     self.trajectory_filter.shift(float(corr[0]), float(corr[1]))
                     filtered_pt = proposed_pt
-                    logger.debug(
-                        f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m"
-                    )
+                    logger.debug(f"Smoother correction applied: ({corr[0]:+.2f}, {corr[1]:+.2f}) m")
         self.outlier_detector.add_position(filtered_pt, dt=dt)
         # New keyframe restarts LK, so chain of local OF comparisons
         # breaks: first OF after keyframe should measure shift FROM keyframe
         # (ref=None -> database = newly added position in window), not from OF-measurement
         # of previous cycle. Otherwise database of shift and dt diverge again.
         self._last_of_raw = None
+        self._of_steps_since_kf = 0
         lat, lon = self.calibration.converter.metric_to_gps(
             float(filtered_pt[0]), float(filtered_pt[1])
         )
@@ -17013,6 +23669,7 @@ class Localizer:
             my,
             filtered_pt,
             best_candidate_id,
+            reference_size=(ref_w, ref_h),
         )
 
         logger.debug(
@@ -17026,7 +23683,13 @@ class Localizer:
         )
 
         # A3: remember angle for temporal prior of next keyframe
-        self._last_best_angle = best_global_angle
+        if self._rot_continuous:
+            # Angle at which this match would have had zero residual rotation:
+            # in steady flight the next keyframe is then aligned to within the
+            # heading change between two keyframes.
+            self._last_best_angle = next_prior_deg(best_global_angle, H_view_to_ref)
+        else:
+            self._last_best_angle = best_global_angle
 
         # Scale prior: extract scale from H for the next keyframe
         self._scale_manager.update_from_homography(M_query_to_ref, rot_width, rot_height)
@@ -17041,8 +23704,10 @@ class Localizer:
             "raw_lat": raw_lat,
             "raw_lon": raw_lon,
             "raw_metric": [mx, my],
+            "fix_source": "keyframe",
+            "since_fix_s": 0.0,
             "scale_ratio": float(best_scale),
-            "rotation_deg": int(best_global_angle),
+            "rotation_deg": self._angle_out(best_global_angle),
             "fov_polygon": gps_corners,
             "sample_spread_m": 0.0,
             "source_id": self._active_source_id,
@@ -17059,6 +23724,7 @@ class Localizer:
         rot_height: int,
         flow_affine: np.ndarray | None = None,
         flow_quality: float | None = None,
+        timestamp: float | None = None,
     ) -> dict:
         """Localization based on pixel shift from Optical Flow.
 
@@ -17148,12 +23814,31 @@ class Localizer:
         if pts_in_ref is None or len(pts_in_ref) == 0:
             return {"success": False, "error": "OF homography failed"}
 
-        pts_metric = GeometryTransforms.apply_affine(pts_in_ref, self._last_state["affine"])
+        try:
+            pts_metric = project_frame_points(
+                self._last_state["affine"],
+                pts_in_ref,
+                *self._last_state.get("reference_size", (0, 0)),
+            )
+        except ValueError:
+            return {"success": False, "error": "OF center outside safe reference projection"}
         if pts_metric is None or len(pts_metric) == 0:
             return {"success": False, "error": "OF affine failed"}
 
         mx, my = float(pts_metric[0, 0]), float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
+
+        if (
+            self._of_min_quality > 0.0
+            and flow_quality is not None
+            and float(flow_quality) < self._of_min_quality
+        ):
+            logger.warning(
+                f"OF rejected: flow_quality={float(flow_quality):.3f} < "
+                f"{self._of_min_quality} (LK track lost)"
+            )
+            self._log_failure(FAILURE_TYPES["Outlier detected"])
+            return {"success": False, "error": "OF rejected — flow quality too low"}
 
         # -- Outlier gate on OF path (audit item 1.2), flag-gated ------------
         # Structural gap: keyframe path checks is_outlier (Step 7), while OF —
@@ -17179,18 +23864,29 @@ class Localizer:
         # if rejected). Without it reference is last accepted position, usually
         # keyframe, and speed accumulates along with LK shift.
         _of_ref = self._last_of_raw if self._of_local_speed else None
+        self._of_steps_since_kf += 1
+        _of_corr = 1.0 + self._of_noise_growth * (self._of_steps_since_kf - 1)
         # noise_scale=1.5 matches base multiplier of OF-branch update() at
         # of_conf=1.0 — OF measurement is inherently noisier than keyframe-fix.
+        self._frame_timestamp = None if timestamp is None else float(timestamp)
+        _kf_dt = self._filter_dt(dt)
         _maha_d2 = (
-            self.trajectory_filter.mahalanobis_sq(metric_pt, dt=dt, noise_scale=1.5)
+            self.trajectory_filter.mahalanobis_sq(
+                metric_pt, dt=_kf_dt, noise_scale=self._of_noise_base * _of_corr
+            )
             if self._maha_gate_enabled
             else None
         )
         _is_out = (
-            self._of_outlier_gate
+            not self.relative_mode
+            and self._of_outlier_gate
             and not _strong_flow
             and self.outlier_detector.is_outlier(
-                metric_pt, dt, ref_position=_of_ref, maha_d2=_maha_d2
+                metric_pt,
+                dt,
+                ref_position=_of_ref,
+                maha_d2=_maha_d2,
+                pred_position=self.trajectory_filter.predict_position(_kf_dt),
             )
         )
         # Updating BEFORE early return: next frame must be compared with this one
@@ -17222,8 +23918,15 @@ class Localizer:
         else:
             of_conf = 0.7
 
-        filtered_pt = self.trajectory_filter.update(
-            metric_pt, dt=dt, noise_scale=1.5 / max(of_conf, 0.25)
+        filtered_pt = (
+            metric_pt
+            if self.relative_mode
+            else self.trajectory_filter.update(
+                metric_pt,
+                dt=_kf_dt,
+                noise_scale=self._of_noise_base * _of_corr / max(of_conf, 0.25),
+                timestamp=self._frame_timestamp,
+            )
         )
         self.outlier_detector.add_position(filtered_pt, dt=dt, reset_consecutive=False)
 
@@ -17231,21 +23934,82 @@ class Localizer:
             float(filtered_pt[0]), float(filtered_pt[1])
         )
         self._sync_ground_scale(lat)
+        # Raw OF position (before KF / smoother), for diagnostics and replay
+        # scoring — same meaning as raw_lat/raw_lon of a keyframe result.
+        raw_lat, raw_lon = self.calibration.converter.metric_to_gps(mx, my)
 
         of_inliers = int(self._last_state.get("inliers", 30) * 0.8)
+        # Provenance for consumers: an OF position chained through failed
+        # keyframes (tracking.of_chain_on_keyframe_fail) is dead reckoning, not
+        # an observation of the map — flagged, with its age and halved confidence.
+        links = int(self._last_state.get("of_chain_links", 0) or 0)
+        fix_t = self._last_state.get("fix_t")
+        since_fix = (
+            round(self._frame_timestamp - float(fix_t), 2)
+            if fix_t is not None and self._frame_timestamp is not None
+            else None
+        )
+        if links > 0:
+            of_conf *= 0.5
 
-        return {
-            "success": True,
-            "lat": lat,
-            "lon": lon,
-            "confidence": round(of_conf, 3),
-            "matched_frame": int(self._last_state.get("candidate_id", -1)),
-            "inliers": of_inliers,
-            "fov_polygon": None,
-            "is_of": True,
-        }
+        return self._coordinate_result(
+            {
+                "success": True,
+                "lat": lat,
+                "lon": lon,
+                "raw_lat": raw_lat,
+                "raw_lon": raw_lon,
+                "fix_source": "dead_reckoning" if links > 0 else "optical_flow",
+                "dead_reckoning_links": links,
+                "since_fix_s": since_fix,
+                "confidence": round(of_conf, 3),
+                "matched_frame": int(self._last_state.get("candidate_id", -1)),
+                "inliers": of_inliers,
+                "fov_polygon": None,
+                "is_of": True,
+            }
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Continuous rotation helpers (localization.rotation_mode) ─────────────
+
+    def _angle_out(self, angle) -> float | int:
+        """Angle as reported/collected: int (k*90) in quarter mode, float otherwise."""
+        return round(float(angle), 2) if self._rot_continuous else int(angle)
+
+    def _refine_rotation(self, query_frame, static_mask, angle, scale, ver, cache, max_keypoints=0):
+        """Re-verify ``ver``'s frame at the residual-corrected angle.
+
+        Returns ``(ver, angle, frame, mask, crop_info, features)`` when the
+        corrected view verifies the same reference frame with more inliers,
+        else None. ``max_keypoints`` (0 = all) must be the budget ``ver`` was
+        verified with, so the inlier counts are comparable.
+        """
+        target = next_prior_deg(angle, ver.H_query_to_ref)
+        residual = angle_distance_deg(target, angle)
+        if residual < self._rot_refine_min:
+            return None
+        frame, mask, crop, feats = self._prepare_and_extract(
+            query_frame, static_mask, target, scale, cache
+        )
+        ver2 = self._geometric_verifier.verify(
+            top_keypoints(feats, max_keypoints),
+            [(int(ver.candidate_id), 0.0)],
+            self.database,
+            tag="refine",
+        )
+        if ver2 is None or ver2.inliers <= ver.inliers:
+            logger.debug(
+                f"Rotation refine {angle:.1f}° -> {target:.1f}° kept the original "
+                f"({ver.inliers} vs {getattr(ver2, 'inliers', 0)} inliers)"
+            )
+            return None
+        logger.debug(
+            f"Rotation refine {angle:.1f}° -> {target:.1f}° (residual {residual:.1f}°): "
+            f"inliers {ver.inliers} -> {ver2.inliers}"
+        )
+        return ver2, target, frame, mask, crop, feats
 
     # ── PIPELINE_OPTIMIZATION_PLAN §A1 ──────────────────────────────────────
 
@@ -17271,6 +24035,10 @@ class Localizer:
         і ALIKED — на 1080p це мінус ~6 МБ memcpy і один resize на keyframe.
         Маску все одно доводиться готувати окремо: селектор її не бачить.
         """
+        if self._rot_continuous:
+            return self._prepare_and_extract_view(
+                query_frame, static_mask, angle, scale, cache, prepared
+            )
         key = (int(angle), round(float(scale), 3))
         cached = cache.get(key)
         if cached is not None:
@@ -17310,6 +24078,42 @@ class Localizer:
         cache[key] = (rotated, rot_mask, crop_info, feats)
         return cache[key]
 
+    def _prepare_and_extract_view(
+        self,
+        query_frame: np.ndarray,
+        static_mask: np.ndarray | None,
+        angle: float,
+        scale: float,
+        cache: dict,
+        prepared: tuple | None = None,
+    ) -> tuple:
+        """Continuous-mode twin of ``_prepare_and_extract``.
+
+        Same-size rotated view (query_rotation.rotate_view) → GSD normalisation
+        → ALIKED, with keypoints restricted to the part of the view that comes
+        from the frame (and to the static/YOLO mask).
+        """
+        key = ("view", round(float(angle), 2), round(float(scale), 3))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        from src.localization.rotation_selector import RotationSelector
+
+        with Telemetry.profile("view_prepare"):
+            if prepared is not None and prepared[0] is not None:
+                frame, crop_info = prepared[0], prepared[1]
+            else:
+                frame, crop_info, _ = RotationSelector._prepare_view(
+                    query_frame, angle, scale, self._scale_manager, None, self._rot_erode
+                )
+            mask = view_mask(query_frame.shape[:2], angle, static_mask, self._rot_erode)
+            if mask is not None and abs(float(scale) - 1.0) > 0.15:
+                mask, _ = self._scale_manager.normalize(mask, float(scale))
+        feats = self.feature_extractor.extract_local_features(frame, static_mask=mask)
+        feats.setdefault("image_size", np.array([frame.shape[0], frame.shape[1]], dtype=np.int32))
+        cache[key] = (frame, mask, crop_info, feats)
+        return cache[key]
+
     def _tp_neighbour_ids(self) -> list[int]:
         """Candidates from neighborhood of last match — without any forward-pass.
 
@@ -17329,19 +24133,106 @@ class Localizer:
             for c in (cid,) if d == 0 else (cid - d, cid + d):
                 if c < 0 or c in ids:
                     continue
-                try:
-                    support_check = getattr(self.database, "is_frame_georef_supported", None)
-                    if support_check is not None and not support_check(c):
-                        continue
-                    if self.database.get_frame_affine(c) is None:
-                        continue
-                except Exception as e:  # noqa: BLE001 — БД може не мати кадру
-                    logger.debug(f"Temporal prior: frame {c} rejected ({e})")
-                    continue
-                ids.append(c)
+                if self._tp_frame_usable(c):
+                    ids.append(c)
         return ids
 
+    def _tp_frame_usable(self, c: int) -> bool:
+        """A frame can end a temporal / spatial prior check: georeferenced + calibrated."""
+        try:
+            support_check = getattr(self.database, "is_frame_georef_supported", None)
+            if support_check is not None and not support_check(c):
+                return False
+            return self.database.get_frame_affine(c) is not None
+        except Exception as e:  # noqa: BLE001 — БД може не мати кадру
+            logger.debug(f"Temporal prior: frame {c} rejected ({e})")
+            return False
+
     def _try_temporal_prior(
+        self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
+    ) -> tuple | None:
+        """Index-neighbour temporal prior, then (flag) the spatial prior."""
+        self._tp_verified = []
+        hit = self._try_index_prior(query_frame, static_mask, cache)
+        if hit is None and self._spatial_prior.enabled:
+            hit = self._try_spatial_prior(query_frame, static_mask, cache)
+        return hit
+
+    def _try_spatial_prior(
+        self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
+    ) -> tuple | None:
+        """Second temporal-prior stage: map frames near the dead-reckoned position.
+
+        Runs at most once per ``localize_frame`` call (the in-frame retry would
+        repeat it) and only within ``spatial_prior_max_age_s`` of the last fix.
+        Angle and scale fall back to the last confirmed ones (the retry clears
+        both priors). Candidates: the ``spatial_prior_nearest_k`` usable frames
+        of the active layer nearest to the prediction, then the index
+        neighbours; the best ``spatial_prior_verify`` by MNN go to LightGlue
+        without the ``temporal_prior_min_mnn`` gate (on other-satellite imagery
+        the probe scores the right frame below it while LightGlue accepts it).
+        Same return tuple as ``_try_index_prior``; verification tag
+        ``spatial_prior``.
+        """
+        if self._sp_frame_done or self._sp_now is None:
+            return None
+        self._sp_frame_done = True
+        sp = self._spatial_prior
+        pred = sp.predict(self._sp_now)
+        if pred is None:
+            return None
+        angle = self._last_best_angle if self._last_best_angle is not None else sp.angle
+        if angle is None:
+            return None
+        scale = self._scale_manager.prior
+        if scale is None:
+            scale = sp.scale
+        scale = 1.0 if scale is None else float(scale)
+
+        index_ids = self._tp_neighbour_ids()
+        ids = sp.nearest_ids(
+            self.database, pred[0], pred[1], exclude=index_ids, usable=self._tp_frame_usable
+        )
+        # Frames the index stage already ran LightGlue on in this frame are not
+        # verified twice.
+        ids = [c for c in ids + index_ids if c not in self._tp_verified]
+        if not ids:
+            return None
+        self._sp_tries += 1
+
+        rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
+            query_frame, static_mask, angle, scale, cache
+        )
+        tp_feats = top_keypoints(feats, self._tp_keypoint_budget())
+        cands = [(int(i), 0.0) for i in ids]
+        ref_cache: dict = {}
+        scored = self._geometric_verifier.mnn_counts(tp_feats, cands, self.database, ref_cache)
+        if not scored:
+            return None
+        # Stable sort: equal probe counts keep the nearest-first order.
+        scored.sort(key=lambda t: -t[0])
+        probe = [(cid, float(m)) for m, cid, _ in scored[: sp.verify]]
+        ver = self._geometric_verifier.verify(
+            tp_feats, probe, self.database, ref_cache=ref_cache, tag="spatial_prior"
+        )
+        if ver is None or ver.inliers < self._tp_accept:
+            got = ver.inliers if ver is not None else 0
+            logger.debug(
+                f"Spatial prior: rejected ({got} inliers < {self._tp_accept}; "
+                f"{len(ids)} candidates, age {sp.age(self._sp_now):.1f} s)"
+            )
+            return None
+        self._sp_hits += 1
+        if self._sp_tries % 25 == 0 or self._sp_hits == 1:
+            logger.info(f"[spatial-prior] tries={self._sp_tries} hits={self._sp_hits}")
+        logger.debug(
+            f"Spatial prior HIT: frame={ver.candidate_id}, inliers={ver.inliers}, "
+            f"angle={angle:.1f} deg, age {sp.age(self._sp_now):.1f} s"
+        )
+        out_angle = float(angle) if self._rot_continuous else int(angle)
+        return (ver, out_angle, float(scale), rotated, rot_mask, crop_info, feats, probe)
+
+    def _try_index_prior(
         self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
     ) -> tuple | None:
         """Item A1: localization without global descriptor.
@@ -17367,10 +24258,13 @@ class Localizer:
         rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
             query_frame, static_mask, angle, scale, cache
         )
+        # Probe and verification on the strongest keypoints only; `feats` (the
+        # full set, also in `cache` for the retrieval path) is what is returned.
+        tp_feats = top_keypoints(feats, self._tp_keypoint_budget())
 
         cands = [(int(i), 0.0) for i in ids]
         ref_cache: dict = {}
-        scored = self._geometric_verifier.mnn_counts(feats, cands, self.database, ref_cache)
+        scored = self._geometric_verifier.mnn_counts(tp_feats, cands, self.database, ref_cache)
         if not scored:
             return None
         scored.sort(key=lambda t: -t[0])
@@ -17382,7 +24276,10 @@ class Localizer:
             return None
 
         probe = [(cid, float(m)) for m, cid, _ in scored[: max(1, self._tp_keep)]]
-        ver = self._geometric_verifier.verify(feats, probe, self.database, ref_cache=ref_cache)
+        self._tp_verified = [cid for cid, _ in probe]
+        ver = self._geometric_verifier.verify(
+            tp_feats, probe, self.database, ref_cache=ref_cache, tag="temporal_prior"
+        )
         if ver is None or ver.inliers < self._tp_accept:
             got = ver.inliers if ver is not None else 0
             logger.debug(
@@ -17390,7 +24287,8 @@ class Localizer:
             )
             return None
 
-        return (ver, int(angle), float(scale), rotated, rot_mask, crop_info, feats, probe)
+        out_angle = float(angle) if self._rot_continuous else int(angle)
+        return (ver, out_angle, float(scale), rotated, rot_mask, crop_info, feats, probe)
 
     def _compute_confidence(
         self,
@@ -17485,6 +24383,8 @@ class Localizer:
                     mkq,
                     mkr,
                     ransac_threshold=self.ransac_thresh,
+                    max_iters=self.ransac_max_iters,
+                    confidence=self.ransac_confidence,
                     backend=self.homography_backend,
                     use_mad_ransac=self.use_mad_ransac,
                     mad_k_factor=self.mad_k_factor,
@@ -17526,6 +24426,8 @@ Key fixes:
 - ratio_threshold default set to 0.75 per Lowe's ratio test for normalized descriptors,
   preventing false positive matches on homogeneous textures.
 """
+
+import copy
 
 import faiss
 import numpy as np
@@ -17775,6 +24677,19 @@ class FeatureMatcher:
         # Fallback (no LightGlue or unsupported descriptor)
         return self._fast_numpy_match(query_features, ref_features, self.ratio_threshold)
 
+    def match_accuracy(self, query_features: dict, ref_features: dict) -> tuple:
+        """Full-depth offline matching without changing the shared live model."""
+        if self.lightglue is None or not hasattr(self.lightglue, "conf"):
+            return self.match(query_features, ref_features)
+        dims = [f["descriptors"].shape[1] for f in (query_features, ref_features)]
+        if dims[0] != dims[1] or dims[0] not in (128, 256):
+            return self.match(query_features, ref_features)
+        model = copy.copy(self.lightglue)
+        model.conf = copy.deepcopy(self.lightglue.conf)
+        model.conf.depth_confidence = -1
+        model.conf.width_confidence = -1
+        return self._lightglue_match(query_features, ref_features, model=model)
+
     def _fast_numpy_match(
         self, query_features: dict, ref_features: dict, ratio_threshold: float = 0.75
     ) -> tuple:
@@ -17947,8 +24862,9 @@ class PatchifyRetrieval:
     """Multi-scale retrieval via DINOv2/DINOv3 patch descriptors.
 
     Splits the image into grid patches (1x1, 2x2, 3x3) = 14 patches total,
-    extracts the CLS-token for each patch, and retrieves the most similar frames
-    via aggregated patch scores.
+    extracts the global descriptor of each patch (the extractor's active one:
+    CLS, VLAD or CESP), and retrieves the most similar frames via aggregated
+    patch scores.
     """
 
     DEFAULT_GRIDS = [(1, 1), (2, 2), (3, 3)]  # 1 + 4 + 9 = 14 патчів
@@ -17959,10 +24875,15 @@ class PatchifyRetrieval:
         descriptor_dim: int = 1024,
         grids: list[list[int]] | None = None,
         batch_size: int = 1,
+        unique_coverage: bool = False,
     ):
         self.feature_extractor = feature_extractor
         self.descriptor_dim = descriptor_dim
         self.batch_size = max(1, batch_size)
+        # localization.patchify_unique_coverage: score a frame by the best hit of
+        # each query patch (coverage over distinct query patches, score <= 1)
+        # instead of summing every reference-patch hit (see search()).
+        self.unique_coverage = bool(unique_coverage)
         self.grids = [tuple(g) for g in grids] if grids else self.DEFAULT_GRIDS
         self.num_patches = sum(r * c for r, c in self.grids)
 
@@ -18044,34 +24965,26 @@ class PatchifyRetrieval:
 
     @torch.no_grad()
     def _extract_batch_descriptors(self, patches: list[np.ndarray]) -> np.ndarray:
-        """Batched inference for patch group.
+        """Descriptors of a group of crops in one batched extractor call.
 
-        Використовує fe.dinov2_transform — нормалізація та розмір вже налаштовані
-        відповідно до активного backend (DINOv2 або DINOv3).
+        Goes through ``FeatureExtractor.extract_global_descriptors_multi``, which
+        resizes every crop to the DINO input size before stacking and applies the
+        same preprocessing (``dino_cpu_resize``), aggregation (VLAD / CESP / CLS)
+        and ``global_batch_max`` chunking as the sequential path. The previous
+        own implementation stacked crops of different sizes (RuntimeError) and
+        called the backbone directly (CLS instead of VLAD, no CPU resize).
         """
         fe = self.feature_extractor
-        device = fe.device
-
-        tensors = []
-        for patch in patches:
-            t = torch.from_numpy(patch).float().div_(255.0).permute(2, 0, 1)
-            tensors.append(t)
-
-        batch_tensor = torch.stack(tensors).to(device, non_blocking=True)
-        # Use the pre-built transform from FeatureExtractor (correct mean/std for the active backend)
-        batch_input = fe.dinov2_transform(batch_tensor)
-
-        amp_dtype = fe.amp_dtype
-        use_half = fe.use_half
-
-        # Determine device type dynamically for correct autocast dtype
-        device_type = "cuda" if "cuda" in str(device) else "cpu"
-        enabled = use_half and device_type == "cuda"
-
-        with torch.amp.autocast(device_type, dtype=amp_dtype, enabled=enabled):
-            out = fe.global_model(batch_input).float()
-
-        return out.cpu().numpy()
+        multi = getattr(fe, "extract_global_descriptors_multi", None)
+        if multi is None:
+            return np.stack([np.asarray(fe.extract_global_descriptor(p)) for p in patches])
+        out = np.asarray(multi(list(patches)), dtype=np.float32)
+        if out.shape != (len(patches), self.descriptor_dim):
+            raise ValueError(
+                f"Batched patch descriptors have shape {out.shape}, expected "
+                f"({len(patches)}, {self.descriptor_dim})"
+            )
+        return out
 
     # ── Index management ─────────────────────────────────────────────────
 
@@ -18144,17 +25057,28 @@ class PatchifyRetrieval:
         frame_hits: dict[int, int] = {}
 
         for patch_idx in range(len(q)):
+            # unique_coverage: one hit per (query patch, frame) — its best one
+            # (FAISS returns hits best-first). Legacy: every reference patch hit
+            # counts, so one frame can collect several hits per query patch.
+            seen: set[int] = set()
             for j in range(search_k):
                 ref_idx = indices[patch_idx, j]
                 if ref_idx < 0:
                     continue
                 fid = int(self.patch_frame_ids[ref_idx])
+                if self.unique_coverage:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
                 score = float(scores[patch_idx, j])
 
                 frame_scores[fid] = frame_scores.get(fid, 0.0) + score
                 frame_hits[fid] = frame_hits.get(fid, 0) + 1
 
-        # Compute final score: coverage * avg_score
+        # Compute final score: coverage * avg_score (= sum of the hit scores /
+        # num_patches). Legacy hits may exceed num_patches, so the score can be
+        # > 1 (an identical frame scores min(search_k, patches per frame)); with unique_coverage
+        # coverage <= 1 and the score is on the cosine scale.
         num_patches = len(q)
         final_scores: dict[int, float] = {}
         for fid in frame_scores:
@@ -18166,6 +25090,192 @@ class PatchifyRetrieval:
         # Sort and return top-K
         sorted_frames = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_frames[:top_k]
+
+
+# ================================================================================
+# File: src\localization\query_rotation.py
+# ================================================================================
+"""Continuous in-plane rotation of the query frame (localization.rotation_mode).
+
+Why
+---
+The legacy path only tries the four quarter turns (np.rot90). A query whose
+heading differs from the reference frames by anything else reaches ALIKED and
+LightGlue with up to ±45° residual rotation. Neither model is rotation
+invariant. Measured on FlightSimulator/test_frame.png (same frame, rotated, so
+the best case): 1638 inliers at 0°, 702 at 30°, 362 at 45°, 6 at 135°.
+np.rot90 also swaps width and height, so a 90° query reached DINO squashed
+along the other axis than the 16:9 reference frames.
+
+What this module does
+---------------------
+* ``rotate_view`` rotates the frame about its centre into a canvas of the SAME
+  size (cv2.warpAffine). The view keeps the reference frame geometry, so the
+  DINO input is squashed exactly like the database frames for every angle. The
+  pixels that fall outside the original frame are marked invalid. ALIKED
+  keypoints there are dropped, and VLAD ignores the tokens there.
+* ``rotation_matrix`` is the same mapping as a 3×3 transform from original-frame
+  pixels to view pixels. The Localizer folds it into the query→reference
+  homography, so everything downstream (centre, FOV, optical flow, object
+  projection) works in ORIGINAL frame coordinates, whatever the angle.
+* ``next_prior_deg`` turns the residual rotation of a verified homography into
+  the angle to apply to the next keyframe. In steady flight the next query is
+  then aligned to within the heading change between two keyframes.
+
+Angle convention: cv2.getRotationMatrix2D, positive = counter-clockwise on
+screen (the same sense as np.rot90 with k > 0), degrees in [0, 360).
+"""
+
+from __future__ import annotations
+
+import cv2
+import numpy as np
+
+QUARTER = "quarter"
+CONTINUOUS = "continuous"
+
+
+def is_continuous(config) -> bool:
+    from config import get_cfg
+
+    return str(get_cfg(config, "localization.rotation_mode", QUARTER)) == CONTINUOUS
+
+
+def norm_deg(angle: float) -> float:
+    """Wrap to [0, 360)."""
+    a = float(angle) % 360.0
+    return 0.0 if abs(a - 360.0) < 1e-9 else a
+
+
+def scan_angles(step_deg: float) -> list[float]:
+    """Bootstrap / recovery angles: 0, step, 2*step, ... < 360."""
+    step = float(step_deg)
+    if not np.isfinite(step) or step <= 0 or step >= 360:
+        return [0.0]
+    n = max(1, int(round(360.0 / step)))
+    return [norm_deg(i * 360.0 / n) for i in range(n)]
+
+
+def rotation_matrix(angle_deg: float, width: int, height: int) -> np.ndarray:
+    """3×3 transform original-frame pixels → same-size rotated view pixels."""
+    m = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), float(angle_deg), 1.0)
+    return np.vstack([m, [0.0, 0.0, 1.0]]).astype(np.float64)
+
+
+def rotate_view(
+    image: np.ndarray,
+    angle_deg: float,
+    mask: np.ndarray | None = None,
+    erode_px: int = 8,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """Rotate ``image`` (and an optional 0/255 ``mask``) about the centre.
+
+    Returns ``(view, view_mask, valid)``. ``valid`` is a uint8 0/255 map of the
+    view pixels that come from the original frame, eroded by ``erode_px`` so
+    keypoints on the artificial black border are rejected. ``view_mask`` is the
+    rotated ``mask`` AND ``valid`` (or just ``valid`` when ``mask`` is None).
+    Angle 0 returns the inputs unchanged (no resampling).
+    """
+    h, w = image.shape[:2]
+    a = norm_deg(angle_deg)
+    if a == 0.0:
+        valid = np.full((h, w), 255, dtype=np.uint8)
+        return image, (mask if mask is not None else None), valid
+    m = rotation_matrix(a, w, h)[:2]
+    view = cv2.warpAffine(
+        image, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+    )
+    ones = np.full((h, w), 255, dtype=np.uint8)
+    valid = cv2.warpAffine(
+        ones, m, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+    )
+    if erode_px > 0:
+        k = 2 * int(erode_px) + 1
+        valid = cv2.erode(valid, np.ones((k, k), dtype=np.uint8))
+    if mask is not None:
+        rotated_mask = cv2.warpAffine(
+            mask, m, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        view_mask = np.where((rotated_mask > 128) & (valid > 128), 255, 0).astype(np.uint8)
+    else:
+        view_mask = valid
+    return view, view_mask, valid
+
+
+def residual_angle_deg(H: np.ndarray, center: tuple[float, float] | None = None) -> float:
+    """In-plane rotation of ``H`` (view → reference) at ``center``, degrees.
+
+    Takes the closest rotation (atan2(j10 - j01, j00 + j11)) of the local
+    Jacobian of the projective map at ``center`` (view pixels; the origin when
+    None), so moderate anisotropic scale and mild perspective barely bias it.
+    The Jacobian is invariant to the scale AND SIGN of ``H``: poselib returns
+    unit-norm homographies with H[2, 2] < 0 in most fits, and the raw 2×2 block
+    of such an H reads 180° off (the continuous-mode prior then pointed the
+    next keyframe the wrong way round). The sign is that of the rotation's
+    [1, 0] entry in y-down pixel coordinates. A degenerate H (centre on the
+    horizon line) gives 0.
+    """
+    h = np.asarray(H, dtype=np.float64)
+    x, y = (0.0, 0.0) if center is None else (float(center[0]), float(center[1]))
+    den = h[2, 0] * x + h[2, 1] * y + h[2, 2]
+    if not np.isfinite(den) or abs(den) <= 1e-12 * max(float(np.abs(h).max()), 1e-300):
+        return 0.0
+    projected = (h[:2, :2] @ np.array([x, y]) + h[:2, 2]) / den
+    j = (h[:2, :2] - np.outer(projected, h[2, :2])) / den
+    return float(np.degrees(np.arctan2(j[1, 0] - j[0, 1], j[0, 0] + j[1, 1])))
+
+
+def next_prior_deg(
+    applied_deg: float, H_view_to_ref: np.ndarray, center: tuple[float, float] | None = None
+) -> float:
+    """Angle to apply next so the view would have matched with zero residual.
+
+    View = R(applied)·Q with cv2's matrix = Rot(-applied) in pixel coordinates;
+    Ref ≈ Rot(phi)·View ⇒ Ref ≈ Rot(phi - applied)·Q ⇒ apply (applied - phi).
+    ``center``: where to measure phi (view pixels), see ``residual_angle_deg``.
+    """
+    return norm_deg(float(applied_deg) - residual_angle_deg(H_view_to_ref, center))
+
+
+def angle_distance_deg(a: float, b: float) -> float:
+    d = abs(norm_deg(a) - norm_deg(b))
+    return min(d, 360.0 - d)
+
+
+def view_mask(
+    shape: tuple[int, int],
+    angle_deg: float,
+    mask: np.ndarray | None = None,
+    erode_px: int = 8,
+) -> np.ndarray | None:
+    """Keypoint mask of a rotated view without re-warping the image.
+
+    ``shape`` is (height, width) of the ORIGINAL frame. Returns the rotated
+    ``mask`` AND the eroded valid area (0/255); None when angle is 0 and there
+    is no mask (nothing to filter).
+    """
+    h, w = int(shape[0]), int(shape[1])
+    a = norm_deg(angle_deg)
+    if a == 0.0:
+        return mask
+    m = rotation_matrix(a, w, h)[:2]
+    valid = cv2.warpAffine(
+        np.full((h, w), 255, dtype=np.uint8),
+        m,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    if erode_px > 0:
+        k = 2 * int(erode_px) + 1
+        valid = cv2.erode(valid, np.ones((k, k), dtype=np.uint8))
+    if mask is None:
+        return valid
+    rotated = cv2.warpAffine(
+        mask, m, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+    )
+    return np.where((rotated > 128) & (valid > 128), 255, 0).astype(np.uint8)
 
 
 # ================================================================================
@@ -18187,6 +25297,7 @@ from typing import Any
 import numpy as np
 
 from config import get_cfg
+from src.geometry.frame_transform import get_frame_transform, project_frame_points
 from src.geometry.point_spread import spread_confidence_factor
 from src.geometry.transformations import GeometryTransforms
 from src.utils.logging_utils import get_logger
@@ -18236,6 +25347,10 @@ class ResultBuilder:
             min(rmse, rmse_norm) / rmse_norm * 0.5 + min(disagreement, diag_norm) / diag_norm * 0.5
         )
         stability_score = float(np.clip(stability_score, 0.0, 1.0))
+        if getattr(getattr(database, "converter", None), "mode", "") == "LOCAL":
+            # Graph disagreement has arbitrary scale here. Use the pixel fit
+            # residual, which is independent of the chosen local map extent.
+            stability_score = float(np.clip(1.0 - rmse / rmse_norm, 0.0, 1.0))
 
         ratio_score = float(best_inliers / (total_matches + 1e-6))
         rmse_score_val = 1.0 / (1.0 + (rmse_val / (self.ransac_thresh + 1e-6)))
@@ -18278,7 +25393,7 @@ class ResultBuilder:
                 "is provisional or invalid"
             )
             return None
-        affine_ref = database.get_frame_affine(frame_id)
+        affine_ref = get_frame_transform(database, frame_id)
         if affine_ref is None:
             logger.debug(
                 f"Retrieval-only fallback failed: no affine matrix for frame {frame_id}. "
@@ -18320,6 +25435,7 @@ class ResultBuilder:
         my: float,
         filtered_pt: Any,
         candidate_id: int,
+        reference_size: tuple | None = None,
     ) -> list:
         """Project the frame FOV to a GPS polygon, guarding against exploded homographies."""
         corners = np.array(
@@ -18373,7 +25489,18 @@ class ResultBuilder:
 
         gps_corners = []
         if ref_corners is not None:
-            metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
+            try:
+                if np.asarray(affine_ref).shape == (3, 3):
+                    if reference_size is None:
+                        return []
+                    metric_corners = project_frame_points(affine_ref, ref_corners, *reference_size)
+                else:
+                    metric_corners = GeometryTransforms.apply_affine(ref_corners, affine_ref)
+            except ValueError:
+                logger.warning(
+                    f"FOV outside safe reference projection for frame {candidate_id}; polygon dropped"
+                )
+                return []
             if metric_corners is not None:
                 fov_w = np.linalg.norm(metric_corners[1] - metric_corners[0])
                 fov_h = np.linalg.norm(metric_corners[3] - metric_corners[0])
@@ -18523,6 +25650,7 @@ from typing import Any
 import numpy as np
 
 from config import get_cfg
+from src.localization.query_rotation import is_continuous, rotate_view
 from src.utils.logging_utils import get_logger
 from src.utils.telemetry import Telemetry
 
@@ -18531,7 +25659,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class RotationResult:
-    angle: int
+    angle: float  # multiples of 90 in "quarter" mode, any value in "continuous"
     score: float
     candidates: list
     source_id: str | None
@@ -18540,6 +25668,32 @@ class RotationResult:
     # to avoid repeated copying and resizing during subsequent feature extraction.
     frame: Any | None = None
     crop_info: Any | None = None
+    # continuous mode: 0/255 map of the view pixels that come from the frame
+    valid: Any | None = None
+    # Multi-layer, localization.patchify_main_rank_margin > 0 or
+    # localization.joint_candidate_ranking: the best (angle, scale) of every layer by
+    # that layer's own top score, as RotationResults.
+    per_source: dict | None = None
+
+
+def extract_globals(extractor: Any, frames: list, valid_masks: list | None) -> list:
+    """Batched global descriptors; validity masks only when the extractor takes them."""
+    multi = len(frames) > 1 and hasattr(extractor, "extract_global_descriptors_multi")
+    if valid_masks is not None:
+        try:
+            if multi:
+                return list(
+                    extractor.extract_global_descriptors_multi(frames, valid_masks=valid_masks)
+                )
+            return [
+                extractor.extract_global_descriptor(f, valid_mask=m)
+                for f, m in zip(frames, valid_masks)
+            ]
+        except TypeError:
+            pass  # extractor without mask support (fakes, older wrappers)
+    if multi:
+        return list(extractor.extract_global_descriptors_multi(frames))
+    return [extractor.extract_global_descriptor(f) for f in frames]
 
 
 class RotationSelector:
@@ -18549,6 +25703,32 @@ class RotationSelector:
         self.feature_extractor = feature_extractor
         self._candidate_retriever = candidate_retriever
         self.config = config
+        self.continuous = is_continuous(config)
+        self.erode_px = int(get_cfg(config, "localization.rotation_border_erode_px", 8))
+        self.track_layers = int(
+            get_cfg(config, "localization.patchify_main_rank_margin", 0) or 0
+        ) > 0 or bool(get_cfg(config, "localization.joint_candidate_ranking", False))
+
+    def _track(self, per_source: dict, angle, sc, frame, crop, valid) -> None:
+        """Keep each layer's best (angle, scale) of the retrieval call just made."""
+        by_source = getattr(self._candidate_retriever, "last_by_source", None)
+        if not self.track_layers or not by_source:
+            return
+        for sid, candidates in by_source.items():
+            if not candidates:
+                continue
+            kept = per_source.get(sid)
+            if kept is None or candidates[0][1] > kept.score:
+                per_source[sid] = RotationResult(
+                    angle=angle,
+                    score=candidates[0][1],
+                    candidates=list(candidates),
+                    source_id=sid,
+                    best_scale=sc,
+                    frame=frame,
+                    crop_info=crop,
+                    valid=valid,
+                )
 
     def select(
         self,
@@ -18567,6 +25747,8 @@ class RotationSelector:
         # Winning (angle, scale) pair frame and crop_info — returned to caller
         best_frame: Any | None = None
         best_crop: Any | None = None
+        best_valid: Any | None = None
+        per_source: dict = {}
 
         rescan_min = get_cfg(self.config, "localization.rotation_rescan_min_score", 0.70)
         use_cascade = get_cfg(self.config, "localization.recovery_cascade", False)
@@ -18586,12 +25768,16 @@ class RotationSelector:
             # We try the prior angle with each scale candidate (usually 1).
             prior_scales = scale_candidates if len(scale_candidates) == 1 else [scale_candidates[0]]
             for sc in prior_scales:
-                rotated_frame, crop_info = self._prepare_frame(
-                    query_frame, prior_angle, sc, scale_manager
-                )
-                global_desc = self.feature_extractor.extract_global_descriptor(rotated_frame)
+                with Telemetry.profile("view_prepare"):
+                    rotated_frame, crop_info, valid = self._prepare(
+                        query_frame, prior_angle, sc, scale_manager
+                    )
+                global_desc = extract_globals(
+                    self.feature_extractor, [rotated_frame], None if valid is None else [valid]
+                )[0]
                 with Telemetry.profile("retrieval"):
                     src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+                self._track(per_source, prior_angle, sc, rotated_frame, crop_info, valid)
                 if candidates and candidates[0][1] >= min(rescan_min, scale_rescan_min):
                     if candidates[0][1] > best_global_score:
                         best_global_score = candidates[0][1]
@@ -18599,7 +25785,7 @@ class RotationSelector:
                         best_global_candidates = candidates
                         best_source_id_per_angle = src_id
                         best_scale = sc
-                        best_frame, best_crop = rotated_frame, crop_info
+                        best_frame, best_crop, best_valid = rotated_frame, crop_info, valid
                 else:
                     logger.debug(
                         f"Prior angle {prior_angle}° scale {sc:.2f} score too low "
@@ -18618,24 +25804,24 @@ class RotationSelector:
                 # rot90 is cached per-angle: otherwise the frame would be
                 # copied for each (angle, scale) pair instead of once per angle
                 # (on 4K footage that is tens of MB of memcpy per extra copy).
-                rot_cache: dict[int, Any] = {}
-                prepared = [
-                    self._prepare_frame(query_frame, a, sc, scale_manager, rot_cache)
-                    for a, sc in stage_combos
-                ]
+                rot_cache: dict[Any, Any] = {}
+                with Telemetry.profile("view_prepare"):
+                    prepared = [
+                        self._prepare(query_frame, a, sc, scale_manager, rot_cache)
+                        for a, sc in stage_combos
+                    ]
                 frames = [p[0] for p in prepared]
+                valids = [p[2] for p in prepared] if self.continuous else None
 
                 # Batch extraction
-                if len(frames) > 1 and hasattr(
-                    self.feature_extractor, "extract_global_descriptors_multi"
-                ):
-                    descs = self.feature_extractor.extract_global_descriptors_multi(frames)
-                else:
-                    descs = [self.feature_extractor.extract_global_descriptor(f) for f in frames]
+                descs = extract_globals(self.feature_extractor, frames, valids)
 
-                for (angle, sc), global_desc, (frm, crop) in zip(stage_combos, descs, prepared):
+                for (angle, sc), global_desc, (frm, crop, valid) in zip(
+                    stage_combos, descs, prepared
+                ):
                     with Telemetry.profile("retrieval"):
                         src_id, candidates = self._candidate_retriever.retrieve(global_desc, top_k)
+                    self._track(per_source, angle, sc, frm, crop, valid)
 
                     if candidates:
                         top_score = candidates[0][1]
@@ -18645,7 +25831,7 @@ class RotationSelector:
                             best_global_candidates = candidates
                             best_source_id_per_angle = src_id
                             best_scale = sc
-                            best_frame, best_crop = frm, crop
+                            best_frame, best_crop, best_valid = frm, crop, valid
 
                 # Stage 1 yielded a confident enough match — skip the rest of the pyramid
                 # (16 out of 20 forward passes in a typical config).
@@ -18663,6 +25849,8 @@ class RotationSelector:
             best_scale=best_scale,
             frame=best_frame,
             crop_info=best_crop,
+            valid=best_valid,
+            per_source=per_source or None,
         )
 
     # ── Recovery cascade planning ──────────────────────────────────────────────
@@ -18681,8 +25869,8 @@ class RotationSelector:
         The cascade cannot be slower than the standard behavior; it is designed to be faster.
 
         Reference scale for Stage 1: prior from ScaleManager if available; otherwise
-        the first element of ``scale_candidates`` (already sorted by proximity to depth-hint);
-        else 1.0.
+        the altitude hint's nearest-layer scale (localization.altitude_hint); otherwise 1.0;
+        else the first element of ``scale_candidates`` (sorted by proximity to depth-hint).
         """
         combos = [(a, sc) for a in angles_to_try for sc in scale_candidates]
         if not use_cascade or len(scale_candidates) <= 1:
@@ -18690,8 +25878,14 @@ class RotationSelector:
 
         primary = None
         prior = getattr(scale_manager, "prior", None) if scale_manager is not None else None
+        # localization.altitude_hint: the scale of the layer nearest the altitude.
+        altitude = (
+            getattr(scale_manager, "altitude_primary", None) if scale_manager is not None else None
+        )
         if prior is not None and prior in scale_candidates:
             primary = prior
+        elif isinstance(altitude, float) and altitude in scale_candidates:
+            primary = altitude
         elif 1.0 in scale_candidates:
             # Scale 1.0 — "as in DB"; most likely when prior is absent.
             primary = 1.0
@@ -18701,6 +25895,49 @@ class RotationSelector:
         stage1 = [c for c in combos if c[1] == primary]
         stage2 = [c for c in combos if c[1] != primary]
         return [stage1, stage2]
+
+    def _prepare(
+        self,
+        query_frame: Any,
+        angle: float,
+        sc: float,
+        scale_manager: Any,
+        rot_cache: dict | None = None,
+    ) -> tuple[Any, Any, Any]:
+        """``(frame, crop_info, valid)`` for the configured rotation mode."""
+        if self.continuous:
+            return self._prepare_view(
+                query_frame, angle, sc, scale_manager, rot_cache, self.erode_px
+            )
+        frame, crop = self._prepare_frame(query_frame, int(angle), sc, scale_manager, rot_cache)
+        return frame, crop, None
+
+    @staticmethod
+    def _prepare_view(
+        query_frame: Any,
+        angle: float,
+        sc: float,
+        scale_manager: Any,
+        rot_cache: dict | None = None,
+        erode_px: int = 8,
+    ) -> tuple[Any, Any, Any]:
+        """Continuous mode: same-size rotated view, then GSD normalisation.
+
+        Returns ``(frame, crop_info, valid)``; ``valid`` follows the frame through
+        the same crop/resize so it stays pixel-aligned with it.
+        """
+        key = ("view", round(float(angle), 3))
+        if rot_cache is not None and key in rot_cache:
+            view, valid = rot_cache[key]
+        else:
+            view, _, valid = rotate_view(query_frame, angle, None, erode_px)
+            if rot_cache is not None:
+                rot_cache[key] = (view, valid)
+        if scale_manager is not None and abs(sc - 1.0) > 0.15:
+            frame, crop = scale_manager.normalize(view, sc)
+            valid_n, _ = scale_manager.normalize(valid, sc)
+            return frame, crop, valid_n
+        return view, None, valid
 
     @staticmethod
     def _prepare_frame(
@@ -18754,6 +25991,17 @@ logger = get_logger(__name__)
 
 # Default octave grid around the DB altitude — covers ~50–200 m if DB is ~100 m
 _DEFAULT_PYRAMID = (0.5, 0.7, 1.0, 1.4, 2.0)
+# Two scale candidates closer than this ratio give practically the same view.
+_SAME_SCALE_RATIO = 1.15
+
+
+def _merge_scales(first: list[float], rest: list[float]) -> list[float]:
+    """``first`` then the ``rest`` that are not practically the same scale as one already kept."""
+    merged: list[float] = []
+    for scale in list(first) + list(rest):
+        if all(max(scale, kept) / min(scale, kept) >= _SAME_SCALE_RATIO for kept in merged):
+            merged.append(scale)
+    return merged
 
 
 @dataclass
@@ -18840,6 +26088,9 @@ class ScaleManager:
         # ── mutable state ──
         self._prior: float | None = None
         self._depth_hint: float | None = None  # set externally per-keyframe
+        # localization.altitude_hint: expected ratios of the layers nearest the
+        # estimated altitude, nearest first (set by the Localizer per keyframe).
+        self._altitude_scales: list[float] | None = None
 
         logger.info(
             f"ScaleManager initialized | pyramid={self._pyramid}, "
@@ -18857,6 +26108,25 @@ class ScaleManager:
     def rescan_min_score(self) -> float:
         return self._rescan_min
 
+    def set_altitude_scales(self, scales: list[float] | None) -> None:
+        """Expected query/layer ratios from the altitude hint (None or [] = no hint)."""
+        kept = []
+        for scale in scales or []:
+            try:
+                value = float(scale)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value > 0.0:
+                kept.append(float(np.clip(value, self._min_r, self._max_r)))
+        self._altitude_scales = kept or None
+
+    @property
+    def altitude_primary(self) -> float | None:
+        """Nearest-layer ratio when there is no prior: recovery_cascade's stage-1 scale."""
+        if self._prior is not None or not self._altitude_scales:
+            return None
+        return self._altitude_scales[0]
+
     def candidates(self) -> list[float]:
         """Scale levels to scan on the next keyframe.
 
@@ -18867,8 +26137,13 @@ class ScaleManager:
         When a depth hint is available and no prior, the pyramid is reordered
         so the closest level to the hint comes first (early-stop friendly).
         """
+        hints = self._altitude_scales or []
         if self._prior is not None:
-            return [self._prior]
+            # The prior (last fix's layer) first; the hinted layers back up a rescan.
+            return _merge_scales([self._prior], hints)
+        if hints:
+            # Hinted layers first, then the rest of the pyramid (not a near-duplicate).
+            return _merge_scales(hints, list(self._pyramid))
 
         pyramid = list(self._pyramid)
 
@@ -19020,8 +26295,10 @@ class ScaleManager:
         """Set a depth-based scale hint for pyramid reordering.
 
         Args:
-            query_depth_scale: 1/median_depth for the query frame.
-            db_depth_scale: median 1/median_depth across DB frames.
+            query_depth_scale: DepthEstimator.get_relative_scale() of the query —
+                1/median(model disparity), i.e. grows with distance.
+            db_depth_scale: median of the same quantity across DB frames.
+                The ratio is therefore query_alt / db_alt, matching ``r``.
         """
         if db_depth_scale < 1e-8:
             return
@@ -19043,6 +26320,199 @@ class ScaleManager:
         """Full reset for a new tracking session."""
         self._prior = None
         self._depth_hint = None
+        self._altitude_scales = None
+
+
+# ================================================================================
+# File: src\localization\spatial_prior.py
+# ================================================================================
+"""Spatial prior: map frames near the dead-reckoned position after a lost fix.
+
+The temporal prior (``Localizer._try_temporal_prior``) probes the last matched
+map frame and its neighbours by DB index. Two things break it (diagnosed
+2026-10-10 on the wb2019 route, other-satellite imagery):
+
+- index neighbours are neighbours along the map's recording path, not on the
+  ground: when the drone leaves that strip, the frame it now sees can be dozens
+  of indices away;
+- a lost frame's in-frame retry clears the angle prior, and the temporal prior
+  needs an angle, so it stays off until the next fix (retrieval only).
+
+This class keeps the last two confirmed fixes, predicts the position at
+constant velocity, and lists the map frames nearest to the prediction. The
+localizer uses it as a second stage when the index stage finds nothing. It
+holds no models and no I/O: positions are WGS84 degrees, distances are an
+equirectangular approximation (exact enough over a few kilometres).
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Iterable
+
+import numpy as np
+
+from config import get_cfg
+
+EARTH_RADIUS_M = 6371008.8
+# GeoreferenceStatus.SUPPORTED (src/geometry/calibration_provenance.py); only a
+# pre-filter here, the caller's `usable` check is authoritative.
+_GEOREF_SUPPORTED = 1
+
+
+class SpatialPrior:
+    """Dead reckoning from the last confirmed fixes plus a nearest-frame query."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        max_age_s: float = 30.0,
+        nearest_k: int = 4,
+        radius_m: float = 1500.0,
+        verify: int = 2,
+        max_speed_mps: float = 120.0,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.max_age_s = float(max_age_s)
+        self.nearest_k = max(0, int(nearest_k))
+        self.radius_m = float(radius_m)
+        self.verify = max(1, int(verify))
+        self.max_speed_mps = float(max_speed_mps)
+        self.reset()
+
+    @classmethod
+    def from_config(cls, config: dict, enabled: bool = True) -> SpatialPrior:
+        return cls(
+            enabled=enabled and bool(get_cfg(config, "localization.spatial_prior", False)),
+            max_age_s=float(get_cfg(config, "localization.spatial_prior_max_age_s", 30.0)),
+            nearest_k=int(get_cfg(config, "localization.spatial_prior_nearest_k", 4)),
+            radius_m=float(get_cfg(config, "localization.spatial_prior_radius_m", 1500.0)),
+            verify=int(get_cfg(config, "localization.spatial_prior_verify", 2)),
+            max_speed_mps=float(get_cfg(config, "tracking.max_speed_mps", 120.0)),
+        )
+
+    def reset(self) -> None:
+        self._clock: float | None = None
+        self._fixes: list[tuple[float, float, float]] = []  # (t, lat, lon), last two
+        self.angle: float | None = None
+        self.scale: float | None = None
+
+    # ── time ────────────────────────────────────────────────────────────────
+    def tick(self, timestamp: float | None, dt: float | None = 1.0) -> float:
+        """Current time of the frame being localized (seconds).
+
+        The caller's timestamp when it has one (video time in the worker and the
+        replay), otherwise the previous time + dt. Time running backwards (a new
+        video, a seek) drops the stored fixes.
+        """
+        if timestamp is not None and math.isfinite(float(timestamp)):
+            now = float(timestamp)
+        else:
+            step = float(dt) if dt is not None and math.isfinite(float(dt)) else 0.0
+            now = (self._clock or 0.0) + max(0.0, step)
+        if self._fixes and now < self._fixes[-1][0]:
+            self._fixes.clear()
+            self.angle = self.scale = None
+        self._clock = now
+        return now
+
+    def record_fix(
+        self,
+        now: float,
+        lat: float,
+        lon: float,
+        angle: float | None = None,
+        scale: float | None = None,
+    ) -> None:
+        """Remember a confirmed fix, the angle prior and the scale prior after it."""
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return
+        if self._fixes and now <= self._fixes[-1][0]:
+            self._fixes[-1] = (float(now), float(lat), float(lon))
+        else:
+            self._fixes = [*self._fixes[-1:], (float(now), float(lat), float(lon))]
+        if angle is not None:
+            self.angle = float(angle)
+        if scale is not None:
+            self.scale = float(scale)
+
+    def age(self, now: float) -> float | None:
+        """Seconds since the last fix, or None without one."""
+        return now - self._fixes[-1][0] if self._fixes else None
+
+    def predict(self, now: float) -> tuple[float, float] | None:
+        """Constant-velocity position at `now`, or None (no fix / fix too old).
+
+        Velocity from the last two fixes; zero when they are further apart than
+        max_age_s or imply a speed above max_speed_mps (a wrong fix).
+        """
+        if not self.enabled or not self._fixes:
+            return None
+        t2, lat2, lon2 = self._fixes[-1]
+        age = now - t2
+        if age < 0 or age > self.max_age_s:
+            return None
+        vlat = vlon = 0.0
+        if len(self._fixes) == 2:
+            t1, lat1, lon1 = self._fixes[0]
+            span = t2 - t1
+            if 0.0 < span <= self.max_age_s:
+                dy, dx = _offset_m(lat1, lon1, lat2, lon2)
+                if math.hypot(dx, dy) / span <= self.max_speed_mps:
+                    vlat = (lat2 - lat1) / span
+                    vlon = (lon2 - lon1) / span
+        return lat2 + vlat * age, lon2 + vlon * age
+
+    # ── map frames ──────────────────────────────────────────────────────────
+    def nearest_ids(
+        self,
+        database,
+        lat: float,
+        lon: float,
+        exclude: Iterable[int] = (),
+        usable: Callable[[int], bool] | None = None,
+    ) -> list[int]:
+        """Up to nearest_k frames of `database` within radius_m of (lat, lon).
+
+        Ordered by distance. `frame_gps` (N × [lat, lon]) is the map's per-frame
+        position; frames without one, outside the radius, in `exclude`, or
+        rejected by `usable` (no calibration / georeference) are skipped.
+        """
+        gps = getattr(database, "frame_gps", None)
+        if gps is None or self.nearest_k == 0:
+            return []
+        gps = np.asarray(gps, dtype=np.float64)
+        if gps.ndim != 2 or gps.shape[0] == 0 or gps.shape[1] < 2:
+            return []
+        dy, dx = _offset_m(lat, lon, gps[:, 0], gps[:, 1])
+        d = np.hypot(dx, dy)
+        d[~np.isfinite(d)] = np.inf
+        d[d > self.radius_m] = np.inf
+        status = getattr(database, "frame_georef_status", None)
+        if status is not None and len(status) == len(d):
+            d[np.asarray(status) != _GEOREF_SUPPORTED] = np.inf
+        n_in = int(np.count_nonzero(np.isfinite(d)))
+        if n_in == 0:
+            return []
+        order = np.argsort(d, kind="stable")[:n_in]
+        skip = {int(c) for c in exclude}
+        out: list[int] = []
+        for c in order[: 50 * self.nearest_k]:
+            c = int(c)
+            if c in skip or (usable is not None and not usable(c)):
+                continue
+            out.append(c)
+            if len(out) >= self.nearest_k:
+                break
+        return out
+
+
+def _offset_m(lat0, lon0, lat, lon):
+    """(north, east) metres from (lat0, lon0) to (lat, lon), equirectangular."""
+    k = math.cos(math.radians(float(lat0)))
+    dy = np.radians(np.asarray(lat) - lat0) * EARTH_RADIUS_M
+    dx = np.radians(np.asarray(lon) - lon0) * EARTH_RADIUS_M * k
+    return dy, dx
 
 
 # ================================================================================
@@ -19057,6 +26527,7 @@ class ScaleManager:
 import gc
 import os
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -19117,6 +26588,31 @@ except ImportError:
     CESP = None
 
 logger = get_logger(__name__)
+
+
+def lightglue_conf(block) -> dict:
+    """LightGlue constructor options from a models.lightglue* config block.
+
+    Defaults are the lightglue library defaults, i.e. what ran before these
+    keys were wired (2026-10).
+    """
+    return {
+        "depth_confidence": float(get_cfg(block, "depth_confidence", 0.95)),
+        "width_confidence": float(get_cfg(block, "width_confidence", 0.99)),
+        "filter_threshold": float(get_cfg(block, "filter_threshold", 0.1)),
+        "flash": bool(get_cfg(block, "flash", True)),
+        "mp": bool(get_cfg(block, "mixed_precision", False)),
+    }
+
+
+def aliked_conf_from(config) -> dict:
+    """ALIKED constructor options from models.aliked (library defaults otherwise)."""
+    return {
+        "model_name": str(get_cfg(config, "models.aliked.model_name", "aliked-n16")),
+        "max_num_keypoints": int(get_cfg(config, "models.aliked.max_keypoints", 4096)),
+        "detection_threshold": float(get_cfg(config, "models.aliked.detection_threshold", 0.2)),
+        "nms_radius": int(get_cfg(config, "models.aliked.nms_radius", 2)),
+    }
 
 
 class ModelManager:
@@ -19255,7 +26751,74 @@ class ModelManager:
             lg_features = "rdd" if local_extractor == "rdd" else "aliked"
             self.load_lightglue(features=lg_features)
             self.load_yolo()
+        self._warmup()
         logger.success("Centralized model prewarm complete")
+
+    def _warmup(self) -> None:
+        """One representative forward pass per prewarmed model, once per process.
+
+        Loading weights leaves CUDA kernel loading, cuBLAS/cuDNN handle creation
+        and allocator growth to the first real call: the first ALIKED call of a
+        session took 3.1 s against a 32 ms average (telemetry 2026-10-15). Inputs
+        mirror the live path: DINO at its input size under the configured fp16
+        autocast, ALIKED on a noise image, LightGlue on random keypoints, YOLO on
+        a blank frame. Never raises; a failed pass is only logged.
+        """
+        if self.device == "cpu" or getattr(self, "_warmed_up", False):
+            return
+        self._warmed_up = True
+        import numpy as np
+
+        from config import get_active_descriptor_cfg
+
+        fp16 = bool(get_cfg(self.config, "models.performance.fp16_enabled", True))
+        size = int(get_active_descriptor_cfg(self.config).input_size)
+        dev = self.device
+
+        def dino():
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=fp16):
+                self.models["dinov2"](torch.zeros(1, 3, size, size, device=dev))
+
+        def aliked():
+            self.models["aliked"]({"image": torch.rand(1, 3, 720, 1280, device=dev)})
+
+        def lightglue(name):
+            n = 512
+            dim = 128 if name in ("lightglue_aliked", "lightglue_sift") else 256
+
+            def side():
+                return {
+                    "keypoints": torch.rand(1, n, 2, device=dev) * 700,
+                    "descriptors": torch.nn.functional.normalize(
+                        torch.randn(1, n, dim, device=dev), dim=-1
+                    ),
+                    "image_size": torch.tensor([[1280, 720]], device=dev),
+                }
+
+            self.models[name]({"image0": side(), "image1": side()})
+
+        def yolo():
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            self.models["yolo"](frame, verbose=False, half=dev == "cuda")  # as YOLOWrapper
+
+        passes = [("dinov2", dino), ("aliked", aliked), ("yolo", yolo)]
+        passes += [
+            (n, lambda n=n: lightglue(n)) for n in list(self.models) if n.startswith("lightglue_")
+        ]
+        done = []
+        for name, run in passes:
+            if name not in self.models:
+                continue
+            t0 = time.perf_counter()
+            try:
+                with torch.inference_mode(), silent_output():
+                    run()
+                torch.cuda.synchronize()
+                done.append(f"{name} {1e3 * (time.perf_counter() - t0):.0f} ms")
+            except Exception as e:  # noqa: BLE001 — warmup is best effort
+                done.append(f"{name} skipped ({type(e).__name__})")
+                logger.debug(f"Warmup pass for {name} skipped: {type(e).__name__}: {e}")
+        logger.info(f"Model warmup: {', '.join(done) or 'no models'}")
 
     def load_local_extractor(self):
         """Loads local feature extractor based on config (aliked | rdd | xfeat)."""
@@ -19354,7 +26917,7 @@ class ModelManager:
                 logger.info(f"Loading XFeat model ({repo}/{model_name})...")
                 self._ensure_vram_available(vram_req)
                 try:
-                    preset = get_cfg(self.config, "models.xfeat.xfeat_preset", "fast")
+                    preset = get_cfg(self.config, "models.xfeat.preset", "fast")
                     try:
                         # Attempt to pass quality_preset if supported by User's XFeat fork
                         model = torch.hub.load(
@@ -19398,6 +26961,9 @@ class ModelManager:
                         "nms_radius": get_cfg(self.config, "models.superpoint.nms_radius", 4),
                         "max_num_keypoints": get_cfg(
                             self.config, "models.superpoint.max_keypoints", 4096
+                        ),
+                        "detection_threshold": get_cfg(
+                            self.config, "models.superpoint.detection_threshold", 0.0005
                         ),
                     }
                     model = SuperPoint(**sp_config).eval().to(self.device)
@@ -19509,7 +27075,11 @@ class ModelManager:
 
                         # For RDD, use SuperPoint architecture (256-dim), as 'rdd' is not native to the library
                         lg_feature_type = "superpoint" if features == "rdd" else features
-                        model = LightGlue(features=lg_feature_type).eval().to(self.device)
+                        lg_conf = lightglue_conf(config)
+                        logger.info(f"LightGlue ({features}) conf: {lg_conf}")
+                        model = (
+                            LightGlue(features=lg_feature_type, **lg_conf).eval().to(self.device)
+                        )
 
                         # If custom weights provided (e.g., for RDD), load them
                         if model_path and os.path.exists(model_path):
@@ -19684,15 +27254,16 @@ class ModelManager:
         with self._model_lock:
             if name not in self.models:
                 vram_req = get_cfg(self.config, "models.aliked.vram_required_mb", 400.0)
-                max_keypoints = get_cfg(self.config, "models.aliked.max_keypoints", 4096)
+                aliked_conf = aliked_conf_from(self.config)
+                max_keypoints = aliked_conf["max_num_keypoints"]
 
-                logger.info(f"Loading ALIKED model (max_keypoints={max_keypoints})...")
+                logger.info(f"Loading ALIKED model ({aliked_conf})...")
                 self._ensure_vram_available(vram_req)
                 try:
                     if ALIKED is None:
                         raise ImportError("lightglue.ALIKED not found")
 
-                    model = ALIKED(max_num_keypoints=max_keypoints).eval().to(self.device)
+                    model = ALIKED(**aliked_conf).eval().to(self.device)
 
                     if self._is_torch_compile_supported():
                         try:
@@ -20171,6 +27742,7 @@ import contextlib
 import math
 import os
 
+import cv2
 import numpy as np
 import torch
 import torchvision.transforms as T
@@ -20209,6 +27781,28 @@ class FeatureExtractor:
                     low_norm_fraction=get_cfg(config, "models.vlad.low_norm_fraction", 0.0),
                 )
                 self._vlad_layer = get_cfg(config, "models.vlad.layer", None)
+                from src.models.wrappers.vlad_aggregator import provenance_mismatches
+
+                active = get_active_descriptor_cfg(self.config)
+                differences = provenance_mismatches(
+                    self.vlad_aggregator.provenance,
+                    {
+                        "layer": self._vlad_layer,
+                        "input_size": int(active.input_size),
+                        "dino_cpu_resize": bool(
+                            get_cfg(config, "models.performance.dino_cpu_resize", False)
+                        ),
+                        "hf_model_id": getattr(active, "hf_model_id", None),
+                        "hf_revision": getattr(active, "hf_revision", "") or "",
+                    },
+                )
+                if differences:
+                    logger.warning(
+                        "VLAD vocabulary was built with other settings than the current "
+                        f"config ({'; '.join(differences)}). Descriptors stay consistent, "
+                        "but the vocabulary may fit worse; rebuild it with "
+                        "scripts/build_vlad_vocab.py."
+                    )
                 if cesp_module is not None:
                     logger.warning("Both VLAD and CESP enabled — VLAD takes precedence")
             else:
@@ -20279,6 +27873,27 @@ class FeatureExtractor:
             self.stream_local = None
 
     @staticmethod
+    def _by_score(keypoints, descriptors, scores):
+        """Order keypoints by detector score, strongest first (torch or numpy).
+
+        ALIKED in threshold mode returns keypoints in raster order (top row
+        first). The database stores only the first database.max_keypoints_stored
+        of them, so with 2049..4095 detections the stored set covered only the
+        upper part of the frame (measured on tests/fixtures/flight_clip.mp4:
+        7 of 13 frames, stored keypoints ending at 51-90 % of the height).
+        Score order makes that truncation keep the strongest points anywhere in
+        the frame. LightGlue and MNN are permutation-invariant, so matching of
+        untruncated sets is unaffected.
+        """
+        if scores is None or len(scores) != len(keypoints) or len(keypoints) < 2:
+            return keypoints, descriptors
+        if isinstance(scores, torch.Tensor):
+            order = torch.argsort(scores, descending=True, stable=True)
+        else:
+            order = np.argsort(-np.asarray(scores), kind="stable")
+        return keypoints[order], descriptors[order]
+
+    @staticmethod
     def _patch_grid_side(n_tokens: int) -> int:
         """Side of square patch grid derived from patch token count."""
         side = int(math.isqrt(int(n_tokens)))
@@ -20317,8 +27932,31 @@ class FeatureExtractor:
             return self._dino_normalize(self._upload_chw(self._cpu_resize_dino(image)))
         return self.dinov2_transform(self._upload_chw(image))
 
+    @staticmethod
+    def _token_validity(valid_mask: np.ndarray | None, n_tokens: int) -> np.ndarray | None:
+        """Per-token validity from a pixel mask of the view (0/255).
+
+        The DINO input squashes the whole view to S×S, so the square patch grid
+        covers the view uniformly; a token is valid when at least half of its
+        area is valid. None / fully valid → None (aggregate everything).
+        """
+        if valid_mask is None:
+            return None
+        side = int(math.isqrt(int(n_tokens)))
+        if side * side != int(n_tokens) or side == 0:
+            return None
+        small = cv2.resize(
+            (np.asarray(valid_mask) > 128).astype(np.float32),
+            (side, side),
+            interpolation=cv2.INTER_AREA,
+        )
+        valid = (small >= 0.5).ravel()
+        return None if valid.all() else valid
+
     @torch.no_grad()
-    def _vlad_descriptors(self, dino_input: torch.Tensor) -> np.ndarray:
+    def _vlad_descriptors(
+        self, dino_input: torch.Tensor, valid_masks: list | None = None
+    ) -> np.ndarray:
         """(B, 3, S, S) -> (B, out_dim) via VLAD patch token aggregation."""
         kwargs = {}
         if self._vlad_layer is not None:
@@ -20329,37 +27967,57 @@ class FeatureExtractor:
             except TypeError:
                 features = self.global_model.forward_features(dino_input)
         tokens = features["x_norm_patchtokens"].float().cpu().numpy()
-        return self.vlad_aggregator.aggregate_batch(tokens)
+        if valid_masks is None:
+            return self.vlad_aggregator.aggregate_batch(tokens)
+        token_valid = [self._token_validity(m, tokens.shape[1]) for m in valid_masks]
+        return self.vlad_aggregator.aggregate_batch(tokens, token_valid)
 
     @torch.no_grad()
-    def extract_global_descriptor(self, image: np.ndarray) -> np.ndarray:
+    def extract_global_descriptor(
+        self, image: np.ndarray, valid_mask: np.ndarray | None = None
+    ) -> np.ndarray:
+        """``valid_mask`` (0/255, image-sized): pixels that belong to the frame.
+
+        Only VLAD can use it (tokens outside are not aggregated); CLS and CESP
+        see the whole input.
+        """
+        # The whole call is the "dinov2" stage. Until 2026-10-10 only the input
+        # preparation was inside it, so single-view calls (the prior-angle check)
+        # reported ~20 ms while the forward pass and VLAD went unrecorded.
         with Telemetry.profile("dinov2"):
             logger.debug("Extracting global descriptor with DINOv2...")
             dino_input = self._dino_input(image)
 
-        if self.vlad_aggregator is not None:
-            return self._vlad_descriptors(dino_input)[0]
+            if self.vlad_aggregator is not None:
+                masks = None if valid_mask is None else [valid_mask]
+                return self._vlad_descriptors(dino_input, masks)[0]
 
-        if self.cesp_module is not None:
-            with torch.amp.autocast(
-                self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
-            ):
-                features = self.global_model.forward_features(dino_input)
-                patch_tokens = features["x_norm_patchtokens"].float()
+            if self.cesp_module is not None:
+                with torch.amp.autocast(
+                    self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                ):
+                    features = self.global_model.forward_features(dino_input)
+                    patch_tokens = features["x_norm_patchtokens"].float()
 
-            h_patches = w_patches = self._patch_grid_side(patch_tokens.shape[1])
-            global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
-        else:
-            with torch.amp.autocast(
-                self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
-            ):
-                global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
+                h_patches = w_patches = self._patch_grid_side(patch_tokens.shape[1])
+                global_desc = self.cesp_module(patch_tokens, h_patches, w_patches)[0].cpu().numpy()
+            else:
+                with torch.amp.autocast(
+                    self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
+                ):
+                    global_desc = self.global_model(dino_input)[0].float().cpu().numpy()
 
-        return global_desc
+            return global_desc
 
     @torch.no_grad()
-    def extract_global_descriptors_multi(self, images: list[np.ndarray]) -> np.ndarray:
-        """Extracts global descriptors for a list of images in a single forward pass."""
+    def extract_global_descriptors_multi(
+        self, images: list[np.ndarray], valid_masks: list | None = None
+    ) -> np.ndarray:
+        """Extracts global descriptors for a list of images in a single forward pass.
+
+        ``valid_masks``: optional per-image validity masks (see
+        ``extract_global_descriptor``); used by VLAD only.
+        """
         if not images:
             return np.empty((0, 0), dtype=np.float32)
 
@@ -20385,9 +28043,13 @@ class FeatureExtractor:
                 chunks = (batch,)
 
             outs = []
+            start = 0
             for chunk in chunks:
+                n = int(chunk.shape[0])
+                masks = None if valid_masks is None else list(valid_masks[start : start + n])
+                start += n
                 if self.vlad_aggregator is not None:
-                    outs.append(np.asarray(self._vlad_descriptors(chunk)))
+                    outs.append(np.asarray(self._vlad_descriptors(chunk, masks)))
                 elif self.cesp_module is not None:
                     with torch.amp.autocast(
                         self._amp_device_type, dtype=self.amp_dtype, enabled=self.use_half
@@ -20418,20 +28080,23 @@ class FeatureExtractor:
     def extract_local_features(self, image: np.ndarray, static_mask: np.ndarray = None) -> dict:
         logger.debug(f"Extracting local features from image: {image.shape}")
 
-        enhanced_image = self.preprocessor.preprocess(image)
-        rgb_tensor = self._upload_chw(enhanced_image)
+        with Telemetry.profile("local_preprocess"):  # CLAHE, upload, optional downscale
+            enhanced_image = self.preprocessor.preprocess(image)
+            rgb_tensor = self._upload_chw(enhanced_image)
 
-        # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
-        max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
-        orig_h, orig_w = rgb_tensor.shape[2], rgb_tensor.shape[3]
-        scale_factor = 1.0
-        if max(orig_h, orig_w) > max_edge:
-            scale_factor = max_edge / float(max(orig_h, orig_w))
-            new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
-            rgb_tensor = torch.nn.functional.interpolate(
-                rgb_tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
-            )
-            logger.debug(f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}")
+            # Fix OOM: Downscale high-resolution frames (e.g. 4K) to prevent massive memory spikes
+            max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
+            orig_h, orig_w = rgb_tensor.shape[2], rgb_tensor.shape[3]
+            scale_factor = 1.0
+            if max_edge > 0 and max(orig_h, orig_w) > max_edge:
+                scale_factor = max_edge / float(max(orig_h, orig_w))
+                new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
+                rgb_tensor = torch.nn.functional.interpolate(
+                    rgb_tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
+                )
+                logger.debug(
+                    f"Downscaled local extraction from {orig_w}x{orig_h} to {new_w}x{new_h}"
+                )
 
         is_xfeat = "XFeat" in self.local_model.__class__.__name__
 
@@ -20439,13 +28104,20 @@ class FeatureExtractor:
             if is_xfeat:
                 top_k = get_cfg(self.config, "models.xfeat.top_k", 2048)
                 xf = self.local_model.detectAndCompute(rgb_tensor, top_k=top_k)[0]
-                keypoints = xf["keypoints"].cpu().numpy()
-                descriptors = xf["descriptors"].cpu().numpy()
+                kp_t, desc_t = self._by_score(xf["keypoints"], xf["descriptors"], xf.get("scores"))
+                keypoints = kp_t.cpu().numpy()
+                descriptors = desc_t.cpu().numpy()
             else:
                 with contextlib.nullcontext():
                     aliked_out = self.local_model({"image": rgb_tensor})
-                keypoints = aliked_out["keypoints"][0].cpu().numpy()
-                descriptors = aliked_out["descriptors"][0].cpu().numpy()
+                scores = aliked_out.get("keypoint_scores")
+                kp_t, desc_t = self._by_score(
+                    aliked_out["keypoints"][0],
+                    aliked_out["descriptors"][0],
+                    scores[0] if scores is not None else None,
+                )
+                keypoints = kp_t.cpu().numpy()
+                descriptors = desc_t.cpu().numpy()
 
         if scale_factor != 1.0:
             keypoints = keypoints / scale_factor
@@ -20521,7 +28193,7 @@ class FeatureExtractor:
         max_edge = get_cfg(self.config, "localization.max_local_edge", 1600)
         orig_h, orig_w = local_batch.shape[2], local_batch.shape[3]
         scale_factor = 1.0
-        if max(orig_h, orig_w) > max_edge:
+        if max_edge > 0 and max(orig_h, orig_w) > max_edge:
             scale_factor = max_edge / float(max(orig_h, orig_w))
             new_h, new_w = int(orig_h * scale_factor), int(orig_w * scale_factor)
             local_batch = torch.nn.functional.interpolate(
@@ -20585,15 +28257,24 @@ class FeatureExtractor:
                         input_dict, top_k=get_cfg(self.config, "models.xfeat.top_k", 2048)
                     )
                     for res in xfeat_out:
-                        out_kpts.append(res["keypoints"].float())
-                        out_descs.append(res["descriptors"].float())
+                        kp_t, desc_t = self._by_score(
+                            res["keypoints"], res["descriptors"], res.get("scores")
+                        )
+                        out_kpts.append(kp_t.float())
+                        out_descs.append(desc_t.float())
                 else:
                     for b in range(B):
                         single_img = local_batch[b : b + 1]
                         aliked_in = {"image": single_img}
                         aliked_out = self.local_model(aliked_in)
-                        out_kpts.append(aliked_out["keypoints"][0].float())
-                        out_descs.append(aliked_out["descriptors"][0].float())
+                        scores = aliked_out.get("keypoint_scores")
+                        kp_t, desc_t = self._by_score(
+                            aliked_out["keypoints"][0],
+                            aliked_out["descriptors"][0],
+                            scores[0] if scores is not None else None,
+                        )
+                        out_kpts.append(kp_t.float())
+                        out_descs.append(desc_t.float())
 
         if self.device == "cuda":
             torch.cuda.synchronize()
@@ -21101,6 +28782,8 @@ vocabulary built via k-means over reference frame tokens, descriptor is concaten
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from src.utils.logging_utils import get_logger
@@ -21127,6 +28810,9 @@ class VladAggregator:
         self.pca_mean: np.ndarray | None = None  # (K*D,)
         self.pca_components: np.ndarray | None = None  # (pca_dim, K*D)
         self.pca_eigvals: np.ndarray | None = None  # (pca_dim,)
+        # How the vocabulary was built (sources, ViT layer, input size, ...); empty
+        # for vocabularies saved before provenance was recorded.
+        self.provenance: dict = {}
 
     @property
     def is_fitted(self) -> bool:
@@ -21156,12 +28842,21 @@ class VladAggregator:
             raise ValueError("fit() needs at least 2 images of tokens")
 
         rng = np.random.default_rng(self.seed)
-        stacked = np.concatenate(
-            [np.asarray(t, dtype=np.float32) for t in tokens_per_image], axis=0
-        )
-        if len(stacked) > max_kmeans_tokens:
-            idx = rng.choice(len(stacked), size=max_kmeans_tokens, replace=False)
-            stacked = stacked[idx]
+        total = sum(len(t) for t in tokens_per_image)
+        if total > max_kmeans_tokens:
+            # Sample per image instead of stacking everything first: at 448 px input
+            # 3000 frames hold ~2.4M tokens (~10 GB float32), more than k-means needs.
+            per_image = max(1, max_kmeans_tokens // len(tokens_per_image))
+            parts = []
+            for t in tokens_per_image:
+                t = np.asarray(t)
+                pick = rng.choice(len(t), size=min(per_image, len(t)), replace=False)
+                parts.append(np.asarray(t[pick], dtype=np.float32))
+            stacked = np.concatenate(parts, axis=0)
+        else:
+            stacked = np.concatenate(
+                [np.asarray(t, dtype=np.float32) for t in tokens_per_image], axis=0
+            )
 
         self.centers = self._kmeans(stacked)
         logger.info(
@@ -21254,8 +28949,21 @@ class VladAggregator:
         n = np.linalg.norm(flat)
         return flat / n if n > 1e-12 else flat
 
-    def aggregate(self, tokens: np.ndarray) -> np.ndarray:
-        """Patch tokens (N, D) -> global descriptor (out_dim,), L2-normalized."""
+    # A partially valid view (rotated query: black wedges outside the frame)
+    # aggregates only its valid tokens; below this count all tokens are kept.
+    MIN_VALID_TOKENS = 16
+
+    def aggregate(self, tokens: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
+        """Patch tokens (N, D) -> global descriptor (out_dim,), L2-normalized.
+
+        ``valid`` (N,) bool selects the tokens to aggregate (None = all).
+        VLAD is a sum over tokens, so a subset is a well-defined descriptor of
+        the visible content; the database side always passes None.
+        """
+        if valid is not None:
+            valid = np.asarray(valid, dtype=bool).ravel()
+            if valid.shape[0] == len(tokens) and int(valid.sum()) >= self.MIN_VALID_TOKENS:
+                tokens = np.asarray(tokens)[valid]
         v = self._vlad(tokens)
         if self.pca_components is not None:
             v = (v - self.pca_mean) @ self.pca_components.T
@@ -21265,13 +28973,21 @@ class VladAggregator:
                 v = v / n
         return v.astype(np.float32)
 
-    def aggregate_batch(self, tokens_batch: np.ndarray | list[np.ndarray]) -> np.ndarray:
+    def aggregate_batch(
+        self,
+        tokens_batch: np.ndarray | list[np.ndarray],
+        valid_batch: list[np.ndarray | None] | None = None,
+    ) -> np.ndarray:
         """(B, N, D) or list of (N_i, D) -> (B, out_dim)."""
-        return np.stack([self.aggregate(t) for t in tokens_batch])
+        if valid_batch is None:
+            return np.stack([self.aggregate(t) for t in tokens_batch])
+        return np.stack([self.aggregate(t, v) for t, v in zip(tokens_batch, valid_batch)])
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, provenance: dict | None = None) -> None:
         if self.centers is None:
             raise RuntimeError("Nothing to save: not fitted")
+        if provenance is not None:
+            self.provenance = dict(provenance)
         np.savez_compressed(
             path,
             centers=self.centers,
@@ -21282,6 +28998,7 @@ class VladAggregator:
             pca_eigvals=self.pca_eigvals if self.pca_eigvals is not None else np.empty(0),
             meta=np.array([self.n_clusters, self.pca_dim, self.seed], dtype=np.int64),
             low_norm_fraction=np.float64(self.low_norm_fraction),
+            provenance_json=np.array(json.dumps(self.provenance, sort_keys=True)),
         )
         logger.info(f"VLAD vocabulary saved: {path} (out_dim={self.out_dim})")
 
@@ -21300,8 +29017,22 @@ class VladAggregator:
             agg.pca_mean = data["pca_mean"].astype(np.float32)
             agg.pca_components = data["pca_components"].astype(np.float32)
             agg.pca_eigvals = data["pca_eigvals"].astype(np.float32)
+        if "provenance_json" in data.files:
+            agg.provenance = json.loads(str(data["provenance_json"]))
         logger.info(f"VLAD vocabulary loaded: {path} | k={n_clusters}, out_dim={agg.out_dim}")
         return agg
+
+
+def provenance_mismatches(provenance: dict, expected: dict) -> list[str]:
+    """Settings recorded in a vocabulary's provenance that differ from ``expected``.
+
+    Keys missing from the provenance (older vocabularies) are not reported.
+    """
+    return [
+        f"{key}: vocabulary {provenance[key]!r} != config {value!r}"
+        for key, value in expected.items()
+        if key in provenance and provenance[key] != value
+    ]
 
 
 # ================================================================================
@@ -21426,6 +29157,7 @@ class CoordinatesBroker(QObject):
         self.config = config
 
         self._last_position: dict | None = None
+        self._coordinate_mode = "GEOGRAPHIC"
         self._last_objects: list[dict] = []
         self._history: deque = deque(maxlen=1000)
 
@@ -21608,6 +29340,12 @@ class CoordinatesBroker(QObject):
 
     # Slots for RealtimeTrackingWorker connections
 
+    @pyqtSlot(str, float)
+    def on_fix_info(self, fix_source: str, since_fix_s: float):
+        """Provenance of the next position (worker emits it right before)."""
+        self._fix_source = fix_source
+        self._since_fix_s = since_fix_s if since_fix_s >= 0 else None
+
     @pyqtSlot(float, float, float, int)
     def on_location_found(self, lat: float, lon: float, confidence: float, inliers: int):
         msg = {
@@ -21617,11 +29355,28 @@ class CoordinatesBroker(QObject):
             "confidence": confidence,
             "inliers": inliers,
             "timestamp": time.time(),
+            # "keyframe" = map observation, "optical_flow" = tracked from one,
+            # "dead_reckoning" = chained odometry, NOT confirmed by the map.
+            "fix_source": getattr(self, "_fix_source", "keyframe"),
+            "since_fix_s": getattr(self, "_since_fix_s", None),
         }
+        if self._coordinate_mode == "LOCAL":
+            msg.pop("lat")
+            msg.pop("lon")
+            msg.update(x=lon, y=lat, coordinate_kind="local_planar", coordinate_units="arbitrary")
         self._last_position = msg
         self._last_fix_mono = time.monotonic()  # Timestamp of last position fix
         self._history.append(msg)
         self._broadcast(msg)
+
+    def set_coordinate_mode(self, mode: str):
+        if mode != self._coordinate_mode:
+            self._last_position = None
+            self._last_objects = []
+            self._history.clear()
+            self._last_fix_mono = None
+            self._last_anchor_mono = None
+        self._coordinate_mode = mode
 
     @pyqtSlot()
     def on_anchor_fix(self):
@@ -21644,6 +29399,11 @@ class CoordinatesBroker(QObject):
             ],
             "timestamp": time.time(),
         }
+        if self._coordinate_mode == "LOCAL":
+            msg.update(coordinate_kind="local_planar", coordinate_units="arbitrary")
+            for obj in msg["objects"]:
+                obj["x"], obj["y"] = obj.pop("lon"), obj.pop("lat")
+                obj.update(coordinate_kind="local_planar", coordinate_units="arbitrary")
         self._last_objects = msg["objects"]
         self._broadcast(msg)
 
@@ -22333,7 +30093,14 @@ logger = get_logger(__name__)
 class TrajectoryFilter:
     """Kalman filter for GPS trajectory smoothing optimized for high speeds"""
 
-    def __init__(self, process_noise=2.0, measurement_noise=5.0, dt=1.0):
+    def __init__(
+        self,
+        process_noise=2.0,
+        measurement_noise=5.0,
+        dt=1.0,
+        reanchor_velocity_from_fixes: bool = False,
+        max_gap_s: float = 0.0,
+    ):
         # Filter state: [x, y, vx, vy]
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
 
@@ -22352,6 +30119,25 @@ class TrajectoryFilter:
         # trusted-fix re-anchor can also refresh velocity after a manoeuvre.
         self._last_raw: tuple[float, float] | None = None
         self.last_update_reanchored = False
+        # Timestamp [s] of the last update() that passed one (tracking.
+        # kalman_dt_from_timestamps): lets the caller predict over the time
+        # since the LAST FILTER UPDATE instead of its own path's dt.
+        self.last_update_t: float | None = None
+        # Re-anchor velocity source (tracking.kalman_reanchor_velocity_from_fixes,
+        # default off = legacy). Legacy derives it from the LAST RAW measurement,
+        # which is usually an optical-flow sample; a lost OF track (e.g. after a
+        # failed keyframe) then turns a good fix into a velocity of hundreds of
+        # m/s (route3min 2026-10-28: 1.4 m fix -> 127 m on the next frame).
+        # On: velocity between the two latest TRUSTED fixes (both timestamped,
+        # <= 5 s apart), else the filter's own velocity.
+        self._reanchor_from_fixes = bool(reanchor_velocity_from_fixes)
+        self._last_trusted: tuple[float, float, float] | None = None
+        # Restart after a long measurement gap (tracking.kalman_max_gap_s;
+        # 0 = legacy). Prediction is clamped to 5 s, so after a longer gap the
+        # whole unexplained displacement entered the velocity (wayback route
+        # 2026-10-28: 15 s without a fix -> 214 m/s instead of 45, output 56 m
+        # off while the raw measurements were 5 m off).
+        self.max_gap_s = max(float(max_gap_s), 0.0)
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(
@@ -22395,6 +30181,17 @@ class TrajectoryFilter:
         self.kf.Q[1, 3] = q_var[0, 1]  # Y / VY covariance
         self.kf.Q[3, 1] = q_var[1, 0]  # VY / Y covariance
         self.kf.Q[3, 3] = q_var[1, 1]  # VY velocity variance
+
+    def predict_position(self, dt: float = 1.0) -> tuple | None:
+        """Constant-velocity position prediction ``dt`` ahead, side-effect free.
+
+        Same dt clamping as ``update``. None before initialisation.
+        """
+        if not self.is_initialized:
+            return None
+        dt = max(0.01, min(dt, 5.0))
+        x = self.kf.x
+        return (float(x[0, 0] + x[2, 0] * dt), float(x[1, 0] + x[3, 0] * dt))
 
     def mahalanobis_sq(
         self, measurement: tuple, dt: float = 1.0, noise_scale: float = 1.0
@@ -22458,6 +30255,7 @@ class TrajectoryFilter:
         dt: float = 1.0,
         noise_scale: float = 1.0,
         trusted_max_offset_m: float | None = None,
+        timestamp: float | None = None,
     ) -> tuple:
         """noise_scale — adaptive measurement noise multiplier:
         > 1 for weak/relative measurements (low confidence, optical flow),
@@ -22474,6 +30272,20 @@ class TrajectoryFilter:
         measurement_xy = (float(measurement[0]), float(measurement[1]))
         z = np.array([[measurement_xy[0]], [measurement_xy[1]]])
         self.last_update_reanchored = False
+        if (
+            self.max_gap_s > 0.0
+            and self.is_initialized
+            and timestamp is not None
+            and self.last_update_t is not None
+            and float(timestamp) - self.last_update_t > self.max_gap_s
+        ):
+            logger.info(
+                f"Kalman restart after {float(timestamp) - self.last_update_t:.1f} s "
+                f"without measurements (> {self.max_gap_s} s)"
+            )
+            self.reset()
+        if timestamp is not None:
+            self.last_update_t = float(timestamp)
 
         if not self.is_initialized:
             self.kf.x = np.array([[measurement_xy[0]], [measurement_xy[1]], [0.0], [0.0]])
@@ -22515,7 +30327,15 @@ class TrajectoryFilter:
             offset = float(np.hypot(filtered_x - measurement_xy[0], filtered_y - measurement_xy[1]))
             if np.isfinite(max_offset) and max_offset > 0.0 and offset > max_offset:
                 safe_dt = max(dt, 0.01)
-                if self._last_raw is None:
+                if self._reanchor_from_fixes:
+                    tr = self._last_trusted
+                    gap = None if (tr is None or timestamp is None) else float(timestamp) - tr[2]
+                    if gap is not None and 0.0 < gap <= 5.0:
+                        vx = (measurement_xy[0] - tr[0]) / gap
+                        vy = (measurement_xy[1] - tr[1]) / gap
+                    else:
+                        vx, vy = float(self.kf.x[2, 0]), float(self.kf.x[3, 0])
+                elif self._last_raw is None:
                     vx = vy = 0.0
                 else:
                     vx = (measurement_xy[0] - self._last_raw[0]) / safe_dt
@@ -22536,6 +30356,8 @@ class TrajectoryFilter:
                     f"limit={max_offset:.2f} m, velocity=({vx:.2f}, {vy:.2f}) m/s"
                 )
 
+        if trusted_max_offset_m is not None and timestamp is not None:
+            self._last_trusted = (measurement_xy[0], measurement_xy[1], float(timestamp))
         self._last_raw = measurement_xy
 
         return filtered_x, filtered_y
@@ -22559,9 +30381,244 @@ class TrajectoryFilter:
         self._prev_raw = None
         self._last_raw = None
         self.last_update_reanchored = False
+        self.last_update_t = None
+        self._last_trusted = None
         self.kf.x = np.zeros((4, 1))
         self.kf.P = np.eye(4) * 1000.0
         logger.info("Kalman filter reset to initial state")
+
+
+# ================================================================================
+# File: src\tracking\keyframe_flow.py
+# ================================================================================
+"""Keyframe-anchored Lucas-Kanade optical flow (shared by worker and replay).
+
+Extracted verbatim from TrackingWorker.run (2026-10-27) so the offline replay
+(scripts/replay_tracking_ground_truth.py) exercises exactly the OF path the
+live worker runs. LK always tracks FROM the keyframe: the anchor image and
+points are set once per accepted keyframe and never advanced on OF frames, so
+the displacement grows with time since the keyframe and errors do not chain.
+
+Pure OpenCV/numpy — no Qt, no torch.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class FlowMeasurement:
+    dx_px: float
+    dy_px: float
+    flow_affine: np.ndarray | None
+    flow_quality: float | None
+    n_points: int
+
+
+class KeyframeFlow:
+    """LK tracker anchored at the last accepted keyframe."""
+
+    def __init__(
+        self,
+        fb_check: bool = False,
+        fb_max_px: float = 2.0,
+        half_res: bool = False,
+        win_px: int = 15,
+        max_level: int = 2,
+        max_anchor_age_s: float = 0.0,
+    ):
+        self.fb_check = bool(fb_check)
+        self.fb_max_px = float(fb_max_px)
+        self.half_res = bool(half_res)
+        # LK capture range grows ~2^max_level * win/2. Legacy 15/2 covers ~60 px;
+        # LK always tracks FROM the keyframe, so at 500 m AGL / 50 m/s the scene
+        # moves ~160 px by the 25th frame and the track is lost (measured
+        # 2026-10-28 on route3min: 37-74 px error at offsets 15-25 vs ~1 px
+        # with 21/4).
+        self.win = (max(int(win_px), 5),) * 2
+        self.max_level = max(int(max_level), 0)
+        # Anchor age limit (0 = off, legacy). The anchor only moves on an
+        # accepted keyframe; after a FAILED keyframe LK keeps tracking from a
+        # frame 1-2 s old, far beyond its capture range (route3min 2026-10-28:
+        # raw OF 235-435 m off). With a limit the stale anchor is dropped and
+        # the next frame is a keyframe attempt, like after a lost track.
+        self.max_anchor_age_s = max(float(max_anchor_age_s), 0.0)
+        self.anchor_t: float | None = None
+        self.prev_gray: np.ndarray | None = None
+        self.prev_gray_half: np.ndarray | None = None
+        self.prev_pts: np.ndarray | None = None
+
+    @property
+    def has_anchor(self) -> bool:
+        """Mirrors the worker's ``prev_pts_for_of is not None`` test."""
+        return self.prev_pts is not None
+
+    def clear(self) -> None:
+        self.prev_pts = None
+
+    def expire(self, t: float | None) -> bool:
+        """Drop the anchor when it is older than max_anchor_age_s. Call before
+        deciding keyframe vs OF for frame time ``t``; True if it was dropped."""
+        if (
+            self.max_anchor_age_s <= 0.0
+            or t is None
+            or self.anchor_t is None
+            or self.prev_pts is None
+        ):
+            return False
+        if t - self.anchor_t > self.max_anchor_age_s:
+            self.prev_pts = None
+            return True
+        return False
+
+    def anchor(self, gray: np.ndarray, t: float | None = None) -> None:
+        """Set a new anchor after an accepted (non retrieval-only) keyframe."""
+        self.anchor_t = t
+        self.prev_gray = gray
+        self.prev_gray_half = (
+            cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            if self.half_res
+            else None
+        )
+        self.prev_pts = cv2.goodFeaturesToTrack(
+            gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
+        )
+
+    def track(self, curr_gray: np.ndarray) -> FlowMeasurement | None:
+        """Flow from the anchor to ``curr_gray``.
+
+        Returns None and drops the anchor when too few points survive — the
+        worker then treats the next frame as a keyframe (same as before).
+        """
+        if self.prev_pts is None or len(self.prev_pts) <= 10:
+            self.prev_pts = None
+            return None
+
+        of_scale = 0.5 if (self.half_res and self.prev_gray_half is not None) else 1.0
+        if of_scale != 1.0:
+            g_prev = self.prev_gray_half
+            g_curr = cv2.resize(curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            pts_prev = np.ascontiguousarray(self.prev_pts * of_scale, dtype=np.float32)
+        else:
+            g_prev, g_curr, pts_prev = self.prev_gray, curr_gray, self.prev_pts
+
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            g_prev,
+            g_curr,
+            pts_prev,
+            None,
+            winSize=self.win,
+            maxLevel=self.max_level,
+        )
+        keep = status.reshape(-1) == 1
+
+        if self.fb_check and keep.any():
+            back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
+                g_curr,
+                g_prev,
+                curr_pts,
+                None,
+                winSize=self.win,
+                maxLevel=self.max_level,
+            )
+            rt_err = np.linalg.norm(back_pts.reshape(-1, 2) - pts_prev.reshape(-1, 2), axis=1)
+            fb_ok = (back_status.reshape(-1) == 1) & (rt_err <= self.fb_max_px)
+            if int((keep & fb_ok).sum()) >= 10:
+                keep = keep & fb_ok
+
+        good_new = curr_pts.reshape(-1, 2)[keep]
+        good_old = pts_prev.reshape(-1, 2)[keep]
+        if of_scale != 1.0:
+            good_new = good_new / of_scale
+            good_old = good_old / of_scale
+
+        if len(good_new) <= 10:
+            self.prev_pts = None
+            return None
+
+        flow_vectors = good_new - good_old
+        dx_px, dy_px = np.median(flow_vectors, axis=0)
+
+        flow_affine = None
+        flow_quality = None
+        try:
+            S_of, of_mask = cv2.estimateAffinePartial2D(
+                good_old,
+                good_new,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=3.0,
+            )
+            if S_of is not None and np.all(np.isfinite(S_of)):
+                flow_affine = S_of
+                if of_mask is not None and len(of_mask) > 0:
+                    inlier_ratio = float(of_mask.sum()) / len(of_mask)
+                    n_norm = min(1.0, len(good_new) / 120.0)
+                    flow_quality = inlier_ratio * n_norm
+        except cv2.error as e:
+            logger.debug(f"OF affine estimation failed: {e}")
+
+        return FlowMeasurement(
+            dx_px=dx_px,
+            dy_px=dy_px,
+            flow_affine=flow_affine,
+            flow_quality=flow_quality,
+            n_points=int(len(good_new)),
+        )
+
+
+class FlowChain:
+    """Keeps optical flow going through failed keyframes (visual odometry).
+
+    Without it a failed keyframe leaves LK tracking from an ever older anchor
+    until the anchor expires; then nothing is output until a keyframe succeeds
+    again (wayback 2019 route, 2026-10-28: ~22 s of flight without a position).
+    With it, a failed keyframe re-anchors LK on the last good OF frame and the
+    localizer composes that frame's homography from the old one, so OF keeps
+    producing positions, drifting slowly, until a keyframe succeeds again or
+    ``max_s`` since the last real keyframe fix is exceeded.
+    """
+
+    def __init__(self, enabled: bool = False, max_s: float = 30.0, max_good_age_s: float = 1.0):
+        self.enabled = bool(enabled)
+        self.max_s = float(max_s)
+        self.max_good_age_s = float(max_good_age_s)
+        self.kf_t: float | None = None
+        self.last_good: tuple[np.ndarray, np.ndarray, float] | None = None
+        self.links = 0
+
+    def note_keyframe_success(self, t: float) -> None:
+        self.kf_t = t
+        self.last_good = None
+        self.links = 0
+
+    def note_of_success(self, gray: np.ndarray, flow_affine, t: float) -> None:
+        if self.enabled and flow_affine is not None:
+            self.last_good = (gray, np.asarray(flow_affine, dtype=np.float64), t)
+
+    def try_rebase(self, localizer, flow: KeyframeFlow, t: float) -> bool:
+        """After a failed keyframe: move the anchor to the last good OF frame."""
+        if not self.enabled or self.last_good is None or self.kf_t is None:
+            return False
+        if t - self.kf_t > self.max_s:
+            return False
+        gray, affine, t_good = self.last_good
+        if t - t_good > self.max_good_age_s:
+            return False
+        if not localizer.rebase_optical_flow_anchor(affine):
+            return False
+        flow.anchor(gray, t_good)
+        self.last_good = None
+        self.links += 1
+        logger.debug(f"OF chain: re-anchored on frame at t={t_good:.2f}s (link {self.links})")
+        return True
 
 
 # ================================================================================
@@ -22686,6 +30743,9 @@ class ObjectTracker:
 
     def __init__(self, config: dict):
         self.config = config
+        # object_tracking.tracked_classes: empty / None = every detected class.
+        classes = self.config.get("tracked_classes")
+        self._tracked_classes = {int(c) for c in classes} if classes else None
 
         if sv is None:
             raise ImportError(
@@ -22789,6 +30849,9 @@ class ObjectTracker:
         """
         tracked_objects = []
 
+        if self._tracked_classes is not None and detections:
+            detections = [d for d in detections if int(d["class_id"]) in self._tracked_classes]
+
         if not detections:
             # supervision requires sv.Detections object even if empty to update track states
             sv_detections = sv.Detections.empty()
@@ -22873,6 +30936,9 @@ class OutlierDetector:
         zscore_enabled=True,
         mahalanobis_enabled=False,
         chi2_threshold=13.816,
+        reacquire_consistent=False,
+        reacquire_tol_m=15.0,
+        reacquire_max_wait=10,
     ):
         self.window = deque(maxlen=window_size)
         self.threshold_std = threshold_std
@@ -22901,6 +30967,20 @@ class OutlierDetector:
         # but the point of switching is to disable Z-score.
         self._mahalanobis_enabled = bool(mahalanobis_enabled)
         self._chi2_threshold = float(chi2_threshold)
+        # Re-acquisition gate (flag, default off = legacy). Legacy behaviour
+        # accepts the N-th consecutive rejected measurement unconditionally —
+        # a direct jump mechanism when the rejections are random false fixes.
+        # With the flag on, the streak is accepted only once two consecutive
+        # rejected candidates sit at a CONSISTENT offset from the KF prediction
+        # (a real relocation: the filter is wrong by a stable vector). Random
+        # false fixes scatter and keep being rejected. ``reacquire_max_wait``
+        # extra rejections cap the wait (0 = never force), so a filter that is
+        # truly lost cannot lock out every measurement forever.
+        self._reacquire = bool(reacquire_consistent)
+        self._reacquire_tol_m = max(float(reacquire_tol_m), 0.0)
+        self._reacquire_max_wait = max(int(reacquire_max_wait), 0)
+        self._streak_offsets: list[np.ndarray] = []
+        self._streak_no_pred = False
 
         logger.info("Initializing OutlierDetector (Speed-based Z-score)")
         logger.info(
@@ -22921,12 +31001,58 @@ class OutlierDetector:
         """Full state reset (new tracking session)."""
         self.window.clear()
         self._consecutive_outliers = 0
+        self._streak_offsets.clear()
+
+    def _note_rejection(self, new_pos_np: np.ndarray, pred_position) -> None:
+        """Count one rejected measurement and remember its offset from the KF
+        prediction (ground metres) for the re-acquisition consistency test."""
+        self._consecutive_outliers += 1
+        self._streak_no_pred = pred_position is None
+        if pred_position is None:
+            self._streak_offsets.clear()
+            return
+        off = (new_pos_np - np.asarray(pred_position, dtype=np.float64)) * self._ground_scale
+        self._streak_offsets.append(off)
+        del self._streak_offsets[:-2]
+
+    def _streak_accept(self) -> bool:
+        """Should the current rejection streak be accepted now?"""
+        if self._consecutive_outliers < self._max_consecutive:
+            return False
+        if not self._reacquire or self._streak_no_pred:
+            # legacy: N-th rejection is accepted unconditionally (also when no
+            # KF prediction exists to test consistency against)
+            return True
+        if len(self._streak_offsets) == 2:
+            drift = float(np.linalg.norm(self._streak_offsets[1] - self._streak_offsets[0]))
+            if drift <= self._reacquire_tol_m:
+                logger.warning(
+                    f"OUTLIER RE-ACQUIRE: two consecutive rejected fixes agree "
+                    f"(offset change {drift:.1f} m <= {self._reacquire_tol_m:.1f} m)"
+                )
+                return True
+        if (
+            self._reacquire_max_wait > 0
+            and self._consecutive_outliers >= self._max_consecutive + self._reacquire_max_wait
+        ):
+            logger.warning(
+                f"OUTLIER RE-ACQUIRE: forced after {self._consecutive_outliers} "
+                f"inconsistent rejections"
+            )
+            return True
+        return False
+
+    def _accept_streak(self) -> None:
+        self.window.clear()
+        self._consecutive_outliers = 0
+        self._streak_offsets.clear()
 
     def add_position(self, position: tuple, dt: float = 1.0, reset_consecutive: bool = True):
         # Now we store both position and dt (time it took to reach this position)
         self.window.append((np.array(position, dtype=np.float64), max(dt, 0.01)))
         if reset_consecutive:
             self._consecutive_outliers = 0
+            self._streak_offsets.clear()
 
     def is_outlier(
         self,
@@ -22934,6 +31060,7 @@ class OutlierDetector:
         dt: float = 1.0,
         ref_position: tuple | None = None,
         maha_d2: float | None = None,
+        pred_position: tuple | None = None,
     ) -> bool:
         """Anomaly detection for measurements.
 
@@ -22949,6 +31076,9 @@ class OutlierDetector:
 
         Passing the previous RAW OF-position as ref_position makes the calculation
         local (frame relative to frame) and removes accumulation.
+
+        ``pred_position`` — KF prediction for this measurement time; used only by
+        the re-acquisition gate (``reacquire_consistent``). None = legacy.
         """
         # The Mahalanobis branch does not need a speed window: the filter
         # covariance already encodes the full history. It is therefore checked
@@ -22960,14 +31090,13 @@ class OutlierDetector:
 
         if len(self.window) < 3:
             if is_maha_outlier:
-                self._consecutive_outliers += 1
-                if self._consecutive_outliers >= self._max_consecutive:
+                self._note_rejection(np.array(new_position, dtype=np.float64), pred_position)
+                if self._streak_accept():
                     logger.warning(
                         f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
                         f"accepting new position (mahalanobis d2={maha_d2:.1f})"
                     )
-                    self.window.clear()
-                    self._consecutive_outliers = 0
+                    self._accept_streak()
                     return False
                 logger.warning(
                     f"OUTLIER DETECTED (mahalanobis): d2={maha_d2:.2f} > "
@@ -23012,18 +31141,17 @@ class OutlierDetector:
         )
 
         if is_speed_outlier or is_zscore_outlier or is_maha_outlier:
-            self._consecutive_outliers += 1
+            self._note_rejection(new_pos_np, pred_position)
 
             # Too many consecutive outliers — drone actually moved, reset window
-            if self._consecutive_outliers >= self._max_consecutive:
+            if self._streak_accept():
                 logger.warning(
                     f"OUTLIER RESET: {self._consecutive_outliers} consecutive outliers — "
                     f"accepting new position. "
                     f"Position: ({new_pos_np[0]:.1f}, {new_pos_np[1]:.1f}), "
                     f"speed={instantaneous_speed:.1f}m/s"
                 )
-                self.window.clear()
-                self._consecutive_outliers = 0
+                self._accept_streak()
                 return False  # Accept the new position
 
             if is_maha_outlier and not is_speed_outlier:
@@ -23048,6 +31176,7 @@ class OutlierDetector:
             return True
 
         self._consecutive_outliers = 0
+        self._streak_offsets.clear()
         return False
 
 
@@ -23090,7 +31219,8 @@ Deliberate deviations from the plan text (rationale in the design note):
 The problem solved per window (positions p_i, i = 0..N-1):
 
     sum_i  w_i * ||p_i - z_i||^2          (fixes; w_i Huber-reweighted, IRLS)
-  + sum_e  w_e * ||p_j - p_i - d_e||^2    (odometry edges; quadratic)
+  + sum_e  w_e * ||p_j - p_i - d_e||^2    (odometry edges; quadratic, or
+                                          Huber-IRLS when odom_huber_k > 0)
   + entry prior on the oldest node        (carries marginalized info forward)
 
 x and y decouple into two SPD N x N systems sharing the same matrix.
@@ -23200,6 +31330,7 @@ class SlidingWindowSmoother:
         deadband_m: float = 2.0,
         gain: float = 0.25,
         max_step_m: float = 3.0,
+        odom_huber_k: float = 0.0,
     ) -> None:
         self.window = max(int(window), 2)
         # Sanitise user-supplied parameters (live incident 2026-07-18:
@@ -23219,6 +31350,16 @@ class SlidingWindowSmoother:
         self.deadband_m = self._sane("deadband_m", deadband_m, 0.0)
         self.gain = min(self._sane("gain", gain, 0.01), 1.0)
         self.max_step_m = self._sane("max_step_m", max_step_m, 0.01)
+        # Robust odometry (flag; 0 = legacy quadratic edges). A collapsed OF
+        # track (LK lock lost on repetitive farmland, cloud, water) produces an
+        # edge that contradicts the fixes; quadratic edges pass that error into
+        # the window at full weight. Huber on the normalized edge residual
+        # (|p_b - p_a - d| / sigma_e) suppresses it the same way fixes are.
+        k_odom = float(odom_huber_k)
+        if not np.isfinite(k_odom) or k_odom <= 0.0:
+            self.odom_huber_k = 0.0
+        else:
+            self.odom_huber_k = max(k_odom, 0.1)
 
         self._nodes: list[_Node] = []
         self._edges: list[_Edge] = []
@@ -23233,10 +31374,12 @@ class SlidingWindowSmoother:
         self._t_last_node = 0.0
         self._last_solution: dict[int, np.ndarray] = {}
         self._last_fix_weights: dict[int, float] = {}
+        self._last_edge_weights: list[float] = []
 
         logger.info(
             f"SlidingWindowSmoother: window={self.window}, huber_k={self.huber_k}, "
-            f"fix_sigma={self.fix_sigma_base_m}m, odom_sigma={self.odom_sigma_base_m}m"
+            f"fix_sigma={self.fix_sigma_base_m}m, odom_sigma={self.odom_sigma_base_m}m, "
+            f"odom_huber_k={self.odom_huber_k or 'off'}"
         )
 
     @staticmethod
@@ -23259,6 +31402,7 @@ class SlidingWindowSmoother:
         self._t_last_node = 0.0
         self._last_solution.clear()
         self._last_fix_weights.clear()
+        self._last_edge_weights = []
 
     def note_of(self, metric_xy, dt: float, quality: float | None = None) -> None:
         """Register a successful optical-flow localization (raw metric point).
@@ -23431,6 +31575,8 @@ class SlidingWindowSmoother:
 
         diag = np.arange(n)
         hw = np.ones(n, dtype=np.float64)  # Huber weights on fixes
+        hw_e = np.ones(len(e_w), dtype=np.float64)  # Huber weights on odometry
+        e_sig = 1.0 / np.sqrt(np.maximum(e_w, 1e-300))
         p = z.copy()
 
         for _ in range(self.irls_iterations):
@@ -23448,12 +31594,13 @@ class SlidingWindowSmoother:
                     b[i] += pw * node.prior[0]
 
             if len(self._edges):
-                np.add.at(A, (e_a, e_a), e_w)
-                np.add.at(A, (e_b, e_b), e_w)
-                np.add.at(A, (e_a, e_b), -e_w)
-                np.add.at(A, (e_b, e_a), -e_w)
-                np.subtract.at(b, e_a, e_w[:, None] * e_d)
-                np.add.at(b, e_b, e_w[:, None] * e_d)
+                ew = e_w * hw_e
+                np.add.at(A, (e_a, e_a), ew)
+                np.add.at(A, (e_b, e_b), ew)
+                np.add.at(A, (e_a, e_b), -ew)
+                np.add.at(A, (e_b, e_a), -ew)
+                np.subtract.at(b, e_a, ew[:, None] * e_d)
+                np.add.at(b, e_b, ew[:, None] * e_d)
 
             try:
                 p = np.linalg.solve(A, b)
@@ -23463,9 +31610,14 @@ class SlidingWindowSmoother:
 
             u = np.linalg.norm(p - z, axis=1) / sig
             hw = np.where(u <= self.huber_k, 1.0, self.huber_k / np.maximum(u, 1e-12))
+            if self.odom_huber_k > 0.0 and len(self._edges):
+                r_e = np.linalg.norm(p[e_b] - p[e_a] - e_d, axis=1) / e_sig
+                k = self.odom_huber_k
+                hw_e = np.where(r_e <= k, 1.0, k / np.maximum(r_e, 1e-12))
 
         self._last_solution = {node.uid: p[i].copy() for i, node in enumerate(self._nodes)}
         self._last_fix_weights = {node.uid: float(hw[i]) for i, node in enumerate(self._nodes)}
+        self._last_edge_weights = [float(w) for w in hw_e]
         return p
 
     # ── introspection (tests / telemetry) ────────────────────────────────────
@@ -23482,6 +31634,12 @@ class SlidingWindowSmoother:
     def last_fix_weights(self) -> dict[int, float]:
         """uid -> final Huber weight of the fix (1.0 = fully trusted)."""
         return dict(self._last_fix_weights)
+
+    @property
+    def last_edge_weights(self) -> list[float]:
+        """Final Huber weights of odometry edges in edge order (1.0 = trusted;
+        all 1.0 when odom_huber_k is off)."""
+        return list(self._last_edge_weights)
 
 
 # ================================================================================
@@ -23916,7 +32074,6 @@ TUNABLE_KEYS: frozenset[str] = frozenset(
         "models.vram_management.max_vram_ratio",
         "models.performance.torch_compile",
         "models.performance.fp16_enabled",
-        "models.performance.propagation_max_workers",
         "database.yolo_batch_size",
         "database.prefetch_queue_size",
         "database.decode_batch_size",
@@ -24217,14 +32374,8 @@ class HardwareProfile:
             f"{tier}-tier: decode batch {decode_batches[tier]}",
         )
 
-        # Propagation workers — match physical cores (capped)
-        prop_workers = min(cpu.physical_cores, 8)
-        _propose(
-            "models.performance.propagation_max_workers",
-            4,
-            prop_workers,
-            f"{cpu.physical_cores} physical cores → {prop_workers} propagation workers",
-        )
+        # (propagation_max_workers removed 2026-10: no code consumed it —
+        # propagation matches pairs sequentially on one GPU.)
 
         return overrides
 
@@ -24748,11 +32899,18 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+# Where the default report goes; tests point it at a temporary folder (root
+# conftest.py) so a pytest run never overwrites the application's report.
+TELEMETRY_DIR_ENV = "DRONELOC_TELEMETRY_DIR"
+# Per-run copies kept in <logs>/telemetry/ (oldest removed beyond this count).
+MAX_RUN_REPORTS = 200
 
 
 class _TelemetryTracker:
@@ -24819,21 +32977,52 @@ class _TelemetryTracker:
             }
         return summary
 
+    @staticmethod
+    def _default_report_paths() -> list[Path]:
+        """``<logs>/telemetry_report.json`` (latest run) + a per-run copy.
+
+        The per-run copy (``<logs>/telemetry/telemetry_<time>_<pid>.json``) keeps
+        earlier runs as baselines; before, every process overwrote the one file.
+        ``DRONELOC_TELEMETRY_DIR`` replaces ``<logs>``.
+        """
+        override = os.environ.get(TELEMETRY_DIR_ENV)
+        if override:
+            logs = Path(override)
+        else:
+            from config import user_data_dir
+
+            logs = user_data_dir() / "logs"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        run_copy = logs / "telemetry" / f"telemetry_{stamp}_{os.getpid()}.json"
+        return [logs / "telemetry_report.json", run_copy]
+
+    @staticmethod
+    def _prune_run_reports(folder: Path, keep: int = MAX_RUN_REPORTS) -> None:
+        reports = sorted(folder.glob("telemetry_*.json"))
+        for old in reports[: max(0, len(reports) - keep)]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
     def dump_report(self, path: str | None = None):
         if not self.stats:
             return
 
-        if path is None:
-            from config import user_data_dir
-
-            path = str(user_data_dir() / "logs" / "telemetry_report.json")
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.get_summary(), f, indent=4)
-            logger.info(f"Telemetry report saved to {path} ({len(self.stats)} stages profiled)")
-        except Exception as e:
-            logger.error(f"Failed to save telemetry report: {e}")
+        targets = [Path(path)] if path is not None else self._default_report_paths()
+        summary = self.get_summary()
+        for target in targets:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=4)
+                logger.info(
+                    f"Telemetry report saved to {target} ({len(self.stats)} stages profiled)"
+                )
+            except Exception as e:
+                logger.error(f"Failed to save telemetry report {target}: {e}")
+        if path is None and len(targets) > 1:
+            self._prune_run_reports(targets[1].parent)
 
 
 # Singleton instance
@@ -24994,6 +33183,23 @@ class VideoSourceConfig:
     # For live: background reader keeps only the most recent frame (drop-late).
     # Without it a consumer slower than the stream chronically lags behind real time.
     drop_late_frames: bool = True
+
+    @classmethod
+    def from_app_config(cls, source: str, config) -> "VideoSourceConfig":
+        """Source + the live_stream.* section of the app config (dict or AppConfig).
+
+        Before 2026-10 the tracking worker built VideoSourceConfig(source=...)
+        only, so live_stream.reconnect_attempts / reconnect_delay_sec /
+        buffer_size in user_config.json never took effect.
+        """
+        from config import get_cfg
+
+        return cls(
+            source=str(source),
+            reconnect_attempts=int(get_cfg(config, "live_stream.reconnect_attempts", 5)),
+            reconnect_delay_sec=float(get_cfg(config, "live_stream.reconnect_delay_sec", 2.0)),
+            buffer_size=int(get_cfg(config, "live_stream.buffer_size", 1)),
+        )
 
 
 class VideoSource:
@@ -25667,6 +33873,83 @@ class EncryptCopyWorker(QThread):
 
 
 # ================================================================================
+# File: src\workers\local_panorama_worker.py
+# ================================================================================
+"""Background creation of a map-aligned reference-video mosaic."""
+
+import hashlib
+import json
+from pathlib import Path
+
+import cv2
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from src.geometry.local_panorama import render_local_panorama
+from src.security.project_scan import assert_project_writable
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class LocalPanoramaWorker(QThread):
+    progress = pyqtSignal(int, str)
+    completed = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, video_path, output_path, layout, source_sha256=""):
+        super().__init__()
+        self.video_path = str(video_path)
+        self.output_path = str(output_path)
+        self.layout = layout
+        self.source_sha256 = source_sha256
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
+
+    def run(self):
+        try:
+            path = Path(self.output_path)
+            if path.suffix.lower() != ".png":
+                raise ValueError("Local panoramas must be saved as PNG")
+            assert_project_writable(path)
+            assert_project_writable(str(path) + ".json")
+            if self.source_sha256:
+                self.progress.emit(0, "Перевірка відповідності відео базі…")
+                digest = hashlib.sha256()
+                with open(self.video_path, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        if not self._is_running:
+                            return
+                        digest.update(chunk)
+                if digest.hexdigest() != self.source_sha256:
+                    raise ValueError(
+                        "Відео не відповідає тому, з якого побудована база цього шару."
+                    )
+            image = render_local_panorama(
+                self.video_path,
+                self.layout,
+                running=lambda: self._is_running,
+                progress=self.progress.emit,
+            )
+            if image is None or not self._is_running:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            ok, encoded = cv2.imencode(".png", image)
+            if not ok:
+                raise ValueError("Cannot encode local panorama")
+            path.write_bytes(encoded.tobytes())
+            Path(str(path) + ".json").write_text(
+                json.dumps(self.layout.metadata(), indent=2), encoding="utf-8"
+            )
+            self.progress.emit(100, "Панораму локальної карти збережено")
+            self.completed.emit(str(path))
+        except Exception as exc:
+            logger.exception("Local panorama generation failed")
+            self.error.emit(str(exc))
+
+
+# ================================================================================
 # File: src\workers\panorama_overlay_worker.py
 # ================================================================================
 import base64
@@ -25867,6 +34150,7 @@ with SO(2)-safe angular residuals (arctan2(sin, cos)).
 import json
 from collections import defaultdict
 
+import cv2
 import faiss
 import h5py
 import numpy as np
@@ -25945,12 +34229,29 @@ class PropagationPipeline:
         self.matcher = matcher
         self.config = config or {}
         self._is_running = True
+        self.relative_mode = getattr(getattr(calibration, "converter", None), "mode", "") == "LOCAL"
+        self.high_accuracy = bool(get_cfg(self.config, "propagation.high_accuracy", False))
+        self.temporal_neighbors = int(get_cfg(self.config, "propagation.temporal_neighbors", 4))
+        self.point_pair_limit = int(get_cfg(self.config, "propagation.point_pair_limit", 512))
+        self._pair_homographies = {}
+        self._pair_diagnostics = {}
+        self._source_frames = None
+        self._frame_homographies = None
+        self._subpixel_status = "disabled"
+        self._terrain_terms = None
+        self._relative_feature_ids = {}
+        self._relative_point_pairs = {}
+        self._relative_alignment_report = None
+        self._relative_alignment_rmse = {}
+        self._last_inlier_pair = None
 
         self.min_matches = get_cfg(self.config, "localization.min_matches", 15)
         self.ransac_thresh = get_cfg(self.config, "localization.ransac_threshold", 3.0)
         self.homography_backend = get_cfg(self.config, "homography.backend", "opencv")
         self.use_mad_ransac = get_cfg(self.config, "homography.use_mad_ransac", True)
         self.mad_k_factor = get_cfg(self.config, "homography.mad_k_factor", 2.5)
+        self.ransac_max_iters = int(get_cfg(self.config, "homography.max_iters", 2000))
+        self.ransac_confidence = float(get_cfg(self.config, "homography.confidence", 0.99))
 
         self.frame_w = self.database.metadata.get("frame_width", 1920)
         self.frame_h = self.database.metadata.get("frame_height", 1080)
@@ -26081,6 +34382,19 @@ class PropagationPipeline:
         self.isotropy_weight = get_cfg(self.config, go + "isotropy_weight", 200.0)
         self.skip_bridges = get_cfg(self.config, "propagation.skip_bridges", False)
         self.mnn_fallback = get_cfg(self.config, "propagation.mnn_fallback", False)
+        # Terrain (relief) terms; off = current behaviour. See terrain_scale.py.
+        self.terrain_prior = get_cfg(self.config, go + "terrain_scale_prior", False)
+        self.terrain_prior_weight = float(get_cfg(self.config, go + "terrain_prior_weight", 10.0))
+        self.terrain_edge_correction = get_cfg(self.config, go + "terrain_edge_correction", True)
+        self.terrain_altitude_model = get_cfg(
+            self.config, go + "terrain_altitude_model", "piecewise"
+        )
+        self.terrain_dem_source = get_cfg(self.config, go + "terrain_dem_source", "terrarium")
+        self.terrain_dem_path = get_cfg(self.config, go + "terrain_dem_path", "")
+        self.terrain_dem_zoom = int(get_cfg(self.config, go + "terrain_dem_zoom", 13))
+        self.terrain_dem_download = get_cfg(self.config, go + "terrain_dem_download", True)
+        self.terrain_focal_px = float(get_cfg(self.config, go + "terrain_focal_px", 0.0))
+        self.terrain_iterations = int(get_cfg(self.config, go + "terrain_iterations", 2))
         self._n_rotation_retry = 0
         self._origin_xy = (0.0, 0.0)
 
@@ -26117,8 +34431,25 @@ class PropagationPipeline:
                 self._cancelled_cb()
 
     def _run_propagation(self):
+        try:
+            self._run_propagation_core()
+        finally:
+            if self._source_frames is not None:
+                self._source_frames.close()
+                self._source_frames = None
+
+    def _run_propagation_core(self):
+        if self.relative_mode:
+            # A single gauge fixes arbitrary translation/rotation/scale. Geographic
+            # priors, old solutions and geographic exports have no meaning here.
+            self.terrain_prior = self.export_geojson = self.warm_start = False
+            self.soft_anchors = self.anchor_gap_check = self.anchor_linear_fallback = False
+            self.pin_exact_anchors = False
+            self.use_bfs = True
         num_frames = self.database.get_num_frames()
-        all_anchors = sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        all_anchors = (
+            [] if self.relative_mode else sorted(self.calibration.anchors, key=lambda a: a.frame_id)
+        )
         anchors = [a for a in all_anchors if a.frame_id < num_frames]
 
         # Validate that all anchors refer to slots within the database.
@@ -26132,7 +34463,7 @@ class PropagationPipeline:
             )
             return
 
-        if not anchors:
+        if not anchors and not self.relative_mode:
             self._report_error("No calibration anchors")
             return
 
@@ -26145,6 +34476,26 @@ class PropagationPipeline:
         # ── Phase 1: Prefetch + Temporal edges ───────────────────────────────
         self._report_progress(0, "Prefetching features into RAM...")
         all_features = self._prefetch_features(num_frames)
+        if self.relative_mode or self.high_accuracy:
+            self._relative_feature_ids = {
+                id(features): fid for fid, features in all_features.items()
+            }
+            self._relative_point_pairs.clear()
+            self._relative_alignment_report = None
+            self._relative_alignment_rmse = {}
+        if self.high_accuracy:
+            self._pair_homographies.clear()
+            self._pair_diagnostics.clear()
+            self._frame_homographies = None
+            if get_cfg(self.config, "propagation.subpixel_refinement", True):
+                from src.geometry.pair_refinement import SourceFrames
+
+                try:
+                    self._source_frames = SourceFrames(self.database.metadata, self._check_running)
+                    self._subpixel_status = "verified_source"
+                except (ValueError, OSError) as exc:
+                    self._subpixel_status = str(exc)
+                    logger.warning(f"Subpixel refinement unavailable: {exc}")
         self._check_running()
         if not all_features:
             # Two cases: (a) corrupted/unreadable file — _prefetch_features already
@@ -26160,9 +34511,42 @@ class PropagationPipeline:
                 )
             return
 
+        # An affine belongs to one exact image.  Applying it to a neighbouring
+        # keyframe silently moves the map, so missing anchor slots are a database
+        # contract error and must be rebuilt as required keyframes. Checked right
+        # after the prefetch: it needs only the anchors and the prefetched slots, and
+        # used to fail after the whole temporal + loop-closure matching (70 s on a
+        # 524-keyframe layer). Relative mode has no anchors here (gauge seeded below).
+        missing_anchor_ids = [a.frame_id for a in anchors if a.frame_id not in all_features]
+        if missing_anchor_ids:
+            self._report_error(
+                "Calibration anchors have no features at exact DB slots: "
+                f"{missing_anchor_ids}. Rebuild the database with "
+                f"database.required_frame_ids={missing_anchor_ids} (or pass the same IDs "
+                "as required_frame_ids to DatabaseBuilder). The affine matrices cannot "
+                "be transferred to neighbouring frames."
+            )
+            return
+
         optimizer = PoseGraphOptimizer(
             self.frame_w, self.frame_h, isotropy_weight=self.isotropy_weight
         )
+        if self.relative_mode:
+            from src.calibration.multi_anchor_calibration import AnchorCalibration
+
+            seed = min(all_features)
+            anchors = [
+                AnchorCalibration(
+                    seed,
+                    np.array(
+                        [
+                            [1.0, 0.0, -self.frame_w / 2],
+                            [0.0, -1.0, self.frame_h / 2],
+                        ]
+                    ),
+                    {"transform_type": "relative_gauge", "projection_mode": "LOCAL"},
+                )
+            ]
         for i in range(num_frames):
             if i in all_features:
                 optimizer.add_node(i)
@@ -26220,22 +34604,18 @@ class PropagationPipeline:
             f"({temporal_count} temporal + {spatial_count} spatial)"
         )
 
-        # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
-        self._report_progress(60, "Fixing GPS anchors (Local Origin)...")
-
-        # An affine belongs to one exact image.  Applying it to a neighbouring
-        # keyframe silently moves the map, so missing anchor slots are a database
-        # contract error and must be rebuilt as required keyframes.
-        missing_anchor_ids = [a.frame_id for a in anchors if a.frame_id not in all_features]
-        if missing_anchor_ids:
-            self._report_error(
-                "Calibration anchors have no features at exact DB slots: "
-                f"{missing_anchor_ids}. Rebuild the database with "
-                f"database.required_frame_ids={missing_anchor_ids} (or pass the same IDs "
-                "as required_frame_ids to DatabaseBuilder). The affine matrices cannot "
-                "be transferred to neighbouring frames."
-            )
+        if self.high_accuracy and self.relative_mode:
+            self._run_accurate_local_map(optimizer, all_features, anchors)
             return
+
+        # ── Phase 3: Fix anchors (Local Origin Strategy) ──────────────────────
+        self._report_progress(
+            60,
+            "Fixing local coordinate origin..."
+            if self.relative_mode
+            else "Fixing GPS anchors (Local Origin)...",
+        )
+
         anchor_nodes = {anchor.frame_id: anchor for anchor in anchors}
 
         # Establish local reference point for numerical stability (Local Center).
@@ -26333,6 +34713,12 @@ class PropagationPipeline:
 
         # ── Phase 4: Optimize ────────────────────────────────────────────────
         self._report_progress(70, "Global graph optimisation (Levenberg-Marquardt)...")
+        # Do not resurrect an edge discarded by the pose-graph pruning stage.
+        relative_graph_pairs = (
+            {tuple(sorted((edge.from_id, edge.to_id))) for edge in optimizer.edges}
+            if self.relative_mode
+            else set()
+        )
         results = optimizer.optimize(
             max_iterations=self.max_iters,
             tolerance=self.tolerance,
@@ -26348,6 +34734,26 @@ class PropagationPipeline:
         )
         logger.info(f"Phase 4 complete: {len(results)} frames optimized")
         self._check_running()
+
+        # ── Phase 4b: terrain terms (flag-gated) ─────────────────────────────
+        # Re-solves from the relief-free solution: DEM footprints need positions
+        # that are already roughly right, and pruning has already happened.
+        if self.terrain_prior:
+            self._report_progress(78, "Terrain relief: DEM scale terms...")
+            terrain = self._build_terrain_terms(optimizer)
+            self._terrain_terms = terrain
+            if terrain is not None:
+                for it in range(self.terrain_iterations):
+                    stats = terrain.apply(optimizer)
+                    logger.info(f"Terrain pass {it + 1}/{self.terrain_iterations}: {stats}")
+                    results = optimizer.optimize(
+                        max_iterations=self.max_iters,
+                        tolerance=self.tolerance,
+                        progress_callback=lambda msg: self._report_progress(78, msg),
+                        use_analytic_jac=self.use_analytic_jac,
+                        kinematic_prior_weight=self.kinematic_prior_weight,
+                    )
+                    self._check_running()
 
         # Propagation diagnostics: edge classes, residuals, worst frames, anchor stress
         try:
@@ -26371,7 +34777,9 @@ class PropagationPipeline:
         force_invalid: set[int] = set()
         if self.anchor_gap_check and flagged_gaps:
             force_invalid = {
-                fid for start, end in flagged_gaps for fid in range(start + 1, end)
+                fid
+                for start, end in flagged_gaps
+                for fid in range(start + 1, end)
                 if fid not in graph_supported
             }
             if force_invalid:
@@ -26402,9 +34810,7 @@ class PropagationPipeline:
             linear_affines = interpolate_linear_anchor_intervals(
                 anchor_affines, linear_intervals, self.frame_w, self.frame_h
             )
-            interior_count = sum(
-                1 for fid in linear_affines if fid not in anchor_affines
-            )
+            interior_count = sum(1 for fid in linear_affines if fid not in anchor_affines)
             logger.info(
                 f"Anchor-linear model: {len(linear_intervals)} stable intervals, "
                 f"{interior_count} interior slots"
@@ -26419,6 +34825,76 @@ class PropagationPipeline:
             )
 
         # ── Phase 5: Save to HDF5 ───────────────────────────────────────────
+        if self.high_accuracy:
+            # Keep the geographic anchor behavior from the existing graph stage.
+            # Refine only relative image geometry around those fixed results.
+            results.update(
+                {fid: affine for fid, affine in linear_affines.items() if fid in results}
+            )
+            self._frame_homographies = self._refine_accurate_map(
+                results,
+                optimizer,
+                all_features,
+                fixed_ids={a.frame_id for a in anchors} | set(linear_affines),
+            )
+            from src.geometry.frame_transform import affine_at_center
+
+            if self._frame_homographies is not None:
+                results.update(
+                    {
+                        fid: affine_at_center(H, self.frame_w, self.frame_h)
+                        for fid, H in self._frame_homographies.items()
+                    }
+                )
+            # Accuracy validation can reject spatial constraints after the
+            # legacy solve. Do not retain support through a rejected edge.
+            graph_supported, compact_component_ids, component_anchors = anchored_graph_support(
+                results.keys(), optimizer.edges, anchor_nodes
+            )
+            frame_components[:] = -1
+            frame_components[: len(compact_component_ids)] = compact_component_ids
+        elif self.relative_mode:
+            from src.geometry.relative_alignment import PointLink, refine_relative_affines
+            from src.geometry.relative_map import normalize_relative_map
+
+            results = {fid: matrix for fid, matrix in results.items() if fid in graph_supported}
+            if len(results) < 2:
+                self._report_error(
+                    "Local map needs at least two visually connected frames. Use denser video sampling."
+                )
+                return
+            self._report_progress(82, "Aligning shared image points in the local map...")
+            links = []
+            for edge in optimizer.edges:
+                if edge.weight <= 0:
+                    continue
+                key = (edge.from_id, edge.to_id)
+                if key not in self._relative_point_pairs:
+                    key = key[::-1]
+                pair = self._relative_point_pairs.get(key)
+                if pair is not None:
+                    links.append(PointLink(*key, *pair, weight=edge.weight))
+            initial_affines = results
+            results, report, frame_rmse = refine_relative_affines(
+                results, links, self.frame_w, self.frame_h, anchors[0].frame_id, self._check_running
+            )
+            extra_links = self._local_overlap_links(results, all_features, relative_graph_pairs)
+            if extra_links:
+                self._report_progress(84, "Refining local map with verified cross-pass overlaps...")
+                results, report, frame_rmse = refine_relative_affines(
+                    initial_affines,
+                    links + extra_links,
+                    self.frame_w,
+                    self.frame_h,
+                    anchors[0].frame_id,
+                    self._check_running,
+                )
+            report["additional_overlap_links"] = len(extra_links)
+            self._relative_alignment_report = report
+            self._relative_alignment_rmse = frame_rmse
+            logger.info(f"Local point alignment: {self._relative_alignment_report}")
+            self._relative_point_pairs.clear()
+            results, _ = normalize_relative_map(results, self.frame_w, self.frame_h)
         self._report_progress(85, "Saving results to HDF5...")
         valid_count = self._save_to_hdf5(
             results,
@@ -26436,11 +34912,22 @@ class PropagationPipeline:
         # Export GeoJSON for visualisation
         if self.export_geojson and self.calibration.converter:
             try:
+                final_transforms = None
+                if self._frame_homographies is not None:
+                    from src.geometry.frame_transform import get_frame_transform
+
+                    final_transforms = {
+                        fid: get_frame_transform(self.database, fid)
+                        for fid in results
+                        if self.database.frame_valid[fid]
+                    }
                 geojson = optimizer.export_graph_geojson(
                     self.calibration.converter,
                     self.frame_w,
                     self.frame_h,
                     origin_xy=self._origin_xy,
+                    frame_transforms=final_transforms,
+                    point_pairs=self._relative_point_pairs,
                 )
                 geojson_path = str(self.database.db_path).replace(".h5", "_graph.geojson")
                 assert_project_writable(geojson_path)
@@ -26455,6 +34942,304 @@ class PropagationPipeline:
             f"Done! {valid_count}/{num_frames} frames received coordinates "
             f"({temporal_count} temporal + {spatial_count} spatial edges).",
         )
+        self._report_completed()
+
+    def _local_overlap_links(self, affines, features, known_pairs):
+        """Verify nearby flight passes that descriptor retrieval did not connect."""
+        from src.geometry.relative_alignment import PointLink, nearby_frame_pairs
+
+        if self.spatial_base_w <= 0:
+            return []
+        candidates = nearby_frame_pairs(
+            affines,
+            self.frame_w,
+            self.frame_h,
+            known_pairs,
+            0 if self.high_accuracy else self.lc_min_gap,
+            limit=min(8, self.lc_top_k),
+        )
+        links = []
+        for index, (first, second) in enumerate(candidates):
+            self._check_running()
+            if index % 50 == 0:
+                self._report_progress(83, f"Checking local overlaps: {index}/{len(candidates)}")
+            # Match second -> first, just like the ordinary spatial graph edges.
+            match = self._match_and_build_edge(features[second], features[first])
+            if match is None:
+                continue
+            _H, inliers, rmse, total, spread = match
+            if (
+                inliers < max(30, self.lc_min_inliers)
+                or inliers / total < 0.3
+                or spread is None
+                or spread < 0.025
+                or rmse > max(3.0, 2 * self.ransac_thresh)
+            ):
+                continue
+            source, target = self._last_inlier_pair
+            if self.high_accuracy:
+                if not self._consistent_with_map(affines, second, first, source, target):
+                    continue
+                links.append(
+                    PointLink(
+                        second,
+                        first,
+                        source,
+                        target,
+                        self._compute_weight(inliers, rmse, self.spatial_base_w),
+                    )
+                )
+                continue
+            source_h = np.column_stack([source, np.ones(len(source))])
+            fitted = np.linalg.lstsq(source_h, target, rcond=None)[0].T
+            # Compare in map space, allowing zoom/rotation between source images
+            # while rejecting flips and implausible changes to the current map.
+            relative = affines[first][:, :2] @ fitted[:, :2] @ np.linalg.inv(affines[second][:, :2])
+            scales = np.linalg.svd(relative, compute_uv=False)
+            if np.linalg.det(relative) <= 0 or scales.min() < 0.5 or scales.max() > 2:
+                continue
+            delta = source_h @ affines[second].T - (
+                target @ affines[first][:, :2].T + affines[first][:, 2]
+            )
+            pixel_scale = np.sqrt(abs(np.linalg.det(affines[second][:, :2])))
+            if np.median(np.linalg.norm(delta, axis=1)) / pixel_scale > 0.75 * np.hypot(
+                self.frame_w, self.frame_h
+            ):
+                continue
+            weight = self._compute_weight(inliers, rmse, self.spatial_base_w)
+            links.append(PointLink(second, first, source, target, weight))
+        logger.info(
+            f"Local overlaps: {len(links)} verified from {len(candidates)} spatial proposals"
+        )
+        return links
+
+    def _consistent_with_map(self, transforms, first, second, source, target):
+        """Reject coherent aliases against independent temporal/map geometry.
+
+        This is a coarse image-space guard, with slack for accumulated drift.
+        A consistent feature consensus alone cannot detect repeated field rows.
+        """
+        from src.geometry.frame_transform import as_homography
+        from src.geometry.pair_refinement import symmetric_errors
+
+        if first not in transforms or second not in transforms:
+            return False
+        try:
+            predicted = np.linalg.inv(as_homography(transforms[second])) @ as_homography(
+                transforms[first]
+            )
+            errors = symmetric_errors(predicted, source, target)
+            return bool(
+                np.isfinite(errors).all()
+                and np.median(errors) <= 0.1 * np.hypot(self.frame_w, self.frame_h)
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            return False
+
+    def _accuracy_links(self, optimizer):
+        from src.geometry.relative_alignment import PointLink
+
+        links, known = [], set()
+        for edge in optimizer.edges:
+            canonical = tuple(sorted((edge.from_id, edge.to_id)))
+            if edge.weight <= 0 or canonical in known:
+                continue
+            key = (edge.to_id, edge.from_id)
+            if key not in self._relative_point_pairs:
+                key = key[::-1]
+            pair = self._relative_point_pairs.get(key)
+            if pair is not None:
+                links.append(PointLink(*key, *pair, weight=edge.weight))
+                known.add(canonical)
+        return links
+
+    def _accuracy_priors(self, initial, optimizer, fixed_ids):
+        """Optional solver priors of the accuracy profile; all off by default.
+
+        Returns (FramePriors, soft anchor ids). Soft anchors are anchor frames whose
+        reference points (points_2d -> points_metric) become observations; they are
+        then refined instead of staying frozen at the graph solution.
+        """
+        from src.geometry.relative_projective import FramePriors
+
+        priors = FramePriors(
+            perspective_sigma_px=float(
+                get_cfg(self.config, "propagation.accuracy_perspective_sigma_px", 0.0)
+            )
+        )
+        soft_ids = set()
+        if get_cfg(self.config, "propagation.accuracy_anchor_points", False):
+            sigma = float(get_cfg(self.config, "propagation.accuracy_anchor_sigma_px", 1.0))
+            for anchor in getattr(self.calibration, "anchors", []):
+                pts = np.asarray(anchor.points_2d or [], dtype=np.float64).reshape(-1, 2)
+                ref = np.asarray(anchor.points_metric or [], dtype=np.float64).reshape(-1, 2)
+                fid = anchor.frame_id
+                if (
+                    fid in initial
+                    and fid in fixed_ids
+                    and len(pts) >= 4
+                    and pts.shape == ref.shape
+                    and np.isfinite(pts).all()
+                    and np.isfinite(ref).all()
+                ):
+                    priors.points[fid] = (pts, ref, sigma)
+                    soft_ids.add(fid)
+        scale_sigma = float(get_cfg(self.config, "propagation.accuracy_terrain_scale_sigma", 0.0))
+        if scale_sigma > 0 and self._terrain_terms is not None:
+            from src.geometry.terrain_scale import ground_scale
+
+            terrain = self._terrain_terms
+            states = optimizer.node_states()
+            fids = [fid for fid in sorted(states) if fid in initial]
+            if fids:
+                fp = terrain.model.sample_footprints(np.array([states[f] for f in fids]))
+                agl = terrain.profile(np.array(fids, dtype=np.float64)) - fp["mean"]
+                k = ground_scale(fp["lat"], terrain.model.converter)
+                ok = np.isfinite(agl) & (agl > terrain.min_agl_m)
+                target = np.log(np.where(ok, agl, 1.0) / (terrain.model.f_px * k))
+                for n, fid in enumerate(fids):
+                    if ok[n] and (fid not in fixed_ids or fid in soft_ids):
+                        priors.log_scale[fid] = (float(target[n]), scale_sigma)
+        if priors:
+            logger.info(
+                f"Accuracy priors: {len(priors.points)} soft anchors, "
+                f"{len(priors.log_scale)} terrain scale priors, "
+                f"perspective sigma {priors.perspective_sigma_px:g} px"
+            )
+        return priors, soft_ids
+
+    def _refine_accurate_map(self, initial, optimizer, features, fixed_ids):
+        from src.geometry.relative_projective import connected_links, refine_projective_map
+
+        links = self._accuracy_links(optimizer)
+        spatial = {
+            tuple(sorted((e.from_id, e.to_id))) for e in optimizer.edges if e.edge_type == "spatial"
+        }
+        rejected = {
+            tuple(sorted((link.first, link.second)))
+            for link in links
+            if tuple(sorted((link.first, link.second))) in spatial
+            and not self._consistent_with_map(
+                initial, link.first, link.second, link.first_points, link.second_points
+            )
+        }
+        # Keep support/provenance and saved diagnostics consistent with the solve.
+        for edge in optimizer.edges:
+            if tuple(sorted((edge.from_id, edge.to_id))) in rejected:
+                edge.weight = 0.0
+        links = [link for link in links if tuple(sorted((link.first, link.second))) not in rejected]
+        original_ids = set(initial)
+        priors, soft_ids = self._accuracy_priors(initial, optimizer, fixed_ids)
+        fixed_ids = set(fixed_ids) - soft_ids
+        initial, links = connected_links(initial, links, fixed_ids | soft_ids)
+        known = {tuple(sorted((edge.from_id, edge.to_id))) for edge in optimizer.edges}
+        extra = (
+            self._local_overlap_links(initial, features, known)
+            if get_cfg(self.config, "propagation.accuracy_extra_overlaps", True)
+            else []
+        )
+        links += extra
+        self._validated_alignment_links = links
+        self._report_progress(75, "Refining full frame geometry with shared image points...")
+        try:
+            result, report, frame_rmse = refine_projective_map(
+                initial,
+                links,
+                self.frame_w,
+                self.frame_h,
+                set(fixed_ids) & initial.keys(),
+                max_nfev=int(get_cfg(self.config, "propagation.projective_max_evaluations", 150)),
+                check_running=self._check_running,
+                priors=priors.restricted(initial),
+                window_frames=int(get_cfg(self.config, "propagation.projective_window_frames", 64)),
+                train_points=int(get_cfg(self.config, "propagation.projective_train_points", 96)),
+                solver=str(get_cfg(self.config, "propagation.projective_solver", "trf")),
+            )
+        except ValueError as exc:
+            self._relative_alignment_report = {
+                "status": "fallback",
+                "reason": str(exc),
+                "refined_frames": 0,
+                "converged": False,
+            }
+            self._relative_alignment_rmse = {}
+            logger.warning(f"Relative refinement unavailable; preserving initialized map: {exc}")
+            return None
+        report["unrefined_frame_ids"] = sorted(original_ids - result.keys())
+        report["rejected_spatial_links"] = len(rejected)
+        report["additional_overlap_links"] = len(extra)
+        report["subpixel_status"] = self._subpixel_status
+        report["accuracy_options"] = {
+            key: get_cfg(self.config, f"propagation.{key}", default)
+            for key, default in (
+                ("projective_solver", "trf"),
+                ("projective_window_frames", 64),
+                ("projective_train_points", 96),
+                ("accuracy_anchor_points", False),
+                ("accuracy_anchor_sigma_px", 1.0),
+                ("accuracy_terrain_scale_sigma", 0.0),
+                ("accuracy_perspective_sigma_px", 0.0),
+                ("accuracy_extra_overlaps", True),
+            )
+        }
+        report["soft_anchor_frames"] = len(soft_ids)
+        report["pairs_checked"] = len(self._pair_diagnostics)
+        report["pairs_rejected"] = sum(
+            bool(q["rejection"]) for q in self._pair_diagnostics.values()
+        )
+        self._relative_alignment_report = report
+        self._relative_alignment_rmse = frame_rmse
+        if not report["converged"]:
+            logger.warning(
+                "Relative alignment reached its iteration budget; validation passed but convergence is not certified"
+            )
+        logger.info(
+            f"Relative alignment ({report['selected_model']}): {report['before_p95_px']:.3f} -> "
+            f"{report['after_p95_px']:.3f} px P95; held-out {report['heldout_after_p95_px']}"
+        )
+        return result
+
+    def _run_accurate_local_map(self, optimizer, features, anchors):
+        from src.geometry.frame_transform import affine_at_center
+        from src.geometry.relative_map import normalize_relative_map
+        from src.geometry.relative_projective import initialize_from_pairs
+
+        gauge_id = anchors[0].frame_id
+        initial = initialize_from_pairs(
+            self._pair_homographies,
+            [(e.from_id, e.to_id, e.weight) for e in optimizer.edges if e.edge_type == "temporal"],
+            {gauge_id: anchors[0].affine_matrix},
+            self.frame_w,
+            self.frame_h,
+        )
+        if len(initial) < 2:
+            self._report_error(
+                "Local map needs at least two visually connected frames. Use denser video sampling."
+            )
+            return
+        transforms = self._refine_accurate_map(initial, optimizer, features, {gauge_id})
+        if transforms is None:
+            transforms = initial
+        self._frame_homographies, _ = normalize_relative_map(transforms, self.frame_w, self.frame_h)
+        affines = {
+            fid: affine_at_center(H, self.frame_w, self.frame_h)
+            for fid, H in self._frame_homographies.items()
+        }
+        supported, components, component_anchors = anchored_graph_support(
+            affines.keys(), optimizer.edges, {gauge_id}
+        )
+        all_components = np.full(self.database.get_num_frames(), -1, dtype=np.int32)
+        all_components[: len(components)] = components
+        self._report_progress(90, "Saving full projective frame geometry...")
+        count = self._save_to_hdf5(
+            affines,
+            anchors,
+            optimizer,
+            graph_supported=supported,
+            frame_components=all_components,
+            component_anchors=component_anchors,
+        )
+        self._report_progress(100, f"Done! {count} frames aligned in the local map.")
         self._report_completed()
 
     # ─── Phase 1: Prefetch + Temporal edges ──────────────────────────────────
@@ -26557,7 +35342,9 @@ class PropagationPipeline:
                     logger.debug(
                         f"Temporal edge across keyframe gap: {recent[-1][0]} → {i} ({gap} slots)"
                     )
-                candidates = recent[::-1] if self.skip_bridges else recent[-1:]
+                candidates = (
+                    recent[::-1] if (self.skip_bridges or self.high_accuracy) else recent[-1:]
+                )
                 for depth, (last_id, last_feat) in enumerate(candidates):
                     similarity, inliers, rmse_val, result, spread = self._try_temporal_pair(
                         feat_i, last_feat, last_id, i
@@ -26603,10 +35390,17 @@ class PropagationPipeline:
                     count += 1
                     if depth > 0:
                         n_bridged += 1
-                    break
+                    if not self.high_accuracy:
+                        break
 
             recent.append((i, feat_i))
-            depth_limit = max(1, self.max_skip_frames) if self.skip_bridges else 1
+            depth_limit = (
+                self.temporal_neighbors
+                if self.high_accuracy
+                else max(1, self.max_skip_frames)
+                if self.skip_bridges
+                else 1
+            )
             if len(recent) > depth_limit:
                 recent.pop(0)
 
@@ -26621,7 +35415,10 @@ class PropagationPipeline:
         if n_gated:
             logger.info(f"Temporal gate rejected {n_gated} edges (degenerate transforms)")
         if n_bridged:
-            logger.info(f"Skip-bridges connected {n_bridged} temporal-chain breaks")
+            if self.high_accuracy:
+                logger.info(f"Added {n_bridged} redundant temporal overlap constraints")
+            else:
+                logger.info(f"Skip-bridges connected {n_bridged} temporal-chain breaks")
         if n_spread_down:
             logger.info(
                 f"Spatial collapse: {n_spread_down}/{count} temporal edges received "
@@ -26687,6 +35484,39 @@ class PropagationPipeline:
             H_true = np.asarray(H_r, dtype=np.float64) @ rotation_homography(ang, cx, cy)
             similarity = homography_to_similarity(H_true, self.frame_w, self.frame_h)
             if similarity is not None:
+                if (
+                    self.relative_mode or self.high_accuracy
+                ) and self._last_inlier_pair is not None:
+                    rotated, reference = self._last_inlier_pair
+                    original = rotate_keypoints(rotated, -ang, cx, cy)
+                    if self.high_accuracy:
+                        from src.geometry.pair_refinement import pair_quality
+
+                        accepted, quality = pair_quality(
+                            H_true,
+                            original,
+                            reference,
+                            _n,
+                            self.frame_w,
+                            self.frame_h,
+                            inlier_count=inliers,
+                            min_ratio=get_cfg(
+                                self.config, "propagation.pair_min_inlier_ratio", 0.3
+                            ),
+                            min_spread=get_cfg(self.config, "propagation.pair_min_spread", 0.025),
+                            max_error=get_cfg(self.config, "propagation.pair_max_error_px", 3.0),
+                        )
+                        # The retained pair is spatially sampled; its size is
+                        # not the original RANSAC inlier count.
+                        quality["inliers"] = inliers
+                        quality["inlier_ratio"] = inliers / max(_n, 1)
+                        quality["rotation_retry_deg"] = float(ang_deg)
+                        self._pair_diagnostics[(to_id, from_id)] = quality
+                        if not accepted:
+                            continue
+                        rmse_val, spread = quality["symmetric_rms_px"], quality["spread"]
+                    self._relative_point_pairs[(to_id, from_id)] = (original, reference)
+                    self._pair_homographies[(to_id, from_id)] = H_true.copy()
                 logger.debug(
                     f"Rotation-retry {from_id}→{to_id} OK @ {ang_deg:.1f}° (chain={chain_angle})"
                 )
@@ -26764,7 +35594,11 @@ class PropagationPipeline:
         topk_sets = {fid: {int(j) for j, _ in cands} for fid, cands in retrieval.items()}
 
         # Pass 2: collect spatial candidates + gates
-        already_matched: set[tuple[int, int]] = set()
+        already_matched: set[tuple[int, int]] = (
+            {tuple(sorted((e.from_id, e.to_id))) for e in optimizer.edges}
+            if self.high_accuracy
+            else set()
+        )
         specs: list[dict] = []
         n_gated_phys = 0
         n_gated_mutual = 0
@@ -26781,7 +35615,7 @@ class PropagationPipeline:
                 j = int(j)
                 if j == i or j == -1:
                     continue
-                if abs(i - j) <= self.lc_min_gap:
+                if abs(i - j) <= (0 if self.high_accuracy else self.lc_min_gap):
                     continue
                 if float(sim_score) < self.lc_min_sim:
                     continue
@@ -27023,7 +35857,9 @@ class PropagationPipeline:
         for frame_id in graph_supported or set():
             if 0 <= frame_id < num_frames and optimized_mask[frame_id]:
                 supported_mask[frame_id] = True
-        filled_count = self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        filled_count = (
+            0 if self.relative_mode else self._fill_gaps_by_interpolation(frame_affine, frame_valid)
+        )
         frame_origin, frame_support_distance, frame_georef_status = classify_calibration(
             frame_valid,
             optimized_mask,
@@ -27079,6 +35915,10 @@ class PropagationPipeline:
                 rmse_list = [s[1] for s in stats if s[1] > 0]
                 frame_matches[fid] = int(np.mean(inliers_list)) if inliers_list else 0
                 frame_rmse[fid] = float(np.mean(rmse_list)) if rmse_list else 0.0
+        if self.relative_mode or self.high_accuracy:
+            for fid, rmse in self._relative_alignment_rmse.items():
+                if frame_valid[fid]:
+                    frame_rmse[fid] = rmse
 
         # Disagreement metric: read by ResultBuilder.compute_confidence (stability_score,
         # then R in Kalman), so the metric shape matters for live localisation.
@@ -27101,7 +35941,38 @@ class PropagationPipeline:
             adj[e.from_id].append(e)
             adj[e.to_id].append(e)
 
-        if self.true_disagreement:
+        if self.high_accuracy and self._frame_homographies:
+            from src.geometry.frame_transform import project_frame_points, project_points
+
+            center = [[self.frame_w / 2, self.frame_h / 2]]
+            for fid in self._frame_homographies:
+                predictions = []
+                for edge in adj[fid]:
+                    if edge.weight <= 0:
+                        continue
+                    other = edge.to_id if edge.from_id == fid else edge.from_id
+                    other_transform = self._frame_homographies.get(other)
+                    pair = self._pair_homographies.get((fid, other))
+                    if pair is None and (other, fid) in self._pair_homographies:
+                        pair = np.linalg.inv(self._pair_homographies[(other, fid)])
+                    if pair is not None and other_transform is not None:
+                        try:
+                            reference = project_points(pair, center)
+                            predictions.append(
+                                project_frame_points(
+                                    other_transform, reference, self.frame_w, self.frame_h
+                                )[0]
+                            )
+                        except ValueError:
+                            # An extrapolated diagnostic must not abort saving a
+                            # valid map, or create a mirrored center prediction.
+                            continue
+                if len(predictions) >= 2:
+                    points = np.asarray(predictions)
+                    frame_disagreement[fid] = float(
+                        np.mean(np.linalg.norm(points - points.mean(axis=0), axis=1))
+                    )
+        elif self.true_disagreement:
             states = optimizer._current_states_full()
             sign = optimizer.sign
             for fid in range(num_frames):
@@ -27178,37 +36049,72 @@ class PropagationPipeline:
                 grp = f.create_group(pending_calibration)
 
                 grp.attrs["version"] = "3.0"  # New version: graph optimisation
-                grp.attrs["num_anchors"] = len(anchors)
+                if self._frame_homographies is not None:
+                    grp.attrs["version"] = "3.1"
+                    grp.attrs["transform_model"] = "projective"
+                    grp.attrs["frame_affine_kind"] = "center_tangent_compatibility"
+                grp.attrs["coordinate_kind"] = (
+                    "local_planar" if self.relative_mode else "geographic"
+                )
+                grp.attrs["coordinate_units"] = (
+                    "arbitrary" if self.relative_mode else "projected_metres"
+                )
+                if self.relative_mode:
+                    grp.attrs["relative_extent"] = 100.0
+                    grp.attrs["gauge_frame_id"] = anchors[0].frame_id
+                grp.attrs["num_anchors"] = 0 if self.relative_mode else len(anchors)
                 grp.attrs["anchors_json"] = json.dumps(
-                    [a.to_dict() for a in anchors], ensure_ascii=False
+                    [] if self.relative_mode else [a.to_dict() for a in anchors], ensure_ascii=False
                 )
                 grp.attrs["projection_json"] = json.dumps(
                     self.calibration.converter.export_metadata()
                 )
                 grp.attrs["optimizer"] = "pose_graph_lm"
+                if (
+                    self.relative_mode or self.high_accuracy
+                ) and self._relative_alignment_report is not None:
+                    grp.attrs["optimizer"] = "pose_graph_lm+affine_point_irls"
+                    if (
+                        self.high_accuracy
+                        and self._relative_alignment_report.get("status") != "fallback"
+                    ):
+                        grp.attrs["optimizer"] = "relative_symmetric_irls"
+                    elif self.high_accuracy:
+                        grp.attrs["optimizer"] = (
+                            "pose_graph_lm"
+                            if not self.relative_mode
+                            else "temporal_projective_initializer"
+                        )
+                    grp.attrs["local_alignment_json"] = json.dumps(self._relative_alignment_report)
+                    if self._relative_alignment_rmse:
+                        grp.attrs["frame_rmse_kind"] = "shared_point_alignment"
                 grp.attrs["provenance_version"] = 1
-                grp.attrs["frame_origin_codes"] = "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated,5=anchor_linear_model"
-                grp.attrs["anchor_linear_model_intervals_json"] = json.dumps(
-                    linear_intervals or []
+                grp.attrs["frame_origin_codes"] = (
+                    "0=unknown,1=anchor,2=optimized,3=interpolated,4=extrapolated,5=anchor_linear_model"
                 )
+                grp.attrs["anchor_linear_model_intervals_json"] = json.dumps(linear_intervals or [])
                 grp.attrs["anchor_linear_model_parameters_json"] = json.dumps(
                     {
                         "enabled": bool(self.anchor_linear_fallback),
                         "min_gap_slots": int(self.anchor_linear_min_gap_slots),
                         "min_run_intervals": int(self.anchor_linear_min_run_intervals),
-                        "max_velocity_deviation": float(
-                            self.anchor_linear_max_velocity_deviation
-                        ),
+                        "max_velocity_deviation": float(self.anchor_linear_max_velocity_deviation),
                     }
                 )
                 grp.attrs["pin_exact_anchors"] = bool(self.pin_exact_anchors)
                 grp.attrs["georef_status_version"] = 1
-                grp.attrs["frame_georef_status_codes"] = "0=unknown,1=supported,2=provisional,3=invalid"
+                grp.attrs["frame_georef_status_codes"] = (
+                    "0=unknown,1=supported,2=provisional,3=invalid"
+                )
                 grp.attrs["component_anchors_json"] = json.dumps(
                     {str(key): value for key, value in (component_anchors or {}).items()}
                 )
                 grp.attrs["frame_rmse_units"] = "reference_pixels"
-                grp.attrs["disagreement_kind"] = "edge_prediction" if self.true_disagreement else "neighbor_tx_spread"
+                grp.attrs["disagreement_kind"] = (
+                    "edge_prediction" if self.true_disagreement else "neighbor_tx_spread"
+                )
+                if self.high_accuracy:
+                    grp.attrs["disagreement_kind"] = "projective_edge_prediction"
                 grp.attrs["num_temporal_edges"] = sum(
                     1 for e in optimizer.edges if e.edge_type == "temporal"
                 )
@@ -27217,6 +36123,27 @@ class PropagationPipeline:
                 )
 
                 grp.create_dataset("frame_affine", data=frame_affine, compression="gzip")
+                if self._frame_homographies is not None:
+                    from src.geometry.frame_transform import as_homography
+
+                    full = np.zeros((num_frames, 3, 3), dtype=np.float64)
+                    for fid in np.flatnonzero(frame_valid):
+                        full[fid] = (
+                            self._frame_homographies.get(int(fid), as_homography(frame_affine[fid]))
+                            if optimized_mask[fid]
+                            else as_homography(frame_affine[fid])
+                        )
+                    for fid, affine in (linear_affines or {}).items():
+                        if 0 <= fid < num_frames:
+                            full[fid] = as_homography(affine)
+                    grp.create_dataset("frame_homography", data=full, compression="gzip")
+                    grp.create_dataset(
+                        "pair_quality_json",
+                        data=json.dumps(
+                            {f"{a}:{b}": value for (a, b), value in self._pair_diagnostics.items()}
+                        ),
+                        dtype=h5py.string_dtype("utf-8"),
+                    )
                 grp.create_dataset(
                     "frame_valid", data=frame_valid.astype(np.uint8), compression="gzip"
                 )
@@ -27234,14 +36161,20 @@ class PropagationPipeline:
                 grp.create_dataset(
                     "frame_support_anchor_count", data=anchor_counts, compression="gzip"
                 )
-                grp.create_dataset("frame_support_distance_slots", data=frame_support_distance, compression="gzip")
+                grp.create_dataset(
+                    "frame_support_distance_slots", data=frame_support_distance, compression="gzip"
+                )
                 grp.create_dataset(
                     "frame_disagreement", data=frame_disagreement, compression="gzip"
                 )
                 grp.create_dataset("frame_matches", data=frame_matches, compression="gzip")
 
                 # Compute and save frame_gps (lat/lon per frame) for SpatialIndex
-                if self.calibration.converter and self.calibration.converter.is_initialized:
+                if (
+                    self.calibration.converter
+                    and self.calibration.converter.is_initialized
+                    and not self.relative_mode
+                ):
                     frame_gps = np.full((num_frames, 2), np.nan, dtype=np.float64)
                     gps_count = 0
                     gps_failed = 0
@@ -27319,9 +36252,7 @@ class PropagationPipeline:
                     for backup in (backup_calibration, backup_gps):
                         if backup in f:
                             del f[backup]
-                    f.attrs["georef_generation"] = int(
-                        f.attrs.get("georef_generation", 0)
-                    ) + 1
+                    f.attrs["georef_generation"] = int(f.attrs.get("georef_generation", 0)) + 1
                     f.flush()
 
             valid_count = int(np.sum(frame_valid))
@@ -27362,6 +36293,115 @@ class PropagationPipeline:
             logger.warning(f"Ground scale factor unavailable ({e}) — using 1.0")
             return 1.0
 
+    def _terrain_focal_px(self) -> float:
+        """Focal length in DB-frame pixels: config, else project.json, else defaults."""
+        if self.terrain_focal_px > 0:
+            return self.terrain_focal_px
+        from src.geometry.dem import find_project_dir
+
+        focal_mm, sensor_mm, origin = 13.2, 8.8, "default camera 13.2/8.8 mm"
+        project = find_project_dir(self.database.db_path)
+        if project is not None:
+            try:
+                data = json.loads((project / "project.json").read_text(encoding="utf-8"))
+                focal_mm = float(data.get("focal_length_mm", focal_mm))
+                sensor_mm = float(data.get("sensor_width_mm", sensor_mm))
+                origin = f"project.json {focal_mm}/{sensor_mm} mm"
+            except Exception as e:  # encrypted or malformed manifest
+                logger.warning(f"Terrain: project.json camera unreadable ({e})")
+        f_px = focal_mm / sensor_mm * float(self.frame_w)
+        logger.info(f"Terrain: focal {f_px:.1f} px ({origin}, frame width {self.frame_w})")
+        return f_px
+
+    def _build_terrain_terms(self, optimizer):
+        """DEM + altitude profile for the terrain terms; None (logged) when unavailable."""
+        from pathlib import Path
+
+        from src.geometry.dem import find_project_dir, resolve_dem
+        from src.geometry.terrain_scale import (
+            AltitudeProfile,
+            TerrainScaleModel,
+            TerrainTerms,
+            altitude_terrain_slope,
+            anchor_altitudes,
+            fit_constant_altitude,
+            metric_to_latlon,
+        )
+
+        converter = getattr(self.calibration, "converter", None)
+        if converter is None:
+            logger.warning("Terrain: calibration has no coordinate converter — skipped")
+            return None
+        states = optimizer.node_states()
+        if not states:
+            return None
+        ox, oy = self._origin_xy
+        diag = 0.5 * float(np.hypot(self.frame_w, self.frame_h))
+        pts_x, pts_y = [], []
+        for st in states.values():
+            r = diag * float(np.exp(0.5 * (st[2] + st[3])))
+            for dx, dy in ((-r, -r), (r, r), (-r, r), (r, -r)):
+                pts_x.append(st[0] + ox + dx)
+                pts_y.append(st[1] + oy + dy)
+        lat, lon = metric_to_latlon(np.array(pts_x), np.array(pts_y), converter)
+        bbox = (float(lat.min()), float(lon.min()), float(lat.max()), float(lon.max()))
+        project = find_project_dir(self.database.db_path)
+        cache = (project or Path(self.database.db_path).parent) / "terrain"
+        dem = resolve_dem(
+            self.terrain_dem_source,
+            self.terrain_dem_path,
+            self.terrain_dem_zoom,
+            bbox,
+            cache,
+            download=self.terrain_dem_download,
+        )
+        if dem is None:
+            logger.warning("Terrain: no DEM — propagation result is relief-free")
+            return None
+        model = TerrainScaleModel(
+            dem=dem,
+            converter=converter,
+            origin_xy=(ox, oy),
+            frame_w=self.frame_w,
+            frame_h=self.frame_h,
+            f_px=self._terrain_focal_px(),
+            sign=optimizer.sign,
+        )
+        anchors = anchor_altitudes(model, optimizer.anchor_states())
+        ok = np.isfinite(anchors["alt"])
+        if not np.any(ok):
+            logger.warning("Terrain: no anchor has DEM under it — skipped")
+            return None
+        alt = anchors["alt"][ok]
+        logger.info(
+            f"Terrain: DEM {dem.source}, {int(ok.sum())} anchors, flight altitude from anchors "
+            f"median {np.median(alt):.1f} m (min {alt.min():.1f}, max {alt.max():.1f}), "
+            f"DEM under anchors {np.nanmin(anchors['dem']):.1f}–{np.nanmax(anchors['dem']):.1f} m"
+        )
+        follow = altitude_terrain_slope(anchors["alt"], anchors["dem"])
+        if follow is not None and follow > 0.5:
+            logger.warning(
+                f"Terrain: anchor altitudes follow the DEM (dH/dDEM = {follow:.2f}) — looks like "
+                "terrain-following flight, where the flat per-frame model already holds; "
+                "terrain terms skipped"
+            )
+            return None
+        fit = fit_constant_altitude(anchors["gsd"], anchors["dem"])
+        if fit is not None:
+            logger.info(
+                f"Terrain check: anchors alone imply focal {fit[0]:.0f} px and constant "
+                f"altitude {fit[1]:.0f} m (used: {model.f_px:.0f} px)"
+            )
+        profile = AltitudeProfile(
+            np.asarray(anchors["ids"])[ok], alt, mode=self.terrain_altitude_model
+        )
+        return TerrainTerms(
+            model,
+            profile,
+            prior_weight=self.terrain_prior_weight,
+            edge_correction=self.terrain_edge_correction,
+        )
+
     def _load_previous_affines(self) -> dict[int, np.ndarray]:
         """Load frame_affine from the previous HDF5 calibration for warm start."""
         try:
@@ -27387,8 +36427,19 @@ class PropagationPipeline:
         here and discarded — only the count remained, which cannot detect all
         points clustered in one image corner.
         """
+        self._last_inlier_pair = None
+        first = self._relative_feature_ids.get(id(features_a))
+        second = self._relative_feature_ids.get(id(features_b))
+        if self.high_accuracy and first is not None and second is not None:
+            self._pair_diagnostics[(first, second)] = {"rejection": "insufficient_matches"}
         try:
-            mkpts_a, mkpts_b = self.matcher.match(features_a, features_b)
+            match = (
+                self.matcher.match_accuracy
+                if self.high_accuracy
+                and callable(getattr(type(self.matcher), "match_accuracy", None))
+                else self.matcher.match
+            )
+            mkpts_a, mkpts_b = match(features_a, features_b)
             if (
                 len(mkpts_a) < self.min_matches
                 and self.mnn_fallback
@@ -27400,13 +36451,26 @@ class PropagationPipeline:
             if len(mkpts_a) < self.min_matches:
                 return None
 
+            if self.high_accuracy and first is not None and second is not None:
+                self._pair_diagnostics[(first, second)] = {
+                    "rejection": "insufficient_geometric_inliers",
+                    "matches": len(mkpts_a),
+                }
+
             H, mask = GeometryTransforms.estimate_homography(
                 mkpts_a,
                 mkpts_b,
                 ransac_threshold=self.ransac_thresh,
+                max_iters=max(10000, self.ransac_max_iters)
+                if self.high_accuracy
+                else self.ransac_max_iters,
+                confidence=max(0.999, self.ransac_confidence)
+                if self.high_accuracy
+                else self.ransac_confidence,
                 backend=self.homography_backend,
                 use_mad_ransac=self.use_mad_ransac,
                 mad_k_factor=self.mad_k_factor,
+                frame_size=(self.frame_w, self.frame_h) if self.high_accuracy else None,
             )
             if H is None or mask is None:
                 return None
@@ -27422,10 +36486,80 @@ class PropagationPipeline:
             pts_b_in = mkpts_b[inlier_mask]
             rmse = float(np.sqrt(np.mean(np.sum((pts_transformed - pts_b_in) ** 2, axis=1))))
 
-            spread = inlier_spread(pts_a_in, self.frame_w, self.frame_h)
+            spread = inlier_spread(
+                pts_a_in, self.frame_w, self.frame_h, principal=self.high_accuracy
+            )
+            if self.high_accuracy:
+                from src.geometry.pair_refinement import pair_quality, refine_pair, refine_subpixel
+
+                refined_count = 0
+                if self._source_frames is not None and first is not None and second is not None:
+                    try:
+                        refined, refined_count = refine_subpixel(
+                            self._source_frames.get(first),
+                            self._source_frames.get(second),
+                            pts_a_in,
+                            pts_b_in,
+                            get_cfg(self.config, "propagation.subpixel_max_correction_px", 2.0),
+                        )
+                        candidate = refine_pair(H, pts_a_in, refined, self.frame_w, self.frame_h)
+                        ok, _ = pair_quality(
+                            candidate,
+                            pts_a_in,
+                            refined,
+                            len(mkpts_a),
+                            self.frame_w,
+                            self.frame_h,
+                            min_ratio=get_cfg(
+                                self.config, "propagation.pair_min_inlier_ratio", 0.3
+                            ),
+                            min_spread=get_cfg(self.config, "propagation.pair_min_spread", 0.025),
+                            max_error=get_cfg(self.config, "propagation.pair_max_error_px", 3.0),
+                        )
+                        if ok:
+                            H, pts_b_in = candidate, refined
+                        else:
+                            refined_count = 0
+                    except PropagationCancelledError:
+                        raise
+                    except (ValueError, OSError, cv2.error) as exc:
+                        refined_count = 0
+                        logger.warning(
+                            f"Subpixel refinement unavailable for {first}->{second}: {exc}"
+                        )
+                H = refine_pair(H, pts_a_in, pts_b_in, self.frame_w, self.frame_h)
+                accepted, quality = pair_quality(
+                    H,
+                    pts_a_in,
+                    pts_b_in,
+                    len(mkpts_a),
+                    self.frame_w,
+                    self.frame_h,
+                    min_ratio=get_cfg(self.config, "propagation.pair_min_inlier_ratio", 0.3),
+                    min_spread=get_cfg(self.config, "propagation.pair_min_spread", 0.025),
+                    max_error=get_cfg(self.config, "propagation.pair_max_error_px", 3.0),
+                )
+                quality["subpixel_points"] = refined_count
+                if first is not None and second is not None:
+                    self._pair_diagnostics[(first, second)] = quality
+                if not accepted:
+                    return None
+                rmse, spread = quality["symmetric_rms_px"], quality["spread"]
+            if self.relative_mode or self.high_accuracy:
+                from src.geometry.relative_alignment import sample_point_pair
+
+                self._last_inlier_pair = sample_point_pair(
+                    pts_a_in, pts_b_in, self.point_pair_limit if self.high_accuracy else 96
+                )
+                if first is not None and second is not None:
+                    self._relative_point_pairs[(first, second)] = self._last_inlier_pair
+                    self._pair_homographies[(first, second)] = H.copy()
 
             return H, inliers, rmse, int(len(mkpts_a)), spread
-        except Exception:
+        except PropagationCancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(f"Pair estimation failed: {type(exc).__name__}: {exc}")
             return None
 
     @staticmethod
@@ -27550,6 +36684,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from config import get_cfg
 from src.models.wrappers.yolo_wrapper import YOLOWrapper
+from src.tracking.keyframe_flow import FlowChain, KeyframeFlow
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -27560,6 +36695,10 @@ class RealtimeTrackingWorker(QThread):
 
     frame_ready = pyqtSignal(np.ndarray)
     location_found = pyqtSignal(float, float, float, int)
+    # Provenance of the next location_found: fix_source ("keyframe" |
+    # "optical_flow" | "dead_reckoning") and seconds since the last real
+    # keyframe fix (-1 = unknown). Emitted right before location_found.
+    fix_info = pyqtSignal(str, float)
     # Precise keyframe localization signal (anchor_fix)
     anchor_fix = pyqtSignal()
     fps_updated = pyqtSignal(float)
@@ -27655,10 +36794,26 @@ class RealtimeTrackingWorker(QThread):
             )
             try:
                 object_tracker = ObjectTracker(tracker_cfg)
-                object_projector = ObjectProjector(self.localizer.calibration)
-                logger.info("Object tracking enabled")
+                if tracker_cfg.get("project_to_gps", True):
+                    object_projector = ObjectProjector(self.localizer.calibration)
+                logger.info(
+                    "Object tracking enabled "
+                    f"(classes={tracker_cfg.get('tracked_classes') or 'all'}, "
+                    f"gps={'on' if object_projector else 'off'})"
+                )
             except Exception as e:
                 logger.error(f"Failed to initialize object tracking: {e}")
+
+        # Optional drone telemetry (flight_data.source; default "none" = vision only).
+        from src.flight_data import build_flight_prior
+
+        try:
+            flight_prior = build_flight_prior(self.config)
+        except Exception as e:  # a broken log must not stop vision-only tracking
+            logger.error(f"Flight data disabled: {e}")
+            flight_prior = None
+        if flight_prior is not None:
+            logger.info("Flight data: heading (and altitude) priors enabled for keyframes")
 
         # Fix 6: Pre-warm fallback models when starting tracking
         threading.Thread(target=self._prewarm_fallback_models, daemon=True).start()
@@ -27687,7 +36842,7 @@ class RealtimeTrackingWorker(QThread):
         if isinstance(self.video_source, VideoSource):
             video_src = self.video_source
         else:
-            v_config = VideoSourceConfig(source=str(self.video_source))
+            v_config = VideoSourceConfig.from_app_config(self.video_source, self.config)
             video_src = VideoSource(v_config)
 
         if not video_src.is_opened:
@@ -27704,9 +36859,21 @@ class RealtimeTrackingWorker(QThread):
         frame_duration_sec = 1.0 / video_fps
 
         frame_idx = 0
-        prev_gray_for_of = None
-        prev_gray_half_for_of = None
-        prev_pts_for_of = None
+        # LK tracker anchored at the last accepted keyframe (shared with the
+        # offline replay — src/tracking/keyframe_flow.py).
+        flow = KeyframeFlow(
+            fb_check=self.of_fb_check,
+            fb_max_px=self.of_fb_max_px,
+            half_res=self.of_half_res,
+            win_px=get_cfg(self.config, "tracking.of_lk_win_px", 15),
+            max_level=get_cfg(self.config, "tracking.of_lk_max_level", 2),
+            max_anchor_age_s=get_cfg(self.config, "tracking.of_max_anchor_age_s", 0.0),
+        )
+        chain = FlowChain(
+            enabled=get_cfg(self.config, "tracking.of_chain_on_keyframe_fail", False),
+            max_s=get_cfg(self.config, "tracking.of_chain_max_s", 30.0),
+        )
+        retry_every = max(1, int(get_cfg(self.config, "tracking.keyframe_retry_every", 1)))
         last_tracked_objects = []
 
         last_localization_video_time = -1.0
@@ -27741,8 +36908,11 @@ class RealtimeTrackingWorker(QThread):
             is_keyframe = frame_idx % self.keyframe_interval == 0
 
             # dt calculation logic
-            _is_of_frame = not (is_keyframe or prev_pts_for_of is None)
-            if is_keyframe or prev_pts_for_of is None:
+            flow.expire(current_video_time_sec)
+            # No anchor and not a scheduled keyframe: retry only every N frames.
+            _retry_skip = not is_keyframe and not flow.has_anchor and (frame_idx % retry_every) != 0
+            _is_of_frame = not (is_keyframe or not flow.has_anchor)
+            if is_keyframe or not flow.has_anchor:
                 if last_keyframe_video_time < 0:
                     calculated_dt = self.keyframe_interval * frame_duration_sec
                 else:
@@ -27769,7 +36939,9 @@ class RealtimeTrackingWorker(QThread):
             loc_result = {"success": False, "error": "Not processed"}
             start_process = time.time()
 
-            if is_keyframe or prev_pts_for_of is None:
+            if _retry_skip:
+                pass  # keyframe retry throttled (tracking.keyframe_retry_every)
+            elif is_keyframe or not flow.has_anchor:
                 # ====== HEAVY KEYFRAME LOCALIZATION ======
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -27791,13 +36963,26 @@ class RealtimeTrackingWorker(QThread):
                         want_depth="depth" in active_debug,
                     )
 
+                yaw_hint = (
+                    flight_prior.yaw_hint_deg(current_video_time_sec)
+                    if flight_prior is not None
+                    else None
+                )
+                # Height for localization.altitude_hint (passed only when known).
+                altitude_m = (
+                    flight_prior.altitude_m(current_video_time_sec)
+                    if flight_prior is not None
+                    else None
+                )
                 try:
                     loc_result = self.localizer.localize_frame(
                         frame_rgb,
                         static_mask=static_mask,
                         dt=calculated_dt,
+                        yaw_hint_deg=yaw_hint,
                         collector=debug_collector,
                         timestamp=current_video_time_sec,
+                        **({"altitude_m": altitude_m} if altitude_m is not None else {}),
                     )
                 except Exception as e:
                     import torch
@@ -27817,15 +37002,10 @@ class RealtimeTrackingWorker(QThread):
                     loc_result.get("success")
                     and loc_result.get("fallback_mode") != "retrieval_only"
                 ):
-                    prev_gray_for_of = curr_gray
-                    prev_gray_half_for_of = (
-                        cv2.resize(curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-                        if self.of_half_res
-                        else None
-                    )
-                    prev_pts_for_of = cv2.goodFeaturesToTrack(
-                        curr_gray, maxCorners=200, qualityLevel=0.01, minDistance=30, mask=None
-                    )
+                    flow.anchor(curr_gray, current_video_time_sec)
+                    chain.note_keyframe_success(current_video_time_sec)
+                elif not loc_result.get("success"):
+                    chain.try_rebase(self.localizer, flow, current_video_time_sec)
 
                 if object_tracker and detections is not None:
                     tracked_objects = object_tracker.update(detections, frame.shape)
@@ -27878,98 +37058,39 @@ class RealtimeTrackingWorker(QThread):
                 if self.of_stride > 1 and (frame_idx % self.of_stride) != 0:
                     if object_tracker:
                         self.objects_detected.emit(last_tracked_objects)
-                elif prev_pts_for_of is not None and len(prev_pts_for_of) > 10:
-                    of_scale = (
-                        0.5 if (self.of_half_res and prev_gray_half_for_of is not None) else 1.0
-                    )
-                    if of_scale != 1.0:
-                        g_prev = prev_gray_half_for_of
-                        g_curr = cv2.resize(
-                            curr_gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
-                        )
-                        pts_prev = np.ascontiguousarray(
-                            prev_pts_for_of * of_scale, dtype=np.float32
-                        )
-                    else:
-                        g_prev, g_curr, pts_prev = prev_gray_for_of, curr_gray, prev_pts_for_of
-
-                    curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                        g_prev,
-                        g_curr,
-                        pts_prev,
-                        None,
-                        winSize=(15, 15),
-                        maxLevel=2,
-                    )
-                    keep = status.reshape(-1) == 1
-
-                    # Forward-backward check
-                    if self.of_fb_check and keep.any():
-                        back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
-                            g_curr,
-                            g_prev,
-                            curr_pts,
-                            None,
-                            winSize=(15, 15),
-                            maxLevel=2,
-                        )
-                        rt_err = np.linalg.norm(
-                            back_pts.reshape(-1, 2) - pts_prev.reshape(-1, 2), axis=1
-                        )
-                        fb_ok = (back_status.reshape(-1) == 1) & (rt_err <= self.of_fb_max_px)
-                        if int((keep & fb_ok).sum()) >= 10:
-                            keep = keep & fb_ok
-
-                    good_new = curr_pts.reshape(-1, 2)[keep]
-                    good_old = pts_prev.reshape(-1, 2)[keep]
-                    if of_scale != 1.0:
-                        good_new = good_new / of_scale
-                        good_old = good_old / of_scale
-
-                    if len(good_new) > 10:
-                        flow_vectors = good_new - good_old
-                        dx_px, dy_px = np.median(flow_vectors, axis=0)
-
-                        flow_affine = None
-                        flow_quality = None
-                        try:
-                            S_of, of_mask = cv2.estimateAffinePartial2D(
-                                good_old,
-                                good_new,
-                                method=cv2.RANSAC,
-                                ransacReprojThreshold=3.0,
-                            )
-                            if S_of is not None and np.all(np.isfinite(S_of)):
-                                flow_affine = S_of
-                                if of_mask is not None and len(of_mask) > 0:
-                                    inlier_ratio = float(of_mask.sum()) / len(of_mask)
-                                    n_norm = min(1.0, len(good_new) / 120.0)
-                                    flow_quality = inlier_ratio * n_norm
-                        except cv2.error as e:
-                            logger.debug(f"OF affine estimation failed: {e}")
-
+                elif flow.has_anchor:
+                    meas = flow.track(curr_gray)
+                    if meas is not None:
                         try:
                             loc_result = self.localizer.localize_optical_flow(
-                                dx_px,
-                                dy_px,
+                                meas.dx_px,
+                                meas.dy_px,
                                 dt=calculated_dt,
                                 rot_width=frame.shape[1],
                                 rot_height=frame.shape[0],
-                                flow_affine=flow_affine,
-                                flow_quality=flow_quality,
+                                flow_affine=meas.flow_affine,
+                                flow_quality=meas.flow_quality,
+                                timestamp=current_video_time_sec,
                             )
                         except Exception as e:
                             logger.error(f"OF Localization error: {e}")
                             loc_result = {"success": False, "error": str(e)}
+                        if loc_result.get("success"):
+                            chain.note_of_success(
+                                curr_gray, meas.flow_affine, current_video_time_sec
+                            )
 
                         if object_tracker:
                             self.objects_detected.emit(last_tracked_objects)
-                    else:
-                        prev_pts_for_of = None
                 else:
-                    prev_pts_for_of = None
+                    flow.clear()
 
             if loc_result.get("success") and loc_result.get("matched_frame", -1) != -1:
+                _since = loc_result.get("since_fix_s")
+                self.fix_info.emit(
+                    str(loc_result.get("fix_source", "keyframe")),
+                    float(_since) if _since is not None else -1.0,
+                )
                 self.location_found.emit(
                     loc_result["lat"],
                     loc_result["lon"],
@@ -27984,7 +37105,11 @@ class RealtimeTrackingWorker(QThread):
                 if loc_result.get("fov_polygon"):
                     self.fov_found.emit(loc_result["fov_polygon"])
 
-                track_type = "OF" if loc_result.get("is_of") else "KF"
+                track_type = (
+                    "DR"
+                    if loc_result.get("fix_source") == "dead_reckoning"
+                    else ("OF" if loc_result.get("is_of") else "KF")
+                )
                 method_txt = (
                     "Similarity"
                     if loc_result.get("fallback_mode") == "retrieval_only"
@@ -28025,6 +37150,8 @@ class RealtimeTrackingWorker(QThread):
                     self.msleep(int(sleep_time * 1000))
 
         video_src.release()
+        if flight_prior is not None:
+            flight_prior.close()  # live MAVLink source: release the UDP port
         logger.info("Tracking worker thread finished cleanly.")
 
     def _prewarm_fallback_models(self):
@@ -28273,6 +37400,11 @@ import os
 import sys
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# numpy's multithreaded OpenBLAS: on Windows (Ryzen 7 9700X) a 120x120 dense solve took
+# 34 ms with the default thread count and 0.05 ms with one thread (2026-10-15,
+# scratch/probe_smoother_threads.py). Only read when numpy loads, so it must stay above
+# every import that pulls numpy in; an explicit environment value still wins.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 # --- PyInstaller: fix DLL loading & redirect caches for frozen builds ---
 if getattr(sys, "frozen", False):

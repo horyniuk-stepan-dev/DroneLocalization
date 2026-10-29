@@ -133,3 +133,6 @@ scripts/allFiles/all_merged_new.py
 # Особисті налаштування користувача — у git тримаємо user_config.example.json
 build_log.txt
 topnew_errors.csv
+
+# User-drawn map features (MapWidget autosave)
+/map_features.geojson

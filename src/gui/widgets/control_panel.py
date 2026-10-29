@@ -58,6 +58,8 @@ class ControlPanel(QWidget):
     clear_map_clicked = pyqtSignal()
     stop_db_generation_clicked = pyqtSignal()
     toggle_objects_clicked = pyqtSignal(bool)
+    select_target_toggled = pyqtSignal(bool)
+    clear_targets_clicked = pyqtSignal()
     add_source_clicked = pyqtSignal()
     active_source_changed = pyqtSignal(str)
     # (source_id, action): "activate" / "calibrate" / "load_calibration" /
@@ -168,11 +170,25 @@ class ControlPanel(QWidget):
         self.btn_localize_image.clicked.connect(self.localize_image_clicked)
         self.btn_toggle_objects.toggled.connect(self.toggle_objects_clicked)
 
+        self.btn_select_target = QPushButton("🎯 Обрати об'єкт на відео")
+        self.btn_select_target.setCheckable(True)
+        self.btn_select_target.setToolTip(
+            "Відео стане на паузу — обведіть об'єкт мишею.\n"
+            "Esc / ПКМ — скасувати. ПКМ по зеленій рамці — зняти ціль."
+        )
+        self.btn_select_target.setEnabled(False)
+        self.btn_clear_targets = QPushButton("✖ Скинути обрані об'єкти")
+        self.btn_clear_targets.setEnabled(False)
+        self.btn_select_target.toggled.connect(self.select_target_toggled)
+        self.btn_clear_targets.clicked.connect(self.clear_targets_clicked)
+
         track_layout.addWidget(self.btn_start_tracking)
         track_layout.addWidget(self.btn_start_live)
         track_layout.addWidget(self.btn_stop_tracking)
         track_layout.addWidget(self.btn_localize_image)
         track_layout.addWidget(self.btn_toggle_objects)
+        track_layout.addWidget(self.btn_select_target)
+        track_layout.addWidget(self.btn_clear_targets)
 
         # Export group
         self.export_group = QGroupBox("Результати")
@@ -327,6 +343,10 @@ class ControlPanel(QWidget):
         self.btn_start_tracking.setEnabled(enabled)
         self.btn_start_live.setEnabled(enabled)
         self.btn_stop_tracking.setEnabled(not enabled)
+        self.btn_select_target.setEnabled(not enabled)
+        self.btn_clear_targets.setEnabled(not enabled)
+        if enabled and self.btn_select_target.isChecked():
+            self.btn_select_target.setChecked(False)
 
         # Disable DB/calibration ops during tracking to prevent GPU OOM
         for btn in [

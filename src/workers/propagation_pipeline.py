@@ -1066,14 +1066,42 @@ class PropagationPipeline:
         from src.geometry.relative_map import normalize_relative_map
         from src.geometry.relative_projective import initialize_from_pairs
 
+        temporal_pairs = [
+            (e.from_id, e.to_id, e.weight) for e in optimizer.edges if e.edge_type == "temporal"
+        ]
+        gauge_affine = anchors[0].affine_matrix
+
+        def seed_from(fid):
+            return initialize_from_pairs(
+                self._pair_homographies,
+                temporal_pairs,
+                {fid: gauge_affine},
+                self.frame_w,
+                self.frame_h,
+            )
+
         gauge_id = anchors[0].frame_id
-        initial = initialize_from_pairs(
-            self._pair_homographies,
-            [(e.from_id, e.to_id, e.weight) for e in optimizer.edges if e.edge_type == "temporal"],
-            {gauge_id: anchors[0].affine_matrix},
-            self.frame_w,
-            self.frame_h,
-        )
+        initial = seed_from(gauge_id)
+        if len(initial) < 2:
+            # The default gauge (first keyframe) can be isolated when all of its
+            # temporal edges were gated out. Seed the gauge in the largest
+            # visually connected component instead of failing the whole map.
+            covered = set(initial)
+            for fid in sorted(features):
+                if fid in covered:
+                    continue
+                candidate = seed_from(fid)
+                covered.update(candidate)
+                if len(candidate) > len(initial):
+                    gauge_id, initial = fid, candidate
+            if gauge_id != anchors[0].frame_id:
+                from src.calibration.multi_anchor_calibration import AnchorCalibration
+
+                logger.warning(
+                    f"Relative gauge #{anchors[0].frame_id} is isolated; re-seeded at "
+                    f"#{gauge_id} (component of {len(initial)} frames)"
+                )
+                anchors = [AnchorCalibration(gauge_id, gauge_affine, dict(anchors[0].qa_data))]
         if len(initial) < 2:
             self._report_error(
                 "Local map needs at least two visually connected frames. Use denser video sampling."

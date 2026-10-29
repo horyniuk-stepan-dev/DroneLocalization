@@ -31,6 +31,8 @@ class RealtimeTrackingWorker(QThread):
     objects_detected = pyqtSignal(object)  # list[TrackedObject]
     objects_gps_updated = pyqtSignal(object)  # list[ObjectGPS]
     debug_view_ready = pyqtSignal(str, np.ndarray)  # (channel_name, BGR image)
+    # Operator-selected targets: list[dict] (id, bbox, lost, lat, lon), every frame
+    manual_targets_updated = pyqtSignal(object)
 
     def __init__(self, video_source: str, localizer, model_manager=None, config=None):
         super().__init__()
@@ -60,6 +62,15 @@ class RealtimeTrackingWorker(QThread):
         self._debug_dino_pca = get_cfg(self.config, "debug_views.dino_pca_enabled", True)
         self._debug_inflight = {}  # {channel: monotonic emit time} — backpressure
         self._debug_inflight_stale_sec = 1.0
+
+        # ── Manual (operator-selected) targets ───────────────────────────────
+        self._mt_lock = threading.Lock()
+        self._mt_cmds: list[tuple[str, object]] = []
+        self._paused = threading.Event()
+        self._mt = None  # ManualTargetTracker, created on first selection
+        self._mt_frame = None  # last frame read (selection is applied to it)
+        self._mt_geom = None  # its KF->frame similarity, None = geometry unknown
+        self._mt_alpha = float(get_cfg(self.config, "manual_tracking.gps_smoothing_alpha", 0.5))
 
         # Latency Tracker when monitoring is enabled
         self._latency_tracker = None
@@ -206,6 +217,12 @@ class RealtimeTrackingWorker(QThread):
         stream_start_time = time.time()
 
         while not self._stop_event.is_set():
+            # Operator commands (add/remove targets) apply to the last shown frame.
+            self._mt_process_commands()
+            if self._paused.is_set():
+                self.msleep(30)
+                continue
+
             loop_start = time.time()
 
             ret, frame = video_src.read()
@@ -213,6 +230,9 @@ class RealtimeTrackingWorker(QThread):
                 logger.info("End of video stream or connection lost.")
                 self.status_update.emit("Video stream ended or connection lost.")
                 break
+            # Geometry of this frame for manual targets: 2x3 similarity
+            # keyframe->current (original px); None = no usable geometry.
+            frame_geom = None
 
             if video_src.is_live:
                 current_video_time_sec = time.time() - stream_start_time
@@ -327,6 +347,7 @@ class RealtimeTrackingWorker(QThread):
                 ):
                     flow.anchor(curr_gray, current_video_time_sec)
                     chain.note_keyframe_success(current_video_time_sec)
+                    frame_geom = np.eye(2, 3, dtype=np.float64)
                 elif not loc_result.get("success"):
                     chain.try_rebase(self.localizer, flow, current_video_time_sec)
 
@@ -402,11 +423,21 @@ class RealtimeTrackingWorker(QThread):
                             chain.note_of_success(
                                 curr_gray, meas.flow_affine, current_video_time_sec
                             )
+                            frame_geom = (
+                                np.asarray(meas.flow_affine, dtype=np.float64)
+                                if meas.flow_affine is not None
+                                else np.array(
+                                    [[1.0, 0.0, meas.dx_px], [0.0, 1.0, meas.dy_px]],
+                                    dtype=np.float64,
+                                )
+                            )
 
                         if object_tracker:
                             self.objects_detected.emit(last_tracked_objects)
                 else:
                     flow.clear()
+
+            self._mt_step(frame, frame_geom)
 
             if loc_result.get("success") and loc_result.get("matched_frame", -1) != -1:
                 _since = loc_result.get("since_fix_s")
@@ -534,8 +565,118 @@ class RealtimeTrackingWorker(QThread):
         with self._debug_lock:
             self._debug_inflight.pop(channel, None)
 
+    # ── Manual targets (GUI -> worker, thread-safe) ──────────────────────────
+    def set_paused(self, paused: bool) -> None:
+        """Freeze playback (used while the operator outlines an object)."""
+        if paused:
+            self._paused.set()
+        else:
+            self._paused.clear()
+
+    def add_manual_target(self, bbox_xyxy) -> None:
+        """Queue a target box (original frame px) for the last shown frame."""
+        with self._mt_lock:
+            self._mt_cmds.append(("add", tuple(float(v) for v in bbox_xyxy)))
+
+    def remove_manual_target(self, target_id: int) -> None:
+        with self._mt_lock:
+            self._mt_cmds.append(("remove", int(target_id)))
+
+    def clear_manual_targets(self) -> None:
+        with self._mt_lock:
+            self._mt_cmds.append(("clear", None))
+
+    def _mt_process_commands(self) -> None:
+        with self._mt_lock:
+            cmds, self._mt_cmds = self._mt_cmds, []
+        if not cmds:
+            return
+        for cmd, arg in cmds:
+            if cmd == "add":
+                if self._mt_frame is None:
+                    self.status_update.emit("Ще немає кадру для вибору об'єкта")
+                    continue
+                if self._mt is None:
+                    from src.tracking.manual_target_tracker import ManualTargetTracker
+
+                    self._mt = ManualTargetTracker(
+                        tracker_type=get_cfg(self.config, "manual_tracking.tracker", "csrt"),
+                        max_side=get_cfg(self.config, "manual_tracking.max_side", 960),
+                        reacquire_ncc=get_cfg(self.config, "manual_tracking.reacquire_ncc", 0.6),
+                        template_refresh_frames=get_cfg(
+                            self.config, "manual_tracking.template_refresh_frames", 30
+                        ),
+                    )
+                try:
+                    tid = self._mt.add(self._mt_frame, arg)
+                except Exception as e:  # noqa: BLE001 — never kill the tracking loop
+                    logger.error(f"Manual target init failed: {e}", exc_info=True)
+                    tid = None
+                if tid is None:
+                    self.status_update.emit("Не вдалося взяти об'єкт на трекінг (замала рамка?)")
+                else:
+                    logger.info(f"Manual target #{tid} added: bbox={arg}")
+                    self.status_update.emit(f"🎯 Ціль #{tid} на супроводі")
+            elif self._mt is not None and cmd == "remove":
+                self._mt.remove(arg)
+            elif self._mt is not None and cmd == "clear":
+                self._mt.clear()
+        if self._mt is not None:
+            targets = self._mt.targets
+            if self._mt_frame is not None:
+                self._mt_project(targets, self._mt_frame, self._mt_geom)
+            self.manual_targets_updated.emit([t.to_dict() for t in targets])
+
+    def _mt_step(self, frame, frame_geom) -> None:
+        """Advance manual-target trackers on this frame and project them."""
+        self._mt_frame = frame
+        self._mt_geom = frame_geom
+        if self._mt is None or not self._mt.targets:
+            return
+        try:
+            targets = self._mt.update(frame)
+            self._mt_project(targets, frame, frame_geom)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Manual target update failed: {e}", exc_info=True)
+            return
+        self.manual_targets_updated.emit([t.to_dict() for t in targets])
+
+    def _mt_project(self, targets, frame, frame_geom) -> None:
+        """Box centre -> map coordinates via the current keyframe state + flow.
+
+        Uses this frame's own geometry, so a target that moves relative to
+        the ground moves on the map too. Without geometry (failed keyframe,
+        skipped OF frame) the last position is kept.
+        """
+        if frame_geom is None or not targets:
+            return
+        state = getattr(self.localizer, "last_state", None)
+        calibration = getattr(self.localizer, "calibration", None)
+        converter = getattr(calibration, "converter", None)
+        if not state or converter is None or not converter.is_initialized:
+            return
+        from src.tracking.pixel_projection import project_pixels_to_metric
+
+        live = [t for t in targets if not t.lost]
+        if not live:
+            return
+        h, w = frame.shape[:2]
+        metric = project_pixels_to_metric(
+            state, np.array([t.center_px for t in live]), w, h, frame_geom
+        )
+        if metric is None:
+            return
+        a = min(max(self._mt_alpha, 0.0), 1.0) or 1.0
+        for t, (mx, my) in zip(live, metric):
+            lat, lon = converter.metric_to_gps(float(mx), float(my))
+            if t.lat is not None and a < 1.0:
+                lat = a * lat + (1.0 - a) * t.lat
+                lon = a * lon + (1.0 - a) * t.lon
+            t.lat, t.lon = float(lat), float(lon)
+
     def stop(self):
         logger.info("Stopping tracking worker...")
+        self._paused.clear()
         self._stop_event.set()
         if not self.wait(5000):
             logger.warning("Tracking worker did not finish within 5 seconds.")

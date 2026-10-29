@@ -17,6 +17,18 @@
             border: 1px solid #52667e; border-radius: 5px; background: #26364b; color: white; cursor: pointer; }
         .panorama-toggle { position: absolute; right: 12px; top: 52px; padding: 7px;
             background: #161e29e8; border-radius: 5px; }
+        .ut-bar { position: absolute; left: 12px; top: 92px; display: flex; flex-direction: column; gap: 2px;
+            background: #161e29e8; border: 1px solid #44546a; border-radius: 6px; padding: 3px; }
+        .ut-bar button { position: static; width: 32px; height: 30px; padding: 0; font-size: 15px; }
+        .ut-bar button.on { background: #b07a00; border-color: #ffb000; }
+        .ut-bar hr { width: 100%; border: 0; border-top: 1px solid #44546a; margin: 2px 0; }
+        .ut-menu { position: absolute; z-index: 10; background: #fff; color: #111; border: 1px solid #888;
+            border-radius: 4px; box-shadow: 0 2px 8px #0008; padding: 3px 0; min-width: 190px; display: none; }
+        .ut-menu div { padding: 5px 12px; cursor: pointer; }
+        .ut-menu div:hover { background: #ffb000; }
+        #ut-toast { position: absolute; left: 50%; bottom: 44px; transform: translateX(-50%); background: #161e29f0;
+            padding: 6px 12px; border-radius: 4px; display: none; pointer-events: none; }
+        #ut-hint { position: absolute; bottom: 12px; right: 12px; background: #161e29e8; padding: 6px; max-width: 45%; }
     </style>
 </head>
 <body>
@@ -27,6 +39,10 @@
     </div>
     <button id="fit">Показати все</button>
     <label class="panorama-toggle" hidden><input id="panorama-visible" type="checkbox" checked> Панорама</label>
+    <div class="ut-bar" id="ut-bar"></div>
+    <div id="ut-hint" hidden></div>
+    <div class="ut-menu" id="ut-menu"><div id="ut-copy">📋 Копіювати координати</div></div>
+    <div id="ut-toast"></div>
     <div id="position">Побудована карта: 0–100 зі збереженням пропорцій</div>
     <script>
         "use strict";
@@ -34,6 +50,7 @@
         const position = document.getElementById("position");
         let bridge, width, height, scale, center = [50, 50], span = 120;
         let path = [], verification = [], objects = [], showObjects = true, marker = null, fov = [];
+        let manualTargets = [];
         let dragging = null, moved = false;
         let panorama = null, panoramaRequest = 0, showPanorama = true;
         // The shared Qt transport uses (vertical, horizontal): local (y, x).
@@ -84,6 +101,172 @@
             image.onerror = () => { position.textContent = "Не вдалося відобразити панораму"; };
             image.src = dataUrl;
         }
+        // ── User map tools (LOCAL: units, not metres) ──────────────────────────
+        const TOOLS = [["select","✋","Вибір: клік по об'єкту — перейменувати (Esc)"],["point","📍","Точка (M)"],
+            ["line","〰","Лінія (L): подвійний клік / Enter — завершити"],
+            ["polygon","⬠","Площа (A): подвійний клік / Enter — завершити"],
+            ["rectangle","▭","Прямокутник (P): два кліки по кутах"],["ruler","📏","Лінійка (R), не зберігається"],
+            ["delete","🗑","Видалити об'єкт кліком (D)"]];
+        const HOTKEYS = {m: "point", l: "line", a: "polygon", p: "rectangle", r: "ruler", d: "delete"};
+        let tool = "select", draft = [], cursorW = null, ruler = [], rulerDone = false, rulerText = "", features = [];
+        const hint = document.getElementById("ut-hint");
+        const toolButtons = {};
+        (function buildBar() {
+            const bar = document.getElementById("ut-bar");
+            const add = (icon, title, fn) => { const b = document.createElement("button");
+                b.textContent = icon; b.title = title; b.onclick = e => { e.stopPropagation(); fn(); }; bar.appendChild(b); return b; };
+            TOOLS.forEach(([id, icon, title]) => { toolButtons[id] = add(icon, title, () => setTool(id)); });
+            bar.appendChild(document.createElement("hr"));
+            add("⇩", "Експорт у GeoJSON", () => bridge && bridge.requestExport());
+            add("⇧", "Імпорт GeoJSON", () => bridge && bridge.requestImport());
+            add("✖", "Видалити всі об'єкти локальної карти", () => bridge && bridge.clearFeatures());
+        })();
+        function setTool(id) {
+            tool = id; draft = []; if (id !== "ruler") { ruler = []; rulerDone = false; rulerText = ""; }
+            Object.entries(toolButtons).forEach(([k, b]) => b.classList.toggle("on", k === id));
+            canvas.style.cursor = id === "select" ? "grab" : (id === "delete" ? "not-allowed" : "crosshair");
+            const t = TOOLS.find(t => t[0] === id); hint.hidden = id === "select"; hint.textContent = t ? t[2] : "";
+            draw();
+        }
+        const toT = p => [p[1], p[0]];      // world [x, y] -> transport [y, x]
+        const fromT = p => [p[1], p[0]];    // transport [y, x] -> world [x, y]
+        const near = (a, b) => { const s = screen(a), t = screen(b); return Math.hypot(s[0] - t[0], s[1] - t[1]) < 6; };
+        function rectRing(a, b) { return [[a[0], a[1]], [a[0], b[1]], [b[0], b[1]], [b[0], a[1]]]; }
+        function featureWorld(f) {
+            const pts = f.coords.map(fromT);
+            return f.type === "rectangle" ? rectRing(pts[0], pts[1]) : pts;
+        }
+        function emitFeature(type, ptsWorld) {
+            const names = {point: "Точка", line: "Лінія", polygon: "Площа", rectangle: "Прямокутник"};
+            if (!bridge) return;
+            bridge.featureUpsert(JSON.stringify({type, coords: ptsWorld.map(toT), mode: "LOCAL",
+                name: names[type] + " " + (features.length + 1), color: "#ffb000"}));
+        }
+        function finishPath() {
+            if (draft.length >= 2 && near(draft[draft.length - 1], draft[draft.length - 2])) draft.pop();
+            if (draft.length >= (tool === "polygon" ? 3 : 2)) emitFeature(tool, draft);
+            draft = []; draw();
+        }
+        function segDist(p, a, b) {
+            const dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+            const t = L2 ? Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2)) : 0;
+            return Math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy);
+        }
+        function inside(p, ring) {
+            let c = false;
+            for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+                const [xi, yi] = ring[i], [xj, yj] = ring[j];
+                if ((yi > p[1]) !== (yj > p[1]) && p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi) c = !c;
+            }
+            return c;
+        }
+        function hitFeature(sx, sy) {
+            const p = [sx, sy];
+            for (let k = features.length - 1; k >= 0; k--) {
+                const f = features[k], pts = featureWorld(f).map(screen);
+                if (f.type === "point") { if (Math.hypot(pts[0][0] - sx, pts[0][1] - sy) < 8) return f; continue; }
+                const closed = f.type !== "line";
+                const segs = closed ? pts.concat([pts[0]]) : pts;
+                for (let i = 1; i < segs.length; i++) if (segDist(p, segs[i - 1], segs[i]) < 6) return f;
+                if (closed && inside(p, pts)) return f;
+            }
+            return null;
+        }
+        function toolClick(w, sx, sy) {
+            if (tool === "select" || tool === "delete") {
+                const f = hitFeature(sx, sy);
+                if (!f) return tool === "select";  // select + empty space -> normal map click
+                if (tool === "delete") bridge.featureDelete(f.id);
+                else {
+                    const name = window.prompt("Назва об'єкта:", f.name);
+                    if (name !== null && name.trim()) bridge.featureUpsert(JSON.stringify(Object.assign({}, f, {name: name.trim()})));
+                }
+                return false;
+            }
+            if (tool === "point") emitFeature("point", [w]);
+            else if (tool === "line" || tool === "polygon") {
+                if (tool === "polygon" && draft.length >= 3 && near(draft[0], w)) { finishPath(); return false; }
+                if (!draft.length || !near(draft[draft.length - 1], w)) draft.push(w);
+            } else if (tool === "rectangle") {
+                if (!draft.length) draft.push(w);
+                else if (!near(draft[0], w)) { emitFeature("rectangle", [draft[0], w]); draft = []; }
+            } else if (tool === "ruler") {
+                if (rulerDone) { ruler = []; rulerDone = false; rulerText = ""; }
+                if (!ruler.length || !near(ruler[ruler.length - 1], w)) ruler.push(w);
+                if (ruler.length >= 2 && bridge) bridge.measureRuler(JSON.stringify(ruler.map(toT)));
+            }
+            draw();
+            return false;
+        }
+        function label(text, p, color) {
+            if (!text) return;
+            const s = screen(p); ctx.font = "12px system-ui";
+            const lines = String(text).split("\n"), w = Math.max(...lines.map(l => ctx.measureText(l).width));
+            ctx.fillStyle = "#161e29d0"; ctx.fillRect(s[0] + 6, s[1] - 18, w + 8, 15 * lines.length + 4);
+            ctx.fillStyle = color; lines.forEach((l, i) => ctx.fillText(l, s[0] + 10, s[1] - 6 + 15 * i));
+        }
+        function drawUser() {
+            features.forEach(f => {
+                const pts = featureWorld(f);
+                if (f.type === "point") dot(pts[0], f.color, "", 5);
+                else line(f.type === "line" ? pts : pts.concat([pts[0]]), f.color, f.type !== "line");
+                const c = pts.reduce((a, p) => [a[0] + p[0] / pts.length, a[1] + p[1] / pts.length], [0, 0]);
+                label(f.name + (f.measure ? "\n" + f.measure : ""), f.type === "point" ? pts[0] : c, "#ffffff");
+            });
+            ctx.setLineDash([6, 4]);
+            if (draft.length) {
+                const pts = cursorW ? draft.concat([cursorW]) : draft;
+                if (tool === "rectangle" && cursorW) line(rectRing(draft[0], cursorW).concat([draft[0]]), "#ffb000");
+                else line(tool === "polygon" && pts.length > 2 ? pts.concat([pts[0]]) : pts, "#ffb000");
+                draft.forEach(p => dot(p, "#ffb000", "", 3));
+            }
+            if (ruler.length) {
+                const pts = cursorW && !rulerDone ? ruler.concat([cursorW]) : ruler;
+                line(pts, "#00e5ff"); ruler.forEach(p => dot(p, "#00e5ff", "", 3));
+                let text = rulerText;
+                if (cursorW && !rulerDone) {
+                    let t = 0; for (let i = 1; i < pts.length; i++) t += Math.hypot(pts[i][0] - pts[i-1][0], pts[i][1] - pts[i-1][1]);
+                    text = t.toFixed(2) + " од.";
+                }
+                label(text, pts[pts.length - 1], "#00e5ff");
+            }
+            ctx.setLineDash([]);
+        }
+        // ── Right-click menu: copy coordinates of the clicked spot ─────────────
+        const menu = document.getElementById("ut-menu"), toast = document.getElementById("ut-toast");
+        let menuPoint = null, toastTimer = 0;
+        const hideMenu = () => { menu.style.display = "none"; };
+        canvas.addEventListener("contextmenu", e => {
+            e.preventDefault();
+            menuPoint = world(e.offsetX, e.offsetY);
+            menu.style.display = "block";
+            menu.style.left = Math.max(0, Math.min(e.offsetX, width - menu.offsetWidth - 4)) + "px";
+            menu.style.top = Math.max(0, Math.min(e.offsetY, height - menu.offsetHeight - 4)) + "px";
+        });
+        menu.addEventListener("contextmenu", e => e.preventDefault());
+        document.getElementById("ut-copy").onclick = () => {
+            if (menuPoint) {
+                const t = menuPoint[0].toFixed(3) + ", " + menuPoint[1].toFixed(3);  // X, Y
+                if (bridge && bridge.copyToClipboard) bridge.copyToClipboard(t);
+                toast.textContent = "Скопійовано X, Y: " + t; toast.style.display = "block";
+                clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.style.display = "none"; }, 1500);
+            }
+            hideMenu();
+        };
+        canvas.addEventListener("pointerdown", e => { if (e.button !== 2) hideMenu(); });
+        canvas.addEventListener("wheel", hideMenu);
+
+        canvas.addEventListener("dblclick", () => {
+            if (tool === "line" || tool === "polygon") finishPath();
+            else if (tool === "ruler") { rulerDone = true; draw(); }
+        });
+        document.addEventListener("keydown", e => {
+            if (e.key === "Escape") { hideMenu(); return setTool("select"); }
+            if (e.key === "Enter" && (tool === "line" || tool === "polygon")) return finishPath();
+            if (e.key === "Backspace" && draft.length) { e.preventDefault(); draft.pop(); return draw(); }
+            const t = HOTKEYS[e.key.toLowerCase()]; if (t && !e.ctrlKey && !e.altKey) setTool(t);
+        });
+
         function draw() {
             width = canvas.clientWidth; height = canvas.clientHeight;
             const ratio = window.devicePixelRatio || 1;
@@ -111,7 +294,13 @@
             line(path, "#ff7979"); line(fov, "#53d7a5", true);
             verification.forEach(p => dot(point(p.lat, p.lon), "#7abaff", p.label));
             if (showObjects) objects.forEach(p => dot(point(p.lat, p.lon), "#ffc56a", p.label));
+            manualTargets.forEach(t => {
+                if (t.trail && t.trail.length > 1) line(t.trail.map(q => point(q[0], q[1])), "#00e676");
+                if (t.lat !== null && t.lat !== undefined)
+                    dot(point(t.lat, t.lon), t.lost ? "#ff9800" : "#00e676", t.label, 6);
+            });
             if (marker) dot(marker, "#ff7979", "", 6);
+            drawUser();
         }
         function fit() {
             const points = [[0, 0], [100, 100], ...path, ...fov,
@@ -127,6 +316,7 @@
             e.preventDefault(); span = Math.min(100000, Math.max(0.01, span * Math.exp(e.deltaY * 0.001))); draw();
         }, {passive: false});
         canvas.addEventListener("pointerdown", e => {
+            if (e.button !== 0) return;  // right button opens the menu, not a drag/click
             dragging = [e.offsetX, e.offsetY]; moved = false; canvas.setPointerCapture(e.pointerId);
         });
         canvas.addEventListener("pointermove", e => {
@@ -137,22 +327,28 @@
                 dragging = [e.offsetX, e.offsetY]; draw();
             }
             const p = world(e.offsetX, e.offsetY);
+            cursorW = p; if (draft.length || (ruler.length && !rulerDone)) draw();
             position.textContent = `X: ${p[0].toFixed(2)}   Y: ${p[1].toFixed(2)} · умовні одиниці`;
         });
         canvas.addEventListener("pointerup", e => {
+            if (e.button !== 0) return;
             dragging = null;
-            if (!moved && bridge) { const p = world(e.offsetX, e.offsetY); bridge.mapClicked(p[1], p[0]); }
+            if (!moved && bridge) {
+                const p = world(e.offsetX, e.offsetY);
+                if (toolClick(p, e.offsetX, e.offsetY)) bridge.mapClicked(p[1], p[0]);
+            }
         });
         canvas.addEventListener("pointercancel", () => { dragging = null; });
         document.getElementById("fit").onclick = fit;
         document.getElementById("panorama-visible").onchange = e => { showPanorama = e.target.checked; draw(); };
-        window.addEventListener("resize", draw); draw();
+        window.addEventListener("resize", draw); setTool("select");
         new QWebChannel(qt.webChannelTransport, channel => {
             bridge = channel.objects.mapBridge;
             bridge.setPanoramaSignal.connect(setPanorama);
             bridge.updateMarkerSignal.connect((y, x) => { marker = point(y, x); draw(); });
             bridge.addTrajectorySignal.connect((y, x) => { path.push(point(y, x)); draw(); });
-            bridge.clearTrajectorySignal.connect(() => { path = []; marker = null; fov = []; objects = []; draw(); });
+            bridge.clearTrajectorySignal.connect(() => { path = []; marker = null; fov = []; objects = []; manualTargets = []; draw(); });
+            bridge.updateManualTargetsSignal.connect(json => { manualTargets = JSON.parse(json); draw(); });
             bridge.updateFOVSignal.connect((...coords) => {
                 fov = []; for (let i = 0; i < coords.length; i += 2) fov.push(point(coords[i], coords[i+1])); draw();
             });
@@ -160,6 +356,8 @@
             bridge.clearVerificationMarkersSignal.connect(() => { verification = []; draw(); });
             bridge.updateObjectMarkersSignal.connect(json => { objects = JSON.parse(json); draw(); });
             bridge.toggleObjectMarkersSignal.connect(visible => { showObjects = visible; draw(); });
+            bridge.loadFeaturesSignal.connect(json => { features = JSON.parse(json); draw(); });
+            bridge.rulerMeasuredSignal.connect(text => { rulerText = text; draw(); });
             bridge.ready("LOCAL");
         });
     </script>
