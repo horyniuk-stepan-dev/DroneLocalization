@@ -6,7 +6,13 @@ from config import APP_CONFIG, APP_SETTINGS, get_cfg
 from src.calibration.multi_anchor_calibration import MultiAnchorCalibration
 from src.core.project import ProjectManager
 from src.database.database_loader import DatabaseLoader
-from src.gui.mixins import CalibrationMixin, DatabaseMixin, PanoramaMixin, TrackingMixin
+from src.gui.mixins import (
+    CalibrationMixin,
+    DatabaseMixin,
+    GeorefMixin,
+    PanoramaMixin,
+    TrackingMixin,
+)
 from src.gui.widgets.control_panel import ControlPanel
 from src.gui.widgets.map_widget import MapWidget
 from src.gui.widgets.video_widget import VideoWidget
@@ -17,7 +23,9 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, QMainWindow):
+class MainWindow(
+    CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, GeorefMixin, QMainWindow
+):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Drone Topometric Localizer")
@@ -163,6 +171,7 @@ class MainWindow(CalibrationMixin, DatabaseMixin, TrackingMixin, PanoramaMixin, 
         cp.stop_tracking_clicked.connect(self.on_stop_tracking)
         cp.calibrate_clicked.connect(self.on_calibrate)
         cp.relative_map_clicked.connect(self.on_build_relative_map)
+        cp.georef_map_clicked.connect(self.on_georeference_local_map)
         cp.load_calibration_clicked.connect(self.on_load_calibration)
         cp.generate_panorama_clicked.connect(self.on_generate_panorama)
         cp.show_panorama_clicked.connect(self.on_show_panorama)

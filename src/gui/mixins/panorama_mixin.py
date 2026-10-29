@@ -195,6 +195,8 @@ class PanoramaMixin:
             if self.calibration.converter.mode == "LOCAL" and Path(path + ".json").exists():
                 layout = LocalPanoramaLayout.from_database(self.database)
                 corners = load_local_panorama_metadata(path, layout)
+            elif Path(path + ".json").exists():
+                corners = self._georef_panorama_corners(path)
             self._display_panorama(path, corners)
 
         except Exception as e:
@@ -328,3 +330,20 @@ class PanoramaMixin:
         return [
             self.calibration.converter.metric_to_gps(float(pt[0]), float(pt[1])) for pt in corners_m
         ]
+
+    def _georef_panorama_corners(self, path):
+        """Corners of a local-map panorama after the layer was georeferenced by
+        control points (written by GeorefMixin); None if it does not apply."""
+        import json
+
+        from src.database.local_georef import georef_info
+
+        info = georef_info(self.database) if self.database is not None else None
+        try:
+            meta = json.loads(Path(path + ".json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        corners = meta.get("georef_corners_latlon")
+        if not info or not corners or meta.get("georef_created_at") != info.get("created_at"):
+            return None
+        return corners
