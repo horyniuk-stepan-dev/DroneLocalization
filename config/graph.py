@@ -69,6 +69,12 @@ class PropagationConfig(BaseModel):
     accuracy_perspective_sigma_px: float = Field(0.0, ge=0)
     # Extra nearby-overlap links found from the map footprint (original: on).
     accuracy_extra_overlaps: bool = True
+    # Auto-georeference of a local (no-GPS) map against a geographic layer:
+    # probe frames localized per run, consensus tolerance in ground metres and
+    # the allowed growth of that tolerance with distance (scale drift).
+    auto_georef_probes: int = Field(40, ge=4, le=500)
+    auto_georef_tolerance_m: float = Field(25.0, gt=0)
+    auto_georef_drift_frac: float = Field(0.05, ge=0, le=0.5)
 
 
 class GraphOptimizationConfig(BaseModel):

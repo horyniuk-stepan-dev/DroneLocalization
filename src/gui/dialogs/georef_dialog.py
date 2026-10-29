@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -30,6 +30,13 @@ from PyQt6.QtWidgets import (
 from src.geometry.coordinates import CoordinateConverter
 
 from src.geometry.georef_fit import AFFINE, MIN_POINTS, SIMILARITY, GeorefFit, fit_georef
+from src.geometry.georef_graph import (
+    GRAPH,
+    MIN_GRAPH_POINTS,
+    GraphGeorefFit,
+    LocalGraph,
+    fit_graph_georef,
+)
 
 _NUM = r"[-+]?\d+(?:[.,]\d+)?"
 _LATLON = re.compile(rf"^\s*({_NUM})\s*[,; ]\s*({_NUM})\s*$")
@@ -99,6 +106,7 @@ class GeorefDialog(QDialog):
         rotation_sign: int,
         *,
         can_reset: bool = False,
+        graph: LocalGraph | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -107,7 +115,12 @@ class GeorefDialog(QDialog):
         self.points = points
         self.converter = converter
         self.rotation_sign = rotation_sign
-        self.fit: GeorefFit | None = None
+        self.graph = graph
+        self.fit: GeorefFit | GraphGeorefFit | None = None
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(350)
+        self._timer.timeout.connect(self._refit_now)
         self.used: list[ControlPoint] = []
         self.reset_requested = False
         self.deleted_ids: list[str] = []
@@ -140,10 +153,21 @@ class GeorefDialog(QDialog):
         lay.addLayout(row_btns)
 
         opts = QHBoxLayout()
+        self.chk_graph = QCheckBox("Нежорстка по графу кадрів (≥3 точки, виправляє дрейф масштабу)")
+        self.chk_graph.setToolTip(
+            "Кожен кадр отримує власну поправку масштабу/повороту/зсуву, плавну вздовж "
+            "графа кадрів. 2 точки або узгоджені точки дають те саме, що й загальна модель; "
+            "з 3+ точками карта «підтягується» до кожної з них. За межами крайніх точок "
+            "поправка не екстраполюється."
+        )
+        self.chk_graph.setEnabled(graph is not None)
+        self.chk_graph.setChecked(graph is not None)
+        self.chk_graph.toggled.connect(self._on_model_toggled)
+        opts.addWidget(self.chk_graph)
         self.chk_affine = QCheckBox(
             "Афінна модель (≥4 точки, дозволяє перекіс — лише для перевірки)"
         )
-        self.chk_affine.toggled.connect(self._refit)
+        self.chk_affine.toggled.connect(self._on_model_toggled)
         opts.addWidget(self.chk_affine)
         opts.addStretch()
         self.chk_features = QCheckBox("Перенести об’єкти локальної карти в GPS")
@@ -168,7 +192,7 @@ class GeorefDialog(QDialog):
         lay.addWidget(buttons)
 
         self._fill()
-        self._refit()
+        self._refit_now()
 
     # ── table ────────────────────────────────────────────────────────────────
 
@@ -211,7 +235,30 @@ class GeorefDialog(QDialog):
 
     # ── fitting ──────────────────────────────────────────────────────────────
 
+    def _on_model_toggled(self, on):
+        sender = self.sender()
+        if on and sender is self.chk_graph:
+            self.chk_affine.setChecked(False)
+        elif on and sender is self.chk_affine:
+            self.chk_graph.setChecked(False)
+        self._refit()
+
+    def _kind(self) -> str:
+        if self.chk_affine.isChecked():
+            return AFFINE
+        if self.chk_graph.isChecked() and self.graph is not None:
+            return GRAPH
+        return SIMILARITY
+
     def _refit(self, *_):
+        # The graph fit re-solves the whole layer; do not run it per keystroke.
+        if self._kind() == GRAPH:
+            self.btn_apply.setEnabled(False)
+            self._timer.start()
+        else:
+            self._refit_now()
+
+    def _refit_now(self, *_):
         from PyQt6.QtGui import QColor
 
         self.fit, self.used = None, []
@@ -230,16 +277,21 @@ class GeorefDialog(QDialog):
             lats.append(ll[0])
             self.used.append(p)
 
-        kind = AFFINE if self.chk_affine.isChecked() else SIMILARITY
-        need = MIN_POINTS[kind]
+        kind = self._kind()
+        if kind == GRAPH and len(src) < MIN_GRAPH_POINTS:
+            kind = SIMILARITY  # 2 points: the graph model is exactly the global one
+        need = MIN_POINTS[kind] if kind != GRAPH else MIN_GRAPH_POINTS
         if len(src) < need:
             self._summary(
                 f"Потрібно щонайменше {need} точки з координатами (є {len(src)}).", ok=False
             )
             return
         try:
-            fit = fit_georef(src, dst, kind=kind, rotation_sign=self.rotation_sign)
-        except ValueError as e:
+            if kind == GRAPH:
+                fit = fit_graph_georef(self.graph, src, dst, rotation_sign=self.rotation_sign)
+            else:
+                fit = fit_georef(src, dst, kind=kind, rotation_sign=self.rotation_sign)
+        except (ValueError, RuntimeError) as e:
             self._summary(f"Не вдалося обчислити: {e}", ok=False)
             return
         # Web-Mercator metres are stretched by 1/cos(lat); report real ground metres.
@@ -255,8 +307,24 @@ class GeorefDialog(QDialog):
         lines = [
             f"<b>RMSE: {fit.rmse * k:.2f} м</b> · масштаб {fit.scale * k:.3f} м/од. · "
             f"поворот {fit.rotation_deg:.1f}° · {len(src)} точок · модель: "
-            + ("подібність" if kind == SIMILARITY else "афінна")
+            + {SIMILARITY: "подібність", AFFINE: "афінна", GRAPH: "нежорстка по графу"}[kind]
         ]
+        if kind == GRAPH:
+            lo, hi = fit.scale_range
+            lines.append(
+                f"Найбільша поправка відносно загальної моделі: {fit.max_correction * k:.1f} м · "
+                f"масштаб уздовж карти {lo * 100:.0f}–{hi * 100:.0f}% від загального · "
+                f"жорсткість {fit.stiffness:g}"
+            )
+            if fit.loo_residuals is not None and fit.global_loo_residuals is not None:
+                g_loo = float(np.sqrt(np.nanmean(fit.global_loo_residuals**2))) * k
+                n_loo = float(np.sqrt(np.nanmean(fit.loo_residuals**2))) * k
+                better = n_loo < g_loo
+                lines.append(
+                    f"<b>Перевірка (RMSE): загальна {g_loo:.2f} м → по графу {n_loo:.2f} м</b>"
+                    + ("" if better else
+                       " <span style='color:#e67e22'>— граф не кращий, краще вимкнути</span>")
+                )
         if fit.loo_residuals is not None:
             lines.append(
                 "«Перевірка» = похибка точки, коли її не використовують для розрахунку. "

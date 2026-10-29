@@ -70,9 +70,18 @@ def _frame_centers(affines, valid, w, h):
 
 
 def _swap_in(grp, name, data):
+    """Replace ``name`` with ``data``; the new dataset is fully written first.
+
+    The old object is only unlinked after the replacement exists under a
+    scratch name, so a failure while writing never leaves ``name`` missing.
+    """
+    scratch = name + "__pending"
+    if scratch in grp:
+        del grp[scratch]
+    grp.create_dataset(scratch, data=data, compression="gzip")
     if name in grp:
         del grp[name]
-    grp.create_dataset(name, data=data, compression="gzip")
+    grp.move(scratch, name)
 
 
 def _rewrite(database, mutate) -> None:
@@ -103,9 +112,14 @@ def apply_local_georef(
     gcps: list[dict],
     rmse_m: float,
     anchors: list[dict],
+    frame_matrices: dict[int, np.ndarray] | None = None,
+    extra: dict | None = None,
 ) -> int:
     """Map every local frame transform through ``matrix`` (local -> metric).
 
+    ``frame_matrices`` (frame id -> 2x3) overrides ``matrix`` per frame — the
+    non-rigid graph georeference; frames missing from it use ``matrix``.
+    ``extra`` is merged into the stored ``georef_transform_json``.
     Returns the number of frames that received GPS.
     """
     M = np.asarray(matrix, dtype=np.float64)
@@ -129,46 +143,80 @@ def apply_local_georef(
             grp.attrs["local_backup_attrs_json"] = json.dumps(
                 {k: _jsonable(grp.attrs[k]) for k in _BACKUP_ATTRS if k in grp.attrs}
             )
+        # Compute everything in memory first: any failure (projection, bad
+        # matrix) must happen before the first byte of the layer is touched.
         valid = grp["frame_valid"][:].astype(bool)
         local = grp["local_frame_affine"][:]
-        geo = local.copy()
+        per_frame = {}
         for fid in np.flatnonzero(valid):
-            geo[fid] = compose_affine(M, local[fid])
-        _swap_in(grp, "frame_affine", geo)
+            Mf = M
+            if frame_matrices is not None and int(fid) in frame_matrices:
+                Mf = np.asarray(frame_matrices[int(fid)], dtype=np.float64)
+                if Mf.shape != (2, 3) or not np.isfinite(Mf).all():
+                    raise ValueError(f"Invalid georeference matrix for frame {fid}")
+            per_frame[int(fid)] = Mf
+        geo = local.copy()
+        for fid, Mf in per_frame.items():
+            geo[fid] = compose_affine(Mf, local[fid])
+        Hg = None
         if "local_frame_homography" in grp:
             H = grp["local_frame_homography"][:]
             Hg = H.copy()
-            for fid in np.flatnonzero(valid):
-                Hg[fid] = compose_homography(M, H[fid])
-            _swap_in(grp, "frame_homography", Hg)
+            for fid, Mf in per_frame.items():
+                Hg[fid] = compose_homography(Mf, H[fid])
+        disagreement = None
         if "local_frame_disagreement" in grp:
-            _swap_in(grp, "frame_disagreement", grp["local_frame_disagreement"][:] * scale)
-        for k in ("relative_extent", "gauge_frame_id"):
-            if k in grp.attrs:
-                del grp.attrs[k]
-        grp.attrs["coordinate_kind"] = "geographic"
-        grp.attrs["coordinate_units"] = "projected_metres"
-        grp.attrs["projection_json"] = json.dumps(converter.export_metadata())
-        grp.attrs["anchors_json"] = json.dumps(anchors, ensure_ascii=False)
-        grp.attrs["num_anchors"] = len(anchors)
-        grp.attrs["georef_transform_json"] = json.dumps(
-            {
-                "kind": kind,
-                "matrix": M.tolist(),
-                "metres_per_unit": scale,
-                "rmse_m": float(rmse_m),
-                "gcps": gcps,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            },
-            ensure_ascii=False,
-        )
+            disagreement = grp["local_frame_disagreement"][:] * scale
+            if frame_matrices is not None and disagreement.ndim >= 1:
+                for fid, Mf in per_frame.items():
+                    if fid < len(disagreement):
+                        sf = float(np.sqrt(abs(np.linalg.det(Mf[:, :2]))))
+                        disagreement[fid] = disagreement[fid] / scale * sf
         centers = _frame_centers(geo, valid, w, h)
         gps = np.full_like(centers, np.nan)
         ok = valid & np.isfinite(centers).all(axis=1)
         if ok.any():
             lat, lon = converter.metric_to_gps_array(centers[ok, 0], centers[ok, 1])
             gps[ok, 0], gps[ok, 1] = lat, lon
+        ground_scale = 1.0
+        if ok.any():
+            ground_scale = float(converter.ground_scale_factor(float(np.nanmean(gps[ok, 0]))))
+        transform_json = json.dumps(
+            {
+                "kind": kind,
+                "matrix": M.tolist(),
+                # Projected (Web-Mercator) metres per local unit, as stored in
+                # frame_affine; ground_metres_per_unit is the real-world scale.
+                "metres_per_unit": scale,
+                "ground_metres_per_unit": scale * ground_scale,
+                "rmse_m": float(rmse_m),
+                "gcps": gcps,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                **(extra or {}),
+            },
+            ensure_ascii=False,
+        )
+        projection_json = json.dumps(converter.export_metadata())
+
+        # Write phase. The layer is marked geographic only as the very last
+        # step; if anything below is interrupted it stays "local_planar" and
+        # the backup in local_* restores it.
+        grp.attrs["coordinate_kind"] = "georef_in_progress"
+        _swap_in(grp, "frame_affine", geo)
+        if Hg is not None:
+            _swap_in(grp, "frame_homography", Hg)
+        if disagreement is not None:
+            _swap_in(grp, "frame_disagreement", disagreement)
         _swap_in(f, "frame_gps", gps)
+        for k in ("relative_extent", "gauge_frame_id"):
+            if k in grp.attrs:
+                del grp.attrs[k]
+        grp.attrs["coordinate_units"] = "projected_metres"
+        grp.attrs["projection_json"] = projection_json
+        grp.attrs["anchors_json"] = json.dumps(anchors, ensure_ascii=False)
+        grp.attrs["num_anchors"] = len(anchors)
+        grp.attrs["georef_transform_json"] = transform_json
+        grp.attrs["coordinate_kind"] = "geographic"
         result["n"] = int(ok.sum())
 
     _rewrite(database, mutate)

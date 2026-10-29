@@ -50,6 +50,7 @@ class ControlPanel(QWidget):
     calibrate_clicked = pyqtSignal()
     relative_map_clicked = pyqtSignal()
     georef_map_clicked = pyqtSignal()
+    auto_georef_clicked = pyqtSignal()
     load_calibration_clicked = pyqtSignal()
     localize_image_clicked = pyqtSignal()
     generate_panorama_clicked = pyqtSignal()
@@ -130,6 +131,12 @@ class ControlPanel(QWidget):
             "вся карта перейде в GPS. Можна скинути назад до X/Y."
         )
         self.btn_georef_map.clicked.connect(self.georef_map_clicked)
+        self.btn_auto_georef = QPushButton("🤖 Автоприв’язка за шарами з GPS")
+        self.btn_auto_georef.setToolTip(
+            "Кадри локальної карти шукаються в усіх шарах з GPS (найкращий збіг); узгоджені збіги стають "
+            "контрольними точками. Ви лише перевіряєте їх у вікні прив’язки."
+        )
+        self.btn_auto_georef.clicked.connect(self.auto_georef_clicked)
         self.btn_load_calibrate = QPushButton("Завантажити калібрування (JSON)")
         self.btn_verify_propagation = QPushButton("🔍 Перевірити пропагацію на карті")
         self.btn_verify_propagation.setToolTip(
@@ -146,6 +153,7 @@ class ControlPanel(QWidget):
         calib_layout.addWidget(self.btn_calibrate)
         calib_layout.addWidget(self.btn_relative_map)
         calib_layout.addWidget(self.btn_georef_map)
+        calib_layout.addWidget(self.btn_auto_georef)
         calib_layout.addWidget(self.btn_load_calibrate)
         calib_layout.addWidget(self.btn_verify_propagation)
         calib_layout.addWidget(self.btn_clear_map)
@@ -364,6 +372,7 @@ class ControlPanel(QWidget):
             self.btn_calibrate,
             self.btn_relative_map,
             self.btn_georef_map,
+            self.btn_auto_georef,
             self.btn_load_calibrate,
             self.btn_verify_propagation,
             self.btn_clear_map,

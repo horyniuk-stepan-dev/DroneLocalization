@@ -17,8 +17,16 @@ logger = get_logger(__name__)
 
 
 class TrackingMixin:
-    def _build_localizer(self) -> Localizer:
-        """Shared factory — used by tracking and single-image localization."""
+    def _build_localizer(self, database=None, calibration=None) -> Localizer:
+        """Shared factory — used by tracking and single-image localization.
+
+        ``database``/``calibration`` select one specific layer instead of the
+        active one (auto-georeference localizes against a reference layer);
+        that localizer is single-layer and leaves the map mode alone.
+        """
+        single_layer = database is not None
+        database = self.database if database is None else database
+        calibration = self.calibration if calibration is None else calibration
         # Load ALIKED and DINOv2 models
         xf = self.model_manager.load_local_extractor()
         nv = self.model_manager.load_dinov2()
@@ -40,20 +48,21 @@ class TrackingMixin:
 
         # Pass model_manager in config for SuperPoint+LightGlue fallback
         localizer_config = {**self.config, "_model_manager": self.model_manager}
-        self.map_widget.set_coordinate_mode(self.calibration.converter.mode)
+        if not single_layer:
+            self.map_widget.set_coordinate_mode(calibration.converter.mode)
 
         # Multi-source support: pass managers if available
-        db_manager = getattr(self, "db_manager", None)
-        calib_manager = getattr(self, "calib_manager", None)
+        db_manager = None if single_layer else getattr(self, "db_manager", None)
+        calib_manager = None if single_layer else getattr(self, "calib_manager", None)
 
         return Localizer(
-            self.database,
+            database,
             fe,
             matcher,
-            self.calibration,
+            calibration,
             config=localizer_config,
-            ref_frame_width=int(self.database.metadata.get("frame_width", 0)),
-            ref_frame_height=int(self.database.metadata.get("frame_height", 0)),
+            ref_frame_width=int(database.metadata.get("frame_width", 0)),
+            ref_frame_height=int(database.metadata.get("frame_height", 0)),
             db_manager=db_manager,
             calib_manager=calib_manager,
         )

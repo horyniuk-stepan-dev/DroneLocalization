@@ -172,6 +172,7 @@ class MainWindow(
         cp.calibrate_clicked.connect(self.on_calibrate)
         cp.relative_map_clicked.connect(self.on_build_relative_map)
         cp.georef_map_clicked.connect(self.on_georeference_local_map)
+        cp.auto_georef_clicked.connect(self.on_auto_georeference)
         cp.load_calibration_clicked.connect(self.on_load_calibration)
         cp.generate_panorama_clicked.connect(self.on_generate_panorama)
         cp.show_panorama_clicked.connect(self.on_show_panorama)

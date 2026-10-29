@@ -531,7 +531,10 @@
         "accuracy_anchor_sigma_px": 6.0,
         "accuracy_terrain_scale_sigma": 0.02,
         "accuracy_perspective_sigma_px": 0.0,
-        "accuracy_extra_overlaps": true
+        "accuracy_extra_overlaps": true,
+        "auto_georef_probes": 40,
+        "auto_georef_tolerance_m": 25.0,
+        "auto_georef_drift_frac": 0.05
     },
     "flight_data": {
         "source": "none",
