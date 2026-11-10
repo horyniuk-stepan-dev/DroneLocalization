@@ -1,6 +1,7 @@
 {
   "after_reset": {
     "confidence": 0.724999994,
+    "fix_source": "keyframe",
     "fov_polygon": [
       [
         49.9978,
@@ -32,12 +33,14 @@
     "rotation_deg": 90,
     "sample_spread_m": 0.0,
     "scale_ratio": 2.0,
+    "since_fix_s": 0.0,
     "source_id": null,
     "success": true
   },
   "extractor_calls_second_keyframe": 2,
   "frame1": {
     "confidence": 0.724999994,
+    "fix_source": "keyframe",
     "fov_polygon": [
       [
         50.0001,
@@ -69,11 +72,13 @@
     "rotation_deg": 180,
     "sample_spread_m": 0.0,
     "scale_ratio": 1.0,
+    "since_fix_s": 0.0,
     "source_id": null,
     "success": true
   },
   "frame1_repeat": {
     "confidence": 0.724999994,
+    "fix_source": "keyframe",
     "fov_polygon": [
       [
         50.0001,
@@ -105,6 +110,7 @@
     "rotation_deg": 180,
     "sample_spread_m": 0.0,
     "scale_ratio": 1.0,
+    "since_fix_s": 0.0,
     "source_id": null,
     "success": true
   },
@@ -116,12 +122,17 @@
   },
   "optical_flow": {
     "confidence": 0.7,
+    "dead_reckoning_links": 0,
+    "fix_source": "optical_flow",
     "fov_polygon": null,
     "inliers": 20,
     "is_of": true,
     "lat": 50.002529391,
     "lon": 30.003448985,
     "matched_frame": 2,
+    "raw_lat": 50.00253,
+    "raw_lon": 30.00345,
+    "since_fix_s": null,
     "success": true
   }
 }
