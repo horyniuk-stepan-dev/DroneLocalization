@@ -25,7 +25,7 @@
     },
     "object_tracking": {
         "enabled": true,
-        "track_activation_threshold": 0.25,
+        "track_activation_threshold": 0.4,
         "lost_track_buffer": 30,
         "minimum_matching_threshold": 0.8,
         "tracked_classes": [
@@ -144,6 +144,27 @@
             "enabled": true,
             "max_layers": 2,
             "telemetry_scale_ema": 0.3
+        },
+        "coverage": {
+            "enabled": true,
+            "edge_guards": true,
+            "cell_m": 5.0,
+            "max_cells": 16000000,
+            "warn_m": 300.0,
+            "warn_s": 15.0,
+            "hyst_m": 50.0,
+            "hyst_s": 5.0,
+            "leave_frac": 0.5,
+            "leave_hyst": 0.1,
+            "lost_after_s": 3.0,
+            "unknown_after_s": 30.0,
+            "velocity_window_s": 3.0,
+            "clear_count": 2,
+            "reacquire_fixes": 2,
+            "reacquire_tol_m": 30.0,
+            "dr_base_m": 20.0,
+            "dr_drift_m_per_s": 5.0,
+            "sound_alert": true
         },
         "min_matches": 12,
         "min_inliers_accept": 10,
@@ -408,7 +429,7 @@
         },
         "performance": {
             "auto_tune": true,
-            "fp16_enabled": false,
+            "fp16_enabled": true,
             "global_batch_max": 4,
             "dino_cpu_resize": true,
             "torch_compile": true,
