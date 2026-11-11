@@ -86,10 +86,18 @@ def _build_exception_hook(log):
             log.info("Interrupted by user (Ctrl+C) — exiting")
             sys.exit(130)
 
-        log.critical(
-            "Unhandled exception caught — application will exit",
-            exc_info=(exctype, value, tb),
-        )
+        # loguru ignores the stdlib ``exc_info=`` kwarg (it is swallowed as a
+        # format argument), so crashes used to leave no traceback in app.log.
+        _opt = getattr(log, "opt", None)
+        if callable(_opt):
+            _opt(exception=(exctype, value, tb)).critical(
+                "Unhandled exception caught — application will exit"
+            )
+        else:
+            log.critical(
+                "Unhandled exception caught — application will exit",
+                exc_info=(exctype, value, tb),
+            )
 
         traceback.print_exception(exctype, value, tb)
         sys.exit(1)

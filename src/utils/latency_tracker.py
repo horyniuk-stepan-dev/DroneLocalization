@@ -12,11 +12,18 @@ from typing import Any
 class LatencyTracker:
     """Rolling window of per-frame latencies with percentile reporting."""
 
-    def __init__(self, window: int = 300, log_interval: int = 100, logger: Any = None):
+    def __init__(
+        self,
+        window: int = 300,
+        log_interval: int = 100,
+        logger: Any = None,
+        label: str = "latency",
+    ):
         self._samples_ms: deque[float] = deque(maxlen=max(1, window))
         self._log_interval = max(1, log_interval)
         self._count = 0
         self._logger = logger
+        self._label = label
 
     def record(self, seconds: float) -> None:
         """Record one frame's processing time (in seconds); log on interval."""
@@ -47,8 +54,8 @@ class LatencyTracker:
     def format_stats(self) -> str:
         st = self.stats()
         if not st:
-            return "latency: (no samples)"
+            return f"{self._label}: (no samples)"
         return (
-            f"latency ms | p50={st['p50_ms']} p95={st['p95_ms']} "
+            f"{self._label} ms | p50={st['p50_ms']} p95={st['p95_ms']} "
             f"p99={st['p99_ms']} max={st['max_ms']} (n={st['n']})"
         )

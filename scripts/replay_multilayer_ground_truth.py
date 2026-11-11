@@ -31,6 +31,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 from collections import Counter
@@ -163,6 +164,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "as confirmed",
     )
     args = parser.parse_args(argv)
+    # Failure CSV next to the report, not into the app's logs/ (failure_log.py).
+    os.environ.setdefault("DRONELOC_FAILURE_CSV", str(args.json.with_suffix(".failures.csv")))
     try:
         args.layer_search_overrides = layer_search_overrides(args.layer_search)
         args.config_overrides = config_overrides(args.config_set)

@@ -278,7 +278,9 @@ class GeometryTransforms:
         # Validate Homography
         if not valid(H):
             if fallback_to_affine:
-                logger.warning(
+                # DEBUG: fires on most rejected candidates of a lost frame and
+                # flooded app.log at WARNING; the frame-level outcome is logged.
+                logger.debug(
                     f"Homography invalid/degenerate (src_pts={len(src_pts)}, threshold={ransac_threshold}). "
                     f"Falling back to Full Affine (6 DoF)."
                 )

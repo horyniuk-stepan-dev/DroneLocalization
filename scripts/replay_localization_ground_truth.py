@@ -12,6 +12,7 @@ import copy
 import csv
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -66,6 +67,8 @@ def main() -> int:
         help="disable the sliding-window trajectory smoother for an ablation run",
     )
     args = parser.parse_args()
+    # Failure CSV next to the report, not into the app's logs/ (failure_log.py).
+    os.environ.setdefault("DRONELOC_FAILURE_CSV", str(args.json.with_suffix(".failures.csv")))
 
     gt = json.loads(args.gt.read_text(encoding="utf-8"))
     slots = gt["slots"][:: max(1, args.every)]
