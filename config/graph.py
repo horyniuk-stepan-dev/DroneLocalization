@@ -75,6 +75,12 @@ class PropagationConfig(BaseModel):
     auto_georef_probes: int = Field(40, ge=4, le=500)
     auto_georef_tolerance_m: float = Field(25.0, gt=0)
     auto_georef_drift_frac: float = Field(0.05, ge=0, le=0.5)
+    # Georeferenced local map: drag a frame marker (or its semi-transparent
+    # video frame) on the map to pin that frame there and re-fit the whole
+    # frame graph (off = markers are not draggable). The weight is how hard a
+    # hand-placed frame pulls compared with an ordinary control point.
+    graph_node_drag: bool = False
+    graph_node_drag_weight: float = Field(10.0, ge=1.0, le=1000.0)
 
 
 class GraphOptimizationConfig(BaseModel):

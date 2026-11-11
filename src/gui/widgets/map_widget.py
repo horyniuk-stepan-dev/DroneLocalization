@@ -55,6 +55,8 @@ class MapBridge(QObject):
     # JSON list of the current mode's features, each with a "measure" label
     loadFeaturesSignal = pyqtSignal(str)
     rulerMeasuredSignal = pyqtSignal(str)  # ruler label text
+    # frame label, JPEG data URL, JSON corners [[lat, lon] x4: TL, TR, BR, BL]
+    nodeFrameSignal = pyqtSignal(str, str, str)
     # JS -> Python (re-emitted for MapWidget)
     featureUpsertRequested = pyqtSignal(str)
     featureDeleteRequested = pyqtSignal(str)
@@ -62,6 +64,18 @@ class MapBridge(QObject):
     exportRequested = pyqtSignal()
     importRequested = pyqtSignal()
     clearFeaturesRequested = pyqtSignal()
+    nodeMoveRequested = pyqtSignal(str, float, float)  # frame label, lat, lon
+    nodeFrameRequested = pyqtSignal(str)  # frame label
+
+    @pyqtSlot(str, float, float)
+    def verificationNodeMoved(self, label: str, lat: float, lon: float):
+        """Called from JavaScript when a frame marker was dragged to a new place."""
+        self.nodeMoveRequested.emit(label, lat, lon)
+
+    @pyqtSlot(str)
+    def requestNodeFrame(self, label: str):
+        """Called from JavaScript when a frame marker is grabbed: wants its image."""
+        self.nodeFrameRequested.emit(label)
 
     @pyqtSlot(str)
     def copyToClipboard(self, text: str):
@@ -107,6 +121,8 @@ class MapWidget(QWebEngineView):
 
     mapClicked = pyqtSignal(float, float)  # Public signal
     featuresChanged = pyqtSignal()  # user-drawn features were added/edited/removed
+    verificationNodeMoved = pyqtSignal(int, float, float)  # frame id, lat, lon
+    verificationNodeFrameRequested = pyqtSignal(int)  # frame id
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -137,6 +153,8 @@ class MapWidget(QWebEngineView):
         b.exportRequested.connect(self.export_features)
         b.importRequested.connect(self.import_features)
         b.clearFeaturesRequested.connect(self._on_clear_features)
+        b.nodeMoveRequested.connect(self._on_node_moved)
+        b.nodeFrameRequested.connect(self._on_node_frame_requested)
 
         self._channel = QWebChannel()
         self._channel.registerObject("mapBridge", self.bridge)
@@ -253,11 +271,45 @@ class MapWidget(QWebEngineView):
         )
 
     @pyqtSlot(list)
-    def show_verification_markers(self, points: list):
+    def show_verification_markers(
+        self, points: list, *, fit_view: bool = True, draggable: bool = False
+    ):
         """
         Accepts points as list of dicts [{'lat': float, 'lon': float, 'label': str}]
+
+        ``fit_view=False`` keeps the current map view; ``draggable`` lets the
+        user drag a marker (reported through ``verificationNodeMoved``). Both
+        exist on the geographic map only.
         """
-        self._emit_update("showVerificationMarkersSignal", json.dumps(points))
+        payload = points
+        if self._coordinate_mode != "LOCAL" and (draggable or not fit_view):
+            payload = {"points": points, "fit": bool(fit_view), "draggable": bool(draggable)}
+        self._emit_update("showVerificationMarkersSignal", json.dumps(payload))
+
+    def show_node_frame(self, frame_id: int, data_url: str, corners: list):
+        """Show a frame image on its ground footprint (corners TL, TR, BR, BL as
+        (lat, lon)); the page drags it together with the frame's marker."""
+        if self._coordinate_mode == "LOCAL":
+            return
+        self._emit_update("nodeFrameSignal", str(int(frame_id)), data_url, json.dumps(corners))
+
+    @staticmethod
+    def _frame_id(label: str) -> int | None:
+        try:
+            return int(label)
+        except ValueError:
+            logger.warning(f"Map marker has no frame id: {label!r}")
+            return None
+
+    def _on_node_moved(self, label: str, lat: float, lon: float):
+        frame_id = self._frame_id(label)
+        if frame_id is not None:
+            self.verificationNodeMoved.emit(frame_id, float(lat), float(lon))
+
+    def _on_node_frame_requested(self, label: str):
+        frame_id = self._frame_id(label)
+        if frame_id is not None:
+            self.verificationNodeFrameRequested.emit(frame_id)
 
     @pyqtSlot()
     def clear_verification_markers(self):

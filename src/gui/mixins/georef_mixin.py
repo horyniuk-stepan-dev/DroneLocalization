@@ -27,6 +27,7 @@ GEOREF_PROJECTION = "WEB_MERCATOR"
 _SIDECAR = "georef_gcps.json"
 _PANORAMA = Path("panoramas") / "local_map.png"
 _AUTO_PREFIX = "auto_gcp_"
+_DRAG_PREFIX = "drag_gcp_"
 
 
 class GeorefMixin:
@@ -113,43 +114,18 @@ class GeorefMixin:
         panorama_layout = self._local_panorama_layout() if info is None else None
         fit = dlg.fit
         gcps = dlg.gcp_records()
-        rmse_m = float(np.sqrt(np.mean([g["residual_m"] ** 2 for g in gcps])))
-        frame_mats, extra, mapper = None, {}, None
-        if fit.kind == GRAPH:
-            k = float(getattr(dlg, "ground_k", 1.0))
-            frame_mats = {int(f): m for f, m in zip(fit.frame_ids, fit.frame_matrices, strict=True)}
-            extra = {
-                "stiffness": fit.stiffness,
-                "max_correction_m": fit.max_correction * k,
-                "scale_range_rel": list(fit.scale_range),
-                "graph_nodes": int(len(fit.frame_ids)),
-            }
-            if fit.loo_residuals is not None:
-                extra["loo_rmse_m"] = float(np.sqrt(np.nanmean(fit.loo_residuals**2))) * k
-            if fit.global_loo_residuals is not None:
-                extra["global_loo_rmse_m"] = (
-                    float(np.sqrt(np.nanmean(fit.global_loo_residuals**2))) * k
-                )
-            mapper = fit.map_points
-        cal = self._georef_calibration(fit.matrix, converter, gcps, frame_mats)
-        try:
-            n = apply_local_georef(
-                db,
-                fit.matrix,
-                converter,
-                kind=fit.kind,
-                gcps=gcps,
-                rmse_m=rmse_m,
-                anchors=[a.to_dict() for a in cal.anchors],
-                frame_matrices=frame_mats,
-                extra=extra,
-            )
-        except Exception as e:
-            logger.error(f"Georeference failed: {e}", exc_info=True)
-            QMessageBox.critical(self, "Помилка", f"Не вдалося прив’язати карту:\n{e}")
+        done = self._commit_georef_fit(
+            fit,
+            gcps,
+            converter,
+            float(getattr(dlg, "ground_k", 1.0)),
+            "Не вдалося прив’язати карту",
+        )
+        if done is None:
             return
+        n, rmse_m = done
+        mapper = fit.map_points if fit.kind == GRAPH else None
 
-        self._install_calibration(cal)
         if info is not None:  # re-fit: bring earlier converted features back first
             self._move_features(np.asarray(info["matrix"]), converter, to_geo=False)
         if dlg.convert_features:
@@ -164,6 +140,48 @@ class GeorefMixin:
         )
 
     # ── pieces ───────────────────────────────────────────────────────────────
+
+    def _commit_georef_fit(self, fit, gcps, converter, ground_k, error_title):
+        """Write ``fit`` into the layer and install the matching calibration.
+
+        Returns ``(frames with GPS, rmse_m)`` or None when the write failed
+        (the error is already shown)."""
+        rmse_m = float(np.sqrt(np.mean([g["residual_m"] ** 2 for g in gcps])))
+        frame_mats, extra = None, {}
+        if fit.kind == GRAPH:
+            k = float(ground_k)
+            frame_mats = {int(f): m for f, m in zip(fit.frame_ids, fit.frame_matrices, strict=True)}
+            extra = {
+                "stiffness": fit.stiffness,
+                "max_correction_m": fit.max_correction * k,
+                "scale_range_rel": list(fit.scale_range),
+                "graph_nodes": int(len(fit.frame_ids)),
+            }
+            if fit.loo_residuals is not None:
+                extra["loo_rmse_m"] = float(np.sqrt(np.nanmean(fit.loo_residuals**2))) * k
+            if fit.global_loo_residuals is not None:
+                extra["global_loo_rmse_m"] = (
+                    float(np.sqrt(np.nanmean(fit.global_loo_residuals**2))) * k
+                )
+        cal = self._georef_calibration(fit.matrix, converter, gcps, frame_mats)
+        try:
+            n = apply_local_georef(
+                self.database,
+                fit.matrix,
+                converter,
+                kind=fit.kind,
+                gcps=gcps,
+                rmse_m=rmse_m,
+                anchors=[a.to_dict() for a in cal.anchors],
+                frame_matrices=frame_mats,
+                extra=extra,
+            )
+        except Exception as e:
+            logger.error(f"Georeference failed: {e}", exc_info=True)
+            QMessageBox.critical(self, "Помилка", f"{error_title}:\n{e}")
+            return None
+        self._install_calibration(cal)
+        return n, rmse_m
 
     def _georef_calibration(self, M, converter, gcps, frame_mats=None) -> MultiAnchorCalibration:
         """A geographic calibration whose anchors are the georeferenced frames
@@ -540,3 +558,211 @@ class GeorefMixin:
         save_points(sidecar, points)
         self.map_widget._features_updated()
 
+    # ── move one frame on the map, re-fit the graph around it ────────────────
+
+    def _graph_nodes_draggable(self) -> bool:
+        """Frame markers of the active layer may be dragged to re-fit its graph."""
+        if not get_cfg(self.config, "propagation.graph_node_drag", False):
+            return False
+        db = self.database
+        if db is None or not getattr(db, "is_propagated", False):
+            return False
+        return self.calibration.converter.mode != "LOCAL" and georef_info(db) is not None
+
+    def _graph_gcp_frames(self) -> set[int]:
+        """Frames that carry a control point (drawn as pinned on the map)."""
+        return {int(a.frame_id) for a in getattr(self.calibration, "anchors", [])}
+
+    def _geo_centers(self, graph) -> np.ndarray:
+        """Current (georeferenced) centres of the graph's frames, projected metres."""
+        geo = self.database.db_file["calibration"]["frame_affine"][:]
+        w = int(self.database.metadata.get("frame_width", 0))
+        h = int(self.database.metadata.get("frame_height", 0))
+        return geo[np.asarray(graph.frame_ids), :2, :] @ np.array([w / 2.0, h / 2.0, 1.0])
+
+    @pyqtSlot(int)
+    def on_graph_node_frame_requested(self, frame_id: int):
+        """Send the video frame behind a map marker to the map, where it is
+        shown semi-transparent on its footprint and dragged with the marker."""
+        if not self._graph_nodes_draggable():
+            return
+        try:
+            import base64
+
+            import cv2
+            from src.geometry.frame_transform import get_frame_transform, project_points
+
+            db = self.database
+            transform = get_frame_transform(db, frame_id)
+            step = int(db.metadata.get("frame_step", 0) or 0)
+            w = int(db.metadata.get("frame_width", 0))
+            h = int(db.metadata.get("frame_height", 0))
+            source = (
+                self._source_config(self._get_current_source_id())
+                if hasattr(self, "_source_config")
+                else None
+            )
+            video = db.metadata.get("source_path", "") or (
+                getattr(source, "video_path", "") if source else ""
+            )
+            if transform is None or step <= 0 or min(w, h) <= 0:
+                return
+            if not video or not Path(video).is_file():
+                self.status_bar.showMessage("Кадр не показано: відео шару не знайдено", 5000)
+                return
+            cap = cv2.VideoCapture(str(video), cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(str(video))
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id * step)
+                ok, bgr = cap.read()
+            finally:
+                cap.release()
+            if not ok or bgr is None:
+                self.status_bar.showMessage(f"Кадр {frame_id} не прочитано з відео", 5000)
+                return
+            scale = 640.0 / max(bgr.shape[:2])
+            if scale < 1.0:
+                bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                return
+            url = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+            conv = self.calibration.converter
+            corners = [  # TL, TR, BR, BL of the frame on the ground
+                [float(v) for v in conv.metric_to_gps(float(x), float(y))]
+                for x, y in project_points(transform, [[0, 0], [w, 0], [w, h], [0, h]])
+            ]
+            self.map_widget.show_node_frame(frame_id, url, corners)
+        except Exception as e:
+            logger.warning(f"Frame {frame_id} preview on the map failed: {e}")
+
+    @pyqtSlot(int, float, float)
+    def on_graph_node_moved(self, frame_id: int, lat: float, lon: float):
+        """A frame marker was dragged on the map: that frame becomes a control
+        point at the new place and the whole frame graph is solved again."""
+        from src.geometry.georef_adjust import move_node, node_index
+
+        title = "Пересунути кадр"
+
+        def restore():  # put the dragged marker back where the layer says it is
+            self.on_verify_propagation(fit_view=False)
+
+        if not self._graph_nodes_draggable() or self._refuse_if_encrypted_project(title):
+            restore()
+            return
+        tw = getattr(self, "tracking_worker", None)
+        if tw is not None and tw.isRunning():
+            QMessageBox.warning(self, "Увага", "Зупиніть трекінг — він використовує цю базу.")
+            restore()
+            return
+        db = self.database
+        info = georef_info(db) or {}
+        gcps = list(info.get("gcps") or [])
+        try:
+            with db.lock:
+                graph = self._local_graph()
+                sign = required_rotation_sign(self._local_affines())
+                old = self._geo_centers(graph) if graph is not None else None
+            if graph is None or len(gcps) < 2:
+                raise ValueError("у шарі немає графа кадрів або контрольних точок прив’язки")
+            node = node_index(graph, frame_id)
+            converter = CoordinateConverter(GEOREF_PROJECTION)
+            mv = move_node(
+                gcps,
+                graph,
+                frame_id,
+                lat,
+                lon,
+                converter,
+                sign,
+                stiffness=info.get("stiffness"),
+                weight=float(get_cfg(self.config, "propagation.graph_node_drag_weight", 10.0)),
+            )
+        except Exception as e:
+            logger.warning(f"Frame {frame_id} move rejected: {e}")
+            QMessageBox.warning(self, title, f"Не вдалося перерахувати граф:\n{e}")
+            restore()
+            return
+
+        k, fit = mv.ground_k, mv.fit
+        shift = np.linalg.norm(mv.centers - old, axis=1) * k
+        asked = float(np.linalg.norm(np.array(converter.gps_to_metric(lat, lon)) - old[node]) * k)
+        prev_max = max((float(g.get("residual_m", 0.0)) for g in gcps), default=0.0)
+        lines = [
+            f"Кадр {frame_id}: нове місце за {asked:.1f} м від поточного.",
+            "",
+            f"Після перерахунку графа за {len(mv.gcps)} контрольними точками:",
+            f"• кадр {frame_id} стане за {mv.residual_m:.2f} м від вказаного місця;",
+            f"• інші контрольні точки: найбільша похибка {mv.others_max_m:.2f} м "
+            f"(зараз {prev_max:.2f} м);",
+            f"• зсунеться більш ніж на 1 м: {int(np.sum(shift > 1.0))} із {graph.n} кадрів, "
+            f"найбільший зсув {float(np.nanmax(shift)):.1f} м.",
+        ]
+        if fit.kind == GRAPH:
+            lo, hi = fit.scale_range
+            lines.append(f"• масштаб уздовж карти: {lo * 100:.0f}–{hi * 100:.0f} % від загального.")
+            if lo < 0.5 or hi > 2.0:
+                lines.append("⚠ Масштаб змінюється більш ніж удвічі — перевірте кадр і місце.")
+            was = info.get("stiffness")
+            if info.get("kind") != GRAPH:
+                lines.append("Модель стане нежорсткою по графу кадрів (була загальна).")
+            elif was and float(was) > fit.stiffness:
+                lines.append(
+                    f"Жорсткість графа {float(was):g} → {fit.stiffness:g}, щоб поправка "
+                    "лишалась місцевою; карта може трохи зміститись і біля інших точок."
+                )
+        if mv.replaced:
+            lines.append("Замінює контрольну точку: " + ", ".join(mv.replaced) + ".")
+        lines += [f"⚠ {w}" for w in fit.warnings]
+        lines += ["", "Застосувати?"]
+        if QMessageBox.question(self, title, "\n".join(lines)) != QMessageBox.StandardButton.Yes:
+            restore()
+            return
+
+        done = self._commit_georef_fit(fit, mv.gcps, converter, k, "Не вдалося перерахувати граф")
+        if done is None:
+            restore()
+            return
+        self._remember_moved_point(mv, graph)
+        if hasattr(self, "_after_layer_data_changed"):
+            self._after_layer_data_changed()
+        self.on_verify_propagation(fit_view=False)
+        self.status_bar.showMessage(
+            f"Кадр {frame_id} пересунуто на {asked:.1f} м, граф перераховано: "
+            f"RMSE {done[1]:.2f} м за {len(mv.gcps)} точками"
+        )
+        logger.info(
+            f"Frame {frame_id} moved by {asked:.1f} m -> ({lat:.7f}, {lon:.7f}); graph re-fit "
+            f"kind={fit.kind} gcps={len(mv.gcps)} rmse={done[1]:.2f} m "
+            f"residual={mv.residual_m:.2f} m max_shift={float(np.nanmax(shift)):.1f} m "
+            f"replaced={mv.replaced}"
+        )
+
+    def _remember_moved_point(self, mv, graph):
+        """Mirror the move in the control-point list of the georeference dialog,
+        so it can be reviewed, switched off or deleted there."""
+        from src.gui.dialogs.georef_dialog import ControlPoint, load_points, save_points
+
+        new = mv.gcps[-1]
+        pid = f"{_DRAG_PREFIX}{mv.frame_id}"
+        tol = 1e-3 * graph.footprint
+        try:
+            sidecar = self._georef_sidecar()
+            points = [p for p in load_points(sidecar, []) if p.id != pid]
+            for p in points:  # superseded points of the same frame
+                if np.hypot(p.x - new["x"], p.y - new["y"]) <= tol:
+                    p.enabled = False
+            points.append(
+                ControlPoint(
+                    pid,
+                    new["name"],
+                    new["x"],
+                    new["y"],
+                    f"{new['lat']:.7f}, {new['lon']:.7f}",
+                    True,
+                )
+            )
+            save_points(sidecar, points)
+        except Exception as e:
+            logger.warning(f"Moved frame is applied, but the control-point list was not saved: {e}")

@@ -631,8 +631,10 @@ class CalibrationMixin:
             self.on_verify_propagation()
 
     @pyqtSlot()
-    def on_verify_propagation(self):
-        """Visualizes propagation quality markers on the map."""
+    def on_verify_propagation(self, *, fit_view: bool = True):
+        """Visualizes propagation quality markers on the map.
+
+        ``fit_view=False`` redraws the markers without changing the map view."""
         if not self.database or not self.database.is_propagated:
             QMessageBox.warning(self, "Увага", "Дані пропагації не знайдено.")
             return
@@ -651,6 +653,9 @@ class CalibrationMixin:
 
             points_to_show = []
             _diag_done = False
+            # Georeferenced local map: frames can be dragged to re-fit the graph.
+            draggable = bool(getattr(self, "_graph_nodes_draggable", lambda: False)())
+            pinned = self._graph_gcp_frames() if draggable else set()
             for i in range(0, num_frames, step):
                 from src.geometry.frame_transform import get_frame_transform, project_points
 
@@ -716,11 +721,14 @@ class CalibrationMixin:
                             "lon": float(lon_c),
                             "label": str(i),
                             "color": color,
+                            "pinned": i in pinned,
                         }
                     )
 
             if points_to_show:
-                self.map_widget.show_verification_markers(points_to_show)
+                self.map_widget.show_verification_markers(
+                    points_to_show, fit_view=fit_view, draggable=draggable
+                )
 
             if valid_mask is not None and rmse_data is not None:
                 valid_rmse = rmse_data[valid_mask]

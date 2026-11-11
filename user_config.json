@@ -567,7 +567,9 @@
         "accuracy_extra_overlaps": true,
         "auto_georef_probes": 40,
         "auto_georef_tolerance_m": 25.0,
-        "auto_georef_drift_frac": 0.05
+        "auto_georef_drift_frac": 0.05,
+        "graph_node_drag": true,
+        "graph_node_drag_weight": 10.0
     },
     "flight_data": {
         "source": "none",

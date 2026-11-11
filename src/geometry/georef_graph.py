@@ -203,13 +203,14 @@ class _System:
         self.H = (A1.T @ A1 + A2.T @ A2 + A3.T @ A3 + A4.T @ A4).tocsc()
         self.g = A1.T @ b1 + A2.T @ b2 + A3.T @ b3 + A4.T @ b4
 
-    def solve(self, lam, gz, gw, cache):
+    def solve(self, lam, gz, gw, cache, weights=None):
         nodes, ca, ct, b = [], [], [], []
+        wk = np.ones(len(gz)) if weights is None else np.asarray(weights, float)
         for k in range(len(gz)):
             idx, w = cache[k]
             nodes.append(idx)
-            ca.append(w * gz[k])
-            ct.append(w)
+            ca.append(w * gz[k] * wk[k])
+            ct.append(w * wk[k])
         n = self.n
         # each control point: one complex equation over its IDW nodes
         rr, cc, vv, rhs = [], [], [], np.empty(2 * len(gz))
@@ -219,7 +220,7 @@ class _System:
             rr += [np.full(len(base), 2 * k)] * 3 + [np.full(len(base), 2 * k + 1)] * 3
             cc += [base, base + 1, base + 2, base, base + 1, base + 3]
             vv += [a_.real, -a_.imag, t_, a_.imag, a_.real, t_]
-            rhs[2 * k], rhs[2 * k + 1] = gw[k].real, gw[k].imag
+            rhs[2 * k], rhs[2 * k + 1] = gw[k].real * wk[k], gw[k].imag * wk[k]
         G = coo_matrix(
             (np.concatenate(vv), (np.concatenate(rr), np.concatenate(cc))),
             shape=(2 * len(gz), 4 * n),
@@ -235,12 +236,20 @@ def fit_graph_georef(
     dst,
     rotation_sign: int = 1,
     stiffness: float | None = None,
+    weights=None,
 ) -> GraphGeorefFit:
     """Fit the correction field. ``stiffness=None`` picks it by leave-one-out
-    when there are >= 4 control points, else uses ``DEFAULT_STIFFNESS``."""
+    when there are >= 4 control points, else uses ``DEFAULT_STIFFNESS``.
+
+    ``weights`` (one per control point, default 1) make a point pull harder
+    than the others — e.g. a frame the operator placed by hand. They scale the
+    point's equations only; residuals stay plain distances."""
     src, dst = _as_points(src), _as_points(dst)
     if len(src) != len(dst):
         raise ValueError("src/dst size mismatch")
+    wts = np.ones(len(src)) if weights is None else np.asarray(weights, dtype=np.float64)
+    if wts.shape != (len(src),) or not np.isfinite(wts).all() or (wts <= 0).any():
+        raise ValueError("weights must be positive, one per control point")
     if len(src) < MIN_GRAPH_POINTS:
         raise ValueError(f"graph: need >= {MIN_GRAPH_POINTS} points, have {len(src)}")
     M0 = fit_similarity(src, dst, rotation_sign)
@@ -267,7 +276,7 @@ def fit_graph_georef(
         out = np.empty(len(src))
         for k in range(len(src)):
             keep = [j for j in range(len(src)) if j != k]
-            a, t = system.solve(lam, gz[keep], gw[keep], [cache[j] for j in keep])
+            a, t = system.solve(lam, gz[keep], gw[keep], [cache[j] for j in keep], wts[keep])
             out[k] = abs(predict(a, t, k) - gw[k])
         return out
 
@@ -299,7 +308,7 @@ def fit_graph_georef(
     if loo_res is None and len(src) >= 4:
         loo_res = loo(stiffness)
 
-    a, t = system.solve(stiffness, gz, gw, cache)
+    a, t = system.solve(stiffness, gz, gw, cache, wts)
     residuals = np.array([abs(predict(a, t, k) - gw[k]) for k in range(len(src))])
 
     # Per-frame 2x3 in uncentred coordinates: w = a*(z - cz) + t + cw.

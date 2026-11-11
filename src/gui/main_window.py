@@ -190,6 +190,8 @@ class MainWindow(
         cp.source_action.connect(self.on_source_action)
         cp.active_source_changed.connect(self.on_active_source_changed)
         self.map_widget.mapClicked.connect(self._on_map_clicked)
+        self.map_widget.verificationNodeMoved.connect(self.on_graph_node_moved)
+        self.map_widget.verificationNodeFrameRequested.connect(self.on_graph_node_frame_requested)
 
     def _on_map_clicked(self, lat: float, lon: float):
         """Handle map click by showing coordinates in the status bar."""

@@ -189,6 +189,7 @@
             if (verificationMarkers) {
                 verificationMarkers.clearLayers();
             }
+            resetNodeDrag();
             if (objectMarkersLayer) {
                 objectMarkersLayer.clearLayers();
             }
@@ -230,14 +231,183 @@
             }
         }
 
+        // ── Draggable frame markers (georeferenced local map) ────────────────
+        // A marker is the centre of one video frame. Grabbing it asks Python
+        // for the frame image, which is drawn semi-transparent on the frame's
+        // ground footprint and moves with the marker; the marker or the image
+        // can be dragged. Dropping reports the new centre to Python, which
+        // re-fits the frame graph and sends all markers again.
+        var NODE_GHOST_OPACITY = 0.55;
+        var NODE_SNAP_PX = 18;        // drop a marker onto a 📍 point -> its exact place
+        var nodeBridge = null;        // set when the web channel connects
+        var nodeMarkers = {};         // frame label -> circleMarker
+        var nodeDrag = null;          // drag in progress
+        var nodeGhost = null;         // {label, base, overlay, corners: [TL, TR, BL]}
+        var nodeDragEndedAt = 0;
+
+        function nodeDragJustEnded() { return Date.now() - nodeDragEndedAt < 300; }
+
+        function clearNodeGhost() {
+            if (nodeGhost && nodeGhost.overlay) map.removeLayer(nodeGhost.overlay);
+            nodeGhost = null;
+        }
+
+        function resetNodeDrag() {
+            if (nodeDrag) {
+                map.removeLayer(nodeDrag.line);
+                map.dragging.enable();
+                nodeDrag = null;
+            }
+            clearNodeGhost();
+            nodeMarkers = {};
+        }
+
+        // `ll` moved by the same screen offset that takes `from` to `to`
+        function shiftedLatLng(ll, from, to) {
+            var z = map.getZoom();
+            return map.unproject(
+                map.project(ll, z).add(map.project(to, z).subtract(map.project(from, z))), z);
+        }
+
+        function placeNodeGhost(center) {
+            var g = nodeGhost;
+            if (!g || !g.overlay) return;
+            g.overlay._topLeft    = shiftedLatLng(g.corners[0], g.base, center);
+            g.overlay._topRight   = shiftedLatLng(g.corners[1], g.base, center);
+            g.overlay._bottomLeft = shiftedLatLng(g.corners[2], g.base, center);
+            g.overlay._reset();
+        }
+
+        function snapToUserPoint(ll) {
+            var feats = (window.mapTools && window.mapTools.features) || [];
+            var p = map.latLngToContainerPoint(ll), best = null, bestD = NODE_SNAP_PX;
+            feats.forEach(function(f) {
+                if (f.type !== 'point') return;
+                var q = L.latLng(f.coords[0][0], f.coords[0][1]);
+                var d = map.latLngToContainerPoint(q).distanceTo(p);
+                if (d < bestD) { bestD = d; best = q; }
+            });
+            return best || ll;
+        }
+
+        function beginNodeDrag(label, ev, viaImage) {
+            var m = nodeMarkers[label];
+            if (!m || nodeDrag || !nodeBridge) return;
+            if (window.mapTools && window.mapTools.isBusy()) return;  // a drawing tool owns the mouse
+            map.dragging.disable();
+            var origin = m.getLatLng();
+            nodeDrag = {
+                label: label, marker: m, origin: origin, viaImage: viaImage, moved: false,
+                grab: map.mouseEventToLatLng(ev),
+                start: L.point(ev.clientX, ev.clientY),
+                line: L.polyline([origin, origin], {
+                    color: '#ffeb3b', weight: 2, dashArray: '5 5', interactive: false
+                }).addTo(map)
+            };
+            if (!nodeGhost || nodeGhost.label !== label) {
+                clearNodeGhost();
+                nodeGhost = { label: label, base: origin, overlay: null, corners: null };
+                nodeBridge.requestNodeFrame(label);
+            }
+        }
+
+        function setNodeFrame(label, dataUrl, cornersJson) {
+            var m = nodeMarkers[label];
+            if (!m || !nodeGhost || nodeGhost.label !== label || nodeGhost.overlay) return;
+            var c = JSON.parse(cornersJson).map(function(p) { return L.latLng(p[0], p[1]); });
+            var overlay = L.imageOverlay.rotated(dataUrl, c[0], c[1], c[3],
+                                                 { opacity: NODE_GHOST_OPACITY }).addTo(map);
+            nodeGhost.overlay = overlay;
+            nodeGhost.corners = [c[0], c[1], c[3]];
+            var img = overlay._image;
+            img.style.pointerEvents = 'auto';
+            img.style.cursor = 'move';
+            img.title = 'Кадр ' + label + ': тягніть, щоб поставити на місце · клік — сховати';
+            img.draggable = false;
+            L.DomEvent.on(img, 'mousedown', function(ev) {
+                if (ev.button !== 0) return;
+                L.DomEvent.stop(ev);
+                beginNodeDrag(label, ev, true);
+            });
+            L.DomEvent.on(img, 'click dblclick', L.DomEvent.stop);
+            img.addEventListener('load', function() { placeNodeGhost(m.getLatLng()); });
+            placeNodeGhost(m.getLatLng());
+        }
+
+        document.addEventListener('mousemove', function(ev) {
+            var d = nodeDrag;
+            if (!d) return;
+            if (!d.moved && L.point(ev.clientX, ev.clientY).distanceTo(d.start) < 4) return;
+            d.moved = true;
+            var at = shiftedLatLng(d.origin, d.grab, map.mouseEventToLatLng(ev));
+            d.marker.setLatLng(at);
+            d.line.setLatLngs([d.origin, at]);
+            placeNodeGhost(at);
+        });
+
+        document.addEventListener('mouseup', function() {
+            var d = nodeDrag;
+            if (!d) return;
+            nodeDrag = null;
+            map.dragging.enable();
+            map.removeLayer(d.line);
+            nodeDragEndedAt = Date.now();
+            if (!d.moved) {
+                // plain click: on the marker -> keep the frame shown; on the frame -> hide it
+                if (d.viaImage) clearNodeGhost();
+                return;
+            }
+            var at = d.marker.getLatLng();
+            if (!d.viaImage) {  // aligning by the image is exact work: no snapping
+                at = snapToUserPoint(at);
+                d.marker.setLatLng(at);
+                placeNodeGhost(at);
+            }
+            nodeBridge.verificationNodeMoved(d.label, at.lat, at.lng);
+        });
+
+        document.addEventListener('keydown', function(ev) {
+            if (ev.key !== 'Escape') return;
+            var d = nodeDrag;
+            if (d) {  // cancel the drag: everything back to where it was
+                nodeDrag = null;
+                map.dragging.enable();
+                map.removeLayer(d.line);
+                d.marker.setLatLng(d.origin);
+                placeNodeGhost(d.origin);
+                nodeDragEndedAt = Date.now();
+            } else {
+                clearNodeGhost();
+            }
+        });
+
+        map.on('zoomend', function() {
+            if (nodeGhost && nodeGhost.overlay) nodeGhost.overlay._reset();
+        });
+
         function showVerificationMarkers(pointsJson) {
             verificationMarkers.clearLayers();
-            var points = JSON.parse(pointsJson);
+            resetNodeDrag();
+            // Either a plain list of points or {points, fit, draggable}
+            var data = JSON.parse(pointsJson);
+            var opts = Array.isArray(data) ? {} : data;
+            var points = Array.isArray(data) ? data : (data.points || []);
+            var draggable = !!opts.draggable;
+
+            // Under the markers and not interactive, so it never takes their mouse events
+            if (points.length > 1) {
+                var lineCoords = points.map(p => [p.lat, p.lon]);
+                var polyline = L.polyline(lineCoords, {
+                    color: '#00ff00', weight: 2, opacity: 0.8, interactive: false
+                });
+                verificationMarkers.addLayer(polyline);
+            }
+
             points.forEach(p => {
                 var m = L.circleMarker([p.lat, p.lon], {
-                    radius: 4,
-                    color: '#ffffff',
-                    weight: 1,
+                    radius: draggable ? 6 : 4,
+                    color: p.pinned ? '#ffeb3b' : '#ffffff',
+                    weight: p.pinned ? 3 : 1,
                     fillColor: p.color || '#007bff',
                     fillOpacity: 0.8
                 });
@@ -247,17 +417,20 @@
                         direction: 'top',
                         className: 'marker-label'
                     });
+                    if (draggable) {
+                        var label = p.label.toString();
+                        nodeMarkers[label] = m;
+                        m.on('mousedown', function(e) {
+                            if (e.originalEvent.button !== 0) return;
+                            L.DomEvent.preventDefault(e.originalEvent);
+                            beginNodeDrag(label, e.originalEvent, false);
+                        });
+                    }
                 }
                 verificationMarkers.addLayer(m);
             });
 
-            if (points.length > 1) {
-                var lineCoords = points.map(p => [p.lat, p.lon]);
-                var polyline = L.polyline(lineCoords, { color: '#00ff00', weight: 2, opacity: 0.8 });
-                verificationMarkers.addLayer(polyline);
-            }
-
-            if (points.length > 0) {
+            if (points.length > 0 && opts.fit !== false) {
                 var bounds = L.latLngBounds(points.map(p => [p.lat, p.lon]));
                 map.fitBounds(bounds);
             }
@@ -265,6 +438,7 @@
 
         function clearVerificationMarkers() {
             verificationMarkers.clearLayers();
+            resetNodeDrag();
         }
 
         function updateObjectMarkers(pointsJson) {
@@ -347,6 +521,8 @@
                     bridge.updateManualTargetsSignal.connect(updateManualTargets);
                     bridge.setCoverageSignal.connect(setCoverage);
                     bridge.setCoverageStateSignal.connect(setCoverageState);
+                    bridge.nodeFrameSignal.connect(setNodeFrame);
+                    nodeBridge = bridge;
 
                     // ── User map tools (point / area / ruler ...) ─────────────
                     var tools = new MapTools(map, bridge);
@@ -357,6 +533,7 @@
                     // ── JS -> Python: Notify on map click ─────────────────────
                     map.on('click', function(e) {
                         if (tools.isBusy()) return;  // a drawing tool owns the click
+                        if (nodeDragJustEnded()) return;  // the click that ends a marker drag
                         bridge.mapClicked(e.latlng.lat, e.latlng.lng);
                     });
 
