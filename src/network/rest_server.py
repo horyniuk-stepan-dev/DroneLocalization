@@ -83,6 +83,10 @@ class RestApiServer:
         # Add operating state and freeze diagnostics when flag is enabled
         if getattr(self.broker.config, "expose_operating_state", False):
             resp.update(self.broker.get_operating_state())
+        get_cov = getattr(self.broker, "get_coverage", None)
+        cov = get_cov() if callable(get_cov) else None
+        if cov is not None:
+            resp["coverage"] = {k: v for k, v in cov.items() if k != "success"}
         return web.json_response(resp)
 
     def _build_ssl_context(self):

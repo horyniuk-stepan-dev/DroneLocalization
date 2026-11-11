@@ -63,6 +63,12 @@ def extract_globals(extractor: Any, frames: list, valid_masks: list | None) -> l
     return [extractor.extract_global_descriptor(f) for f in frames]
 
 
+def _needs_normalize(scale_manager: Any, sc: float) -> bool:
+    """ScaleManager.needs_normalize, legacy |sc - 1| > 0.15 for minimal stand-ins."""
+    check = getattr(scale_manager, "needs_normalize", None)
+    return bool(check(sc)) if callable(check) else abs(float(sc) - 1.0) > 0.15
+
+
 class RotationSelector:
     """Pick the best frame rotation (and scale) via global-descriptor retrieval."""
 
@@ -300,7 +306,7 @@ class RotationSelector:
             view, _, valid = rotate_view(query_frame, angle, None, erode_px)
             if rot_cache is not None:
                 rot_cache[key] = (view, valid)
-        if scale_manager is not None and abs(sc - 1.0) > 0.15:
+        if scale_manager is not None and _needs_normalize(scale_manager, sc):
             frame, crop = scale_manager.normalize(view, sc)
             valid_n, _ = scale_manager.normalize(valid, sc)
             return frame, crop, valid_n
@@ -321,6 +327,6 @@ class RotationSelector:
             rotated = np.ascontiguousarray(np.rot90(query_frame, k=angle // 90))
             if rot_cache is not None:
                 rot_cache[angle] = rotated
-        if scale_manager is not None and abs(sc - 1.0) > 0.15:
+        if scale_manager is not None and _needs_normalize(scale_manager, sc):
             return scale_manager.normalize(rotated, sc)
         return rotated, None

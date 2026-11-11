@@ -180,9 +180,14 @@ class TrackingMixin:
         self.tracking_worker.finished.connect(self._on_tracking_finished)
         self.tracking_worker.debug_view_ready.connect(self._on_debug_view_ready)
         self.tracking_worker.manual_targets_updated.connect(self.on_manual_targets_updated)
+        self.tracking_worker.coverage_outline.connect(self.on_coverage_outline)
+        self.tracking_worker.coverage_info.connect(self.on_coverage_info)
+        self._coverage_info = {}
+        self._coverage_geojson = None
 
         if hasattr(self, "coordinates_broker") and self.coordinates_broker:
             self.coordinates_broker.set_coordinate_mode(self.calibration.converter.mode)
+            self.tracking_worker.coverage_info.connect(self.coordinates_broker.on_coverage_info)
             self.tracking_worker.fix_info.connect(self.coordinates_broker.on_fix_info)
             self.tracking_worker.location_found.connect(self.coordinates_broker.on_location_found)
             self.tracking_worker.anchor_fix.connect(self.coordinates_broker.on_anchor_fix)
@@ -382,6 +387,11 @@ class TrackingMixin:
                 "fix_source": getattr(self, "_fix_source", "keyframe"),
             }
         )
+        _cov = getattr(self, "_coverage_info", None) or {}
+        for _k in ("coverage_state", "dist_to_edge_m", "time_to_edge_s",
+                   "return_bearing_deg", "fix_confirmed"):
+            if _k in _cov:
+                self._tracking_results[-1][_k] = _cov[_k]
         if self.calibration.converter.mode == "LOCAL":
             row = self._tracking_results[-1]
             row.pop("lat", None)
@@ -392,7 +402,9 @@ class TrackingMixin:
         coords = (f"X={lon:.3f}, Y={lat:.3f}" if self.calibration.converter.mode == "LOCAL"
                   else f"{lat:.6f}, {lon:.6f}")
         source = getattr(self, "_fix_source", "keyframe")
-        if source == "dead_reckoning":
+        if _cov.get("fix_confirmed") is False and source == "keyframe":
+            prefix = "⚠ Фікс ще не підтверджено (повернення на мапу) | "
+        elif source == "dead_reckoning":
             age = getattr(self, "_since_fix_s", -1.0)
             age_txt = f"{age:.0f} с" if age is not None and age >= 0 else "?"
             prefix = f"⚠ ОДОМЕТРІЯ без підтвердження мапою ({age_txt}) | "
@@ -401,6 +413,91 @@ class TrackingMixin:
         self.status_bar.showMessage(
             f"{prefix}Локалізація: {coords} | Впевненість: {confidence:.2f} | Точок: {inliers}"
         )
+
+    # ── Map coverage (localization.coverage) ────────────────────────────────
+
+    _COVERAGE_STYLE = {
+        "inside": ("#1b5e20", "white"),
+        "near_edge": ("#ffb300", "black"),
+        "leaving": ("#ff6d00", "black"),
+        "outside": ("#d50000", "white"),
+        "lost_inside": ("#6a1b9a", "white"),
+        "unknown": ("#424242", "white"),
+    }
+
+    @pyqtSlot(object)
+    def on_coverage_outline(self, rings: list):
+        self.map_widget.set_coverage(rings)
+        self._coverage_geojson = {
+            "type": "Feature",
+            "properties": {"type": "map_coverage"},
+            "geometry": {
+                "type": "MultiPolygon",
+                "coordinates": [
+                    [[[float(lon), float(lat)] for lat, lon in list(r) + list(r[:1])]]
+                    for r in rings
+                ],
+            },
+        }
+
+    @staticmethod
+    def coverage_text(info: dict) -> str:
+        """Short operator text for a coverage_info dict (Ukrainian UI)."""
+        state = info.get("coverage_state", "unknown")
+        dist = info.get("dist_to_edge_m")
+        tte = info.get("time_to_edge_s")
+        if state == "inside":
+            return f"Мапа: в межах ({dist:.0f} м до краю)" if dist is not None else "Мапа: в межах"
+        if state == "near_edge":
+            parts = [f"{dist:.0f} м" if dist is not None else None,
+                     f"{tte:.0f} с" if tte is not None else None]
+            return "⚠ КРАЙ МАПИ: " + " / ".join(p for p in parts if p)
+        if state == "leaving":
+            return "⚠ ВИХІД ЗА МАПУ: кадр переважно поза мапою"
+        if state == "outside":
+            brg, rd = info.get("return_bearing_deg"), info.get("return_dist_m")
+            back = f" — назад: {brg:.0f}°, {rd:.0f} м" if brg is not None and rd is not None else ""
+            return f"⛔ ПОЗА МАПОЮ{back}"
+        if state == "lost_inside":
+            return "Втрачено в межах мапи (пошук)"
+        since = info.get("since_position_s")
+        last = ""
+        if info.get("last_known_lat") is not None:
+            last = f", остання: {info['last_known_lat']:.5f}, {info['last_known_lon']:.5f}"
+        age = f" ({since:.0f} с без позиції{last})" if since is not None else ""
+        return f"⛔ ПОЗИЦІЯ НЕВІДОМА{age}"
+
+    @pyqtSlot(object)
+    def on_coverage_info(self, info: dict):
+        prev = (getattr(self, "_coverage_info", None) or {}).get("coverage_state")
+        self._coverage_info = dict(info)
+        state = info.get("coverage_state", "unknown")
+        label = getattr(self, "_coverage_label", None)
+        if label is None:
+            from PyQt6.QtWidgets import QLabel
+
+            label = QLabel()
+            label.setContentsMargins(6, 0, 6, 0)
+            self.status_bar.addPermanentWidget(label)
+            self._coverage_label = label
+        bg, fg = self._COVERAGE_STYLE.get(state, self._COVERAGE_STYLE["unknown"])
+        label.setStyleSheet(f"background:{bg}; color:{fg}; font-weight:bold; padding:2px 6px;")
+        text = self.coverage_text(info)
+        label.setText(text)
+        if state != prev:
+            src = None
+            if state == "outside":
+                if info.get("lat") is not None:
+                    src = (info["lat"], info["lon"])
+                elif info.get("last_known_lat") is not None:
+                    src = (info["last_known_lat"], info["last_known_lon"])
+            to = (info["return_lat"], info["return_lon"]) if info.get("return_lat") is not None else None
+            self.map_widget.set_coverage_state(state, src, to if src is not None else None)
+        if info.get("coverage_alert"):
+            logger.warning(f"Coverage alert: {text}")
+            self.control_panel.update_status(text)
+            if get_cfg(self.config, "localization.coverage.sound_alert", True):
+                QApplication.beep()
 
     @pyqtSlot(object)
     def on_objects_detected(self, objects: list):

@@ -125,8 +125,35 @@
         var verificationMarkers = L.layerGroup().addTo(map);
         var objectMarkersLayer = L.layerGroup().addTo(map);
         var manualTargetsLayer = L.layerGroup().addTo(map);
+        // Map coverage outline (localization.coverage) + return line when outside
+        var coverageLayer = L.layerGroup().addTo(map);
+        var coverageReturnLine = L.polyline([], { color: '#ff1744', weight: 2, dashArray: '4 6' }).addTo(map);
+        var COVERAGE_COLORS = {
+            inside: '#00e5ff', near_edge: '#ffb300', leaving: '#ff6d00',
+            outside: '#ff1744', lost_inside: '#ab47bc', unknown: '#9e9e9e'
+        };
 
         // ── Bridge functions ──────────────────────────────────────────────────
+        function setCoverage(json) {
+            coverageLayer.clearLayers();
+            var rings = JSON.parse(json || '[]');
+            rings.forEach(function(r) {
+                L.polygon(r, { color: COVERAGE_COLORS.inside, weight: 2, dashArray: '8 6',
+                               fill: false, interactive: false }).addTo(coverageLayer);
+            });
+        }
+
+        function setCoverageState(json) {
+            var s = JSON.parse(json || '{}');
+            var color = COVERAGE_COLORS[s.state] || COVERAGE_COLORS.unknown;
+            coverageLayer.eachLayer(function(l) { l.setStyle({ color: color }); });
+            if (s.from && s.to) {
+                coverageReturnLine.setLatLngs([s.from, s.to]);
+            } else {
+                coverageReturnLine.setLatLngs([]);
+            }
+        }
+
         function updateMarker(lat, lon) {
             var pos = new L.LatLng(lat, lon);
             if (droneMarker === null) {
@@ -318,6 +345,8 @@
                     bridge.updateObjectMarkersSignal.connect(updateObjectMarkers);
                     bridge.toggleObjectMarkersSignal.connect(toggleObjectMarkers);
                     bridge.updateManualTargetsSignal.connect(updateManualTargets);
+                    bridge.setCoverageSignal.connect(setCoverage);
+                    bridge.setCoverageStateSignal.connect(setCoverageState);
 
                     // ── User map tools (point / area / ruler ...) ─────────────
                     var tools = new MapTools(map, bridge);

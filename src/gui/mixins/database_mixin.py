@@ -781,7 +781,9 @@ class DatabaseMixin:
             elif path.endswith(".geojson") or "GeoJSON" in selected_filter:
                 if not path.endswith(".geojson"):
                     path += ".geojson"
-                ResultExporter.export_geojson(self._tracking_results, path)
+                ResultExporter.export_geojson(
+                    self._tracking_results, path, coverage=getattr(self, "_coverage_geojson", None)
+                )
                 if hasattr(self, "_object_tracking_results") and self._object_tracking_results:
                     obj_path = path.replace(".geojson", "_objects.geojson")
                     ResultExporter.export_objects_geojson(self._object_tracking_results, obj_path)

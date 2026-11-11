@@ -42,6 +42,7 @@ class DebugCollector:
     # -- Output: retrieval / rotation panel ------------------------------
     candidate_id: int = -1
     retrieval_candidates: list = field(default_factory=list)  # [(frame_id, score), ...]
+    retrieval_source: str | None = None  # layer the candidates come from (multi-layer)
     global_angle: int = 0
     scale: float = 1.0
     global_score: float = 0.0

@@ -44,6 +44,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -206,6 +207,86 @@ def summarize(rows: list[dict], jump_m: float) -> dict:
 # ── main ─────────────────────────────────────────────────────────────────────
 
 
+def summarize_coverage(
+    rows: list[dict], warn_m: float, false_horizon_s: float = 60.0
+) -> dict | None:
+    """Edge gates of the vision-only plan (1.4) against ground truth.
+
+    Truth = ground-truth centre inside / outside the coverage model.
+    - exits: per true exit, lead time of the first alert (near_edge / leaving /
+      outside / unknown) since the estimated state was last ``inside``.
+    - false_alerts: alerts after which the truth does not come within
+      ``warn_m`` of the edge (or leave) within ``false_horizon_s``.
+    - confirmed fixes with the true centre outside: split into accurate
+      (<= 25 m; legitimate at the edge, part of the frame is on the map) and
+      false (> 25 m).
+    """
+    rows = [r for r in rows if "coverage_state" in r]
+    if not rows:
+        return None
+    alert_states = ("near_edge", "leaving", "outside", "unknown")
+    states: dict[str, int] = {}
+    for r in rows:
+        states[r["coverage_state"]] = states.get(r["coverage_state"], 0) + 1
+    near = [
+        (r["t"], r.get("gt_inside") is False or (r.get("gt_dist_to_edge_m") or 1e9) < warn_m)
+        for r in rows
+        if r.get("gt_inside") is not None
+    ]
+    exits, reentries = [], []
+    false_alerts = []
+    conf_out_ok = conf_out_false = 0
+    cls_ok = cls_n = 0
+    first_alert_t = None
+    prev_in = None
+    reentry_t = None
+    for r in rows:
+        gin = r.get("gt_inside")
+        t = r["t"]
+        if r["coverage_state"] == "inside":
+            first_alert_t = None
+        if r.get("coverage_alert") and r["coverage_state"] in alert_states:
+            if first_alert_t is None:
+                first_alert_t = t
+            if not any(n for tt, n in near if t <= tt <= t + false_horizon_s):
+                false_alerts.append(t)
+        if prev_in is True and gin is False:
+            exits.append(
+                {"t": t, "lead_s": None if first_alert_t is None else round(t - first_alert_t, 2)}
+            )
+        if prev_in is False and gin is True:
+            reentry_t = t
+        if (
+            reentry_t is not None
+            and r.get("path") == "kf"
+            and r.get("success")
+            and r.get("fix_confirmed") is not False
+        ):
+            reentries.append(round(t - reentry_t, 2))
+            reentry_t = None
+        if gin is False and r.get("path") == "kf" and r.get("success") and r.get("fix_confirmed"):
+            if (r.get("final_error_m") or 0.0) > 25.0:
+                conf_out_false += 1
+            else:
+                conf_out_ok += 1
+        if r["coverage_state"] in ("outside", "lost_inside") and gin is not None:
+            cls_n += 1
+            cls_ok += (r["coverage_state"] == "outside") == (gin is False)
+        if gin is not None:
+            prev_in = gin
+    return {
+        "states": states,
+        "exits": exits,
+        "exits_warned": sum(1 for e in exits if e["lead_s"] is not None and e["lead_s"] >= 0),
+        "false_alerts": len(false_alerts),
+        "false_alert_t": false_alerts,
+        "confirmed_fixes_truly_outside": conf_out_ok + conf_out_false,
+        "confirmed_fixes_truly_outside_false": conf_out_false,
+        "outside_vs_lost_inside_correct": f"{cls_ok}/{cls_n}",
+        "reentry_to_first_confirmed_fix_s": reentries,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     from scripts.replay_multilayer_ground_truth import (
         build_localizer,
@@ -250,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
         help="cuda.synchronize around timed stages (honest stage times, slightly slower)",
     )
     args = parser.parse_args(argv)
+    # Failure CSV next to the report, not into the app's logs/ (failure_log.py).
+    os.environ.setdefault("DRONELOC_FAILURE_CSV", str(args.json.with_suffix(".failures.csv")))
     try:
         sources = source_specs(args.source)
         set_overrides = config_overrides(args.config_set)
@@ -447,7 +530,27 @@ def main(argv: list[str] | None = None) -> int:
                 "raw_lon": result.get("raw_lon") if success else None,
                 "final_error_m": None,
                 "raw_error_m": None,
+                "failure_reason": result.get("failure_reason"),
             }
+            if "coverage_state" in result:
+                for key in (
+                    "coverage_state",
+                    "coverage_alert",
+                    "dist_to_edge_m",
+                    "time_to_edge_s",
+                    "return_bearing_deg",
+                    "footprint_inside_frac",
+                    "fix_confirmed",
+                ):
+                    row[key] = result.get(key)
+                row["confirmed"] = success and result.get("fix_confirmed") is not False
+                cov_model = localizer.coverage_model
+                if cov_model is not None and gt_valid:
+                    q = cov_model.query(float(gt_point[0]), float(gt_point[1]))
+                    row["gt_inside"] = bool(q.inside)
+                    row["gt_dist_to_edge_m"] = (
+                        round(q.dist_to_edge_m, 1) if math.isfinite(q.dist_to_edge_m) else None
+                    )
             if success and gt_valid:
                 target = (row["gt_lat"], row["gt_lon"])
                 row["final_error_m"] = distance_m((float(row["lat"]), float(row["lon"])), target)
@@ -487,6 +590,9 @@ def main(argv: list[str] | None = None) -> int:
             "of_stride": of_stride,
         },
         "summary": summarize(rows, args.jump_m),
+        "coverage": summarize_coverage(
+            rows, float(get_cfg(config, "localization.coverage.warn_m", 300.0))
+        ),
         "rows": [r for r in rows if r["path"] == "kf"],
         "tracking_rows": rows,
     }

@@ -61,6 +61,10 @@ class OutlierDetector:
         # extra rejections cap the wait (0 = never force), so a filter that is
         # truly lost cannot lock out every measurement forever.
         self._reacquire = bool(reacquire_consistent)
+        # Set per keyframe by the localizer (localization.coverage.edge_guards):
+        # near the map edge a rejection streak ends only on two mutually
+        # consistent fixes, never by count alone.
+        self.suppress_forced_accept = False
         self._reacquire_tol_m = max(float(reacquire_tol_m), 0.0)
         self._reacquire_max_wait = max(int(reacquire_max_wait), 0)
         self._streak_offsets: list[np.ndarray] = []
@@ -103,6 +107,21 @@ class OutlierDetector:
         """Should the current rejection streak be accepted now?"""
         if self._consecutive_outliers < self._max_consecutive:
             return False
+        if getattr(self, "suppress_forced_accept", False):
+            if not self._streak_no_pred and len(self._streak_offsets) == 2:
+                drift = float(np.linalg.norm(self._streak_offsets[1] - self._streak_offsets[0]))
+                if drift <= self._reacquire_tol_m:
+                    logger.warning(
+                        f"OUTLIER RE-ACQUIRE (map edge): two consecutive rejected fixes "
+                        f"agree (offset change {drift:.1f} m)"
+                    )
+                    return True
+            # Escape hatch: a coasting filter whose prediction keeps moving away
+            # (e.g. the drone turned while outside the map) would otherwise
+            # reject every fix forever.
+            return self._consecutive_outliers >= self._max_consecutive + max(
+                self._reacquire_max_wait, 10
+            )
         if not self._reacquire or self._streak_no_pred:
             # legacy: N-th rejection is accepted unconditionally (also when no
             # KF prediction exists to test consistency against)

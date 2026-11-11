@@ -142,3 +142,22 @@ class TestShiftUnaffectedBySeed:
         assert kf.kf.x[0, 0] == pytest.approx(155.0)
         assert kf.kf.x[1, 0] == pytest.approx(-3.0)
         assert (float(kf.kf.x[2, 0]), float(kf.kf.x[3, 0])) == pytest.approx(v_before)
+
+
+def test_reanchor_velocity_cap_keeps_plausible_velocity():
+    from src.tracking.kalman_filter import TrajectoryFilter
+
+    kf = TrajectoryFilter(
+        process_noise=2.0,
+        measurement_noise=5.0,
+        reanchor_velocity_from_fixes=True,
+        reanchor_max_speed=150.0,
+    )
+    for k in range(10):
+        kf.update((50.0 * k, 0.0), dt=1.0, timestamp=float(k))
+    kf.update((500.0, 0.0), dt=1.0, trusted_max_offset_m=5.0, timestamp=10.0)
+    # implausible jump of 400 m in 1 s -> re-anchor; velocity must stay sane
+    kf.update((950.0, 0.0), dt=1.0, trusted_max_offset_m=5.0, timestamp=11.0)
+    assert kf.last_update_reanchored
+    vx, vy = float(kf.kf.x[2, 0]), float(kf.kf.x[3, 0])
+    assert (vx * vx + vy * vy) ** 0.5 <= 150.0

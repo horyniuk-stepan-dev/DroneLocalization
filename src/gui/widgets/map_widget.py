@@ -42,6 +42,9 @@ class MapBridge(QObject):
     toggleObjectMarkersSignal = pyqtSignal(bool)
     # Operator-selected targets with trails (JSON list)
     updateManualTargetsSignal = pyqtSignal(str)
+    # Map coverage: JSON list of rings [[lat, lon], ...] / JSON {state, from, to}
+    setCoverageSignal = pyqtSignal(str)
+    setCoverageStateSignal = pyqtSignal(str)
 
     # JS -> Python: Map Click
     mapClickedSignal = pyqtSignal(float, float)
@@ -270,6 +273,23 @@ class MapWidget(QWebEngineView):
     @pyqtSlot(bool)
     def set_objects_visible(self, visible: bool):
         self._emit_update("toggleObjectMarkersSignal", visible)
+
+    def set_coverage(self, rings: list):
+        """Draw the reference-map coverage outline: list of rings of (lat, lon)."""
+        if self._coordinate_mode == "LOCAL":
+            return  # local_map.html has no coverage layer yet
+        payload = [[[float(a), float(b)] for a, b in ring] for ring in rings]
+        self._emit_update("setCoverageSignal", json.dumps(payload))
+
+    def set_coverage_state(self, state: str, from_ll=None, to_ll=None):
+        """Colour the outline by coverage state; draw a return line when given."""
+        if self._coordinate_mode == "LOCAL":
+            return
+        msg = {"state": state}
+        if from_ll is not None and to_ll is not None:
+            msg["from"] = [float(from_ll[0]), float(from_ll[1])]
+            msg["to"] = [float(to_ll[0]), float(to_ll[1])]
+        self._emit_update("setCoverageStateSignal", json.dumps(msg))
 
     def update_manual_targets(self, targets: list):
         """targets: [{id, label, lat, lon, lost, trail: [[lat, lon], ...]}]."""

@@ -55,6 +55,49 @@ class AltitudeHintConfig(BaseModel):
     # Weight of each telemetry + visual fix in refining the camera footprint factor
     # (ground width per metre of altitude, initially sensor width / focal length).
     telemetry_scale_ema: float = Field(default=0.3, gt=0, le=1)
+    # Vision-only plan 2.1: keep a visual query-GSD estimate through failed
+    # keyframes (optical-flow scale change, dead-reckoning chain) instead of
+    # losing the hint with the invalidated scale prior. Expires after
+    # visual_max_age_s without a keyframe fix (src/localization/visual_altitude.py).
+    visual_track: bool = False
+    visual_max_age_s: float = Field(default=60.0, gt=0)
+
+
+class CoverageConfig(BaseModel):
+    """Map coverage model + edge state (src/localization/coverage.py). Default off.
+
+    enabled: build the coverage of all reference frames at tracking start and
+    report coverage_state / dist_to_edge_m / time_to_edge_s / return_bearing_deg
+    with every result (GUI status, broker, export). edge_guards: in edge states
+    also disable retrieval-only fallback and forced outlier acceptance, reject
+    keyframe fixes whose footprint is mostly off the map and restart the full
+    rotation / scale scan once outside (vision-only plan 1.3). All thresholds are
+    starting values to tune on the edge test routes (plan 0.4).
+    """
+
+    enabled: bool = False
+    edge_guards: bool = False
+    cell_m: float = Field(default=5.0, gt=0)
+    max_cells: int = Field(default=16_000_000, ge=10_000)
+    warn_m: float = Field(default=300.0, ge=0)
+    warn_s: float = Field(default=15.0, ge=0)
+    hyst_m: float = Field(default=50.0, ge=0)
+    hyst_s: float = Field(default=5.0, ge=0)
+    leave_frac: float = Field(default=0.5, ge=0, le=1)
+    leave_hyst: float = Field(default=0.1, ge=0, le=1)
+    lost_after_s: float = Field(default=3.0, ge=0)
+    unknown_after_s: float = Field(default=30.0, gt=0)
+    velocity_window_s: float = Field(default=3.0, gt=0)
+    clear_count: int = Field(default=2, ge=1)
+    reacquire_fixes: int = Field(default=2, ge=1)
+    reacquire_tol_m: float = Field(default=30.0, ge=0)
+    dr_base_m: float = Field(default=20.0, ge=0)
+    # Edge routes 2026-11-10 (50 m/s, 1000 m): dead-reckoning error max 15-17 m
+    # after 5 s, 29-37 m after 10 s, 108-147 m after 30 s; along the border
+    # 25-33 m already ~2 s after the last keyframe fix (hence base 20 m).
+    dr_drift_m_per_s: float = Field(default=5.0, ge=0)
+    # Operator alert sound in the GUI on near_edge / leaving / outside / unknown.
+    sound_alert: bool = True
 
 
 class ConfidenceConfig(BaseModel):
@@ -68,6 +111,7 @@ class ConfidenceConfig(BaseModel):
 class LocalizationConfig(BaseModel):
     layer_search: LayerSearchConfig = Field(default_factory=LayerSearchConfig)
     altitude_hint: AltitudeHintConfig = Field(default_factory=AltitudeHintConfig)
+    coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     min_matches: int = 12
     min_inliers_accept: int = 10
     # Absolute post-fit reprojection gate. Adaptive RANSAC may refine its own
@@ -201,6 +245,24 @@ class LocalizationConfig(BaseModel):
     # out_of_coverage і скидає пріори кута/масштабу (наступний кадр — повний скан).
     # Читався з 2026-07, але не був оголошений — user_config не міг його змінити.
     max_consecutive_failures: int = 10
+    # Vision-only plan 2.4: until the session's first fix, a failed keyframe is
+    # retried in the same frame at up to N further rotations (the angles already
+    # verified are skipped). 0 = off. Legacy search path only.
+    cold_start_extra_angles: int = Field(default=0, ge=0, le=7)
+    # Vision-only plan 2.5: the spatial prior (frames near the dead-reckoned
+    # position) also probes the two other layers nearest in scale, each at its
+    # expected scale, and switches layer on a hit. Off = active layer only.
+    spatial_prior_all_layers: bool = False
+    # |query/layer scale - 1| under which the query is matched at its own size
+    # instead of being cropped/resized to the layer's GSD (legacy 0.15). Wayback
+    # replay 2026-11-10: the same keyframe at ratio 0.85 (cropped) matched with
+    # 108 inliers, at 0.86 (not cropped) failed and started an 18 s gap.
+    # None = legacy (0.15 for "normalize at all", [0.85, 1.18] inside normalize()).
+    scale_normalize_deadband: float | None = Field(default=None, ge=0, le=0.5)
+    # Apply scale_normalize_deadband only to the altitude hint's layer ratios
+    # while the scale prior is lost (a global 0.05 band, 2026-11-10: winter
+    # p95 3.9 -> 35 m, tele@heading keyframes 97 -> 82 %).
+    scale_normalize_deadband_hint_only: bool = False
 
     # ── ADDENDUM 2.1: каскадний recovery замість повного добутку. Дефолт off. ──
     # off = ПОТОЧНА поведінка: 4 кути × 5 масштабів = 20 ViT-forward одним батчем.
@@ -418,6 +480,26 @@ class TrackingConfig(BaseModel):
     # кадрів від останнього оновлення фільтра; детектор аутлаєрів і smoother
     # лишаються на dt воркера. False = стара поведінка.
     kalman_dt_from_timestamps: bool = False
+    # Vision-only plan 2.2 (src/tracking/output_blend.py): a keyframe fix that
+    # differs from the continued output by reanchor_blend_min_m ..
+    # reanchor_blend_max_offset_m is reached in steps of at most
+    # reanchor_blend_max_step_m per output instead of one jump (0 = off). The
+    # tracker itself uses the fix; only the reported position is blended.
+    reanchor_blend_max_step_m: float = Field(default=0.0, ge=0)
+    # No absorption after this many seconds without an output (the continued
+    # output is then a guess; heading route: absorbing after a 0.8 s gap kept a
+    # 26 m offset on screen).
+    reanchor_blend_max_gap_s: float = Field(default=0.5, gt=0)
+    # Cap of the Kalman re-anchor velocity in map units / s (0 = off). Web
+    # Mercator units are ~1.5x ground metres at 48 deg N.
+    kalman_reanchor_max_speed: float = Field(default=0.0, ge=0)
+    # Re-anchor the Kalman filter on the first keyframe fix after a dead-reckoning
+    # stretch even when it has fewer than outlier_trust_min_inliers inliers.
+    # During DR the filter is fed with drifting OF positions at low noise, so an
+    # ordinary update lags behind the new fix (wayback_2018 111 s: raw 8 m, shown 49 m).
+    kalman_reanchor_after_dr: bool = False
+    reanchor_blend_min_m: float = Field(default=5.0, ge=0)
+    reanchor_blend_max_offset_m: float = Field(default=40.0, gt=0)
     # Швидкість при re-anchor до сильного фіксу (2026-10-28). Стара поведінка:
     # (фікс − останній СИРИЙ вимір) / dt, а сирий вимір зазвичай OF; загублений
     # OF-трек перетворює точний фікс на швидкість у сотні м/с. True = швидкість

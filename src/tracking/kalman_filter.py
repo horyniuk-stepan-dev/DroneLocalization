@@ -17,6 +17,7 @@ class TrajectoryFilter:
         dt=1.0,
         reanchor_velocity_from_fixes: bool = False,
         max_gap_s: float = 0.0,
+        reanchor_max_speed: float = 0.0,
     ):
         # Filter state: [x, y, vx, vy]
         self.kf = KalmanFilter(dim_x=4, dim_z=2)
@@ -55,6 +56,12 @@ class TrajectoryFilter:
         # 2026-10-28: 15 s without a fix -> 214 m/s instead of 45, output 56 m
         # off while the raw measurements were 5 m off).
         self.max_gap_s = max(float(max_gap_s), 0.0)
+        # Plausibility cap of a re-anchor velocity, map units / s
+        # (tracking.kalman_reanchor_max_speed; 0 = off). heading route
+        # 2026-11-10: a re-anchor set (257, -392) after a lost OF track and the
+        # following outputs jumped; above the cap the pre-update filter velocity
+        # is kept (or zero if that is implausible too).
+        self.reanchor_max_speed = max(float(reanchor_max_speed), 0.0)
 
         logger.info("Initializing Kalman filter for high-speed trajectory smoothing")
         logger.info(
@@ -233,6 +240,7 @@ class TrajectoryFilter:
         dt = max(0.01, min(dt, 5.0))
         self._update_matrices_for_dt(dt)
 
+        v_before = (float(self.kf.x[2, 0]), float(self.kf.x[3, 0]))
         self.kf.predict()
         self.kf.update(z)
 
@@ -257,6 +265,13 @@ class TrajectoryFilter:
                 else:
                     vx = (measurement_xy[0] - self._last_raw[0]) / safe_dt
                     vy = (measurement_xy[1] - self._last_raw[1]) / safe_dt
+                cap = self.reanchor_max_speed
+                if cap > 0.0 and float(np.hypot(vx, vy)) > cap:
+                    logger.debug(
+                        f"Re-anchor velocity ({vx:.1f}, {vy:.1f}) above {cap:.0f}: "
+                        f"keeping ({v_before[0]:.1f}, {v_before[1]:.1f})"
+                    )
+                    vx, vy = v_before if float(np.hypot(*v_before)) <= cap else (0.0, 0.0)
                 self.kf.x = np.array(
                     [[measurement_xy[0]], [measurement_xy[1]], [vx], [vy]], dtype=np.float64
                 )

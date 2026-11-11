@@ -6,7 +6,7 @@ from src.geometry.point_spread import inlier_spread
 from src.geometry.transformations import GeometryTransforms
 from src.localization.altitude_hint import AltitudeHint
 from src.localization.candidate_retriever import CandidateRetriever
-from src.localization.failure_log import FAILURE_TYPES, FailureLogger
+from src.localization.failure_log import FAILURE_TYPES, FailureLogger, classify_failure
 from src.localization.geometric_verifier import GeometricVerifier
 from src.localization.keypoint_budget import top_keypoints
 from src.localization.layer_search import LayerSearch
@@ -32,6 +32,12 @@ from src.utils.resolution_normalizer import ResolutionNormalizer
 from src.utils.telemetry import Telemetry
 
 logger = get_logger(__name__)
+
+
+def _ang_dist(a: float, b: float) -> float:
+    """Smallest absolute difference of two angles in degrees."""
+    d = abs(float(a) - float(b)) % 360.0
+    return min(d, 360.0 - d)
 
 
 class Localizer:
@@ -82,6 +88,7 @@ class Localizer:
                 self.config, "tracking.kalman_reanchor_velocity_from_fixes", False
             ),
             max_gap_s=get_cfg(self.config, "tracking.kalman_max_gap_s", 0.0),
+            reanchor_max_speed=get_cfg(self.config, "tracking.kalman_reanchor_max_speed", 0.0),
         )
         self.outlier_detector = OutlierDetector(
             window_size=get_cfg(self.config, "tracking.outlier_window", 10),
@@ -249,6 +256,34 @@ class Localizer:
             get_cfg(self.config, "tracking.trusted_fix_max_filter_offset_m", 5.0)
         )
 
+        # Map coverage (vision-only plan phase 1): geometric model of where the
+        # reference map ends + coverage state per result. Built lazily at the
+        # first reset_session / localization (localization.coverage.enabled).
+        self._coverage_enabled = bool(get_cfg(self.config, "localization.coverage.enabled", False))
+        self._coverage_guards = self._coverage_enabled and bool(
+            get_cfg(self.config, "localization.coverage.edge_guards", False)
+        )
+        self._coverage = None  # CoverageMonitor | None
+        self._coverage_built = False
+
+        # Re-anchor blending of the reported position (tracking.reanchor_blend_*).
+        self._kf_reanchor_after_dr = bool(
+            get_cfg(self.config, "tracking.kalman_reanchor_after_dr", False)
+        )
+        self._last_fix_source = None
+        self._blend = None
+        _blend_step = float(get_cfg(self.config, "tracking.reanchor_blend_max_step_m", 0.0) or 0.0)
+        if _blend_step > 0.0:
+            from src.tracking.output_blend import OutputBlend
+
+            self._blend = OutputBlend(
+                _blend_step,
+                float(get_cfg(self.config, "tracking.reanchor_blend_min_m", 5.0)),
+                float(get_cfg(self.config, "tracking.reanchor_blend_max_offset_m", 40.0)),
+                float(get_cfg(self.config, "tracking.reanchor_blend_max_gap_s", 0.5)),
+            )
+        self._blend_clock = 0.0
+
         # Fix #1: Guard against infinite loop when outside coverage bounds
         self._consecutive_failures = 0
         self._max_failures = get_cfg(self.config, "localization.max_consecutive_failures", 10)
@@ -289,6 +324,15 @@ class Localizer:
             self.config, getattr(_project_manager, "settings", None)
         )
         self._telemetry_altitude_m = None
+        self._visual_scale = None
+        if self._altitude_hint.enabled and get_cfg(
+            self.config, "localization.altitude_hint.visual_track", False
+        ):
+            from src.localization.visual_altitude import VisualScaleTrack
+
+            self._visual_scale = VisualScaleTrack(
+                get_cfg(self.config, "localization.altitude_hint.visual_max_age_s", 60.0)
+            )
         self._altitude_norm_width = None
         self._altitude_hint_logged: set = set()
 
@@ -540,6 +584,13 @@ class Localizer:
         gsd = self._gsd_of(sid)
         return float(prior) * float(gsd) if gsd else None
 
+    def _tracked_query_gsd(self):
+        """Visual query GSD kept through failures (altitude_hint.visual_track), or None."""
+        track = getattr(self, "_visual_scale", None)
+        if track is None:
+            return None
+        return track.estimate(getattr(self, "_frame_timestamp", None))
+
     # ── localization.altitude_hint ──────────────────────────────────────────────
 
     def _layer_gsds(self, source_ids=None) -> dict:
@@ -593,6 +644,8 @@ class Localizer:
         visual = None
         if belief is not None and active_gsd:
             visual = float(np.exp(belief.log_ratio)) * float(active_gsd)
+        if visual is None:
+            visual = self._tracked_query_gsd()
         gsd, _ = self._hint_query_gsd(norm_width, visual)
         ids = getattr(self.db_manager, "all_source_ids", None)
         if ids is None:
@@ -804,6 +857,130 @@ class Localizer:
         self._sp_frame_done = False
         if self._smoother is not None:
             self._smoother.reset()
+        self._failure_logger.new_run()
+        self._had_fix = False
+        self._cold_exclude = None
+        if self._blend is not None:
+            self._blend.reset()
+        self._blend_last_source = None
+        self._last_fix_source = None
+        if self._visual_scale is not None:
+            self._visual_scale.reset()
+        monitor = self.coverage_monitor
+        if monitor is not None:
+            monitor.reset()
+            self._failure_logger.coverage_state = monitor.state
+
+    # ── Map coverage (vision-only plan phase 1) ─────────────────────────────
+
+    @property
+    def coverage_monitor(self):
+        """CoverageMonitor, built on first access (None when disabled or no footprints)."""
+        if not self._coverage_enabled:
+            return None
+        if not self._coverage_built:
+            self._coverage_built = True
+            try:
+                from src.localization.coverage import (
+                    CoverageMonitor,
+                    CoverageParams,
+                    build_coverage,
+                )
+
+                model = build_coverage(self, self.config)
+                if model is not None:
+                    self._coverage = CoverageMonitor(model, CoverageParams.from_config(self.config))
+            except Exception as e:
+                logger.opt(exception=e).error(f"Coverage model build failed — coverage off: {e}")
+                self._coverage = None
+        return self._coverage
+
+    @property
+    def coverage_model(self):
+        monitor = self.coverage_monitor
+        return monitor.model if monitor is not None else None
+
+    def _edge_guards_active(self) -> bool:
+        return bool(
+            self._coverage_guards and self._coverage is not None and self._coverage.edge_active
+        )
+
+    def _footprint_fraction(self, M_query_to_ref, affine_ref, width, height, ref_w, ref_h):
+        """Share of the query footprint on covered map cells (None = cannot tell)."""
+        model = self.coverage_model
+        if model is None:
+            return None
+        try:
+            corners = np.array(
+                [[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float64
+            )
+            ref = GeometryTransforms.apply_homography(corners, M_query_to_ref)
+            if ref is None:
+                return None
+            if np.asarray(affine_ref).shape == (3, 3):
+                metric = project_frame_points(affine_ref, ref, ref_w, ref_h)
+            else:
+                metric = GeometryTransforms.apply_affine(ref, affine_ref)
+            conv = self.calibration.converter
+            if hasattr(conv, "metric_to_gps_array"):
+                lat, lon = conv.metric_to_gps_array(metric[:, 0], metric[:, 1])
+            else:
+                lat, lon = np.array([conv.metric_to_gps(float(a), float(b)) for a, b in metric]).T
+            return model.fraction_inside(np.column_stack([lat, lon]))
+        except Exception:
+            return None
+
+    def _finish(self, result: dict, timestamp=None, dt=None) -> dict:
+        """Failure reason + coverage annotation for every public result."""
+        if not result.get("success") and result.get("error") not in (None, "Not processed"):
+            result.setdefault("failure_reason", classify_failure(result.get("error")))
+        if timestamp is not None:
+            self._blend_clock = float(timestamp)
+        else:
+            self._blend_clock += float(dt or 0.0)
+        if (
+            self._blend is not None
+            and not self.relative_mode
+            and result.get("success")
+            and not result.get("fallback_mode")
+            and "lat" in result
+            and "lon" in result
+        ):
+            is_kf = result.get("fix_source", "keyframe") == "keyframe" and not result.get("is_of")
+            lat, lon, off = self._blend.apply(
+                float(result["lat"]),
+                float(result["lon"]),
+                self._blend_clock,
+                is_kf,
+                absorb=getattr(self, "_blend_last_source", None) != "dead_reckoning",
+            )
+            self._blend_last_source = result.get("fix_source", "keyframe")
+            if off > 0.0:
+                result["unblended_lat"], result["unblended_lon"] = result["lat"], result["lon"]
+                result["lat"], result["lon"] = lat, lon
+            result["output_offset_m"] = round(off, 2)
+        if result.get("success") and not result.get("fallback_mode"):
+            self._last_fix_source = result.get("fix_source", "keyframe")
+        monitor = self.coverage_monitor
+        if monitor is None:
+            return result
+        prev = monitor.state
+        monitor.update(result, timestamp, dt)
+        self._failure_logger.coverage_state = monitor.state
+        if self._coverage_guards and monitor.state != prev:
+            if monitor.state in ("outside", "unknown"):
+                # Re-entry search (plan 1.3): full rotation / scale scan, and
+                # retrieval centred on the covered point nearest to us.
+                self._last_best_angle = None
+                self._scale_manager.invalidate()
+            if self.db_manager is not None and monitor.state in ("outside", "unknown"):
+                point = monitor.nearest_return_point()
+                if point is not None:
+                    try:
+                        self.db_manager.update_retriever_positions(*point)
+                    except Exception as e:
+                        logger.debug(f"update_retriever_positions failed: {e}")
+        return result
 
     def _maybe_set_depth_hint(self, frame: np.ndarray) -> None:
         """Soft depth-based reorder of the scale pyramid (every N keyframes; hint only)."""
@@ -859,6 +1036,109 @@ class Localizer:
             logger.debug(f"Debug depth skipped: {e}")
 
     def localize_frame(
+        self,
+        query_frame,
+        static_mask=None,
+        dt=1.0,
+        yaw_hint_deg=None,
+        collector=None,
+        timestamp=None,
+        altitude_m=None,
+    ) -> dict:
+        _ = self.coverage_monitor  # built on first use
+        guards = self._edge_guards_active()
+        self.outlier_detector.suppress_forced_accept = guards
+        self._cold_last_angle = None
+        result = self._localize_frame_outer(
+            query_frame, static_mask, dt, yaw_hint_deg, collector, timestamp, altitude_m
+        )
+        result = self._cold_start_retry(
+            result, query_frame, static_mask, dt, yaw_hint_deg, collector, timestamp, altitude_m
+        )
+        if result.get("success") and not result.get("fallback_mode"):
+            self._had_fix = True
+        if (
+            self._visual_scale is not None
+            and result.get("success")
+            and not result.get("fallback_mode")
+        ):
+            self._visual_scale.on_keyframe(timestamp, self._estimated_query_gsd())
+        return self._finish(result, timestamp, dt)
+
+    def _cold_start_retry(
+        self, result, query_frame, static_mask, dt, yaw_hint_deg, collector, timestamp, altitude_m
+    ):
+        """Vision-only plan 2.4: before the session's first fix, a failed frame is
+        retried at the next-best rotations instead of waiting for the next frame.
+
+        route3min 2026-11-10: frame 0 failed in 10 of 12 runs, each time at the
+        single angle the global descriptor ranked first (e.g. 180 deg, score
+        0.876), while the next keyframe matched at 0 deg (0.910).
+        """
+        extra = int(get_cfg(self.config, "localization.cold_start_extra_angles", 0) or 0)
+        if (
+            extra <= 0
+            or result.get("success")
+            or getattr(self, "_had_fix", False)
+            or (
+                self.db_manager is not None
+                and get_cfg(self.config, "localization.layer_search.enabled", False)
+            )
+        ):
+            return result
+        failures = self._consecutive_failures
+        # The retries must not shift any per-call schedule (depth hint every N
+        # keyframes, temporal-prior counters): the first cold3 replay changed
+        # later stretches of the same flight through these side effects.
+        from copy import deepcopy
+
+        counters = {
+            k: getattr(self, k, None)
+            for k in (
+                "_depth_hint_counter",
+                "_debug_depth_counter",
+                "_tp_counter",
+                "_tp_tries",
+                "_tp_hits",
+                "_last_best_angle",
+            )
+        }
+        scale_before = deepcopy(self._scale_manager)
+        sp_before = deepcopy(self._spatial_prior)
+        tried: list[float] = []
+        try:
+            for _ in range(extra):
+                last = getattr(self, "_cold_last_angle", None)
+                if last is None:
+                    break
+                tried.append(last)
+                self._cold_exclude = list(tried)
+                self._cold_last_angle = None
+                retry = self._localize_frame_outer(
+                    query_frame, static_mask, dt, yaw_hint_deg, collector, timestamp, altitude_m
+                )
+                if retry.get("success"):
+                    logger.info(
+                        f"Cold start: fix at a further rotation after excluding "
+                        f"{[round(a, 1) for a in tried]}"
+                    )
+                    retry["cold_start_retries"] = len(tried)
+                    result = retry
+                    return result
+                result = retry
+        finally:
+            self._cold_exclude = None
+            for k, v in counters.items():
+                if k != "_last_best_angle" or not result.get("success"):
+                    setattr(self, k, v)
+            # One frame counts as one failure for the out-of-coverage counter.
+            if not result.get("success"):
+                self._consecutive_failures = failures
+                self._scale_manager = scale_before
+                self._spatial_prior = sp_before
+        return result
+
+    def _localize_frame_outer(
         self,
         query_frame,
         static_mask=None,
@@ -971,6 +1251,8 @@ class Localizer:
         self._last_state = new_state
         self._last_of_raw = None
         self._of_steps_since_kf = 0
+        if getattr(self, "_visual_scale", None) is not None:
+            self._visual_scale.on_rebase(flow_affine)
         return True
 
     def _hint_allows_temporal_prior(self, yaw_hint_deg: float | None) -> bool:
@@ -1152,6 +1434,12 @@ class Localizer:
             angles_to_try = list(self._rot_scan)
         else:
             angles_to_try = [0, 90, 180, 270]
+        # Cold start (localization.cold_start_extra_angles): a retry of the same
+        # frame skips the angles whose verification already failed.
+        excluded = getattr(self, "_cold_exclude", None)
+        if excluded:
+            kept = [a for a in angles_to_try if all(_ang_dist(a, e) >= 30.0 for e in excluded)]
+            angles_to_try = kept or angles_to_try
 
         top_k = self.retrieval_top_k
 
@@ -1231,6 +1519,8 @@ class Localizer:
             # Query scale vs the layer of the last fix, before retrieval switches layers
             # (localization.patchify_adaptive).
             self._frame_query_gsd = self._estimated_query_gsd()
+            if self._frame_query_gsd is None:
+                self._frame_query_gsd = self._tracked_query_gsd()
             self._apply_altitude_hint(width)
             prior_angle = self._last_best_angle
             use_prior = self.enable_auto_rotation and self._consecutive_failures == 0
@@ -1263,6 +1553,7 @@ class Localizer:
                 }
             best_global_score = rot.score
             best_global_angle = rot.angle
+            self._cold_last_angle = float(rot.angle)
             best_global_candidates = rot.candidates
             best_source_id_per_angle = rot.source_id
             best_scale = rot.best_scale
@@ -1274,6 +1565,7 @@ class Localizer:
                 collector.retrieval_candidates = [
                     (int(cid), float(sc)) for cid, sc in best_global_candidates
                 ][: self.retrieval_top_k]
+                collector.retrieval_source = best_source_id_per_angle
 
             logger.debug(
                 f"Selected rotation {best_global_angle}° scale {best_scale:.2f} "
@@ -1721,6 +2013,27 @@ class Localizer:
         my = float(pts_metric[0, 1])
         metric_pt = np.array([mx, my], dtype=np.float64)
 
+        # Coverage gate (plan 1.3, localization.coverage.edge_guards): near or
+        # beyond the map edge a fix whose footprint lies mostly off the map is not
+        # confirmed — the matched sliver cannot vouch for the whole frame.
+        if self._edge_guards_active():
+            _frac = self._footprint_fraction(
+                M_query_to_ref, affine_ref, rot_width, rot_height, ref_w, ref_h
+            )
+            if _frac is not None and _frac < self._coverage.p.leave_frac:
+                self._log_failure(
+                    FAILURE_TYPES["Footprint outside coverage"],
+                    inliers=best_inliers,
+                    details=f"footprint inside={_frac:.2f}",
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"Fix footprint mostly outside map coverage ({_frac:.0%} inside)"
+                    ),
+                    "footprint_inside_frac": round(_frac, 2),
+                }
+
         # ── Step 7: Outlier filtering ─────────────────────────────────────
         # Strong geometry beats kinematic prior: fix supported by hundreds of
         # RANSAC inliers should not be discarded due to platform speed assumptions.
@@ -1786,6 +2099,11 @@ class Localizer:
             best_candidate_id, best_inliers, best_total_matches, best_rmse, best_spread
         )
 
+        # First keyframe after dead reckoning: the filter state followed the
+        # drifting DR chain, so the fix re-anchors it (tracking.kalman_reanchor_after_dr).
+        _after_dr = self._kf_reanchor_after_dr and self._last_fix_source == "dead_reckoning"
+        if _after_dr:
+            logger.debug("Keyframe after dead reckoning: Kalman re-anchor allowed")
         filtered_pt = (
             metric_pt
             if self.relative_mode
@@ -1793,7 +2111,9 @@ class Localizer:
                 metric_pt,
                 dt=_kf_dt,
                 noise_scale=1.0 / max(confidence, 0.25),
-                trusted_max_offset_m=(self._trusted_fix_max_filter_offset if _strong else None),
+                trusted_max_offset_m=(
+                    self._trusted_fix_max_filter_offset if (_strong or _after_dr) else None
+                ),
                 timestamp=self._frame_timestamp,
             )
         )
@@ -1820,7 +2140,7 @@ class Localizer:
                     float(filtered_pt[1]) + float(corr[1]),
                 )
                 proposed_offset = float(np.linalg.norm(np.asarray(proposed_pt) - metric_pt))
-                if _strong and proposed_offset > self._trusted_fix_max_filter_offset:
+                if (_strong or _after_dr) and proposed_offset > self._trusted_fix_max_filter_offset:
                     # Never let a delayed smoother correction violate the
                     # same contract enforced by the front-end KF.
                     self._smoother.reset()
@@ -1907,6 +2227,29 @@ class Localizer:
     # ─────────────────────────────────────────────────────────────────────────
 
     def localize_optical_flow(
+        self,
+        dx_px: float,
+        dy_px: float,
+        dt: float,
+        rot_width: int,
+        rot_height: int,
+        flow_affine: np.ndarray | None = None,
+        flow_quality: float | None = None,
+        timestamp: float | None = None,
+    ) -> dict:
+        result = self._localize_optical_flow_impl(
+            dx_px, dy_px, dt, rot_width, rot_height, flow_affine, flow_quality, timestamp
+        )
+        # OF failures are per-frame noise between keyframes; the coverage state
+        # only follows OF positions (failed keyframes report the gaps).
+        if not result.get("success"):
+            result.setdefault("failure_reason", classify_failure(result.get("error")))
+            return result
+        if self._visual_scale is not None:
+            self._visual_scale.on_flow(flow_affine)
+        return self._finish(result, timestamp, dt)
+
+    def _localize_optical_flow_impl(
         self,
         dx_px: float,
         dy_px: float,
@@ -2237,7 +2580,7 @@ class Localizer:
 
         k = int(angle) // 90
         rot_mask = np.rot90(static_mask, k=k).copy() if static_mask is not None else None
-        needs_gsd = abs(float(scale) - 1.0) > 0.15
+        needs_gsd = self._scale_manager.needs_normalize(scale)
 
         if prepared is not None and prepared[0] is not None:
             # Frame is already prepared by selector for these same (angle, scale).
@@ -2298,7 +2641,7 @@ class Localizer:
                     query_frame, angle, scale, self._scale_manager, None, self._rot_erode
                 )
             mask = view_mask(query_frame.shape[:2], angle, static_mask, self._rot_erode)
-            if mask is not None and abs(float(scale) - 1.0) > 0.15:
+            if mask is not None and self._scale_manager.needs_normalize(scale):
                 mask, _ = self._scale_manager.normalize(mask, float(scale))
         feats = self.feature_extractor.extract_local_features(frame, static_mask=mask)
         feats.setdefault("image_size", np.array([frame.shape[0], frame.shape[1]], dtype=np.int32))
@@ -2380,6 +2723,21 @@ class Localizer:
             scale = sp.scale
         scale = 1.0 if scale is None else float(scale)
 
+        hit = self._spatial_prior_active(query_frame, static_mask, cache, pred, angle, scale)
+        if hit is not None:
+            return hit
+        if self.db_manager is not None and get_cfg(
+            self.config, "localization.spatial_prior_all_layers", False
+        ):
+            # Only after the active layer failed: other layers are coarser maps
+            # (sp_layers 2026-11-11: probing them first moved ~25 keyframe fixes
+            # per route from `main` to layer 2, keyframe p95 2.4 -> 4.1 m).
+            return self._spatial_prior_layers(query_frame, static_mask, cache, pred, angle, scale)
+        return None
+
+    def _spatial_prior_active(self, query_frame, static_mask, cache, pred, angle, scale):
+        """Legacy spatial prior: frames of the active layer near the prediction."""
+        sp = self._spatial_prior
         index_ids = self._tp_neighbour_ids()
         ids = sp.nearest_ids(
             self.database, pred[0], pred[1], exclude=index_ids, usable=self._tp_frame_usable
@@ -2422,6 +2780,91 @@ class Localizer:
         )
         out_angle = float(angle) if self._rot_continuous else int(angle)
         return (ver, out_angle, float(scale), rotated, rot_mask, crop_info, feats, probe)
+
+    def _spatial_prior_layers(self, query_frame, static_mask, cache, pred, angle, scale):
+        """Spatial prior over every layer (localization.spatial_prior_all_layers).
+
+        appearance_gap 2026-11-11 (old Esri imagery): the right place matches
+        with a median of 170-370 inliers, but on most failed keyframes it is on
+        another layer than the active one and at another scale (e.g. climbing to
+        1600 m on `main` while layer 2 matches at 0.7), and the global
+        descriptor ranks it outside the top 12 even at the true pose. Here the
+        frames near the dead-reckoned position of each layer are probed at that
+        layer's expected scale: query GSD (scale prior x active-layer GSD, else
+        the visual track) / layer GSD. Layers nearest in scale first; the active
+        layer at the last scale is left to the legacy check that follows.
+        """
+        sp = self._spatial_prior
+        q_gsd = self._estimated_query_gsd() or self._tracked_query_gsd()
+        if q_gsd is None:
+            act = self._gsd_of(self._active_source_id)
+            q_gsd = float(scale) * float(act) if act else None
+        if q_gsd is None:
+            return None
+        plans = []
+        for sid in list(getattr(self.db_manager, "all_source_ids", []) or []):
+            gsd = self._gsd_of(sid)
+            if not gsd:
+                continue
+            r = float(q_gsd) / float(gsd)
+            if not (0.4 <= r <= 2.5):
+                continue
+            if sid == self._active_source_id and abs(np.log(r / max(float(scale), 1e-6))) < 0.1:
+                continue  # same as the legacy check
+            plans.append((abs(float(np.log(r))), sid, r))
+        plans.sort()
+        for _, sid, r in plans[:2]:
+            db = self.db_manager.get_database(sid)
+            if db is None:
+                continue
+
+            def usable(c, _db=db):
+                try:
+                    chk = getattr(_db, "is_frame_georef_supported", None)
+                    if chk is not None and not chk(c):
+                        return False
+                    return _db.get_frame_affine(c) is not None
+                except Exception:  # noqa: BLE001
+                    return False
+
+            ids = sp.nearest_ids(db, pred[0], pred[1], usable=usable)
+            if not ids:
+                continue
+            self._sp_tries += 1
+            rotated, rot_mask, crop_info, feats = self._prepare_and_extract(
+                query_frame, static_mask, angle, r, cache
+            )
+            tp_feats = top_keypoints(feats, self._tp_keypoint_budget())
+            ref_cache: dict = {}
+            scored = self._geometric_verifier.mnn_counts(
+                tp_feats, [(int(i), 0.0) for i in ids], db, ref_cache
+            )
+            if not scored:
+                continue
+            scored.sort(key=lambda t: -t[0])
+            probe = [(cid, float(m)) for m, cid, _ in scored[: sp.verify]]
+            ver = self._geometric_verifier.verify(
+                tp_feats, probe, db, ref_cache=ref_cache, tag="spatial_prior_layers"
+            )
+            if ver is None or ver.inliers < self._tp_accept:
+                logger.debug(
+                    f"Spatial prior [{sid} x{r:.2f}]: rejected "
+                    f"({ver.inliers if ver is not None else 0} inliers)"
+                )
+                continue
+            self._sp_hits += 1
+            if sid != self._active_source_id:
+                self._active_source_id = sid
+                self.database = db
+                if self.calib_manager is not None:
+                    self.calibration = self.calib_manager.get(sid)
+            logger.info(
+                f"Spatial prior HIT on layer {sid} at scale {r:.2f}: frame={ver.candidate_id}, "
+                f"inliers={ver.inliers}, age {sp.age(self._sp_now):.1f} s"
+            )
+            out_angle = float(angle) if self._rot_continuous else int(angle)
+            return (ver, out_angle, float(r), rotated, rot_mask, crop_info, feats, probe)
+        return None
 
     def _try_index_prior(
         self, query_frame: np.ndarray, static_mask: np.ndarray | None, cache: dict
@@ -2601,6 +3044,10 @@ class Localizer:
         return best
 
     def _localize_by_reference_frame(self, frame_id: int, score: float) -> dict:
+        if self._edge_guards_active():
+            # Plan 1.3: near / beyond the map edge a retrieval-only position is
+            # the nearest map frame, not where the drone is.
+            return None
         return self._result_builder.fallback(frame_id, score, self.database, self.calibration)
 
     def _log_failure(self, error_type: str, inliers: int = 0, details: str = "") -> None:

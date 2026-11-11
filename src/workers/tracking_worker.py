@@ -12,6 +12,30 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Result fields forwarded with coverage_info (src/localization/coverage.py).
+_COVERAGE_KEYS = (
+    "coverage_state",
+    "coverage_alert",
+    "dist_to_edge_m",
+    "time_to_edge_s",
+    "return_bearing_deg",
+    "return_dist_m",
+    "return_lat",
+    "return_lon",
+    "footprint_inside_frac",
+    "fix_confirmed",
+    "position_uncertainty_m",
+    "last_known_lat",
+    "last_known_lon",
+    "since_position_s",
+    "since_fix_s",
+    "fix_source",
+    "lat",
+    "lon",
+    "success",
+    "failure_reason",
+)
+
 
 class RealtimeTrackingWorker(QThread):
     """Real-time localization worker thread (Optimized for XFeat + YOLO11)"""
@@ -24,6 +48,11 @@ class RealtimeTrackingWorker(QThread):
     fix_info = pyqtSignal(str, float)
     # Precise keyframe localization signal (anchor_fix)
     anchor_fix = pyqtSignal()
+    # Map coverage (localization.coverage): outline rings [[(lat, lon), ...]]
+    # once per run, then per processed result a dict with coverage_state,
+    # dist_to_edge_m, time_to_edge_s, return_bearing_deg, coverage_alert, ...
+    coverage_outline = pyqtSignal(object)
+    coverage_info = pyqtSignal(object)
     fps_updated = pyqtSignal(float)
     error = pyqtSignal(str)
     status_update = pyqtSignal(str)
@@ -81,6 +110,19 @@ class RealtimeTrackingWorker(QThread):
                 log_interval=get_cfg(self.config, "models.performance.latency_log_interval", 100),
                 logger=logger,
             )
+        # Keyframe-only latency: the all-frame window above is dominated by cheap
+        # optical-flow frames, so its percentiles hide the keyframe cost.
+        self._kf_latency_tracker = None
+        if self._latency_tracker is not None:
+            self._kf_latency_tracker = LatencyTracker(
+                log_interval=max(
+                    1,
+                    int(get_cfg(self.config, "models.performance.latency_log_interval", 100))
+                    // max(1, int(self.keyframe_interval)),
+                ),
+                logger=logger,
+                label="keyframe latency",
+            )
 
     def _models_to_pin(self) -> list[str]:
         """Model names to pin in VRAM during tracking."""
@@ -99,6 +141,9 @@ class RealtimeTrackingWorker(QThread):
         # Reset session state via public API
         if hasattr(self.localizer, "reset_session"):
             self.localizer.reset_session()
+        _cov_model = getattr(self.localizer, "coverage_model", None)
+        if _cov_model is not None:
+            self.coverage_outline.emit([[tuple(p) for p in r] for r in _cov_model.outline_ll])
 
         # Debug views: fresh backpressure state for new session
         with self._debug_lock:
@@ -281,6 +326,7 @@ class RealtimeTrackingWorker(QThread):
 
             loc_result = {"success": False, "error": "Not processed"}
             start_process = time.time()
+            _kf_path_ran = (not _retry_skip) and (is_keyframe or not flow.has_anchor)
 
             if _retry_skip:
                 pass  # keyframe retry throttled (tracking.keyframe_retry_every)
@@ -439,6 +485,11 @@ class RealtimeTrackingWorker(QThread):
 
             self._mt_step(frame, frame_geom)
 
+            if "coverage_state" in loc_result:
+                self.coverage_info.emit(
+                    {k: loc_result.get(k) for k in _COVERAGE_KEYS if k in loc_result}
+                )
+
             if loc_result.get("success") and loc_result.get("matched_frame", -1) != -1:
                 _since = loc_result.get("since_fix_s")
                 self.fix_info.emit(
@@ -454,6 +505,7 @@ class RealtimeTrackingWorker(QThread):
                 if (
                     not loc_result.get("is_of")
                     and loc_result.get("fallback_mode") != "retrieval_only"
+                    and loc_result.get("fix_confirmed", True) is not False
                 ):
                     self.anchor_fix.emit()
                 if loc_result.get("fov_polygon"):
@@ -493,6 +545,8 @@ class RealtimeTrackingWorker(QThread):
             process_duration = time.time() - start_process
             if self._latency_tracker is not None:
                 self._latency_tracker.record(process_duration)
+            if self._kf_latency_tracker is not None and _kf_path_ran:
+                self._kf_latency_tracker.record(process_duration)
             self.fps_updated.emit(1.0 / process_duration if process_duration > 0 else 0)
 
             frame_idx += 1

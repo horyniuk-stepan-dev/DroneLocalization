@@ -135,3 +135,29 @@ def test_kf_predict_position_is_pure_and_constant_velocity():
     assert np.array_equal(kf.kf.P, P_before)
     assert abs(px - (140.0 + 2.0 * 10.0)) < 1.0
     assert abs(py - 5.0) < 0.5
+
+
+# ── Map-edge guard (vision-only plan 1.3): no forced acceptance by count ──
+
+
+def test_edge_guard_blocks_count_based_acceptance():
+    det = _detector()
+    det.suppress_forced_accept = True
+    assert _streak(det, SCATTER) == [True, True, True, True]
+
+
+def test_edge_guard_accepts_consistent_pair():
+    det = _detector()
+    det.suppress_forced_accept = True
+    same = [(400.0, 0.0)] * 4
+    # 3rd rejection reaches max_consecutive and the last two offsets agree.
+    assert _streak(det, same) == [True, True, False, False]
+
+
+def test_edge_guard_escape_hatch():
+    det = _detector()
+    det.suppress_forced_accept = True
+    offsets = [SCATTER[k % 4] for k in range(14)]
+    res = _streak(det, offsets)
+    assert res[:12] == [True] * 12
+    assert res[12] is False  # 3 + 10 rejections: accepted to avoid a dead lock

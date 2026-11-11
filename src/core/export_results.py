@@ -9,6 +9,16 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Map-coverage columns (localization.coverage), exported when present.
+COVERAGE_FIELDS = (
+    "coverage_state",
+    "dist_to_edge_m",
+    "time_to_edge_s",
+    "return_bearing_deg",
+    "fix_confirmed",
+    "since_fix_s",
+)
+
 
 class ResultExporter:
     """Exports localization results to various formats (CSV, GeoJSON, KML)."""
@@ -38,6 +48,7 @@ class ResultExporter:
         if any("fix_source" in r for r in results):
             # keyframe / optical_flow / dead_reckoning (not confirmed by the map)
             fieldnames.append("fix_source")
+        fieldnames += [k for k in COVERAGE_FIELDS if any(k in r for r in results)]
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -52,7 +63,9 @@ class ResultExporter:
         logger.success(f"Exported {len(results)} results to CSV: {output_path}")
 
     @staticmethod
-    def export_geojson(results: list[dict[str, Any]], output_path: str) -> None:
+    def export_geojson(
+        results: list[dict[str, Any]], output_path: str, coverage: dict | None = None
+    ) -> None:
         """Exports localization results to GeoJSON format including FOV polygons."""
         if any(r.get("coordinate_kind") == "local_planar" for r in results):
             raise ValueError("Local maps have no GPS coordinates. Export as CSV instead.")
@@ -72,6 +85,7 @@ class ResultExporter:
                     "timestamp": r.get("timestamp"),
                     "matched_frame": r.get("matched_frame"),
                     "fix_source": r.get("fix_source", "keyframe"),
+                    **{k: r[k] for k in COVERAGE_FIELDS if k in r},
                 },
             )
             features.append(point)
@@ -95,6 +109,10 @@ class ResultExporter:
                     },
                 )
                 features.append(polygon)
+
+        if coverage is not None:
+            # Map coverage outline (CoverageModel.outline_geojson()).
+            features.append(coverage)
 
         feature_collection = geojson.FeatureCollection(
             features, properties={"exported_at": datetime.now().isoformat()}

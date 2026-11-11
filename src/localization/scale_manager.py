@@ -117,6 +117,17 @@ class ScaleManager:
         self._ema_alpha: float = get_cfg(cfg, "localization.scale_prior_ema", 0.7)
         self._rescan_min: float = get_cfg(cfg, "localization.scale_rescan_min_score", 0.65)
         self._use_depth_hint: bool = get_cfg(cfg, "localization.scale_use_depth_hint", True)
+        # |r - 1| below which the query is matched at its own size (no crop /
+        # resize to the layer's GSD). None = legacy bands: 0.15 in the callers,
+        # [0.85, 1.18] inside normalize().
+        _band = get_cfg(cfg, "localization.scale_normalize_deadband", None)
+        self._deadband: float | None = None if _band is None else float(_band)
+        # True: the narrow band applies only while there is no scale prior (after
+        # a lost keyframe) and only to the altitude hint's layer ratios — the
+        # re-search case; ordinary tracking keeps the legacy bands.
+        self._deadband_hint_only: bool = bool(
+            get_cfg(cfg, "localization.scale_normalize_deadband_hint_only", False)
+        )
         # Clipping range for the prior (prevents runaway EMA)
         self._min_r: float = 0.3
         self._max_r: float = 3.5
@@ -134,6 +145,20 @@ class ScaleManager:
         )
 
     # ── public API ──────────────────────────────────────────────────────────
+
+    def needs_normalize(self, scale: float) -> bool:
+        """Should a query at ratio ``scale`` be GSD-normalized before matching?"""
+        band = self._band_for(float(scale))
+        return abs(float(scale) - 1.0) > (0.15 if band is None else band)
+
+    def _band_for(self, r: float) -> float | None:
+        """Configured narrow band for ratio ``r``, or None for the legacy bands."""
+        band = getattr(self, "_deadband", None)
+        if band is None or not getattr(self, "_deadband_hint_only", False):
+            return band
+        if self._prior is not None or not self._altitude_scales:
+            return None
+        return band if any(abs(r - s) < 1e-3 for s in self._altitude_scales) else None
 
     @property
     def prior(self) -> float | None:
@@ -212,7 +237,9 @@ class ScaleManager:
         h, w = frame.shape[:2]
 
         # Tolerance band — no transform needed
-        if 0.85 <= r <= 1.18:
+        band = self._band_for(float(r))
+        no_op = (0.85 <= r <= 1.18) if band is None else abs(r - 1.0) <= band
+        if no_op:
             return frame, CropInfo(
                 scale_r=r,
                 crop_x=0,

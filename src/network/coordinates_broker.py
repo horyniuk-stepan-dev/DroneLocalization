@@ -13,6 +13,16 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+# Coverage fields copied into every position message (localization.coverage).
+_POSITION_COVERAGE_KEYS = (
+    "coverage_state",
+    "dist_to_edge_m",
+    "time_to_edge_s",
+    "return_bearing_deg",
+    "fix_confirmed",
+    "position_uncertainty_m",
+)
+
 
 class CoordinatesBroker(QObject):
     """Centralized coordinates broker for all downstream consumers."""
@@ -22,6 +32,8 @@ class CoordinatesBroker(QObject):
         self.config = config
 
         self._last_position: dict | None = None
+        # Latest map-coverage info (localization.coverage); None when disabled.
+        self._coverage: dict | None = None
         self._coordinate_mode = "GEOGRAPHIC"
         self._last_objects: list[dict] = []
         self._history: deque = deque(maxlen=1000)
@@ -126,6 +138,7 @@ class CoordinatesBroker(QObject):
     def set_tracking_active(self, active: bool):
         self.is_tracking_active = active
         if active:
+            self._coverage = None
             self._tracking_start_time = time.time()
             self._last_fix_mono = None
             self._last_anchor_mono = None
@@ -225,6 +238,11 @@ class CoordinatesBroker(QObject):
             "fix_source": getattr(self, "_fix_source", "keyframe"),
             "since_fix_s": getattr(self, "_since_fix_s", None),
         }
+        cov = self._coverage
+        if cov is not None:
+            for key in _POSITION_COVERAGE_KEYS:
+                if key in cov:
+                    msg[key] = cov[key]
         if self._coordinate_mode == "LOCAL":
             msg.pop("lat")
             msg.pop("lon")
@@ -242,6 +260,35 @@ class CoordinatesBroker(QObject):
             self._last_fix_mono = None
             self._last_anchor_mono = None
         self._coordinate_mode = mode
+
+    @pyqtSlot(object)
+    def on_coverage_info(self, info: dict):
+        """Map-coverage state of the latest result (emitted before its position).
+
+        A ``coverage`` message is broadcast on every state change or alert, so
+        consumers also learn "outside" / "position unknown" while no position
+        is being published.
+        """
+        prev = (self._coverage or {}).get("coverage_state")
+        self._coverage = dict(info)
+        if info.get("coverage_state") != prev or info.get("coverage_alert"):
+            msg = {"type": "coverage", "timestamp": time.time()}
+            msg.update({k: v for k, v in info.items() if k not in ("success",)})
+            if self._coordinate_mode == "LOCAL":
+                for a, b in (
+                    ("lat", "y"),
+                    ("lon", "x"),
+                    ("last_known_lat", "last_known_y"),
+                    ("last_known_lon", "last_known_x"),
+                    ("return_lat", "return_y"),
+                    ("return_lon", "return_x"),
+                ):
+                    if a in msg:
+                        msg[b] = msg.pop(a)
+            self._broadcast(msg)
+
+    def get_coverage(self) -> dict | None:
+        return dict(self._coverage) if self._coverage is not None else None
 
     @pyqtSlot()
     def on_anchor_fix(self):

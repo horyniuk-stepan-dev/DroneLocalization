@@ -170,3 +170,27 @@ class TestScaleManagerReset:
         sm.reset()
         assert sm.prior is None
         assert sm._depth_hint is None
+
+
+def test_deadband_hint_only_applies_to_hint_ratio_without_prior():
+    import numpy as np
+
+    from src.localization.scale_manager import ScaleManager
+
+    cfg = {
+        "localization": {
+            "scale_normalize_deadband": 0.05,
+            "scale_normalize_deadband_hint_only": True,
+        }
+    }
+    sm = ScaleManager(cfg)
+    frame = np.zeros((720, 1280, 3), np.uint8)
+    # no hint: legacy bands
+    assert not sm.needs_normalize(0.86)
+    sm.set_altitude_scales([0.86, 1.8])
+    assert sm.needs_normalize(0.86)
+    assert sm.normalize(frame, 0.86)[0].shape[1] < 1280
+    assert not sm.needs_normalize(0.9)  # not a hint ratio
+    sm._prior = 0.86  # tracking again: legacy bands
+    assert not sm.needs_normalize(0.86)
+    assert sm.normalize(frame, 0.86)[0].shape == frame.shape
