@@ -143,7 +143,9 @@
         "altitude_hint": {
             "enabled": true,
             "max_layers": 2,
-            "telemetry_scale_ema": 0.3
+            "telemetry_scale_ema": 0.3,
+            "visual_track": false,
+            "visual_max_age_s": 60.0
         },
         "coverage": {
             "enabled": true,
@@ -237,6 +239,10 @@
         "spread_floor": 0.35,
         "spread_log_every": 50,
         "max_consecutive_failures": 10,
+        "cold_start_extra_angles": 3,
+        "spatial_prior_all_layers": true,
+        "scale_normalize_deadband": null,
+        "scale_normalize_deadband_hint_only": false,
         "recovery_cascade": true,
         "candidate_prefilter": true,
         "prefilter_keep": 2,
@@ -291,6 +297,12 @@
         "of_noise_scale": 0.1,
         "of_noise_growth_per_step": 0.0,
         "kalman_dt_from_timestamps": true,
+        "reanchor_blend_max_step_m": 3.0,
+        "reanchor_blend_max_gap_s": 0.5,
+        "kalman_reanchor_max_speed": 150.0,
+        "kalman_reanchor_after_dr": true,
+        "reanchor_blend_min_m": 5.0,
+        "reanchor_blend_max_offset_m": 40.0,
         "kalman_reanchor_velocity_from_fixes": true,
         "kalman_max_gap_s": 3.0,
         "of_fb_max_px": 2.0,
