@@ -50,13 +50,13 @@ warnings.filterwarnings("ignore", category=UserWarning, message="xFormers is not
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-import argparse
 import traceback
 
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import QApplication
 
 from config import APP_SETTINGS, CONFIG_LOAD_STATUS, CONFIG_LOADED_FROM, user_data_dir
+from src.cli_args import parse_args
 from src.core.headless_runner import HeadlessRunner
 from src.gui.main_window import MainWindow
 from src.utils.logging_utils import enable_crash_handler, get_logger, setup_logging
@@ -289,43 +289,7 @@ def main() -> None:
     else:
         logger.info("Auto-tune disabled (models.performance.auto_tune = false)")
 
-    parser = argparse.ArgumentParser(description="Drone Topometric Localization")
-    parser.add_argument("--headless", action="store_true", help="Run without GUI")
-    parser.add_argument(
-        "--project", type=str, help="Path to project directory (required for headless)"
-    )
-    parser.add_argument(
-        "--source", type=str, help="Video source URL or path (required for headless)"
-    )
-    # ВАЖЛИВО: default=None, а не число. Раніше дефолти argparse (8765/8080)
-    # БЕЗУМОВНО перезаписували network_api.ws_port / rest_port із user_config.json
-    # навіть коли прапорець не передавали — headless завжди слухав 8080, хоча
-    # конфіг казав 8081.
-    parser.add_argument(
-        "--ws-port",
-        type=int,
-        default=None,
-        help="WebSocket port (default: network_api.ws_port from config)",
-    )
-    parser.add_argument(
-        "--rest-port",
-        type=int,
-        default=None,
-        help="REST API port (default: network_api.rest_port from config)",
-    )
-    parser.add_argument(
-        "--supervise",
-        action="store_true",
-        help="Headless: run the pipeline in a child process and auto-restart it on crash",
-    )
-    parser.add_argument(
-        "--max-restarts",
-        type=int,
-        default=0,
-        help="Supervisor: stop after N restarts (0 = unlimited)",
-    )
-
-    args = parser.parse_args()
+    args = parse_args()
 
     # HARDENING P0-3: supervisor mode wraps the headless pipeline in an
     # auto-restarting parent process. Flag-gated; off = current behavior.
