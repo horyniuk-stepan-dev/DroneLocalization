@@ -273,7 +273,7 @@ class ModelManager:
 
         def yolo():
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-            self.models["yolo"](frame, verbose=False, half=dev == "cuda")  # as YOLOWrapper
+            self.models["yolo"](frame, verbose=False, half=dev == "cuda" and fp16)  # as YOLOWrapper
 
         passes = [("dinov2", dino), ("aliked", aliked), ("yolo", yolo)]
         passes += [

@@ -10,13 +10,19 @@ logger = get_logger(__name__)
 class YOLOWrapper:
     """Wrapper for YOLOv11 segmentation (compatible with YOLOv8 API)"""
 
-    def __init__(self, model, device="cuda"):
+    def __init__(self, model, device="cuda", half: bool | None = None):
         self.model = model
         self.device = device
         # COCO classes: 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
         self.dynamic_classes = {0, 1, 2, 3, 5, 7}
 
-        self.use_half = device == "cuda" and torch.cuda.is_available()
+        # Half precision follows models.performance.fp16_enabled like the other
+        # models (GTX 1650 2026-11-11: fp16 matmul 0.43 vs fp32 1.78 TFLOPS).
+        if half is None:
+            from config import APP_CONFIG, get_cfg
+
+            half = bool(get_cfg(APP_CONFIG, "models.performance.fp16_enabled", True))
+        self.use_half = bool(half) and device == "cuda" and torch.cuda.is_available()
 
     @torch.no_grad()
     def detect_and_mask(self, image: np.ndarray) -> tuple:
