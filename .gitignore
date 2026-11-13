@@ -136,3 +136,6 @@ topnew_errors.csv
 
 # User-drawn map features (MapWidget autosave)
 /map_features.geojson
+benchmarks/
+
+.benchmarks
